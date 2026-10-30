@@ -7,7 +7,7 @@
 
 use crate::gate_result::{GateResult, Status};
 use crate::runner::{run_code, Check};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -87,23 +87,50 @@ fn verdict(spec: &Spec, head_sha: &str, status: Status, class: Option<&str>, mes
     GateResult { status, gate_id: spec.id.to_string(), head_sha: head_sha.to_string(), failure_class: class.map(|c| c.to_string()), message: message.to_string(), file: None, line: None }
 }
 
-/// Refuse a base tree where any part of the check path is a symlink, so the copy below can never write or delete outside the tree.
-fn no_symlink_on_path(root: &Path, program: &str) -> Result<(), String> {
-    let mut p = root.to_path_buf();
-    for part in Path::new(program).components() {
-        p.push(part);
-        match std::fs::symlink_metadata(&p) {
-            Ok(m) if m.file_type().is_symlink() => return Err("base tree has a symlink on the check path".to_string()),
-            Ok(_) => {}
-            Err(_) => break,
+/// Prepare the destination of the carried check inside the base tree and return it. Every part of the path must be a plain name (checked by the caller);
+/// each existing part must be a real directory (never a symlink), missing parts are created one at a time, an existing destination must be a regular file,
+/// and the parent must still resolve inside the base tree before anything is written.
+fn prepare_dst(root: &Path, program: &str) -> Result<PathBuf, String> {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for c in Path::new(program).components() {
+        match c {
+            Component::Normal(n) => parts.push(n),
+            _ => return Err("check path must be plain names relative to the repo".to_string()),
         }
     }
-    Ok(())
+    let (file, dirs) = parts.split_last().ok_or("check path empty")?;
+    let mut p = root.to_path_buf();
+    for d in dirs {
+        p.push(d);
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => return Err("base tree has a non-directory or symlink on the check path".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&p).map_err(|_| "could not prepare the base tree".to_string())?,
+            Err(_) => return Err("could not inspect the base tree".to_string()),
+        }
+    }
+    let dst = p.join(file);
+    match std::fs::symlink_metadata(&dst) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err("base tree has a non-file or symlink at the check path".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("could not inspect the base tree".to_string()),
+    }
+    let real_root = root.canonicalize().map_err(|_| "base tree unreadable".to_string())?;
+    let real_parent = p.canonicalize().map_err(|_| "base tree unreadable".to_string())?;
+    if !real_parent.starts_with(&real_root) {
+        return Err("check path escapes the base tree".to_string());
+    }
+    Ok(dst)
 }
 
 /// Run the declared check at `base` and at `head`. Err means the request is refused (bad ref, head not the recorded sha, head equal to base, check path invalid);
 /// Ok carries a normalized result.
 pub fn both_ends(repo: &Path, base: &str, head: &str, recorded_head: &str, spec: &Spec) -> Result<GateResult, String> {
+    // Lexical gate before anything else: every part of the check path must be a plain name (no dot-dot, dot, root or prefix).
+    if spec.program.is_empty() || !Path::new(spec.program).components().all(|c| matches!(c, Component::Normal(_))) {
+        return Err("check path must be plain names relative to the repo".to_string());
+    }
     let base_sha = commit_sha(repo, base)?;
     let head_sha = commit_sha(repo, head)?;
     if head_sha != recorded_head {
@@ -116,13 +143,8 @@ pub fn both_ends(repo: &Path, base: &str, head: &str, recorded_head: &str, spec:
     let base_tree = Tree::add(repo, &base_sha)?;
     // The check file comes from head (validated inside the head tree); carry it into the base tree.
     Check::load(&head_tree.path, spec.id, spec.program, spec.args, spec.budget, spec.max_output)?;
-    no_symlink_on_path(&base_tree.path, spec.program)?;
     let src = head_tree.path.join(spec.program);
-    let dst = base_tree.path.join(spec.program);
-    if let Some(dir) = dst.parent() {
-        std::fs::create_dir_all(dir).map_err(|_| "could not prepare the base tree".to_string())?;
-    }
-    let _ = std::fs::remove_file(&dst);
+    let dst = prepare_dst(&base_tree.path, spec.program)?;
     std::fs::copy(&src, &dst).map_err(|_| "could not carry the check to the base tree".to_string())?;
 
     let base_check = Check::load(&base_tree.path, spec.id, spec.program, spec.args, spec.budget, spec.max_output)?;

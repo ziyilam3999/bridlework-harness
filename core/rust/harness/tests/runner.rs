@@ -62,7 +62,7 @@ fn past_budget_is_fail_and_inside_budget_is_pass() {
 
     script(&d, "quick.sh", "echo fine");
     let r = run(&d, &load(&d, "quick.sh", 5000, 1000).unwrap(), SHA);
-    assert_eq!(r.status, Status::Pass);
+    assert_eq!(r.status, Status::Pass, "{:?} {}", r.failure_class, r.message);
     assert_eq!(r.failure_class, None);
     assert_eq!(r.head_sha, SHA);
     assert!(r.message.contains("fine"));
@@ -88,7 +88,7 @@ fn output_over_the_cap_is_cut_and_marked() {
     let d = scratch("cap");
     script(&d, "loud.sh", "head -c 200000 /dev/zero | tr '\\0' a");
     let r = run(&d, &load(&d, "loud.sh", 10000, 1000).unwrap(), SHA);
-    assert_eq!(r.status, Status::Pass);
+    assert_eq!(r.status, Status::Pass, "{:?} {}", r.failure_class, r.message);
     assert!(r.message.contains("[output cut at 1000 bytes]"));
     assert!(r.message.len() < 1100);
     script(&d, "small.sh", "echo tiny");

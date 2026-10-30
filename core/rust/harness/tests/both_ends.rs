@@ -65,7 +65,7 @@ fn spec() -> Spec<'static> {
 fn red_at_base_and_green_at_head_passes_and_names_the_head_sha() {
     let (d, base, head) = repo("ok", "bad", "good", true);
     let r = both_ends(&d, &base, &head, &head, &spec()).unwrap();
-    assert_eq!(r.status, Status::Pass);
+    assert_eq!(r.status, Status::Pass, "{:?} {}", r.failure_class, r.message);
     assert_eq!(r.failure_class, None);
     assert_eq!(r.head_sha, head);
     assert!(r.validate().is_ok());
@@ -78,7 +78,7 @@ fn red_at_base_and_green_at_head_passes_and_names_the_head_sha() {
 fn a_check_added_by_the_fix_still_runs_against_base() {
     let (d, base, head) = repo("added", "bad", "good", false);
     let r = both_ends(&d, &base, &head, &head, &spec()).unwrap();
-    assert_eq!(r.status, Status::Pass);
+    assert_eq!(r.status, Status::Pass, "{:?} {}", r.failure_class, r.message);
     let _ = std::fs::remove_dir_all(d);
 }
 
@@ -194,6 +194,46 @@ fn a_symlinked_check_folder_at_base_never_writes_outside_the_tree() {
     let head = git(&d, &["rev-parse", "HEAD"]);
     assert!(both_ends(&d, &base, &head, &head, &spec()).is_err());
     assert_eq!(std::fs::read_to_string(outside.join("check.sh")).unwrap(), "victim\n");
+    assert_eq!(git(&d, &["worktree", "list"]).lines().count(), 1);
+    let _ = std::fs::remove_dir_all(d);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
+#[test]
+fn a_dot_dot_check_path_never_writes_outside_the_trees() {
+    let d = scratch("dots");
+    let outside = scratch("dots-outside");
+    let decoy = outside.join("decoy.txt");
+    std::fs::write(&decoy, "victim\n").unwrap();
+    // The decoy's absolute path without its leading slash, so it also exists as a relative file inside head.
+    let abs = decoy.to_str().unwrap().to_string();
+    let rel = abs.trim_start_matches('/').to_string();
+
+    git(&d, &["init", "-q"]);
+    std::fs::write(d.join("value.txt"), "bad").unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "base"]);
+    let base = git(&d, &["rev-parse", "HEAD"]);
+
+    // Head: `a` is a symlink to a 30-deep folder inside head, so thirty dot-dots from `a` land back at the head root, and the relative decoy path exists there.
+    let deep = (0..30).map(|_| "d").collect::<Vec<_>>().join("/");
+    std::fs::create_dir_all(d.join(&deep)).unwrap();
+    std::fs::write(d.join(&deep).join("keep"), "x").unwrap();
+    std::os::unix::fs::symlink(&deep, d.join("a")).unwrap();
+    let target = d.join(&rel);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "head"]);
+    let head = git(&d, &["rev-parse", "HEAD"]);
+
+    let program = format!("a/{}{}", "../".repeat(30), rel);
+    let mut s = spec();
+    s.program = &program;
+    assert!(both_ends(&d, &base, &head, &head, &s).is_err());
+    assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "victim\n");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
     assert_eq!(git(&d, &["worktree", "list"]).lines().count(), 1);
     let _ = std::fs::remove_dir_all(d);
     let _ = std::fs::remove_dir_all(outside);
