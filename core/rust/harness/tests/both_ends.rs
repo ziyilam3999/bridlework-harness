@@ -131,3 +131,70 @@ fn bad_refs_and_bad_check_paths_are_refused() {
     assert_eq!(git(&d, &["worktree", "list"]).lines().count(), 1);
     let _ = std::fs::remove_dir_all(d);
 }
+
+#[test]
+fn base_equal_to_head_is_refused() {
+    let (d, _base, head) = repo("same", "bad", "good", true);
+    assert!(both_ends(&d, &head, &head, &head, &spec()).is_err());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn the_check_cannot_tell_base_from_head_by_its_path() {
+    let (d, base, head) = repo("path", "bad", "good", true);
+    let f = d.join("ci/check.sh");
+    std::fs::write(&f, "#!/bin/sh\ncase \"$PWD\" in *base*) exit 1;; esac\nexit 0\n").unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "keyed on path"]);
+    let head2 = git(&d, &["rev-parse", "HEAD"]);
+    let r = both_ends(&d, &base, &head2, &head2, &spec()).unwrap();
+    assert_ne!(head, head2);
+    assert_eq!((r.status, r.failure_class.as_deref()), (Status::Fail, Some("passes-at-base")));
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_helper_missing_at_base_is_not_a_red_result() {
+    let d = scratch("helper");
+    git(&d, &["init", "-q"]);
+    std::fs::write(d.join("value.txt"), "same").unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "base"]);
+    let base = git(&d, &["rev-parse", "HEAD"]);
+    // head adds a helper that exits 0 and a check that runs it: nothing is actually fixed.
+    std::fs::create_dir_all(d.join("ci")).unwrap();
+    std::fs::write(d.join("ci/check.sh"), "#!/bin/sh\nexec ./ci/helper.sh\n").unwrap();
+    std::fs::write(d.join("ci/helper.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    for f in ["ci/check.sh", "ci/helper.sh"] {
+        std::fs::set_permissions(d.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "head"]);
+    let head = git(&d, &["rev-parse", "HEAD"]);
+    let r = both_ends(&d, &base, &head, &head, &spec()).unwrap();
+    assert_eq!((r.status, r.failure_class.as_deref()), (Status::Fail, Some("base-error")));
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_symlinked_check_folder_at_base_never_writes_outside_the_tree() {
+    let d = scratch("link");
+    let outside = scratch("link-outside");
+    std::fs::write(outside.join("check.sh"), "victim\n").unwrap();
+    git(&d, &["init", "-q"]);
+    std::os::unix::fs::symlink(&outside, d.join("ci")).unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "base"]);
+    let base = git(&d, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(d.join("ci")).unwrap();
+    write_check(&d);
+    std::fs::write(d.join("value.txt"), "good").unwrap();
+    git(&d, &["add", "-A"]);
+    git(&d, &["commit", "-q", "-m", "head"]);
+    let head = git(&d, &["rev-parse", "HEAD"]);
+    assert!(both_ends(&d, &base, &head, &head, &spec()).is_err());
+    assert_eq!(std::fs::read_to_string(outside.join("check.sh")).unwrap(), "victim\n");
+    assert_eq!(git(&d, &["worktree", "list"]).lines().count(), 1);
+    let _ = std::fs::remove_dir_all(d);
+    let _ = std::fs::remove_dir_all(outside);
+}
