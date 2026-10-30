@@ -69,6 +69,37 @@ fn run_scan(args: &[String], testmode: bool, surface: &str) -> Result<Outcome, S
     Ok(Outcome { hits, stderr, text_mode })
 }
 
+/// `harness fixtures names | list | near-miss | line <name> | marker <name> | class <name> | extra <name>`:
+/// prints synthetic test material for drivers. It reads nothing.
+fn fixtures_cmd(a: &[String]) -> i32 {
+    use crate::fixtures;
+    let cases = fixtures::cases();
+    let pick = |n: &str| cases.iter().find(|c| c.name == n);
+    match a.iter().map(|s| s.as_str()).collect::<Vec<&str>>().as_slice() {
+        ["names"] => cases.iter().for_each(|c| println!("{}", c.name)),
+        ["list"] => print!("{}", fixtures::synthetic_list()),
+        ["near-miss"] => fixtures::near_misses().iter().for_each(|l| println!("{}", l)),
+        ["line", n] => match pick(n) {
+            Some(c) => println!("{}", c.line),
+            None => return 2,
+        },
+        ["marker", n] => match pick(n) {
+            Some(c) => println!("{}", c.marker),
+            None => return 2,
+        },
+        ["class", n] => match pick(n) {
+            Some(c) => println!("{}", c.class),
+            None => return 2,
+        },
+        ["extra", n] => match fixtures::extra(n) {
+            Some(t) => println!("{}", t),
+            None => return 2,
+        },
+        _ => return 2,
+    }
+    0
+}
+
 pub fn run(mut args: Vec<String>) -> i32 {
     if args.len() == 1 && args[0] == "--version" {
         println!("{}", crate::version_line());
@@ -80,6 +111,9 @@ pub fn run(mut args: Vec<String>) -> i32 {
             println!("{}", c);
         }
         return 0;
+    }
+    if !args.is_empty() && args[0] == "fixtures" {
+        return fixtures_cmd(&args[1..]);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
         eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode>");

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod decode;
 pub mod detect;
 pub mod explain;
+pub mod fixtures;
 pub mod gitio;
 pub mod overlay;
 pub mod scan;
