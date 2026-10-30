@@ -89,6 +89,11 @@ fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 
+/// The exact committer pair GitHub itself stamps on merge commits made in its web UI. Committer field only.
+fn webflow_committer(name: &str, email: &str) -> bool {
+    name == "GitHub" && email == ["no", "reply", "@", "github", ".com"].concat()
+}
+
 fn meta(ctx: &Ctx, sha: &str, out: &mut Vec<Hit>) -> Result<(), String> {
     let raw = utf8(git(&["log", "-1", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", sha])?)?;
     let parts: Vec<&str> = raw.splitn(5, '\0').collect();
@@ -102,6 +107,9 @@ fn meta(ctx: &Ctx, sha: &str, out: &mut Vec<Hit>) -> Result<(), String> {
         ("message", parts[4].to_string()),
     ];
     for (f, t) in fields {
+        if f == "committer" && webflow_committer(parts[2], parts[3]) {
+            continue;
+        }
         for h in scan_text(ctx, &format!("{}.{}", s, f), &t) {
             let h = Hit { line: 1, ..h };
             if !out.contains(&h) {
