@@ -1,0 +1,73 @@
+#!/bin/sh
+# pre-push privacy gate. Refuses the push when the engine reports a hit or any error (fail closed).
+# Args: $1 remote name, $2 push URL. Stdin: one "<local ref> <local sha> <remote ref> <remote sha>" line per ref.
+zero=0000000000000000000000000000000000000000
+url="$2"
+top=$(git rev-parse --show-toplevel) || exit 1
+eng="$top/core/rust/target/release/harness"
+if [ ! -x "$eng" ]; then
+  echo "pre-push: privacy engine missing; build it with: cd core/rust && cargo build --release" >&2
+  exit 1
+fi
+gitdir=$(git rev-parse --absolute-git-dir) || exit 1
+tm=""
+if [ "$HARNESS_PRIVACY_TESTMODE" = "synthetic-test" ]; then
+  tm="--testmode synthetic-test"
+  printf 'testmode used\n' >> "$gitdir/harness-privacy-testmode.log"
+fi
+fail=0
+total=0
+hits=0
+errf="$gitdir/harness-privacy-prepush.err"
+
+# Remote tips that exist locally, to exclude from the range (no reliance on remote-tracking refs).
+remote_list=$(git ls-remote "$url" </dev/null 2>/dev/null) || {
+  echo "pre-push: could not list the remote; refusing" >&2
+  exit 1
+}
+excl=""
+for s in $(printf '%s\n' "$remote_list" | cut -f1 | sort -u); do
+  if git cat-file -e "$s^{commit}" 2>/dev/null; then
+    excl="$excl $s"
+  fi
+done
+
+while read -r lref lsha rref rsha; do
+  [ "$lsha" = "$zero" ] && continue
+  case "$rref" in
+    refs/notes/*) echo "pre-push: pushing notes refs is refused" >&2; fail=1; continue ;;
+  esac
+  ty=$(git cat-file -t "$lsha" 2>/dev/null) || { fail=1; continue; }
+  if [ "$ty" = "tag" ]; then
+    out=$("$eng" privacy scan $tm --tag "$lsha" </dev/null 2>"$errf"); rc=$?
+    if [ "$rc" -ne 0 ]; then
+      fail=1
+      hits=$((hits + $(printf '%s' "$out" | wc -l)))
+      "$eng" privacy explain $tm --tag "$lsha" </dev/null >&2 2>/dev/null
+    fi
+    lsha=$(git rev-parse "$lsha^{commit}" 2>/dev/null) || { fail=1; continue; }
+  fi
+  if [ -n "$excl" ]; then
+    set -- "$lsha" --not $excl
+  else
+    set -- "$lsha"
+  fi
+  out=$("$eng" privacy scan $tm --range "$@" </dev/null 2>"$errf"); rc=$?
+  n=$(sed -n 's/^scanned_commits=//p' "$errf" | tail -1)
+  total=$((total + ${n:-0}))
+  if [ "$rc" -ne 0 ]; then
+    fail=1
+    hits=$((hits + $(printf '%s\n' "$out" | sed '/^$/d' | wc -l)))
+    "$eng" privacy explain $tm --range "$@" </dev/null >&2 2>/dev/null
+    if [ "$rc" -ge 2 ]; then
+      echo "pre-push: engine error (exit $rc); refusing" >&2
+    fi
+  fi
+done
+
+printf 'scanned_commits=%s hits=%s\n' "$total" "$hits" >> "$gitdir/harness-privacy-prepush.log"
+if [ "$fail" -ne 0 ]; then
+  echo "pre-push: refused by the privacy gate" >&2
+  exit 1
+fi
+exit 0
