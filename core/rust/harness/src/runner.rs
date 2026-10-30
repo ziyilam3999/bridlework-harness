@@ -72,6 +72,11 @@ fn result(check: &Check, head_sha: &str, status: Status, class: Option<&str>, me
 
 /// Run the check in `repo_root`. Never panics on a check's behavior; every outcome is a normalized result.
 pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
+    run_code(repo_root, check, head_sha).0
+}
+
+/// Like `run`, also returning the check's own exit code when it exited on its own (None for a timeout, a signal or a spawn failure).
+pub fn run_code(repo_root: &Path, check: &Check, head_sha: &str) -> (GateResult, Option<i32>) {
     // The budget clock starts before spawn, so spawn and reader setup count against it.
     let start = Instant::now();
     let mut child = match Command::new(&check.program)
@@ -83,7 +88,7 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return result(check, head_sha, Status::Fail, Some("spawn-error"), "check could not be started".to_string()),
+        Err(_) => return (result(check, head_sha, Status::Fail, Some("spawn-error"), "check could not be started".to_string()), None),
     };
     let buf = Arc::new(Mutex::new(Vec::new()));
     let cut = Arc::new(Mutex::new(false));
@@ -135,12 +140,12 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
         message.push_str(&format!("\n[output cut at {} bytes]", check.max_output));
     }
     if timed_out {
-        return result(check, head_sha, Status::Fail, Some("timeout"), message);
+        return (result(check, head_sha, Status::Fail, Some("timeout"), message), None);
     }
     match status {
-        Some(s) if s.success() => result(check, head_sha, Status::Pass, None, message),
-        Some(_) => result(check, head_sha, Status::Fail, Some("check-failed"), message),
-        None => result(check, head_sha, Status::Fail, Some("run-error"), message),
+        Some(s) if s.success() => (result(check, head_sha, Status::Pass, None, message), Some(0)),
+        Some(s) => (result(check, head_sha, Status::Fail, Some("check-failed"), message), s.code()),
+        None => (result(check, head_sha, Status::Fail, Some("run-error"), message), None),
     }
 }
 
