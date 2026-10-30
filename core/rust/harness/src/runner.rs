@@ -1,6 +1,7 @@
 //! Gate runner core (std only). Runs one declared check as a child process and returns a normalized `GateResult`.
 //! A check past its time budget is FAIL (class timeout), never PASS. Captured output is capped in bytes and marked as cut.
 //! A check path is resolved with realpath when loaded; a path that leaves the repo (dot-dot, absolute, or a symlink out) is refused.
+//! Known limits: the resolved path is not re-checked at run time (load-to-run swap is not closed), and only the direct child is killed, not its descendants.
 
 use crate::gate_result::{GateResult, Status};
 use std::io::Read;
@@ -17,13 +18,17 @@ pub struct Check {
     pub id: String,
     program: PathBuf,
     pub args: Vec<String>,
-    pub budget: Duration,
-    pub max_output: usize,
+    budget: Duration,
+    max_output: usize,
+    poll: Duration,
 }
 
 impl Check {
     /// Resolve `program` (a path relative to the repo root) with realpath and refuse anything that lands outside the repo.
     pub fn load(repo_root: &Path, id: &str, program: &str, args: &[&str], budget: Duration, max_output: usize) -> Result<Check, String> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')) {
+            return Err("check id malformed".to_string());
+        }
         if program.is_empty() || Path::new(program).is_absolute() {
             return Err("check path must be relative to the repo".to_string());
         }
@@ -38,7 +43,7 @@ impl Check {
         if max_output == 0 || budget.is_zero() {
             return Err("budget and output cap must be above zero".to_string());
         }
-        Ok(Check { id: id.to_string(), program: real, args: args.iter().map(|s| s.to_string()).collect(), budget, max_output })
+        Ok(Check { id: id.to_string(), program: real, args: args.iter().map(|s| s.to_string()).collect(), budget, max_output, poll: Duration::from_millis(10) })
     }
 }
 
@@ -67,6 +72,8 @@ fn result(check: &Check, head_sha: &str, status: Status, class: Option<&str>, me
 
 /// Run the check in `repo_root`. Never panics on a check's behavior; every outcome is a normalized result.
 pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
+    // The budget clock starts before spawn, so spawn and reader setup count against it.
+    let start = Instant::now();
     let mut child = match Command::new(&check.program)
         .args(&check.args)
         .current_dir(repo_root)
@@ -87,11 +94,16 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
         thread::spawn(move || capture(stream, b, cap, c, t));
     }
     drop(tx);
-    let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
+            // An exit seen only after the budget has run out is still a timeout: fail closed.
+            Ok(Some(s)) => {
+                if start.elapsed() >= check.budget {
+                    timed_out = true;
+                }
+                break Some(s);
+            }
             Ok(None) => {
                 if start.elapsed() >= check.budget {
                     timed_out = true;
@@ -99,7 +111,7 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
                     let _ = child.wait();
                     break None;
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(check.poll);
             }
             Err(_) => {
                 let _ = child.kill();
@@ -129,5 +141,28 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
         Some(s) if s.success() => result(check, head_sha, Status::Pass, None, message),
         Some(_) => result(check, head_sha, Status::Fail, Some("check-failed"), message),
         None => result(check, head_sha, Status::Fail, Some("run-error"), message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A long poll gap makes the late-exit race deterministic: the child exits 0 well inside the gap, and the first look at it is past the budget.
+    #[cfg(unix)]
+    #[test]
+    fn exit_seen_only_after_the_budget_is_a_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("hr-late-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("quick.sh");
+        std::fs::write(&f, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = Check::load(&d, "late", "quick.sh", &[], Duration::from_millis(100), 100).unwrap();
+        c.poll = Duration::from_millis(400);
+        let r = run(&d, &c, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!((r.status, r.failure_class.as_deref()), (Status::Fail, Some("timeout")));
+        let _ = std::fs::remove_dir_all(d);
     }
 }

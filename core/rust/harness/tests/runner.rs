@@ -26,6 +26,30 @@ fn load(dir: &Path, prog: &str, budget_ms: u64, cap: usize) -> Result<Check, Str
 }
 
 #[test]
+fn a_clean_exit_after_the_budget_is_still_fail() {
+    let d = scratch("late");
+    script(&d, "ok.sh", "exit 0");
+    // One nanosecond: the budget is gone before any exit can be seen, so a clean exit must not pass.
+    let c = Check::load(&d, "smoke", "ok.sh", &[], Duration::from_nanos(1), 1000).unwrap();
+    for _ in 0..5 {
+        let r = run(&d, &c, SHA);
+        assert_eq!((r.status, r.failure_class.as_deref()), (Status::Fail, Some("timeout")));
+    }
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_malformed_check_id_is_refused_at_load() {
+    let d = scratch("id");
+    script(&d, "ok.sh", "exit 0");
+    for bad in ["", "bad id!", "UPPER", "a/b"] {
+        assert!(Check::load(&d, bad, "ok.sh", &[], Duration::from_secs(1), 100).is_err(), "should refuse {:?}", bad);
+    }
+    assert!(Check::load(&d, "unit-tests.v1_a", "ok.sh", &[], Duration::from_secs(1), 100).is_ok());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
 fn past_budget_is_fail_and_inside_budget_is_pass() {
     let d = scratch("budget");
     script(&d, "slow.sh", "exec sleep 5");
