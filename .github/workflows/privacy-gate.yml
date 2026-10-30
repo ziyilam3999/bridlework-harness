@@ -1,0 +1,25 @@
+name: privacy-gate
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build engine
+        run: cargo build --release --locked
+        working-directory: core/rust
+      - name: Scan
+        env:
+          HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}
+        run: sh ci/privacy-gate.sh

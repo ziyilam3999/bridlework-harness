@@ -1,0 +1,33 @@
+name: privacy-text
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened]
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  release:
+    types: [created, edited, published]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  text:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build engine
+        run: cargo build --release --locked
+        working-directory: core/rust
+      - name: Scan text
+        env:
+          HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}
+        run: sh ci/privacy-text.sh "$GITHUB_EVENT_PATH"
