@@ -3,12 +3,12 @@
 //! One rule runs through it: every input is resolved once, under its one root, and only the resolved value is used afterwards; every write is re-checked
 //! against the root it lands in. Non-goals: the check is not sandboxed (a hostile check can still find the main repo or tell the ends apart by commit or
 //! content); grandchildren are not killed; a stateful check may differ between runs. Removing `GIT_*` stops accidental redirection only.
-//! Repo-configured content filters that git runs during checkout are the repo owner's own configuration and are not suppressed.
+//! The check at BOTH ends is the head commit's blob bytes at mode 0755, so a content filter or a file mode in either checkout cannot make the ends differ.
 
 use crate::runner::{run_ended, Check, Ended};
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,11 +143,11 @@ fn head_blob(repo: &Path, head_sha: &str, program: &str) -> Result<Vec<u8>, Stri
     if f.len() != 3 || f[0] != "100755" || f[1] != "blob" {
         return Err("check path is not a regular executable file in the head commit".to_string());
     }
-    let bytes = git_bytes(repo, &["cat-file", "blob", f[2]])?;
-    if bytes.len() > MAX_CHECK_BYTES {
+    let size: usize = git(repo, &["cat-file", "-s", f[2]])?.parse().map_err(|_| "check file size unreadable".to_string())?;
+    if size > MAX_CHECK_BYTES {
         return Err("check file is too large".to_string());
     }
-    Ok(bytes)
+    git_bytes(repo, &["cat-file", "blob", f[2]])
 }
 
 /// The private scratch folder, removed when dropped.
@@ -168,7 +168,28 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        force_remove(&self.path);
+    }
+}
+
+/// Make every real folder under `p` writable again (never following a symlink), so a check that left read-only folders cannot block removal.
+fn relax(p: &Path) {
+    if let Ok(m) = std::fs::symlink_metadata(p) {
+        if m.file_type().is_dir() {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    relax(&e.path());
+                }
+            }
+        }
+    }
+}
+
+fn force_remove(p: &Path) {
+    if std::fs::remove_dir_all(p).is_err() {
+        relax(p);
+        let _ = std::fs::remove_dir_all(p);
     }
 }
 
@@ -185,10 +206,9 @@ impl Tree {
         let p = path.to_str().ok_or("tree path not utf-8")?;
         let mut tree = Tree { repo: repo.top.clone(), common: repo.common.clone(), path: path.to_path_buf(), admin: None };
         git(&repo.top, &["worktree", "add", "--detach", p, sha]).map_err(|_| "could not create a worktree".to_string())?;
-        // Record this tree's own admin entry now (the `.git` pointer file names it).
-        let pointer = std::fs::read_to_string(path.join(".git")).map_err(|_| "worktree pointer unreadable".to_string())?;
-        let admin = pointer.trim().strip_prefix("gitdir:").map(|s| PathBuf::from(s.trim())).ok_or("worktree pointer malformed")?;
-        tree.admin = Some(admin);
+        // Record this tree's own admin entry now, as git itself resolves it (absolute, even when the pointer file is relative), before any check runs.
+        let admin = git(path, &["rev-parse", "--path-format=absolute", "--git-dir"]).map_err(|_| "worktree git dir unreadable".to_string())?;
+        tree.admin = Some(Path::new(&admin).canonicalize().map_err(|_| "worktree git dir unreadable".to_string())?);
         Ok(tree)
     }
 }
@@ -199,16 +219,16 @@ impl Drop for Tree {
             let _ = git(&self.repo, &["worktree", "remove", "--force", p]);
         }
         // If git could not remove it (for example the check rewrote `.git`), remove the folder and this tree's own admin entry only.
-        let _ = std::fs::remove_dir_all(&self.path);
+        force_remove(&self.path);
         if let Some(admin) = &self.admin {
             if admin.starts_with(self.common.join("worktrees")) && admin != &self.common.join("worktrees") {
-                let _ = std::fs::remove_dir_all(admin);
+                force_remove(admin);
             }
         }
     }
 }
 
-/// Place the head's check into the base tree. Every existing parent part must be a real directory (never a symlink); missing parts are created one at a time;
+/// Place the head's check into a tree (base: carried over; head: rewritten from the blob so both ends run the same bytes). Every existing parent part must be a real directory (never a symlink); missing parts are created one at a time;
 /// the destination must be absent or a regular single-link file that is not the tree's `.git` entry; the canonical parent must stay under the canonical tree.
 fn place_check(tree: &Path, parts: &[OsString], bytes: &[u8]) -> Result<(), String> {
     let (file, dirs) = parts.split_last().ok_or("check path empty")?;
@@ -247,11 +267,13 @@ fn place_check(tree: &Path, parts: &[OsString], bytes: &[u8]) -> Result<(), Stri
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o755).open(&dst).map_err(|_| "could not write the check into the base tree".to_string())?;
     f.write_all(bytes).map_err(|_| "could not write the check into the base tree".to_string())?;
     f.flush().map_err(|_| "could not write the check into the base tree".to_string())?;
+    // The mode given at open applies only when the file is created; set it on the open handle so an existing file ends up 0755 too.
+    f.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(|_| "could not write the check into the base tree".to_string())?;
     Ok(())
 }
 
-fn run_in(tree: &Path, sha: &str, spec: &Spec) -> Result<EndReport, String> {
-    let check = Check::load(tree, spec.id, spec.program, spec.args, spec.budget, spec.max_output)?;
+fn run_in(tree: &Path, sha: &str, rel: &str, spec: &Spec) -> Result<EndReport, String> {
+    let check = Check::load(tree, spec.id, rel, spec.args, spec.budget, spec.max_output)?;
     let (res, ended) = run_ended(tree, &check, sha);
     Ok(EndReport { sha: sha.to_string(), ended, output: res.message })
 }
@@ -270,22 +292,26 @@ pub fn prepare_and_run(repo_path: &Path, base: &str, head: &str, recorded_head: 
         return Err("base and head are the same commit".to_string());
     }
     let parts = plain_parts(spec.program)?;
-    let blob = head_blob(&repo.top, &head_sha, spec.program)?;
+    // Resolved once: from here on only the normalized path is used, by git, by the loader and by the placement.
+    let rel: String = parts.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+    let blob = head_blob(&repo.top, &head_sha, &rel)?;
     let root = scratch_root(&repo)?;
     // Check the spec's limits and id now too, so a bad one is refused before any tree exists.
     Check::load_limits(spec.id, spec.budget, spec.max_output)?;
 
     let scratch = Scratch::create(&root)?;
-    let tree_path = scratch.path.join("t");
+    // The folder is named like the scratch folder, so git's admin entry name is unique to this run and identical at both ends.
+    let tree_path = scratch.path.join(scratch.path.file_name().ok_or("scratch folder unnamed")?);
 
     let base_report = {
         let tree = Tree::add(&repo, &tree_path, &base_sha)?;
         place_check(&tree.path, &parts, &blob)?;
-        run_in(&tree.path, &base_sha, spec)?
+        run_in(&tree.path, &base_sha, &rel, spec)?
     };
     let head_report = {
         let tree = Tree::add(&repo, &tree_path, &head_sha)?;
-        run_in(&tree.path, &head_sha, spec)?
+        place_check(&tree.path, &parts, &blob)?;
+        run_in(&tree.path, &head_sha, &rel, spec)?
     };
     drop(scratch);
     Ok(Reports { base: base_report, head: head_report })

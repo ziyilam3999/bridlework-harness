@@ -91,6 +91,11 @@ struct Fx {
 
 /// Two commits. Base holds value.txt = `base_val` (and the check when `check_at_base`); head holds value.txt = `head_val` and the check.
 fn fixture(name: &str, base_val: &str, head_val: &str, check_at_base: bool, check: &str) -> Fx {
+    fixture_mode(name, base_val, head_val, if check_at_base { Some(0o755) } else { None }, check)
+}
+
+/// Like `fixture`, with the mode the check has in the base commit (None: absent at base).
+fn fixture_mode(name: &str, base_val: &str, head_val: &str, base_mode: Option<u32>, check: &str) -> Fx {
     let root = base_dir(name);
     let (repo, tmp, work) = (root.join("repo"), root.join("tmp"), root.join("work"));
     for d in [&repo, &tmp, &work] {
@@ -98,8 +103,8 @@ fn fixture(name: &str, base_val: &str, head_val: &str, check_at_base: bool, chec
     }
     git(&repo, &["init", "-q"]);
     put(&repo, "value.txt", base_val, 0o644);
-    if check_at_base {
-        put(&repo, "ci/check.sh", check, 0o755);
+    if let Some(m) = base_mode {
+        put(&repo, "ci/check.sh", check, m);
     }
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "base"]);
@@ -125,7 +130,7 @@ struct Out {
     raw: String,
 }
 
-fn run_with(fx: &Fx, params: &[(&str, &str)], env: &[(&str, &str)]) -> Out {
+fn write_params(fx: &Fx, params: &[(&str, &str)]) {
     let mut p: Vec<(String, String)> = vec![
         ("repo".into(), fx.repo.to_string_lossy().into_owned()),
         ("base".into(), fx.base.clone()),
@@ -139,12 +144,23 @@ fn run_with(fx: &Fx, params: &[(&str, &str)], env: &[(&str, &str)]) -> Out {
     }
     let body: String = p.iter().map(|(k, v)| format!("{}={}\n", k, v)).collect();
     std::fs::write(fx.repo.join(".git/tp-params"), body).unwrap();
+}
+
+fn child_cmd(fx: &Fx, env: &[(&str, &str)]) -> Command {
     let mut c = Command::new(std::env::current_exe().unwrap());
     c.args(["--ignored", "--exact", "child_run", "--nocapture", "--test-threads=1"]).current_dir(&fx.repo).env("TMPDIR", &fx.tmp);
     for (k, v) in env {
         c.env(k, v);
     }
-    let o = c.output().unwrap();
+    c
+}
+
+fn run_with(fx: &Fx, params: &[(&str, &str)], env: &[(&str, &str)]) -> Out {
+    write_params(fx, params);
+    parse_out(child_cmd(fx, env).output().unwrap())
+}
+
+fn parse_out(o: std::process::Output) -> Out {
     let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
     let mut out = Out { raw: stdout.clone(), ..Default::default() };
     for line in stdout.lines() {
@@ -297,6 +313,7 @@ fn a_relative_tmpdir_is_refused_and_creates_nothing_in_the_repo() {
     assert_eq!(std::fs::read_dir(&ginner).unwrap().count(), 0);
     let admin = fx.repo.join(".git/worktrees");
     assert!(!admin.exists() || std::fs::read_dir(&admin).unwrap().count() == 0);
+    assert_clean(&fx);
     let _ = std::fs::remove_dir_all(fx.root);
 }
 
@@ -387,7 +404,10 @@ fn a_signal_at_base_is_reported_as_a_signal() {
 
 #[test]
 fn bad_inputs_are_refused_before_any_tree_exists() {
-    let fx = fixture("ac11", "bad", "good", true, GOOD_CHECK);
+    // The check leaves a marker whenever it runs anywhere; a refused request must never leave one (nothing ran, so no tree existed).
+    let marker = std::env::temp_dir().join(format!("htp-ac11-{}", std::process::id())).join("work/ran");
+    let check = format!("#!/bin/sh\ntouch {}\ntest \"$(cat value.txt)\" = good\n", marker.display());
+    let fx = fixture("ac11", "bad", "good", true, &check);
     // extra files at head: a symlink blob, a non-executable file
     symlink("check.sh", fx.repo.join("ci/link.sh")).unwrap();
     put(&fx.repo, "ci/plain.sh", GOOD_CHECK, 0o644);
@@ -414,6 +434,7 @@ fn bad_inputs_are_refused_before_any_tree_exists() {
     for (name, params) in cases {
         let o = run_with(&fx, &params, &[]);
         assert!(o.err.is_some(), "case {} was not refused: {}", name, o.raw);
+        assert!(!marker.exists(), "case {}: the check ran before the refusal", name);
         assert_clean(&fx);
     }
     // a linked work tree of the scratch repo is refused as the repo path
@@ -422,6 +443,7 @@ fn bad_inputs_are_refused_before_any_tree_exists() {
     let linked_s = linked.to_str().unwrap().to_string();
     let o = run_with(&fx, &[("repo", &linked_s)], &[]);
     refused(&o, "linked work tree");
+    assert!(!marker.exists(), "linked work tree: the check ran before the refusal");
     git(&fx.repo, &["worktree", "remove", "--force", linked.to_str().unwrap()]);
     assert_clean(&fx);
     let _ = std::fs::remove_dir_all(fx.root);
@@ -437,4 +459,95 @@ fn git_hooks_never_fire_during_tree_preparation() {
     assert!(!marker.exists(), "a repo hook fired during tree preparation");
     assert_clean(&fx);
     let _ = std::fs::remove_dir_all(fx.root);
+}
+
+#[test]
+fn an_existing_non_executable_check_at_base_still_runs_there() {
+    let fx = fixture_mode("fix1", "bad", "good", Some(0o644), GOOD_CHECK);
+    let o = run(&fx);
+    assert!(o.ok, "{}", o.raw);
+    assert_eq!((o.base_end.as_str(), o.head_end.as_str()), ("exit:1", "exit:0"));
+    assert_clean(&fx);
+    let _ = std::fs::remove_dir_all(fx.root);
+}
+
+#[test]
+fn relative_worktree_pointers_do_not_break_cleanup_between_the_ends() {
+    for (name, body) in [("deletes", "#!/bin/sh\nrm -f .git\nexit 0\n"), ("junk", "#!/bin/sh\necho junk > .git\nexit 0\n")] {
+        let fx = fixture(&format!("fix2-{}", name), "bad", "good", true, body);
+        git(&fx.repo, &["config", "worktree.useRelativePaths", "true"]);
+        let o = run(&fx);
+        assert!(o.ok, "{} {}", name, o.raw);
+        assert_eq!((o.base_end.as_str(), o.head_end.as_str()), ("exit:0", "exit:0"), "case {}", name);
+        assert_clean(&fx);
+        let _ = std::fs::remove_dir_all(fx.root);
+    }
+}
+
+#[test]
+fn concurrent_runs_on_one_repo_see_the_same_pointer_at_both_ends() {
+    let root = base_dir("fix3-log");
+    let log = root.join("log.txt");
+    // Run A is short and starts first; run B is long (its scratch root name says so) and starts later, so B's base tree is made while A's exists
+    // and B's head tree is made after A's is gone: under a constant tree-folder name git would give B two different admin names.
+    let check = format!("#!/bin/sh\ncase \"$TMPDIR\" in *slow*) sleep 3.5;; *) sleep 1.5;; esac\necho \"$(pwd -P) $(cat ./.git)\" >> {}\nexit 0\n", log.display());
+    let fx = fixture("fix3", "bad", "good", true, &check);
+    let (ta, tb) = (fx.root.join("ta"), fx.root.join("slow-tb"));
+    std::fs::create_dir_all(&ta).unwrap();
+    std::fs::create_dir_all(&tb).unwrap();
+    write_params(&fx, &[]);
+    let a = child_cmd(&fx, &[("TMPDIR", ta.to_str().unwrap())]).spawn_piped();
+    std::thread::sleep(Duration::from_millis(400));
+    let b = child_cmd(&fx, &[("TMPDIR", tb.to_str().unwrap())]).spawn_piped();
+    let (oa, ob) = (parse_out(a.wait_with_output().unwrap()), parse_out(b.wait_with_output().unwrap()));
+    assert!(oa.ok && ob.ok, "{} {}", oa.raw, ob.raw);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let mut by_dir: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for l in text.lines() {
+        by_dir.entry(l.split_once(' ').unwrap().0).or_default().push(l);
+    }
+    assert_eq!(by_dir.len(), 2, "{}", text);
+    for (d, lines) in &by_dir {
+        assert_eq!(lines.len(), 2, "{}", d);
+        assert_eq!(lines[0], lines[1], "pointer differs between the ends of one run:\n{}", text);
+    }
+    assert_clean(&fx);
+    assert_eq!(std::fs::read_dir(&ta).unwrap().count() + std::fs::read_dir(&tb).unwrap().count(), 0, "scratch roots not empty");
+    let _ = std::fs::remove_dir_all(fx.root);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_content_filter_at_head_does_not_change_what_runs() {
+    let fx = fixture("fix4", "bad", "good", true, GOOD_CHECK);
+    put(&fx.repo, ".gitattributes", "ci/check.sh text eol=crlf\n", 0o644);
+    git(&fx.repo, &["add", "-A"]);
+    git(&fx.repo, &["commit", "-q", "-m", "attrs"]);
+    let head = git(&fx.repo, &["rev-parse", "HEAD"]);
+    let fx = Fx { head, ..fx };
+    let o = run(&fx);
+    assert!(o.ok, "{}", o.raw);
+    assert_eq!((o.base_end.as_str(), o.head_end.as_str()), ("exit:1", "exit:0"), "{}", o.raw);
+    assert_clean(&fx);
+    let _ = std::fs::remove_dir_all(fx.root);
+}
+
+#[test]
+fn read_only_folders_left_by_a_check_do_not_block_cleanup() {
+    let fx = fixture("fix5", "bad", "good", true, "#!/bin/sh\nmkdir -p d/e\ntouch d/e/f\nchmod 500 d/e d\nexit 0\n");
+    let o = run(&fx);
+    assert!(o.ok, "{}", o.raw);
+    assert_eq!((o.base_end.as_str(), o.head_end.as_str()), ("exit:0", "exit:0"));
+    assert_clean(&fx);
+    let _ = std::fs::remove_dir_all(fx.root);
+}
+
+trait SpawnPiped {
+    fn spawn_piped(&mut self) -> std::process::Child;
+}
+
+impl SpawnPiped for Command {
+    fn spawn_piped(&mut self) -> std::process::Child {
+        self.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()
+    }
 }
