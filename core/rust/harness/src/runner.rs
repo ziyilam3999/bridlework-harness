@@ -148,7 +148,8 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
 mod tests {
     use super::*;
 
-    /// A long poll gap makes the late-exit race deterministic: the child exits 0 well inside the gap, and the first look at it is past the budget.
+    /// Deterministic late exit: the child runs 200ms (so the first look, right after spawn, always sees it running), the budget is 100ms, and the next look is 400ms later.
+    /// The child therefore exits 0 after the budget and is first seen as exited past it; that must be a timeout, never a pass.
     #[cfg(unix)]
     #[test]
     fn exit_seen_only_after_the_budget_is_a_timeout() {
@@ -157,7 +158,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("quick.sh");
-        std::fs::write(&f, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&f, "#!/bin/sh\nsleep 0.2\nexit 0\n").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut c = Check::load(&d, "late", "quick.sh", &[], Duration::from_millis(100), 100).unwrap();
         c.poll = Duration::from_millis(400);
