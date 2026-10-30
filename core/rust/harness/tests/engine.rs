@@ -155,7 +155,12 @@ fn base_cmd() -> Command {
 fn run_text(cmd: &mut Command, input: &str) -> (i32, String, String) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut ch = cmd.spawn().unwrap();
-    ch.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    // A fail-closed run exits before it reads stdin, so the write may hit a closed pipe; the caller still asserts exit code and output.
+    match ch.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("stdin write failed: {:?}", e.kind()),
+    }
     let o = ch.wait_with_output().unwrap();
     (o.status.code().unwrap(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
 }
