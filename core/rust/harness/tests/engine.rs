@@ -372,3 +372,61 @@ fn invalid_utf8_refused() {
     assert_eq!((rc, out.as_str()), (2, ""));
     let _ = std::fs::remove_dir_all(d);
 }
+
+// ---- web-flow committer allowance ----
+
+fn commit_as(d: &PathBuf, author: (&str, &str), committer: (&str, &str)) {
+    let o = Command::new("git")
+        .current_dir(d)
+        .env("GIT_AUTHOR_NAME", author.0)
+        .env("GIT_AUTHOR_EMAIL", author.1)
+        .env("GIT_COMMITTER_NAME", committer.0)
+        .env("GIT_COMMITTER_EMAIL", committer.1)
+        .args(["-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "synthetic change"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "commit failed");
+}
+
+fn range_head(name: &str, author: (&str, &str), committer: (&str, &str)) -> (i32, String) {
+    let d = tmp(name);
+    git(&d, &["init", "-q"]);
+    commit_as(&d, author, committer);
+    let (rc, out, _) = scan_in(&d, &["--range", "HEAD"]);
+    let _ = std::fs::remove_dir_all(d);
+    (rc, out)
+}
+
+fn plain_noreply() -> String {
+    j(&["1+t", "@", "users.", "noreply.example"])
+}
+
+fn webflow_addr() -> String {
+    j(&["no", "reply", "@", "github", ".com"])
+}
+
+#[test]
+fn webflow_committer_allowed_only_in_committer_field() {
+    let pn = plain_noreply();
+    let ok_author = ("Tester", pn.as_str());
+    let wf = webflow_addr();
+    // (a) the exact web-flow pair as committer passes
+    let (rc, out) = range_head("wf-a", ok_author, ("GitHub", &wf));
+    assert_eq!((rc, out.as_str()), (0, ""));
+    // (b) the same pair in the author field still fails
+    let (rc, out) = range_head("wf-b", ("GitHub", wf.as_str()), ("Tester", pn.as_str()));
+    assert_eq!(rc, 1);
+    assert!(out.lines().any(|l| l.ends_with(".author:1:email")));
+    // (c) a different no-reply-style committer still fails
+    let other = j(&["no", "reply", "@", "example", ".invalid"]);
+    let (rc, out) = range_head("wf-c", ok_author, ("GitHub", &other));
+    assert_eq!(rc, 1);
+    assert!(out.lines().any(|l| l.ends_with(".committer:1:email")));
+    // right address under a different name still fails
+    let (rc, _) = range_head("wf-c2", ok_author, ("Someone", &wf));
+    assert_eq!(rc, 1);
+    // (d) a personal-style address as committer still fails
+    let (rc, out) = range_head("wf-d", ok_author, ("GitHub", &email()));
+    assert_eq!(rc, 1);
+    assert!(out.lines().any(|l| l.ends_with(".committer:1:email")));
+}
