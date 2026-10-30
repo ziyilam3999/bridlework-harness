@@ -1,0 +1,17 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+description = "Privacy gate engine for the harness repository"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
