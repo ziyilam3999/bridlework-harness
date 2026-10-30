@@ -1,0 +1,19 @@
+name: rust-test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test
+        run: sh ci/rust-test.sh
