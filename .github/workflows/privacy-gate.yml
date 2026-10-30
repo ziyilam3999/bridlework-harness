@@ -22,4 +22,14 @@ jobs:
       - name: Scan
         env:
           HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}
-        run: sh ci/privacy-gate.sh
+        run: |
+          rc=0
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git update-ref refs/gate/base HEAD^1
+            git checkout --detach HEAD^2
+            sh ci/privacy-gate.sh --tree || rc=1
+            sh ci/privacy-gate.sh --range HEAD ^refs/gate/base || rc=1
+          else
+            sh ci/privacy-gate.sh || rc=1
+          fi
+          exit "$rc"
