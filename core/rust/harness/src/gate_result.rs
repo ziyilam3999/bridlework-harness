@@ -54,6 +54,9 @@ impl GateResult {
         if self.line.is_some() && self.file.is_none() {
             return Err("line needs a file".to_string());
         }
+        if self.line == Some(0) {
+            return Err("line is 1-based".to_string());
+        }
         if self.file.as_deref() == Some("") {
             return Err("file is empty".to_string());
         }
@@ -192,6 +195,9 @@ impl<'a> P<'a> {
 
     fn hex4(&mut self) -> Result<u32, String> {
         let h = self.b.get(self.i..self.i + 4).ok_or("short unicode escape")?;
+        if !h.iter().all(|c| c.is_ascii_hexdigit()) {
+            return Err("bad unicode escape".to_string());
+        }
         let s = std::str::from_utf8(h).map_err(|_| "bad unicode escape".to_string())?;
         let n = u32::from_str_radix(s, 16).map_err(|_| "bad unicode escape".to_string())?;
         self.i += 4;
@@ -420,5 +426,10 @@ mod tests {
         let r = GateResult::from_json(&j).unwrap();
         assert_eq!(r.message, "a\u{e9}\u{1f600}\u{7}");
         assert!(GateResult::from_json(&j.replace("\\ude00", "")).is_err());
+        let plus = pass().to_json().unwrap().replace("\"ok\"", "\"\\u+041\"");
+        assert!(GateResult::from_json(&plus).is_err());
+        let mut g = fail();
+        g.line = Some(0);
+        assert!(g.validate().is_err());
     }
 }
