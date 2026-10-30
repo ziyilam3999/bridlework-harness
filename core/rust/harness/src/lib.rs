@@ -10,6 +10,8 @@ pub mod gate_result;
 pub mod gitio;
 pub mod overlay;
 pub mod runner;
+#[cfg(unix)]
+pub mod tree_prep;
 pub mod scan;
 
 /// Crate version string printed by `harness --version`.
