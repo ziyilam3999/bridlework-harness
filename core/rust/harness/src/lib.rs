@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 pub mod both_ends;
+#[cfg(unix)]
+pub mod caps;
 pub mod classes;
 pub mod cli;
 pub mod config;
