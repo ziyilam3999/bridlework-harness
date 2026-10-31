@@ -310,6 +310,68 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
+const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...]";
+/// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
+const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
+
+/// `harness ticket intake <ticket-file> --repo-map <id>=<dir> [--repo-map ...]`. Exit 0 accepted (one stdout line:
+/// `ticket=<id> repo_id=<id> head=<sha>`); 1 the ticket is refused (stdout empty, stderr names the field or the repo id);
+/// 2 usage error or the ticket file cannot be read (stdout empty). The repo comes from the ticket and the map only, never from the
+/// working folder. Read-only. No folder (mapped or ticket file) is ever printed.
+fn ticket_cmd(a: &[String]) -> i32 {
+    use crate::intake::{intake, RepoMap};
+    use crate::ticket::Ticket;
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    if a.first().map(|s| s.as_str()) != Some("intake") {
+        eprintln!("{}", TICKET_USAGE);
+        return 2;
+    }
+    let mut map = RepoMap::new();
+    let mut file: Option<&str> = None;
+    let mut it = a[1..].iter();
+    while let Some(arg) = it.next() {
+        if arg == "--repo-map" {
+            let Some(spec) = it.next() else { return fail("--repo-map is missing its value") };
+            if let Err(e) = map.add(spec) {
+                return fail(&e);
+            }
+        } else if arg.starts_with("--") {
+            return fail("unknown option");
+        } else if file.replace(arg.as_str()).is_some() {
+            return fail("more than one ticket file given");
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("{}", TICKET_USAGE);
+        return 2;
+    };
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(file).and_then(|f| f.take(TICKET_READ_LIMIT).read_to_end(&mut bytes));
+    if read.is_err() {
+        return fail("the ticket file cannot be read");
+    }
+    let ticket = match Ticket::parse_bytes(&bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("harness: ticket refused: {}", e);
+            return 1;
+        }
+    };
+    match intake(&ticket, &map) {
+        Ok(ok) => {
+            println!("ticket={} repo_id={} head={}", ok.ticket_id, ok.repo_id.as_str(), ok.head_sha);
+            0
+        }
+        Err(r) => {
+            eprintln!("harness: ticket refused: {}", r);
+            1
+        }
+    }
+}
+
 pub fn run(mut args: Vec<String>) -> i32 {
     if args.len() == 1 && args[0] == "--version" {
         println!("{}", crate::version_line());
@@ -327,6 +389,9 @@ pub fn run(mut args: Vec<String>) -> i32 {
     }
     if !args.is_empty() && args[0] == "config" {
         return config_cmd(&args[1..]);
+    }
+    if !args.is_empty() && args[0] == "ticket" {
+        return ticket_cmd(&args[1..]);
     }
     if !args.is_empty() && args[0] == "fixtures" {
         return fixtures_cmd(&args[1..]);
