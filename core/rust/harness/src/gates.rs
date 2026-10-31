@@ -409,7 +409,7 @@ mod tests {
         let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
         for (code, want) in [(0, Status::Pass), (3, Status::Fail)] {
             let s = Scratch::new("run");
-            put(&s.0, "gates/check-ok.json", sw(VALID, r#""id":"g1""#, r#""id":"check-ok""#).replace("ci/c.sh", "check.sh").as_bytes());
+            put(&s.0, "gates/check-ok.json", sw(VALID, r#""id":"g1""#, r#""id":"check-ok""#).replace("ci/c.sh", "check.sh").replace("1000", "20000").as_bytes());
             put_exec(&s.0, "check.sh", &format!("#!/bin/sh\nexit {}\n", code));
             let gates = Gates::load(&s.0).expect("a valid gate loads");
             assert_eq!(gates.ids(), vec!["check-ok"]);
@@ -524,12 +524,30 @@ mod tests {
             let e = load_one("g1.json", text.as_bytes()).expect_err(name);
             assert!(e.contains("g1.json"), "arm {}: file named: {}", name, e);
             assert!(e.contains(why), "arm {} refused for the wrong reason: {}", name, e);
+            let field = match name.split(' ').next().unwrap() {
+                "id" => Some("`id`"),
+                "program" | "bad" | "lone" | "signed" | "short" => Some("`program`"),
+                "timeout" => Some("`timeout_ms`"),
+                "max" => Some("`max_output_bytes`"),
+                "both_ends" => Some("`both_ends`"),
+                "args" => Some("`args`"),
+                _ => None,
+            };
+            if let Some(f) = field {
+                assert!(e.contains(f), "arm {} names its field {}: {}", name, f, e);
+            }
         }
         let e = load_one("g1.json", b"{\"id\":\"g\xff1\"}").unwrap_err();
         assert!(e.contains("g1.json") && e.contains("utf-8"), "non-utf-8: {}", e);
-        let big = format!("{}{}", VALID, " ".repeat(MAX_GATE_BYTES as usize));
+        let exact = format!("{}{}", VALID, " ".repeat(1_048_576 - VALID.len()));
+        assert_eq!(exact.len(), 1_048_576);
+        assert!(load_one("g1.json", exact.as_bytes()).is_ok(), "exactly 1 MiB loads");
+        let big = format!("{} ", exact);
         let e = load_one("g1.json", big.as_bytes()).unwrap_err();
         assert!(e.contains("g1.json") && e.contains("too large"), "over 1 MiB: {}", e);
+        let max = sw(&sw(VALID, "1000", "18446744073709551615"), "4096", "18446744073709551615");
+        let g = load_one("g1.json", max.as_bytes()).expect("the largest 64-bit values load");
+        assert_eq!((g.get("g1").unwrap().timeout_ms, g.get("g1").unwrap().max_output_bytes), (u64::MAX, u64::MAX));
         let spaced = "{ \"id\" : \"g1\" ,\n \"program\" : \"ci/c.sh\" , \"args\" : [ \"a\" , \"b\\\"c\" ] , \"timeout_ms\" : 1000 ,\n\"max_output_bytes\" : 4096 , \"both_ends\" : true }\n";
         let ok = load_one("g1.json", spaced.as_bytes()).expect("the control arm loads");
         let g = ok.get("g1").unwrap();
@@ -565,17 +583,26 @@ mod tests {
         put(&c.0, "gates/.gitkeep", b"");
         put(&c.0, "gates/README.md", junk);
         put(&c.0, "gates/path-map.json", junk);
-        assert!(Gates::load(&c.0).unwrap_err().contains("no gate files"));
+        let e = Gates::load(&c.0).unwrap_err();
+        assert!(e.contains("gates folder") && e.contains("no gate files"), "{}", e);
         // a missing gates folder, and gates as a plain file
         let m = Scratch::new("missing");
-        assert!(Gates::load(&m.0).is_err(), "no gates folder");
+        assert!(Gates::load(&m.0).unwrap_err().contains("gates folder"), "no gates folder");
         put(&m.0, "gates", b"x");
-        assert!(Gates::load(&m.0).is_err(), "gates is a plain file");
+        assert!(Gates::load(&m.0).unwrap_err().contains("gates folder"), "gates is a plain file");
+        let nowhere = std::env::temp_dir().join(format!("hg-nowhere-{}", std::process::id()));
+        assert!(Gates::load(&nowhere).unwrap_err().contains("gates folder"), "a repo root that does not exist");
         // an uppercase stem is refused by the id rule, naming the file
         let e = load_one("Cargo-Test.json", sw(VALID, r#""id":"g1""#, r#""id":"Cargo-Test""#).as_bytes()).unwrap_err();
         assert!(e.contains("Cargo-Test.json") && e.contains("`id`"), "{}", e);
         #[cfg(unix)]
         {
+            let f = Scratch::new("fifo");
+            put(&f.0, "gates/g1.json", VALID.as_bytes());
+            let made = Command::new("mkfifo").arg(f.0.join("gates/pipe")).status().expect("mkfifo runs");
+            assert!(made.success());
+            let e = Gates::load(&f.0).unwrap_err();
+            assert!(e.contains("pipe") && e.contains("not a regular file"), "a FIFO is refused, not opened: {}", e);
             let l = Scratch::new("dirlink");
             put(&l.0, "gates/g1.json", VALID.as_bytes());
             std::os::unix::fs::symlink(&l.0, l.0.join("gates/s.json")).unwrap();
