@@ -14,6 +14,41 @@ fn required_in(section: &str) -> Result<Vec<String>, String> {
     Ok(section[open + 1..close].split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect())
 }
 
+/// The top-level key names inside a branch's `properties` object (brace-depth scan; strings here never hold braces).
+fn property_keys(section: &str) -> Result<Vec<String>, String> {
+    let at = section.find("\"properties\"").ok_or("no properties object")?;
+    let open = at + section[at..].find('{').ok_or("properties is not an object")?;
+    let (mut depth, mut keys, mut cur, mut in_str) = (0usize, Vec::new(), String::new(), false);
+    for (i, c) in section[open..].char_indices() {
+        if in_str {
+            if c == '"' {
+                in_str = false;
+                if depth == 1 && section[open + i + 1..].trim_start().starts_with(':') {
+                    keys.push(cur.clone());
+                }
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                cur.clear();
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(keys);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err("properties object is not closed".to_string())
+}
+
 /// Err names the first way the schema text disagrees with the loader.
 fn check(schema: &str) -> Result<(), String> {
     let marker = "\"title\": \"";
@@ -35,6 +70,12 @@ fn check(schema: &str) -> Result<(), String> {
         want.sort();
         if got != want {
             return Err(format!("{name}: required set {got:?} differs from the loader's {want:?}"));
+        }
+        // Both directions: a property the loader does not know (an extra optional key the schema would allow) is drift too.
+        let mut props = property_keys(section).map_err(|e| format!("{name}: {e}"))?;
+        props.sort();
+        if props != want {
+            return Err(format!("{name}: property set {props:?} differs from the loader's {want:?}"));
         }
         for key in &want {
             if !section.contains(&format!("\"{key}\":")) {
@@ -75,6 +116,7 @@ fn planted_a_schema_that_drifted_from_the_loader_is_caught() {
         ("a kind const that no longer matches", good.replacen("\"kind\": { \"const\": \"escalation\" }", "\"kind\": { \"const\": \"escalate\" }", 1)),
         ("extra keys allowed", good.replacen("\"additionalProperties\": false", "\"additionalProperties\": true", 1)),
         ("a kind branch missing", good.replacen("\"title\": \"budget_exceeded\"", "\"title\": \"budget\"", 1)),
+        ("an extra optional property the loader does not know", good.replacen("\"reason\": {", "\"note\": { \"type\": \"string\" },\n        \"reason\": {", 1)),
         ("a stale line cap", good.replace("4096 bytes", "8192 bytes")),
     ];
     for (name, m) in mutants {
