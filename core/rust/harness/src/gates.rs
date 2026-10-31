@@ -243,12 +243,12 @@ impl Gates {
     /// be a regular file (a subdirectory or any other shape is refused); non-`.json` files are ignored; each `.json` file must
     /// canonicalize back under the repo root, be UTF-8, be at most 1 MiB, and parse as a gate. No gate file at all is refused.
     pub fn load(repo_root: &Path) -> Result<Gates, String> {
-        let root = repo_root.canonicalize().map_err(|_| "repo root unreadable".to_string())?;
+        let root = repo_root.canonicalize().map_err(|_| "gates folder: repo root unreadable".to_string())?;
         let dir = root.join("gates");
         let mut names: Vec<String> = Vec::new();
         for e in std::fs::read_dir(&dir).map_err(|_| "gates folder missing or unreadable".to_string())? {
             let e = e.map_err(|_| "gates folder unreadable".to_string())?;
-            names.push(e.file_name().into_string().map_err(|_| "a gates entry name is not utf-8".to_string())?);
+            names.push(e.file_name().into_string().map_err(|_| "gates folder: an entry name is not utf-8".to_string())?);
         }
         names.sort();
         let mut gates: Vec<Gate> = Vec::new();
@@ -435,11 +435,17 @@ mod tests {
         put(&s.0, "gates/capped.json", r#"{"id":"capped","program":"cap.sh","args":[],"timeout_ms":20000,"max_output_bytes":8,"both_ends":false}"#.as_bytes());
         put(&s.0, "gates/slow.json", r#"{"id":"slow","program":"slow.sh","args":["5"],"timeout_ms":200,"max_output_bytes":4096,"both_ends":false}"#.as_bytes());
         put_exec(&s.0, "cap.sh", "#!/bin/sh\nprintf 0123456789abcdef\nexit 3\n");
+        // the executable bit is not checked at load: a program that cannot be started loads, then fails when it runs
+        put(&s.0, "gates/plain.json", r#"{"id":"plain","program":"plain.sh","args":[],"timeout_ms":20000,"max_output_bytes":4096,"both_ends":false}"#.as_bytes());
+        put(&s.0, "plain.sh", b"#!/bin/sh\nexit 0\n");
         put_exec(&s.0, "slow.sh", "#!/bin/sh\nsleep \"$1\"\n");
         let gates = Gates::load(&s.0).unwrap();
         let r = runner::run(&s.0, &to_check(&s.0, gates.get("capped").unwrap()).unwrap(), SHA);
         assert_eq!(r.failure_class.as_deref(), Some("check-failed"), "{}", r.message);
         assert!(r.message.contains("[output cut at 8 bytes]"), "{}", r.message);
+        let r = runner::run(&s.0, &to_check(&s.0, gates.get("plain").unwrap()).unwrap(), SHA);
+        assert_eq!(r.status, Status::Fail);
+        assert_eq!(r.failure_class.as_deref(), Some("spawn-error"), "{}", r.message);
         let r = runner::run(&s.0, &to_check(&s.0, gates.get("slow").unwrap()).unwrap(), SHA);
         assert_eq!(r.status, Status::Fail);
         assert_eq!(r.failure_class.as_deref(), Some("timeout"), "{}", r.message);
@@ -539,6 +545,7 @@ mod tests {
         put(&s.0, "gates/.gitkeep", b"");
         put(&s.0, "gates/README.md", junk);
         put(&s.0, "gates/.hidden.json", junk);
+        put(&s.0, "gates/JUNK.JSON", junk);
         assert_eq!(Gates::load(&s.0).expect("reserved, carrier and dot names are skipped").ids(), vec!["g1"]);
         // an unrecognized json file is refused, naming it
         put(&s.0, "gates/weird.json", junk);
