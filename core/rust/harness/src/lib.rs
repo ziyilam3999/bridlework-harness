@@ -18,6 +18,7 @@ pub mod runner;
 #[cfg(unix)]
 pub mod tree_prep;
 pub mod scan;
+pub mod ticket;
 
 /// Crate version string printed by `harness --version`.
 pub fn version_line() -> String {
