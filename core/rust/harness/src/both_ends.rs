@@ -187,12 +187,14 @@ pub fn judge_ticket_reports(reports: &Reports, neighbours: &[(&str, &Reports)], 
 
 /// The one call a gate makes for a ticket with neighbour suites: the declared check and every neighbour each go through tree preparation (one tree pair per
 /// suite), every refusal passes through verbatim, and the reports are folded by `judge_ticket_reports`. Suite names are checked before any tree exists.
+/// The base and head refs are resolved once, by the declared run; every neighbour is then run against those two shas, not the refs.
 pub fn judge_ticket(repo_path: &Path, base: &str, head: &str, recorded_head: &str, spec: &Spec, neighbour_specs: &[Spec]) -> Result<GateResult, String> {
     check_ids(spec.id, neighbour_specs.iter().map(|s| s.id))?;
     let reports = prepare_and_run(repo_path, base, head, recorded_head, spec)?;
     let mut neighbour_reports: Vec<Reports> = Vec::new();
     for s in neighbour_specs {
-        neighbour_reports.push(prepare_and_run(repo_path, base, head, recorded_head, s)?);
+        // Pinned to the shas the declared run resolved: the refs are read once, so a ref moved by a check cannot send a later suite to another commit.
+        neighbour_reports.push(prepare_and_run(repo_path, &reports.base.sha, &reports.head.sha, recorded_head, s)?);
     }
     let pairs: Vec<(&str, &Reports)> = neighbour_specs.iter().map(|s| s.id).zip(neighbour_reports.iter()).collect();
     judge_ticket_reports(&reports, &pairs, recorded_head, spec.id)
@@ -251,6 +253,12 @@ mod tests {
         let r = judge_ticket_reports(&declared_fail, &[("nb-suite", &nb)], HEAD, ID).unwrap();
         assert_eq!(r.failure_class.as_deref(), Some("passes-at-base"));
         assert!(r.message.contains("NB-MARKER"), "{}", r.message);
+        // every non-zero exit at head after a green base is a new failure, 126 and 127 included
+        for c in [1, 2, 126, 127, 255] {
+            let nb = rp(Ended::Exit(0), Ended::Exit(c), "");
+            let r = judge_ticket_reports(&red_green(), &[("nb-suite", &nb)], HEAD, ID).unwrap();
+            assert_eq!(r.failure_class.as_deref(), Some("neighbour-new-failure"), "head exit {}", c);
+        }
     }
 
     #[test]
@@ -260,6 +268,7 @@ mod tests {
             let r = judge_ticket_reports(&red_green(), &[("nb-suite", &nb)], HEAD, ID).unwrap();
             assert_eq!(r.status, Status::Fail, "head {:?}", head);
             assert_eq!(r.failure_class.as_deref(), Some("neighbour-head-error"), "head {:?}", head);
+            assert!(r.message.contains("nb-suite"), "{}", r.message);
             assert!(r.validate().is_ok());
         }
     }
@@ -272,11 +281,29 @@ mod tests {
             let r = judge_ticket_reports(&red_green(), &[("nb-suite", &red_head)], HEAD, ID).unwrap();
             assert_eq!(r.status, Status::Fail, "base {:?}", base);
             assert_eq!(r.failure_class.as_deref(), Some("neighbour-base-error"), "base {:?}", base);
+            assert!(r.message.contains("nb-suite"), "{}", r.message);
+            // an unreadable base with any head that is not a clean exit 0 also fails closed
+            for head in [Ended::Signal(9), Ended::TimedOut, Ended::NotStarted, Ended::Unknown, Ended::Exit(126), Ended::Exit(127)] {
+                let nb = rp(base, head, "");
+                let r = judge_ticket_reports(&red_green(), &[("nb-suite", &nb)], HEAD, ID).unwrap();
+                assert_eq!(r.failure_class.as_deref(), Some("neighbour-base-error"), "base {:?} head {:?}", base, head);
+            }
             let green_head = rp(base, Ended::Exit(0), "");
             let r = judge_ticket_reports(&red_green(), &[("nb-suite", &green_head)], HEAD, ID).unwrap();
             assert_eq!((&r.status, &r.failure_class), (&alone.status, &alone.failure_class), "base {:?}", base);
             assert!(!r.message.contains("red at base"), "an unreadable base is not red at base: {}", r.message);
         }
+    }
+
+    #[test]
+    fn the_first_neighbour_finding_names_the_class_and_every_finding_is_in_the_message() {
+        let head_error = rp(Ended::Exit(0), Ended::Unknown, "");
+        let new_failure = rp(Ended::Exit(0), Ended::Exit(1), "");
+        let r = judge_ticket_reports(&red_green(), &[("first", &head_error), ("second", &new_failure)], HEAD, ID).unwrap();
+        assert_eq!(r.failure_class.as_deref(), Some("neighbour-head-error"));
+        assert!(r.message.contains("first") && r.message.contains("second"), "{}", r.message);
+        let r = judge_ticket_reports(&red_green(), &[("second", &new_failure), ("first", &head_error)], HEAD, ID).unwrap();
+        assert_eq!(r.failure_class.as_deref(), Some("neighbour-new-failure"));
     }
 
     #[test]
@@ -337,23 +364,35 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    /// Base commit: value.txt "bad", other.txt = `nb_base`, the neighbour suite. Head commit: value.txt "good", other.txt = `nb_head`, the declared check added.
-    fn repo(name: &str, nb_base: &str, nb_head: &str, declared_check: &str) -> (PathBuf, String, String) {
+    const NB_SCRIPT: &str = "#!/bin/sh\ntest \"$(cat other.txt)\" = ok\n";
+    const NB2_SCRIPT: &str = "#!/bin/sh\ntest \"$(cat other2.txt)\" = ok\n";
+
+    /// Base commit: value.txt "bad", other.txt and other2.txt from `nb` (base values), the two neighbour suites. Head commit: value.txt "good", the `nb` head
+    /// values, the declared check added. `nb_script` is the first neighbour suite.
+    fn repo_with(name: &str, nb: [(&str, &str); 2], declared_check: &str, nb_script: &str) -> (PathBuf, String, String) {
         let repo = scratch(name);
         git(&repo, &["init", "-q"]);
         put(&repo, "value.txt", "bad", 0o644);
-        put(&repo, "other.txt", nb_base, 0o644);
-        put(&repo, "ci/nb.sh", "#!/bin/sh\ntest \"$(cat other.txt)\" = ok\n", 0o755);
+        put(&repo, "other.txt", nb[0].0, 0o644);
+        put(&repo, "other2.txt", nb[1].0, 0o644);
+        put(&repo, "ci/nb.sh", nb_script, 0o755);
+        put(&repo, "ci/nb2.sh", NB2_SCRIPT, 0o755);
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "base"]);
         let base = git(&repo, &["rev-parse", "HEAD"]);
         put(&repo, "value.txt", "good", 0o644);
-        put(&repo, "other.txt", nb_head, 0o644);
+        put(&repo, "other.txt", nb[0].1, 0o644);
+        put(&repo, "other2.txt", nb[1].1, 0o644);
         put(&repo, "ci/check.sh", declared_check, 0o755);
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "head"]);
         let head = git(&repo, &["rev-parse", "HEAD"]);
         (repo, base, head)
+    }
+
+    /// One neighbour suite (the second stays green at both ends).
+    fn repo(name: &str, nb_base: &str, nb_head: &str, declared_check: &str) -> (PathBuf, String, String) {
+        repo_with(name, [(nb_base, nb_head), ("ok", "ok")], declared_check, NB_SCRIPT)
     }
 
     fn only_the_main_tree(repo: &Path) {
@@ -399,6 +438,47 @@ mod tests {
         only_the_main_tree(&c);
 
         for d in [a, b, c, marker.parent().unwrap().to_path_buf()] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn two_neighbours_each_get_their_own_outcome() {
+        // the first was already broken (red at base), the second was fine and the head commit broke it
+        let (a, base, head) = repo_with("two", [("broken", "broken"), ("ok", "broken")], FIX_CHECK, NB_SCRIPT);
+        let r = judge_ticket(&a, &base, &head, &head, &spec(ID, "ci/check.sh"), &[spec("first-suite", "ci/nb.sh"), spec("second-suite", "ci/nb2.sh")]).unwrap();
+        assert_eq!(r.failure_class.as_deref(), Some("neighbour-new-failure"), "{}", r.message);
+        assert!(r.message.contains("neighbour second-suite broke at head"), "{}", r.message);
+        assert!(r.message.contains("red at base: first-suite"), "{}", r.message);
+        assert!(!r.message.contains("red at base: second-suite"), "{}", r.message);
+        only_the_main_tree(&a);
+        let _ = std::fs::remove_dir_all(a);
+    }
+
+    #[test]
+    fn a_ref_moved_by_a_check_cannot_send_a_later_suite_to_another_commit() {
+        // The declared check moves the branch `b`, which the caller used as the base ref. The neighbour must still run on the base the declared run resolved.
+        let log = scratch("moved-log").join("log.txt");
+        let nb_script = format!("#!/bin/sh\ncat value.txt >> {}\ntest \"$(cat other.txt)\" = ok\n", log.display());
+        let (a, base, _old_head) = repo_with("moved", [("ok", "ok"), ("ok", "ok")], FIX_CHECK, &nb_script);
+        git(&a, &["checkout", "-q", "-b", "side", &base]);
+        put(&a, "value.txt", "third", 0o644);
+        git(&a, &["add", "-A"]);
+        git(&a, &["commit", "-q", "-m", "third"]);
+        let third = git(&a, &["rev-parse", "HEAD"]);
+        git(&a, &["checkout", "-q", "main"]);
+        git(&a, &["branch", "b", &base]);
+        // the declared check (code from the head commit) moves `b` to the third commit, then does its normal test
+        let moving = format!("#!/bin/sh\ngit update-ref refs/heads/b {}\ntest \"$(cat value.txt)\" = good\n", third);
+        put(&a, "ci/check.sh", &moving, 0o755);
+        git(&a, &["add", "-A"]);
+        git(&a, &["commit", "-q", "-m", "moving check"]);
+        let head = git(&a, &["rev-parse", "HEAD"]);
+        let r = judge_ticket(&a, "b", &head, &head, &spec(ID, "ci/check.sh"), &[spec("nb-suite", "ci/nb.sh")]).expect("a moved ref must not make the aggregate refuse");
+        assert_eq!(r.status, Status::Pass, "{:?} {}", r.failure_class, r.message);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "badgood", "the neighbour ran on a commit the declared run did not resolve (base value then head value)");
+        only_the_main_tree(&a);
+        for d in [a, log.parent().unwrap().to_path_buf()] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
