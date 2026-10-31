@@ -39,9 +39,10 @@ fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/final-gate.XXXXXX") || { echo "final-gate: no temp folder" >&2; exit 2; }
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 mkdir "$work/result" || exit 2
+mkdir "$work/caps" || exit 2
 emit_ticket > "$work/ticket.json" || exit 2
 
-out=$("$bin" ticket gate "$work/ticket.json" --repo-map "core=$repo" --base "$base" --result-dir "$work/result")
+out=$("$bin" ticket gate "$work/ticket.json" --repo-map "core=$repo" --base "$base" --result-dir "$work/result" --caps-dir "$work/caps")
 rc=$?
 printf '%s\n' "$out"
 if [ "$rc" -eq 0 ]; then
