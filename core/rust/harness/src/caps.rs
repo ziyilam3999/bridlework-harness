@@ -25,6 +25,14 @@ pub const RECORD_READ_LIMIT: u64 = 4096 + 1;
 pub const REASON_FIX_ROUND_CAP: &str = "fix-round-cap";
 /// The event log inside the caps folder.
 pub const EVENTS_FILE: &str = "events.jsonl";
+/// The reason token of the re-plan threshold refusal.
+pub const REASON_REPLAN_THRESHOLD: &str = "replan-threshold";
+/// This many identical FAILs in a row, on different heads, latch the ticket (the next run is refused with `replan-threshold`).
+pub const REPLAN_AFTER: u8 = 2;
+/// The streak schema version this reader accepts.
+pub const STREAK_VERSION: u64 = 1;
+/// The longest signature: a 250-byte gate id, `:`, and a class token (well under 64 bytes) are at most 265 bytes, so no legal gate reaches this.
+pub const SIG_MAX: usize = 320;
 
 /// What a ticket's record says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +86,97 @@ impl Record {
     }
 }
 
+fn gate_part_ok(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn class_part_ok(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+}
+
+fn sha_ok(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A well-formed signature: `<gate id>:<failure class>`, both from fixed alphabets (`:` is in neither), at most `SIG_MAX` bytes.
+pub fn signature_ok(sig: &str) -> bool {
+    match sig.split_once(':') {
+        Some((gate, class)) => sig.len() <= SIG_MAX && gate_part_ok(gate) && class_part_ok(class),
+        None => false,
+    }
+}
+
+/// The signature of a decided FAIL: the failing gate id and its failure class, never the message, a line or a head. Fails closed when either
+/// half is outside its alphabet or the whole is over `SIG_MAX`.
+pub fn signature(gate: &str, class: &str) -> Result<String, String> {
+    let sig = format!("{}:{}", gate, class);
+    if !gate_part_ok(gate) || !class_part_ok(class) || sig.len() > SIG_MAX {
+        return Err("the failure signature cannot be built".to_string());
+    }
+    Ok(sig)
+}
+
+/// The same-failure streak of a ticket: the last counted signature, the head it failed on, and how many consecutive fix attempts failed with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Streak {
+    pub ticket: String,
+    pub repo_id: String,
+    pub sig: String,
+    pub head: String,
+    /// 1..=`REPLAN_AFTER`.
+    pub count: u8,
+}
+
+impl Streak {
+    pub fn state_ok(&self) -> bool {
+        (1..=REPLAN_AFTER).contains(&self.count) && signature_ok(&self.sig) && sha_ok(&self.head)
+    }
+
+    /// Count has reached the threshold: the ticket needs a new plan.
+    pub fn latched(&self) -> bool {
+        self.count >= REPLAN_AFTER
+    }
+
+    /// The canonical bytes, newline included.
+    pub fn encode(&self) -> String {
+        format!(
+            "{{\"v\":{},\"ticket\":\"{}\",\"repo_id\":\"{}\",\"sig\":\"{}\",\"head\":\"{}\",\"count\":{}}}\n",
+            STREAK_VERSION, self.ticket, self.repo_id, self.sig, self.head, self.count
+        )
+    }
+
+    /// Strict decode: the bytes must equal the canonical encoding of a valid streak for exactly this ticket and repo.
+    pub fn decode(bytes: &[u8], ticket: &str, repo_id: &str) -> Result<Streak, String> {
+        let refused = || "the streak file is not the canonical streak for this ticket and repo".to_string();
+        let text = std::str::from_utf8(bytes).map_err(|_| refused())?;
+        let head_of_line = format!("{{\"v\":{},\"ticket\":\"{}\",\"repo_id\":\"{}\",\"sig\":\"", STREAK_VERSION, ticket, repo_id);
+        let rest = text.strip_prefix(head_of_line.as_str()).ok_or_else(refused)?;
+        let (sig, rest) = rest.split_at(rest.find('"').ok_or_else(refused)?);
+        let rest = rest.strip_prefix("\",\"head\":\"").ok_or_else(refused)?;
+        let (head, _) = rest.split_at(rest.find('"').ok_or_else(refused)?);
+        for count in 1..=REPLAN_AFTER {
+            let cand = Streak { ticket: ticket.to_string(), repo_id: repo_id.to_string(), sig: sig.to_string(), head: head.to_string(), count };
+            if cand.state_ok() && cand.encode().as_bytes() == bytes {
+                return Ok(cand);
+            }
+        }
+        Err(refused())
+    }
+}
+
+/// The streak after a decided verdict. `fail` is `Some((signature, head))` for a FAIL and `None` for a PASS (which clears it).
+/// A FAIL on a different head with the same signature extends the streak (a fix attempt that did not help); a FAIL on the same head with the same
+/// signature is a plain re-run and leaves it unchanged; every other FAIL starts a new streak at 1.
+pub fn advance(prev: Option<&Streak>, ticket: &str, repo_id: &str, fail: Option<(&str, &str)>) -> Option<Streak> {
+    let (sig, head) = fail?;
+    let count = match prev {
+        Some(p) if p.sig == sig && p.head == head => p.count,
+        Some(p) if p.sig == sig => p.count.saturating_add(1).min(REPLAN_AFTER),
+        _ => 1,
+    };
+    Some(Streak { ticket: ticket.to_string(), repo_id: repo_id.to_string(), sig: sig.to_string(), head: head.to_string(), count })
+}
+
 /// Read at most `RECORD_READ_LIMIT` bytes from `r`; more than 4 KiB is refused.
 pub fn read_bounded<R: Read>(r: R) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
@@ -101,6 +200,14 @@ pub fn may_start(rounds: u8) -> Result<(), Refusal> {
         return Err(Refusal { kind: Kind::Escalation, reason: REASON_FIX_ROUND_CAP });
     }
     Ok(())
+}
+
+/// May a run start? A latched streak is refused first (`replan-threshold`, the more specific cause), then the fix-round cap.
+pub fn start_check(rounds: u8, streak: Option<&Streak>) -> Result<(), Refusal> {
+    if streak.map(|s| s.latched()).unwrap_or(false) {
+        return Err(Refusal { kind: Kind::ReplanRequired, reason: REASON_REPLAN_THRESHOLD });
+    }
+    may_start(rounds)
 }
 
 /// The event that records a refusal. The `ticket` field is the lowercased id (an event ticket is a lowercase token).
@@ -156,20 +263,33 @@ impl Caps {
         format!("{}.rounds", id)
     }
 
+    fn streak_name(id: &str) -> String {
+        format!("{}.replan", id)
+    }
+
     /// The id is usable as a file name and no differently-cased twin of its record name exists. Nothing is created.
     pub fn check_names(&self, id: &str) -> Result<(), String> {
         Caps::id_ok(id)?;
-        self.check_case_twin(id)
+        self.check_case_twin(id)?;
+        self.check_streak_case_twin(id)
     }
 
     /// A differently-cased twin of the record name is a collision (by name, on every filesystem).
     fn check_case_twin(&self, id: &str) -> Result<(), String> {
-        let want = Caps::record_name(id);
+        self.twin_of(&Caps::record_name(id), "a cap record whose name differs only by letter case already exists")
+    }
+
+    /// The same rule for the streak file name.
+    fn check_streak_case_twin(&self, id: &str) -> Result<(), String> {
+        self.twin_of(&Caps::streak_name(id), "a streak file whose name differs only by letter case already exists")
+    }
+
+    fn twin_of(&self, want: &str, msg: &str) -> Result<(), String> {
         let rd = fs::read_dir(&self.dir).map_err(|_| "the caps directory could not be listed".to_string())?;
         for e in rd {
             let name = e.map_err(|_| "the caps directory could not be listed".to_string())?.file_name().to_string_lossy().into_owned();
-            if name != want && name.eq_ignore_ascii_case(&want) {
-                return Err("a cap record whose name differs only by letter case already exists".to_string());
+            if name != want && name.eq_ignore_ascii_case(want) {
+                return Err(msg.to_string());
             }
         }
         Ok(())
@@ -198,6 +318,75 @@ impl Caps {
     /// Rounds used: 0 when there is no record. (A caller that also has the result folder must refuse "no record but a result file".)
     pub fn rounds(&self, id: &str, repo_id: &str) -> Result<u8, String> {
         Ok(self.read(id, repo_id)?.map(|r| r.rounds()).unwrap_or(0))
+    }
+
+    /// The streak reader: `Ok(None)` when no streak file exists (a ticket with no counted FAIL, or every ticket from before this rule), `Ok(Some)` for
+    /// a canonical streak for this ticket and repo, `Err` for anything else (a link, a non-regular entry, an oversize or malformed file, a wrong
+    /// identity, a case twin). A refusal is never read as "no streak".
+    pub fn read_streak(&self, id: &str, repo_id: &str) -> Result<Option<Streak>, String> {
+        Caps::id_ok(id)?;
+        self.check_streak_case_twin(id)?;
+        let path = self.dir.join(Caps::streak_name(id));
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err("the streak file exists and is not a regular file".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("the streak file could not be inspected".to_string()),
+        }
+        let f = File::open(&path).map_err(|_| "the streak file could not be opened".to_string())?;
+        if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Err("the streak file exists and is not a regular file".to_string());
+        }
+        let bytes = read_bounded(f)?;
+        Streak::decode(&bytes, id, repo_id).map(Some)
+    }
+
+    /// Replace the streak durably, with the lock held, exactly as `write` does for the record: a stale temp is removed (never opened for truncation),
+    /// the temp is made with `create_new`, synced, renamed over the streak, and the folder is synced.
+    pub fn write_streak(&self, s: &Streak, _held: &Lock) -> Result<(), String> {
+        Caps::id_ok(&s.ticket)?;
+        if !s.state_ok() {
+            return Err("the streak state is out of range".to_string());
+        }
+        let target = self.dir.join(Caps::streak_name(&s.ticket));
+        let tmp = self.dir.join(format!(".{}.replan.tmp", s.ticket));
+        match fs::symlink_metadata(&target) {
+            Ok(m) if !m.file_type().is_file() => return Err("the streak file exists and is not a regular file".to_string()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("the streak file could not be inspected".to_string()),
+        }
+        match fs::symlink_metadata(&tmp) {
+            Ok(_) => fs::remove_file(&tmp).map_err(|_| "a stale streak temp file could not be removed".to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("the streak temp file could not be inspected".to_string()),
+        }
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|_| "the streak file could not be created".to_string())?;
+        if f.write_all(s.encode().as_bytes()).and_then(|_| f.sync_all()).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return Err("the streak file could not be written".to_string());
+        }
+        drop(f);
+        if fs::rename(&tmp, &target).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return Err("the streak file could not be put in place".to_string());
+        }
+        File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|_| "the caps directory could not be synced".to_string())
+    }
+
+    /// Clear the streak (a PASS): remove the file if it exists, then sync the folder. Absent is already clear. A link or other non-regular entry is
+    /// refused, never removed or followed.
+    pub fn clear_streak(&self, id: &str, _held: &Lock) -> Result<(), String> {
+        Caps::id_ok(id)?;
+        let target = self.dir.join(Caps::streak_name(id));
+        match fs::symlink_metadata(&target) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err("the streak file exists and is not a regular file".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("the streak file could not be inspected".to_string()),
+        }
+        fs::remove_file(&target).map_err(|_| "the streak file could not be removed".to_string())?;
+        File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|_| "the caps directory could not be synced".to_string())
     }
 
     /// The per-ticket lock `.<id>.lock`, taken without waiting. The file is created once and never deleted. A link or non-regular entry is refused.
@@ -400,6 +589,133 @@ mod tests {
         assert_eq!(caps.read("EX-1", "r"), Ok(Some(rec(2, false))), "twin: the same bytes as a regular file");
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    const H1: &str = "1111111111111111111111111111111111111111";
+    const H2: &str = "2222222222222222222222222222222222222222";
+
+    fn streak(sig: &str, head: &str, count: u8) -> Streak {
+        Streak { ticket: "EX-1".to_string(), repo_id: "r".to_string(), sig: sig.to_string(), head: head.to_string(), count }
+    }
+
+    // AC 18: the golden bytes of the streak file in each state, and the strict decoder.
+    #[test]
+    fn the_streak_bytes_are_pinned_and_the_decoder_is_strict() {
+        let one = streak("t:check-failed", H1, 1);
+        assert_eq!(
+            one.encode(),
+            "{\"v\":1,\"ticket\":\"EX-1\",\"repo_id\":\"r\",\"sig\":\"t:check-failed\",\"head\":\"1111111111111111111111111111111111111111\",\"count\":1}\n"
+        );
+        assert!(streak("t:check-failed", H2, 2).encode().ends_with("\"count\":2}\n"));
+        for c in 1..=REPLAN_AFTER {
+            let s = streak("t:check-failed", H1, c);
+            assert_eq!(Streak::decode(s.encode().as_bytes(), "EX-1", "r"), Ok(s), "round trip");
+        }
+        let good = one.encode();
+        let bad: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"nope\n".to_vec(),
+            good.replace("\"v\":1", "\"v\":2").into_bytes(),
+            good.replace("\"count\":1", "\"count\":0").into_bytes(),
+            good.replace("\"count\":1", "\"count\":3").into_bytes(),
+            good.replace("\"count\":1", "\"count\":-1").into_bytes(),
+            good.replace("\"count\":1", "\"count\":\"1\"").into_bytes(),
+            good.replace("\"count\":1", "\"count\":01").into_bytes(),
+            good.replace("t:check-failed", "tcheck-failed").into_bytes(),
+            good.replace("t:check-failed", "T:check-failed").into_bytes(),
+            good.replace("t:check-failed", "t:check failed").into_bytes(),
+            good.replace("t:check-failed", &format!("{}:c", "a".repeat(SIG_MAX - 1))).into_bytes(),
+            good.replace(H1, "abc").into_bytes(),
+            good.replace(H1, &"A".repeat(40)).into_bytes(),
+            format!("{good}{good}").into_bytes(),
+            good.trim_end().as_bytes().to_vec(),
+            [good.as_bytes(), b"\0"].concat(),
+            vec![0xff, 0xfe],
+            good.replace("\"head\":\"1111111111111111111111111111111111111111\",\"count\":1", "\"count\":1,\"head\":\"1111111111111111111111111111111111111111\"").into_bytes(),
+        ];
+        for b in &bad {
+            assert!(Streak::decode(b, "EX-1", "r").is_err(), "{:?} must be refused", String::from_utf8_lossy(b));
+        }
+        assert!(Streak::decode(good.as_bytes(), "EX-2", "r").is_err(), "another ticket's streak");
+        assert!(Streak::decode(good.as_bytes(), "EX-1", "q").is_err(), "another repo's streak");
+    }
+
+    // AC 18: every row of the transition table.
+    #[test]
+    fn the_streak_transition_table_is_pinned() {
+        let a = "t:check-failed";
+        let b = "u:check-failed";
+        let none = advance(None, "EX-1", "r", Some((a, H1)));
+        assert_eq!(none, Some(streak(a, H1, 1)), "FAIL, no streak");
+        let one = streak(a, H1, 1);
+        assert_eq!(advance(Some(&one), "EX-1", "r", Some((a, H2))), Some(streak(a, H2, 2)), "FAIL, different head, same signature");
+        assert_eq!(advance(Some(&one), "EX-1", "r", Some((b, H2))), Some(streak(b, H2, 1)), "FAIL, different head, different signature");
+        assert_eq!(advance(Some(&one), "EX-1", "r", Some((a, H1))), Some(one.clone()), "FAIL, same head, same signature: a plain re-run");
+        assert_eq!(advance(Some(&one), "EX-1", "r", Some((b, H1))), Some(streak(b, H1, 1)), "FAIL, same head, different signature: a flaky check");
+        assert_eq!(advance(Some(&one), "EX-1", "r", None), None, "PASS clears");
+        assert_eq!(advance(None, "EX-1", "r", None), None, "PASS with no streak");
+        let two = streak(a, H2, 2);
+        assert_eq!(advance(Some(&two), "EX-1", "r", Some((a, H1))), Some(streak(a, H1, 2)), "the count never passes the threshold");
+        assert_eq!(advance(Some(&two), "EX-1", "r", Some((a, H2))), Some(two.clone()), "same head and signature at the threshold");
+        assert_eq!(advance(Some(&two), "EX-1", "r", None), None);
+        assert!(!one.latched() && two.latched(), "latched iff the count reached the threshold");
+    }
+
+    // AC 18: the start rule over rounds 0-4 x latched or not.
+    #[test]
+    fn the_start_rule_refuses_a_latched_ticket_first_and_then_the_cap() {
+        let open = streak("t:check-failed", H1, 1);
+        let latched = streak("t:check-failed", H2, 2);
+        for rounds in 0..=MAX_FIX_ROUNDS {
+            let r = start_check(rounds, Some(&latched)).unwrap_err();
+            assert_eq!((r.kind, r.reason), (Kind::ReplanRequired, "replan-threshold"), "latched at {rounds} rounds");
+            for streak in [None, Some(&open)] {
+                match start_check(rounds, streak) {
+                    Ok(()) => assert!(rounds < MAX_FIX_ROUNDS, "{rounds} rounds, not latched"),
+                    Err(r) => assert_eq!((rounds >= MAX_FIX_ROUNDS, r.kind, r.reason), (true, Kind::Escalation, "fix-round-cap")),
+                }
+            }
+        }
+    }
+
+    // AC 18: the signature builder and its bound.
+    #[test]
+    fn the_signature_is_bounded_and_fixed_alphabet() {
+        assert_eq!(signature("t", "check-failed"), Ok("t:check-failed".to_string()));
+        let longest_class = "passes-at-base";
+        let gate250 = "a".repeat(250);
+        let sig = signature(&gate250, longest_class).unwrap();
+        assert_eq!(sig.len(), 265);
+        assert!(sig.len() <= SIG_MAX && signature_ok(&sig));
+        assert!(signature(&"a".repeat(SIG_MAX), "c").is_err(), "321 bytes");
+        assert!(signature(&"a".repeat(SIG_MAX - 2), "c").is_ok(), "exactly SIG_MAX");
+        for (g, c) in [("", "c"), ("g", ""), ("G", "c"), ("g", "C"), ("g:h", "c"), ("g", "c:d"), ("g h", "c"), ("g", "c.d"), ("g", "c d")] {
+            assert!(signature(g, c).is_err(), "{g:?}/{c:?}");
+        }
+        assert!(!signature_ok("no-colon") && !signature_ok("a:b:c"));
+    }
+
+    #[test]
+    fn the_streak_file_is_written_read_and_cleared_under_the_lock() {
+        let d = scratch();
+        let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
+        assert_eq!(caps.read_streak("EX-1", "r"), Ok(None));
+        let held = caps.lock("EX-1").unwrap();
+        let s = streak("t:check-failed", H1, 1);
+        caps.write_streak(&s, &held).unwrap();
+        assert_eq!(fs::read_to_string(d.join("EX-1.replan")).unwrap(), s.encode());
+        assert_eq!(caps.read_streak("EX-1", "r"), Ok(Some(s.clone())));
+        assert!(caps.read_streak("EX-1", "q").is_err(), "another repo");
+        fs::write(d.join(".EX-1.replan.tmp"), "junk").unwrap();
+        caps.write_streak(&streak("t:check-failed", H2, 2), &held).unwrap();
+        assert!(!d.join(".EX-1.replan.tmp").exists(), "a stale temp is removed");
+        caps.clear_streak("EX-1", &held).unwrap();
+        assert!(!d.join("EX-1.replan").exists() && caps.read_streak("EX-1", "r") == Ok(None));
+        caps.clear_streak("EX-1", &held).unwrap();
+        fs::write(d.join("ex-1.replan"), "x").unwrap();
+        assert!(caps.read_streak("EX-1", "r").is_err() && caps.check_names("EX-1").is_err(), "a case twin of the streak name");
+        assert!(caps.read_streak("EX-2", "r").is_ok(), "twin: another ticket");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
