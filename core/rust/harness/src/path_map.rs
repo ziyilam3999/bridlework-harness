@@ -201,10 +201,15 @@ pub fn judge(map: &PathMap, changed: &[String], head_sha: &str) -> Result<GateRe
     Ok(r)
 }
 
-/// One git call: no hooks, no inherited `GIT_*` name, no stdin, run from the canonical root.
+/// One git call: no hooks, no inherited `GIT_*` name, no stdin, run from the canonical root and pinned to that root's own `.git`
+/// (git never walks up to a parent repo, so the map root and the root paths are reported against are the same).
 fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
     let mut c = Command::new("git");
     c.current_dir(root)
+        .arg("--git-dir")
+        .arg(root.join(".git"))
+        .arg("--work-tree")
+        .arg(root)
         .args(["-c", "core.hooksPath=/dev/null", "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=none"])
         .arg(format!("{}^{{commit}}", base))
         .arg(format!("{}^{{commit}}", head))
@@ -575,6 +580,9 @@ mod tests {
         put(d, "sub/gates/path-map.json", r#"{"docs":["c"],"core":["c"]}"#);
         let e = judge_diff(&d.join("sub"), &c1, &c2).unwrap_err();
         assert!(e.contains("top level"), "a subfolder root is refused: {}", e);
+        // an empty .git folder passes an exists() check but is not a repository: git must not walk up to the parent
+        std::fs::create_dir_all(d.join("sub/.git")).unwrap();
+        assert!(judge_diff(&d.join("sub"), &c1, &c2).is_err(), "an empty .git folder in a subfolder is refused");
         put_map(d, r#"{"docs":["c"],"core":["c"]}"#);
         assert_eq!(judge_diff(d, &c1, &c2).unwrap().status, Status::Pass, "the top level itself works");
     }
