@@ -9,6 +9,7 @@ pub mod detect;
 pub mod explain;
 pub mod fixtures;
 pub mod gate_result;
+pub mod gates;
 pub mod gitio;
 pub mod overlay;
 pub mod path_map;
