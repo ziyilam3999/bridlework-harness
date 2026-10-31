@@ -87,8 +87,8 @@ link_bin() { ln "$GBIN" "$1" 2>/dev/null || cp "$GBIN" "$1"; }
 
 new_world() { # [pass|fail]
   W=$(mktemp -d "$TR/w.XXXXXX")
-  EXT=$W/ext; R=$W/r; O=$W/other; RES=$W/res
-  mkdir -p "$EXT" "$RES" "$W/home" "$O"
+  EXT=$W/ext; R=$W/r; O=$W/other; RES=$W/res; CAPS=$W/caps
+  mkdir -p "$EXT" "$RES" "$CAPS" "$W/home" "$O"
   mkgaterepo "$R" "${1:-pass}"
   git init -q "$O" >/dev/null 2>&1; echo o > "$O/o.txt"; git_q "$O" add -A; git_q "$O" commit -q -m o
   cp "$HOOK_SRC" "$EXT/hook.sh"; link_bin "$EXT/harness"; chmod +x "$EXT/hook.sh"
@@ -100,7 +100,7 @@ new_world() { # [pass|fail]
 # The real gate writes the result (outside the repo). Optional argument: the exit code the gate should return (default 0).
 gate() {
   local want=${1:-0} rc
-  (cd "$W/home" && "$ENVBIN" -i PATH="$PATH" HOME="$W/home" "$EXT/harness" ticket gate "$EXT/ticket.json" --repo-map "demo=$R" --base "$BASE" --result-dir "$RES" >/dev/null 2>&1)
+  (cd "$W/home" && "$ENVBIN" -i PATH="$PATH" HOME="$W/home" "$EXT/harness" ticket gate "$EXT/ticket.json" --repo-map "demo=$R" --base "$BASE" --result-dir "$RES" --caps-dir "$CAPS" >/dev/null 2>&1)
   rc=$?
   [ "$rc" -eq "$want" ] || fail "gate run exited $rc, expected $want"
 }
