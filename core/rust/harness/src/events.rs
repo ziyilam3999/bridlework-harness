@@ -363,7 +363,12 @@ fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool) -> Result<(),
     let line = ev.encode()?;
     let path = check_log_path(root, log)?;
     let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
+    // NOTE for 6b: `check_log_path` resolves the path and `open` resolves it again, so a symlink swapped in between could
+    // point the open outside the root. Not closed here (out of scope for 6a); re-check the opened file's identity if needed.
     let mut f = OpenOptions::new().read(true).append(true).create(true).open(&path).map_err(io)?;
+    // Exclusive advisory lock across check + write + sync, so the torn-tail check only ever sees a settled file (another
+    // writer of this module is never caught mid-append). Held until `f` drops. It does not bind a writer outside this module.
+    f.lock().map_err(|e| AppendError::Io(e.to_string()))?;
     let len = f.metadata().map_err(io)?.len();
     if len > 0 {
         f.seek(SeekFrom::End(-1)).map_err(io)?;
@@ -665,6 +670,29 @@ mod tests {
         run_writers(&t, split_write);
         let r = read_log(&t.log()).unwrap();
         assert!(!r.is_clean() || r.events.len() != WRITERS * PER, "the check must see interleaving from a two-write writer");
+    }
+
+    /// Mutation proof for the lock: while another handle holds the lock with a half-written line on disk, `append` must wait
+    /// (not refuse). Without the lock it would read the half line as a torn tail and return `Err(TornTail)` at once.
+    #[test]
+    fn ac6_append_waits_for_the_lock_instead_of_seeing_an_in_flight_line() {
+        let t = Tmp::new();
+        let line = ev(Kind::Escalation, 1).encode().unwrap();
+        let (a, b) = line.as_bytes().split_at(line.len() / 2);
+        let mut holder = OpenOptions::new().append(true).create(true).open(t.log()).unwrap();
+        holder.lock().unwrap();
+        holder.write_all(a).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (root, log) = (t.0.clone(), t.log());
+        let h = std::thread::spawn(move || tx.send(append(&root, &log, &ev(Kind::Escalation, 2))).unwrap());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "append must still be waiting on the lock, not have refused");
+        holder.write_all(b).unwrap();
+        drop(holder);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Ok(()));
+        h.join().unwrap();
+        let r = read_log(&t.log()).unwrap();
+        assert!(r.is_clean());
+        assert_eq!(r.events.iter().map(|e| e.ts_ms).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]
