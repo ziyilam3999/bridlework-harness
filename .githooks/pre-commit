@@ -1,0 +1,20 @@
+#!/bin/sh
+# pre-commit privacy gate. Scans the lines being added to the index and refuses the commit
+# when the engine reports a hit or cannot decide (fail closed). No arguments, no switch.
+top=$(git rev-parse --show-toplevel) || exit 1
+eng="$top/core/rust/target/release/harness"
+if [ ! -x "$eng" ]; then
+  echo "pre-commit: privacy engine missing; build it with: cd core/rust && cargo build --release" >&2
+  exit 1
+fi
+out=$("$eng" privacy scan --staged </dev/null 2>/dev/null); rc=$?
+if [ "$rc" -eq 0 ]; then
+  exit 0
+fi
+if [ "$rc" -eq 1 ]; then
+  "$eng" privacy explain --staged </dev/null >&2 2>/dev/null
+else
+  echo "pre-commit: engine error (exit $rc); refusing" >&2
+fi
+echo "pre-commit: refused by the privacy gate" >&2
+exit 1

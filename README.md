@@ -7,7 +7,7 @@ and refuses the push when a value of a protected class is found.
 
 - `core/rust/` : Rust workspace. The `harness` crate holds the scan engine
   (std only, no external crates).
-- `.githooks/` : the pre-push hook that calls the engine.
+- `.githooks/` : the pre-push hook and the `.githooks/pre-commit` hook; both call the engine.
 - `ci/` : entry scripts and lints that CI runs.
 - `.github/workflows/` : the workflows that call those scripts.
 - `dashboard/` : the dashboard (placeholder).
@@ -30,3 +30,5 @@ and refuses the push when a value of a protected class is found.
     cd core/rust && cargo build --release
 
 The hook looks for the binary at `core/rust/target/release/harness`.
+
+Turn the hooks on in a clone: `git config core.hooksPath .githooks`
