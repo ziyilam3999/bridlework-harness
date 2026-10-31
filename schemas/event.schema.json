@@ -1,0 +1,52 @@
+{
+  "title": "event",
+  "description": "One line of the event log (.harness/events.jsonl), one branch per kind. A human and tool mirror of the loader's exact key set per kind; the crate does not interpret this file, and a test pins each branch's required set to the loader's. A line is at most 4096 bytes including its newline.",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "escalation",
+      "description": "A fix-round cap was reached and the ticket was escalated.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "reason"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "kind": { "const": "escalation" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "reason": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } }
+      }
+    },
+    {
+      "title": "replan_required",
+      "description": "The ticket must be re-planned before more work is done on it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "reason"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "kind": { "const": "replan_required" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "reason": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } }
+      }
+    },
+    {
+      "title": "budget_exceeded",
+      "description": "The ticket went over its budget and was stopped.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "reason"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "kind": { "const": "budget_exceeded" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "reason": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } }
+      }
+    }
+  ]
+}

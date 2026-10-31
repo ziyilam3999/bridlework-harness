@@ -312,6 +312,10 @@ fn ac9_a_directory_a_link_out_of_the_root_and_an_unwritable_log_are_refused() {
     assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("EVENT NOT RECORDED"));
     assert_eq!(fs::read(outside.log()).unwrap(), outside_before, "nothing was written through the link");
+    // With no --root the root is the log's parent folder, so the same link is refused (a root forced to `/` would accept it).
+    let o = append(&t.log(), "escalation", "3");
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert_eq!(fs::read(outside.log()).unwrap(), outside_before, "no --root: still nothing written through the link");
     // Twin: the same link with a --root that contains the target is accepted.
     assert!(ok(&with_root(&t.log(), &outside.0)));
     assert_eq!(out(&list(&outside.log())).lines().count(), 2);
