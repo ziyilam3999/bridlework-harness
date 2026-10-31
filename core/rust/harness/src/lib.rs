@@ -11,6 +11,7 @@ pub mod fixtures;
 pub mod gate_result;
 pub mod gitio;
 pub mod overlay;
+pub mod path_map;
 pub mod runner;
 #[cfg(unix)]
 pub mod tree_prep;
