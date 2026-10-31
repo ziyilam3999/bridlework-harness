@@ -254,6 +254,8 @@ struct Outcome {
     failing_gate: String,
     /// True when this FAIL used the last allowed round, so the next run will be refused.
     cap_reached: bool,
+    /// True when this FAIL was the 2nd identical one in a row on a new head, so the next run is refused with `replan-threshold`.
+    replan_reached: bool,
 }
 
 /// What a call ended with: a verdict, or a refusal to run at all (the fix-round cap).
@@ -317,7 +319,9 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
             0
         }
     };
-    if let Err(refusal) = caps::may_start(used) {
+    // The same-failure streak is read once, here, under the lock; every later update is computed from THIS value and never re-reads the file.
+    let streak = caps.read_streak(&ticket.id, &repo_id).map_err(err2)?;
+    if let Err(refusal) = caps::start_check(used, streak.as_ref()) {
         caps.escalate(&refusal, &ticket.id, &repo_id)
             .map_err(|m| Stop(2, format!("harness: ESCALATION NOT RECORDED reason={} ({})", refusal.reason, m)))?;
         return Ok(Ran::Refused { ticket_id: ticket.id, head, reason: refusal.reason });
@@ -391,10 +395,21 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
         None => (fold_pass(&passed, &head), GATE_ID.to_string()),
     };
     let fixed = if result.status == Status::Pass { used } else { used + 1 };
+    // The streak is decided from the point-B value, before any write, so a signature that cannot be built stops here with the round still counted.
+    let fail_key = match result.status {
+        Status::Pass => None,
+        Status::Fail => Some((caps::signature(&failing_gate, result.failure_class.as_deref().unwrap_or("unknown")).map_err(err2)?, head.clone())),
+    };
+    let next = caps::advance(streak.as_ref(), &ticket.id, &repo_id, fail_key.as_ref().map(|(s, h)| (s.as_str(), h.as_str())));
+    // Streak (or its removal) first, then the round record, then the result: a failed later write never leaves a FAIL uncounted.
+    match &next {
+        Some(s) => caps.write_streak(s, &lock).map_err(err2)?,
+        None => caps.clear_streak(&ticket.id, &lock).map_err(err2)?,
+    }
     caps.write(&Record { ticket: ticket.id.clone(), repo_id: repo_id.clone(), fix_rounds: fixed, in_flight: false }, &lock).map_err(err2)?;
     write_result(&rdir, &ticket.id, &target, &result)?;
     drop(lock);
-    Ok(Ran::Verdict(Outcome { ticket_id: ticket.id, head, result, failing_gate, cap_reached: fixed >= caps::MAX_FIX_ROUNDS }))
+    Ok(Ran::Verdict(Outcome { ticket_id: ticket.id, head, result, failing_gate, cap_reached: fixed >= caps::MAX_FIX_ROUNDS, replan_reached: next.as_ref().map(|s| s.latched()).unwrap_or(false) }))
 }
 
 /// `harness ticket gate ...` (the arguments after `gate`). Exit 0 only for a written PASS; 1 a FAIL (written) or a ticket refusal; 2 any error.
@@ -415,6 +430,9 @@ pub fn gate_cmd(a: &[String]) -> i32 {
                 eprintln!("harness: gate FAIL class={} gate={}", o.result.failure_class.as_deref().unwrap_or("unknown"), o.failing_gate);
                 if o.cap_reached {
                     eprintln!("harness: fix-round cap reached; the next run is refused and escalated");
+                }
+                if o.replan_reached {
+                    eprintln!("harness: re-plan threshold reached; the next run is refused with replan_required");
                 }
                 1
             }
