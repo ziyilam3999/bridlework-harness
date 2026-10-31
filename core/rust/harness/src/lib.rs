@@ -1,5 +1,7 @@
 //! Privacy gate engine (std only).
 
+#[cfg(unix)]
+pub mod both_ends;
 pub mod classes;
 pub mod cli;
 pub mod decode;
