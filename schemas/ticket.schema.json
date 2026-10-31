@@ -1,0 +1,23 @@
+{
+  "title": "ticket",
+  "description": "One ticket file. A human and tool mirror of the eleven-key shape in docs/ticket-contract.md; the crate does not interpret this file, and a later test pins its required set to the reader's.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "repo_id", "title", "group", "size", "objective", "acceptance_criteria", "dependencies", "risk", "owner_role", "evidence_links"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1, "description": "The ticket's own id." },
+    "repo_id": { "type": "string", "pattern": "^(?!\\.{1,2}$)[a-z0-9._-]+$", "description": "Which repository the ticket is for: a plain name, never a path, never '.' or '..'. Where the repository lives is not part of this file." },
+    "title": { "type": "string", "minLength": 1 },
+    "group": { "type": "string", "minLength": 1 },
+    "size": { "type": "string", "enum": ["S", "M", "L"] },
+    "objective": { "type": "string", "minLength": 1 },
+    "acceptance_criteria": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+    "dependencies": { "type": "array", "items": { "type": "string" } },
+    "risk": { "type": "string", "enum": ["normal", "high"] },
+    "owner_role": {
+      "type": "string",
+      "enum": ["orchestration_portfolio", "execution_verification", "risk_review", "friction_learning", "knowledge_lessons", "harness_governance"]
+    },
+    "evidence_links": { "type": "array", "items": { "type": "string" } }
+  }
+}
