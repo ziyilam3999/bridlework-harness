@@ -141,11 +141,10 @@ impl PathMap {
         if !real.starts_with(root) {
             return Err("path map escapes the repo".to_string());
         }
-        let f = std::fs::File::open(&real).map_err(|_| "path map unreadable".to_string())?;
-        let meta = f.metadata().map_err(|_| "path map unreadable".to_string())?;
-        if !meta.is_file() {
+        if !std::fs::metadata(&real).map_err(|_| "path map unreadable".to_string())?.is_file() {
             return Err("path map is not a file".to_string());
         }
+        let f = std::fs::File::open(&real).map_err(|_| "path map unreadable".to_string())?;
         let mut bytes = Vec::new();
         f.take(MAX_MAP_BYTES + 1).read_to_end(&mut bytes).map_err(|_| "path map unreadable".to_string())?;
         if bytes.len() as u64 > MAX_MAP_BYTES {
@@ -206,7 +205,7 @@ pub fn judge(map: &PathMap, changed: &[String], head_sha: &str) -> Result<GateRe
 fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
     let mut c = Command::new("git");
     c.current_dir(root)
-        .args(["-c", "core.hooksPath=/dev/null", "diff", "--name-only", "-z", "--no-renames"])
+        .args(["-c", "core.hooksPath=/dev/null", "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=none"])
         .arg(format!("{}^{{commit}}", base))
         .arg(format!("{}^{{commit}}", head))
         .arg("--");
@@ -234,7 +233,8 @@ fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<String>, Str
         .collect()
 }
 
-/// The one composition entry. Every refusal precedes any verdict: shas, then the map, then the one git call, then `judge`.
+/// The one composition entry. Every refusal precedes any verdict: shas, then the root (it must hold `.git`, so the map root and the
+/// root git reports paths against are the same), then the map, then the one git call, then `judge`.
 pub fn judge_diff(repo_root: &Path, base: &str, head: &str) -> Result<GateResult, String> {
     if !sha_ok(base) {
         return Err("base is not a full lowercase hex sha".to_string());
@@ -246,6 +246,9 @@ pub fn judge_diff(repo_root: &Path, base: &str, head: &str) -> Result<GateResult
         return Err("base and head are the same commit".to_string());
     }
     let root: PathBuf = repo_root.canonicalize().map_err(|_| "repo root unreadable".to_string())?;
+    if !root.join(".git").exists() {
+        return Err("repo root is not a repository top level".to_string());
+    }
     let map = PathMap::load_canonical(&root)?;
     let changed = changed_paths(&root, base, head)?;
     judge(&map, &changed, head)
@@ -504,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn git_env_cannot_steer_the_diff() {
+    fn git_env_and_config_cannot_steer_the_diff() {
         let sc = Scratch::new("env");
         let decoy = Scratch::new("decoy");
         let d = &sc.0;
@@ -535,5 +538,44 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout).to_string();
         let line = text.lines().find_map(|l| l.split_once("HPM-RESULT:").map(|(_, r)| r)).expect("child printed a result");
         assert_eq!(line, clean, "a steered environment gives the same verdict as a clean one");
+
+        // config steering: a repo that hides submodule changes must not hide a changed pointer
+        let sub = Scratch::new("sub");
+        let s = &sub.0;
+        git(s, &["init", "-q"]);
+        put(s, "core/rust/lib.rs", "fn main() {}\n");
+        git(s, &["add", "core"]);
+        git(s, &["update-index", "--add", "--cacheinfo", &format!("160000,{},vend", "1".repeat(40))]);
+        git(s, &["commit", "-q", "-m", "one"]);
+        let b = git(s, &["rev-parse", "HEAD"]);
+        git(s, &["update-index", "--cacheinfo", &format!("160000,{},vend", "2".repeat(40))]);
+        git(s, &["commit", "-q", "-m", "two"]);
+        let h = git(s, &["rev-parse", "HEAD"]);
+        git(s, &["config", "diff.ignoreSubmodules", "all"]);
+        put_map(s, r#"{"core/rust":["c"]}"#);
+        let r = judge_diff(s, &b, &h).unwrap();
+        assert_eq!(r.status, Status::Fail, "a changed submodule pointer is still a changed path");
+        assert_eq!(r.file.as_deref(), Some("vend"));
+    }
+
+    #[test]
+    fn a_root_that_is_not_a_repository_top_level_is_refused() {
+        let sc = Scratch::new("top");
+        let d = &sc.0;
+        git(d, &["init", "-q"]);
+        put(d, "core/rust/lib.rs", "fn main() {}\n");
+        git(d, &["add", "core"]);
+        git(d, &["commit", "-q", "-m", "one"]);
+        let c1 = git(d, &["rev-parse", "HEAD"]);
+        put(d, "docs/new.md", "new\n");
+        git(d, &["add", "docs"]);
+        git(d, &["commit", "-q", "-m", "two"]);
+        let c2 = git(d, &["rev-parse", "HEAD"]);
+        // a subfolder holds a map that would cover everything, while git reports paths from the top
+        put(d, "sub/gates/path-map.json", r#"{"docs":["c"],"core":["c"]}"#);
+        let e = judge_diff(&d.join("sub"), &c1, &c2).unwrap_err();
+        assert!(e.contains("top level"), "a subfolder root is refused: {}", e);
+        put_map(d, r#"{"docs":["c"],"core":["c"]}"#);
+        assert_eq!(judge_diff(d, &c1, &c2).unwrap().status, Status::Pass, "the top level itself works");
     }
 }
