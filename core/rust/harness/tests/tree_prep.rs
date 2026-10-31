@@ -472,8 +472,10 @@ fn bad_inputs_are_refused_before_any_tree_exists() {
     let linked = fx.work.join("linked");
     git(&fx.repo, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
     let linked_s = linked.to_str().unwrap().to_string();
+    let guard2 = lock(&[&fx.repo.join(".git/worktrees"), &fx.tmp]);
     let o = run_with(&fx, &[("repo", &linked_s)], &[]);
     refused(&o, "linked work tree");
+    drop(guard2);
     assert!(!marker.exists(), "linked work tree: the check ran before the refusal");
     git(&fx.repo, &["worktree", "remove", "--force", linked.to_str().unwrap()]);
     assert_clean(&fx);
