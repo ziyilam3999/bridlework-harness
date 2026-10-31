@@ -203,7 +203,7 @@ pub fn judge(map: &PathMap, changed: &[String], head_sha: &str) -> Result<GateRe
 
 /// One git call: no hooks, no inherited `GIT_*` name, no stdin, run from the canonical root and pinned to that root's own `.git`
 /// (git never walks up to a parent repo, so the map root and the root paths are reported against are the same).
-fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
+pub(crate) fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<String>, String> {
     let mut c = Command::new("git");
     c.current_dir(root)
         .arg("--git-dir")
