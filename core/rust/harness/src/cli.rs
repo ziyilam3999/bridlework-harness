@@ -236,6 +236,80 @@ fn events_cmd(a: &[String]) -> i32 {
     }
 }
 
+const CONFIG_USAGE: &str = "usage: harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]";
+
+/// `harness config check`. Exit 0 the config loaded (stdout: `config ok repos=<n> shadow=ok`, plus `repo_id=<id> mapped` and
+/// `budget size=<S> wall_seconds=<n> tokens=<n>` when asked); 1 `--repo` names an id that is not in the map; 2 everything else
+/// (no config configured, an empty source, a bad file, a bad command line). The source is `--config`, else `HARNESS_CONFIG`, nothing
+/// else: an empty value is refused and never falls back. No folder and no config value is ever printed.
+fn config_cmd(a: &[String]) -> i32 {
+    use crate::config::Config;
+    use crate::repo_id::RepoId;
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    if a.first().map(|s| s.as_str()) != Some("check") {
+        eprintln!("{}", CONFIG_USAGE);
+        return 2;
+    }
+    let (mut file, mut repo, mut size): (Option<&str>, Option<&str>, Option<&str>) = (None, None, None);
+    let mut it = a[1..].iter();
+    while let Some(flag) = it.next() {
+        let slot = match flag.as_str() {
+            "--config" => &mut file,
+            "--repo" => &mut repo,
+            "--budget" => &mut size,
+            _ => return fail("unknown option"),
+        };
+        let Some(val) = it.next() else { return fail("an option is missing its value") };
+        if slot.replace(val.as_str()).is_some() {
+            return fail("an option was given twice");
+        }
+    }
+    let id = match repo.map(RepoId::parse) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(e)) => return fail(&e),
+        None => None,
+    };
+    let path = match file {
+        Some(f) => std::ffi::OsString::from(f),
+        None => match std::env::var_os("HARNESS_CONFIG") {
+            Some(v) => v,
+            None => return fail("no config configured (pass --config <file> or set HARNESS_CONFIG)"),
+        },
+    };
+    if path.is_empty() {
+        return fail("the config source is empty");
+    }
+    let cfg = match Config::load(std::path::Path::new(&path)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    // A bad size is a command-line error (2) and is decided BEFORE the repo lookup (1), so a bad size never reads as a lookup refusal.
+    let budget_line = match size {
+        Some(s) => match cfg.budget(s) {
+            Some(b) => Some(format!("budget size={} wall_seconds={} tokens={}", s, b.wall_seconds, b.tokens)),
+            None => return fail("--budget must be exactly S, M or L"),
+        },
+        None => None,
+    };
+    if let Some(id) = &id {
+        if cfg.repo_dir(id).is_none() {
+            eprintln!("harness: repo_id {} is not in the config map", id.as_str());
+            return 1;
+        }
+    }
+    println!("config ok repos={} shadow=ok", cfg.repo_count());
+    if let Some(id) = &id {
+        println!("repo_id={} mapped", id.as_str());
+    }
+    if let Some(l) = budget_line {
+        println!("{}", l);
+    }
+    0
+}
+
 pub fn run(mut args: Vec<String>) -> i32 {
     if args.len() == 1 && args[0] == "--version" {
         println!("{}", crate::version_line());
@@ -250,6 +324,9 @@ pub fn run(mut args: Vec<String>) -> i32 {
     }
     if !args.is_empty() && args[0] == "events" {
         return events_cmd(&args[1..]);
+    }
+    if !args.is_empty() && args[0] == "config" {
+        return config_cmd(&args[1..]);
     }
     if !args.is_empty() && args[0] == "fixtures" {
         return fixtures_cmd(&args[1..]);
