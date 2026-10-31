@@ -29,7 +29,7 @@ pub const KEYS: [&str; 14] = [
 ];
 
 const SECTIONS: [&str; 3] = ["repos", "budgets", "shadow"];
-const YAML_WORDS: [&str; 7] = ["true", "false", "null", "yes", "no", "on", "off"];
+const YAML_WORDS: [&str; 11] = ["true", "false", "null", "yes", "no", "on", "off", "y", "n", ".inf", ".nan"];
 
 /// The wall-time and token limit of one ticket size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,7 @@ fn number(s: &str) -> Option<u64> {
 
 /// An absolute folder spelling: starts with `/`, no `..` component, no control character, no trailing `/`.
 fn folder_ok(f: &str) -> bool {
-    f.starts_with('/') && !f.ends_with('/') && !f.chars().any(|c| c.is_control()) && !f.split('/').any(|c| c == "..")
+    f.starts_with('/') && !f.ends_with('/') && !f.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) && !f.split('/').any(|c| c == "..")
 }
 
 impl Config {
@@ -126,11 +126,15 @@ impl Config {
         let mut nums: [Option<u64>; 14] = [None; 14];
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
+            let here = match section {
+                Some(s) => format!("section `{}`", SECTIONS[s]),
+                None => "line".to_string(),
+            };
             if line.contains('\t') {
-                return Err(refuse(n, "line", "a tab is not allowed"));
+                return Err(refuse(n, &here, "a tab is not allowed"));
             }
             if line.contains('\r') {
-                return Err(refuse(n, "line", "a carriage return is not allowed"));
+                return Err(refuse(n, &here, "a carriage return is not allowed"));
             }
             if line.is_empty() {
                 continue;
@@ -140,12 +144,12 @@ impl Config {
                 continue;
             }
             if bare.is_empty() {
-                return Err(refuse(n, "line", "a line of only spaces is not allowed"));
+                return Err(refuse(n, &here, "a line of only spaces is not allowed"));
             }
             if !line.starts_with(' ') {
                 let name = line.strip_suffix(':').filter(|nm| shown(nm) != "key");
                 let name = name.ok_or_else(|| refuse(n, "section", "expected a section name followed by a colon and nothing else"))?;
-                let idx = SECTIONS.iter().position(|s| *s == name).ok_or_else(|| refuse(n, "section", "unknown section"))?;
+                let idx = SECTIONS.iter().position(|s| *s == name).ok_or_else(|| refuse(n, &format!("section `{name}`"), "unknown section"))?;
                 if seen[idx] {
                     return Err(refuse(n, &format!("section `{name}`"), "duplicate section"));
                 }
@@ -155,7 +159,7 @@ impl Config {
             }
             let sec = match section {
                 Some(s) => SECTIONS[s],
-                None => return Err(refuse(n, "line", "an entry before any section")),
+                None => return Err(refuse(n, &format!("key `{}`", shown(bare.split(':').next().unwrap_or(""))), "an entry before any section")),
             };
             let rest = line.strip_prefix("  ").filter(|r| !r.starts_with(' ')).ok_or_else(|| refuse(n, &format!("section `{sec}`"), "an entry is indented by exactly two spaces"))?;
             let colon = rest.find(':').ok_or_else(|| refuse(n, &format!("section `{sec}`"), "expected `key: value`"))?;
@@ -170,8 +174,9 @@ impl Config {
             let (val, quoted) = plain_value(raw).map_err(|why| refuse(n, &at, why))?;
             if sec == "repos" {
                 let id = RepoId::parse(key).map_err(|_| refuse(n, &format!("section `repos` key `repo_id`"), "must be a plain repo id"))?;
-                if YAML_WORDS.contains(&id.as_str()) {
-                    return Err(refuse(n, &format!("section `repos` key `repo_id`"), "a YAML special word cannot be a repo id"));
+                let numeric = id.as_str().parse::<f64>().is_ok() && id.as_str().starts_with(|c: char| c.is_ascii_digit() || c == '.');
+                if YAML_WORDS.contains(&id.as_str()) || numeric {
+                    return Err(refuse(n, &format!("section `repos` key `repo_id`"), "a YAML special word or number cannot be a repo id"));
                 }
                 let at = format!("section `repos` repo `{}`", id.as_str());
                 if !folder_ok(val) {
@@ -186,7 +191,7 @@ impl Config {
                 repos.push((id, val.to_string()));
             } else {
                 let full = format!("{sec}.{key}");
-                let slot = KEYS.iter().position(|k| *k == full).ok_or_else(|| refuse(n, &format!("section `{sec}`"), "unknown key"))?;
+                let slot = KEYS.iter().position(|k| *k == full).ok_or_else(|| refuse(n, &at, "unknown key"))?;
                 if nums[slot].is_some() {
                     return Err(refuse(n, &at, "duplicate key"));
                 }
@@ -345,9 +350,45 @@ mod tests {
     #[test]
     fn an_unknown_key_is_refused_and_a_known_key_in_the_wrong_section_is_unknown() {
         let e = refused(&valid().replacen("  s_tokens: 222\n", "  s_tokens: 222\n  extra: 1\n", 1));
-        assert!(e.contains("unknown key"), "{e}");
+        assert!(e.contains("unknown key") && e.contains("`extra`") && e.contains("`budgets`"), "{e}");
         let e = refused(&valid().replacen("shadow:\n", "shadow:\n  s_tokens: 3\n", 1));
-        assert!(e.contains("unknown key"), "{e}");
+        assert!(e.contains("unknown key") && e.contains("`s_tokens`") && e.contains("`shadow`"), "{e}");
+        // a folder-shaped key is not echoed
+        let e = refused(&valid().replacen("  s_tokens: 222\n", &format!("  s_tokens: 222\n  {SECRET}: 1\n"), 1));
+        assert!(e.contains("unknown key") && !leaks(&e, SECRET), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_section_names_the_section() {
+        let e = refused(&valid().replacen("budgets:\n", "zzz:\n", 1));
+        assert!(e.contains("unknown section") && e.contains("`zzz`") && e.contains("line"), "{e}");
+        let e = refused(&valid().replacen("budgets:\n", &format!("{SECRET}:\n"), 1));
+        assert!(!leaks(&e, SECRET), "{e}");
+    }
+
+    #[test]
+    fn a_tab_and_an_entry_before_any_section_name_where_they_are() {
+        let e = refused(&valid().replacen("  s_tokens", "\ts_tokens", 1));
+        assert!(e.contains("tab") && e.contains("section `budgets`"), "{e}");
+        let e = refused(&valid().replacen("  p7_cap: 10", "  p7_cap:\t10", 1));
+        assert!(e.contains("section `shadow`"), "{e}");
+        let e = refused(&format!("  extra: 1\n{}", valid()));
+        assert!(e.contains("before any section") && e.contains("`extra`") && e.contains("line 1"), "{e}");
+        let e = refused(&format!("  {SECRET}: 1\n{}", valid()));
+        assert!(e.contains("before any section") && !leaks(&e, SECRET), "{e}");
+    }
+
+    #[test]
+    fn number_like_repo_ids_and_a_unicode_line_break_in_a_folder_are_refused() {
+        for id in ["123", "1.5", "1e3", ".5", ".inf", ".nan", "y", "n"] {
+            let e = refused(&text(&format!("  {id}: /x")));
+            assert!(e.contains("`repo_id`"), "{id}: {e}");
+        }
+        Config::parse(&text("  v1: /x\n  a.b: /y\n  e3: /z")).unwrap();
+        for c in ['\u{2028}', '\u{2029}'] {
+            let e = refused(&text(&format!("  a: /x{c}y")));
+            assert!(e.contains("repo `a`"), "{e}");
+        }
     }
 
     #[test]
