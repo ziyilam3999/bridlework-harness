@@ -7,6 +7,7 @@ pub mod cli;
 pub mod core_layering;
 pub mod decode;
 pub mod detect;
+pub mod events;
 pub mod explain;
 pub mod fixtures;
 pub mod gate_result;
