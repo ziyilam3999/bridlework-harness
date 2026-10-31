@@ -24,6 +24,37 @@ KEY_RE = re.compile(r"""^(\s*)(-\s+)?(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))\s
 STRICT_RE = re.compile(r"^ *(?:- +)?[A-Za-z0-9_.-]+:(?: +(.*))?$")
 PR_FLOW = re.compile(r"pull_request[\"']?\s*:\s*\{[^}]*\b(paths|paths-ignore|branches|branches-ignore|types)\b")
 
+# final-gate.yml only: the EXACT expected file (EXACT-SKELETON compare). Whole-line comments, blank lines, trailing comments
+# and trailing spaces or tabs are dropped from both sides; every other line must match, in order, character for character.
+# The variable values (checkout@v4, fetch-depth 2, timeout-minutes 60) are fixed here too, as the 14b plan fixes them.
+# TO UPDATE (one reviewed change in both places): edit .github/workflows/final-gate.yml, run
+#   sh ci/workflow-lint.sh --print-skeleton .github/workflows/final-gate.yml
+# and paste its output between the SKELETON markers below.
+# SKELETON-BEGIN
+SKELETON = """\
+name: final-gate
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  final-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Workflow lint
+        run: sh ci/workflow-lint.sh
+      - name: Smoke
+        run: sh ci/final-gate-smoke.sh
+      - name: Final gate
+        run: sh ci/final-gate.sh
+"""
+# SKELETON-END
+
 
 def code(line):
     s = line.strip()
@@ -167,6 +198,45 @@ def lint_14c(path, cl):
     return bad
 
 
+def skeleton_lines(raw):
+    """[(line number, text)] of a raw file text with comment-only lines, blank lines, trailing comments and trailing space/tab dropped."""
+    out = []
+    for n, line in enumerate(raw.split("\n"), 1):
+        s = line.rstrip(" \t")
+        t = s.lstrip(" \t")
+        if not t or t.startswith("#"):
+            continue
+        out.append((n, re.sub(r"[ \t]+#.*$", "", s)))
+    return out
+
+
+def read_raw(path):
+    """File text, one char per byte (latin-1), so no newline translation and no unicode whitespace rewriting happens."""
+    return open(path, "rb").read().decode("latin-1")
+
+
+def skeleton_bad(path):
+    """final-gate.yml must equal the expected skeleton; anything else is refused at the first differing line."""
+    if os.path.islink(path):
+        # a symlinked workflow file: the lint would read the target, GitHub reads the link itself; never accept that
+        return [(1, "final-gate-skeleton")]
+    raw = read_raw(path)
+    bad = []
+    # raw bytes: only tab, LF and printable ASCII are allowed anywhere (comments too): CR, NEL, LS, PS and every other
+    # byte some YAML parser might treat as a line break are refused on the raw line, before any trimming.
+    for n, line in enumerate(raw.split("\n"), 1):
+        if re.search(r"[^\x20-\x7e\t]", line):
+            bad.append((n, "final-gate-line-shape"))
+    got = skeleton_lines(raw)
+    exp = SKELETON.rstrip("\n").split("\n")
+    for i in range(max(len(got), len(exp))):
+        if i >= len(got) or i >= len(exp) or got[i][1] != exp[i]:
+            at = got[i][0] if i < len(got) else len(raw.split("\n"))
+            bad.append((at, "final-gate-skeleton"))
+            break
+    return bad
+
+
 def lint(path):
     bad = []
     lines = open(path, encoding="utf-8").read().split("\n")
@@ -247,10 +317,19 @@ def lint(path):
         if "secrets." in c and i not in covered:
             bad.append((i + 1, "secret-outside-scan-step"))
     bad.extend(lint_14c(path, cl))
+    if os.path.basename(path) == "final-gate.yml":
+        bad.extend(skeleton_bad(path))
     return bad
 
 
 rc = 0
+if len(sys.argv) == 3 and sys.argv[1] == "--print-skeleton":
+    # maintainer helper: print the skeleton form of a workflow file (the text to paste into SKELETON above)
+    if not os.path.isfile(sys.argv[2]):
+        sys.stderr.write("workflow-lint: unreadable file\n")
+        sys.exit(2)
+    sys.stdout.write("".join(t + "\n" for _, t in skeleton_lines(read_raw(sys.argv[2]))))
+    sys.exit(0)
 for f in sys.argv[1:]:
     if not os.path.isfile(f):
         sys.stderr.write("workflow-lint: unreadable file\n")

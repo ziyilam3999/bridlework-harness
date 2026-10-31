@@ -322,7 +322,7 @@ ltwin pr-branches $FG $FG "s#$PRL#  pull_request:\n    branches: [master]#" pull
 ltwin pr-branches-ignore $FG $FG "s#$PRL#  pull_request:\n    branches-ignore: [x]#" pull-request-filter
 ltwin pr-types $FG $FG "s#$PRL#  pull_request:\n    types: [labeled]#" pull-request-filter
 ltwin pr-filter-in-other-workflow rust-test.yml rust-test.yml "s#$PRL#  pull_request:\n    paths: [\"core/**\"]#" pull-request-filter
-lclean push-branches $FG $FG "s#$PRL#  pull_request:\n  push:\n    branches: [master]#"
+lclean push-branches rust-test.yml rust-test.yml "s#$PRL#  pull_request:\n  push:\n    branches: [master]#"
 
 # C2b any if: in final-gate.yml, whatever the key spelling
 ltwin if-gate-step $FG $FG "s#$G_STEP#\1\n        if: false#" if-in-final-gate
@@ -381,6 +381,49 @@ ltwin shape-lone-cr $FG $FG "s#$G_RUN#\1$(printf '\r')| tee gate.log#" final-gat
 ltwin shape-unicode-line-sep $FG $FG "s#$G_RUN#\1$(printf '\342\200\250')| tee gate.log#" final-gate-line-shape
 ltwin shape-doc-marker $FG $FG 's#^(name: final-gate)$#---\n\1#' final-gate-line-shape
 lclean shape-comments-and-blank-lines $FG $FG 's#^(        run: sh ci/final-gate\.sh)$#\1  \# trailing comment\n\n        \# a comment line#'
+# C3d exact skeleton (final-gate.yml): the file must equal the expected skeleton, comments and blank lines aside. Every twin
+# below passes the older per-line rules (or is only partly caught by them); only the skeleton compare names all of them.
+SK=final-gate-skeleton
+# F2: the gate's run line nested under the Smoke step's env: (an env var called run, the gate never runs), and inside a multi-line quoted name
+ltwin skel-f2-run-under-env $FG $FG 's#^      - name: Final gate$#        env:\n          name: Final gate#;s#^        run: sh ci/final-gate\.sh$#          run: sh ci/final-gate.sh#' $SK
+ltwin skel-f2-run-in-quoted-name $FG $FG 's#^      - name: Final gate$#      - name: "Final gate#;s#^        run: sh ci/final-gate\.sh$#        run: sh ci/final-gate.sh\n        x: y"\n      - uses: actions/checkout@v4#' $SK
+ltwin skel-f2-run-in-single-quoted-name $FG $FG "s#^      - name: Final gate\$#      - name: 'Final gate#;s#^        run: sh ci/final-gate\.sh\$#        run: sh ci/final-gate.sh\n        x: y'\n      - uses: actions/checkout@v4#" $SK
+ltwin skel-f2-run-under-job-env $FG $FG 's#^(    timeout-minutes: 60)$#\1\n    env:\n      run: sh ci/final-gate.sh#;s#^        run: sh ci/final-gate\.sh$#        run: sh ci/workflow-lint.sh#' $SK
+# reordered step, added step (all run lines still allowlisted), extra key, changed action version, changed names, changed timeout
+ltwin skel-reordered-step $FG $FG 's#run: sh ci/workflow-lint\.sh#run: sh ci/TMPSWAP.sh#;s#run: sh ci/final-gate-smoke\.sh#run: sh ci/workflow-lint.sh#;s#run: sh ci/TMPSWAP\.sh#run: sh ci/final-gate-smoke.sh#' $SK
+ltwin skel-added-step $FG $FG "s#$G_STEP#      - name: Extra\n        run: sh ci/extra.sh\n\1#" $SK
+ltwin skel-added-step-last $FG $FG "s#$G_RUN#\1\n      - name: After\n        run: sh ci/extra.sh#" $SK
+ltwin skel-removed-gate-step $FG $FG 's#^(      - name: Final gate)$#      - name: Smoke again#;s#^        run: sh ci/final-gate\.sh$#        run: sh ci/final-gate-smoke.sh#' $SK
+ltwin skel-extra-key-step $FG $FG "s#$G_STEP#\1\n        id: gate#" $SK
+ltwin skel-extra-key-job $FG $FG 's#^(    timeout-minutes: 60)$#\1\n    concurrency: x#' $SK
+ltwin skel-working-directory $FG $FG "s#$G_STEP#\1\n        working-directory: ci/evil#" $SK
+ltwin skel-env-path $FG $FG "s#$G_STEP#\1\n        env:\n          PATH: ci/evil#" $SK
+ltwin skel-local-uses-step $FG $FG "s#$G_STEP#      - uses: ./ci/act\n\1#" $SK
+ltwin skel-second-job $FG $FG "s#$G_RUN#\1\n  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sh ci/rust-test.sh#" $SK
+ltwin skel-matrix $FG $FG 's#^(    timeout-minutes: 60)$#\1\n    strategy:\n      matrix:\n        a: [1]#' $SK
+ltwin skel-action-version $FG $FG 's#actions/checkout@v4#actions/checkout@v5#' $SK
+ltwin skel-action-unpinned $FG $FG 's#actions/checkout@v4#actions/checkout@main#' $SK
+ltwin skel-fetch-depth $FG $FG 's#fetch-depth: 2#fetch-depth: 1#' $SK
+ltwin skel-timeout $FG $FG 's#timeout-minutes: 60#timeout-minutes: 10#' $SK
+ltwin skel-workflow-name $FG $FG 's#^name: final-gate$#name: Final gate#' $SK
+ltwin skel-job-id $FG $FG 's#^  final-gate:$#  final-gate2:#' $SK final-gate-job-name
+ltwin skel-runs-on $FG $FG 's#runs-on: ubuntu-latest#runs-on: self-hosted#' $SK
+ltwin skel-trigger-added $FG $FG "s#$PRL#  pull_request:\n  push:#" $SK
+ltwin skel-step-name $FG $FG 's#^      - name: Final gate$#      - name: Gate#' $SK
+ltwin skel-crlf $FG $FG "s#\$#$(printf '\r')#" $SK final-gate-line-shape
+ltwin skel-trailing-ls $FG $FG "s#$G_RUN#\1$(printf '\342\200\250')#" $SK final-gate-line-shape
+ltwin skel-bom $FG $FG "1s#^#$(printf '\357\273\277')#" $SK final-gate-line-shape
+ltwin skel-tab-in-value $FG $FG "s#^(        run: sh ci/final-gate\.sh)\$#        run:$(printf '\t')sh ci/final-gate.sh#" $SK
+ltwin skel-end-marker $FG $FG 's#^(        run: sh ci/final-gate\.sh)$#\1\n...#' $SK
+# clean twins: whole-line comments (quotes, pipes and run-looking text inside them), blank lines, trailing comments, trailing spaces, a tab-indented comment
+lclean skel-comments-blanks-trailing-space $FG $FG "s#$G_STEP#\# note: run: sh ci/evil.sh | \"x\"\n\n\1   #;s#^(    runs-on: ubuntu-latest)\$#\1 \# trailing#;s#^(      - name: Smoke)\$#$(printf '\t')\# tab comment\n\1#"
+# a symlinked final-gate.yml is refused whatever it points at (even a byte-for-byte good target)
+mkdir "$tmp/lsym" && cp "$wf" "$tmp/lsym/real.yml" && ln -s real.yml "$tmp/lsym/final-gate.yml"
+lo=$(sh "$here/workflow-lint.sh" "$tmp/lsym/final-gate.yml" 2>&1); lrc=$?
+if [ "$lrc" -eq 1 ] && printf '%s\n' "$lo" | grep -qE '^final-gate\.yml:1:final-gate-skeleton$'; then ok C-twin-skel-symlink-refused; else bad C-twin-skel-symlink-refused; fi
+# maintainer path: the printed skeleton of the real file, saved as final-gate.yml, is itself clean (the embedded copy is what the real file prints)
+mkdir "$tmp/ps" && sh "$here/workflow-lint.sh" --print-skeleton "$wf" > "$tmp/ps/final-gate.yml" 2>/dev/null
+if [ -s "$tmp/ps/final-gate.yml" ] && sh "$here/workflow-lint.sh" "$tmp/ps/final-gate.yml" >/dev/null 2>&1; then ok C3d-print-skeleton-round-trip-clean; else bad C3d-print-skeleton-round-trip-clean; fi
 
 # C4 caches and required-name collisions
 ltwin cache-actions $FG $FG "s#$G_STEP#      - uses: actions/cache@v4\n\1#" cache-action
