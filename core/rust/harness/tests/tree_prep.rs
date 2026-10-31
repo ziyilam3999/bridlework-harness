@@ -198,6 +198,30 @@ fn assert_clean(fx: &Fx) {
     assert_eq!(std::fs::read_dir(&fx.tmp).unwrap().count(), 0, "scratch root not empty");
 }
 
+/// Makes every given folder unwritable (0500) so that creating anything in it fails; modes come back when the guard drops, even after a failed assert.
+/// A refusal that comes later than it should then shows up as a different error ("could not create ..."), because the tree or scratch folder can no longer be made.
+struct Lock {
+    dirs: Vec<PathBuf>,
+}
+
+fn lock(dirs: &[&Path]) -> Lock {
+    let l = Lock { dirs: dirs.iter().map(|d| d.to_path_buf()).collect() };
+    for d in &l.dirs {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(std::fs::create_dir(d.join("probe")).is_err(), "lock not effective on {:?} (running as root?)", d);
+    }
+    l
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        for d in &self.dirs {
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
 fn refused(o: &Out, needle: &str) {
     let e = o.err.as_deref().unwrap_or_else(|| panic!("expected a refusal, got: {}", o.raw));
     assert!(e.contains(needle), "refusal {:?} lacks {:?}", e, needle);
@@ -294,25 +318,25 @@ fn a_dot_dot_check_path_never_writes_outside_the_trees() {
 #[test]
 fn a_relative_tmpdir_is_refused_and_creates_nothing_in_the_repo() {
     let fx = fixture("ac5", "bad", "good", true, GOOD_CHECK);
+    let inside = fx.repo.join("inside");
+    let ginner = fx.repo.join(".git/inner");
+    let guard = lock(&[&inside, &ginner, &fx.repo.join(".git/worktrees")]);
     // a relative TMPDIR, child cwd = the repo work tree
     let o = run_with(&fx, &[], &[("TMPDIR", "rel-tmp")]);
     refused(&o, "absolute");
     assert_eq!(git(&fx.repo, &["status", "--porcelain", "--ignored"]), "");
     assert!(!fx.repo.join("rel-tmp").exists());
     // an absolute TMPDIR inside the work tree
-    let inside = fx.repo.join("inside");
-    std::fs::create_dir_all(&inside).unwrap();
     let o = run_with(&fx, &[], &[("TMPDIR", inside.to_str().unwrap())]);
     refused(&o, "inside the repo");
     assert_eq!(std::fs::read_dir(&inside).unwrap().count(), 0);
     // an absolute TMPDIR inside the git folder
-    let ginner = fx.repo.join(".git/inner");
-    std::fs::create_dir_all(&ginner).unwrap();
     let o = run_with(&fx, &[], &[("TMPDIR", ginner.to_str().unwrap())]);
     refused(&o, "inside the repo");
     assert_eq!(std::fs::read_dir(&ginner).unwrap().count(), 0);
     let admin = fx.repo.join(".git/worktrees");
     assert!(!admin.exists() || std::fs::read_dir(&admin).unwrap().count() == 0);
+    drop(guard);
     assert_clean(&fx);
     let _ = std::fs::remove_dir_all(fx.root);
 }
@@ -320,11 +344,13 @@ fn a_relative_tmpdir_is_refused_and_creates_nothing_in_the_repo() {
 #[test]
 fn a_check_path_naming_dot_git_in_any_case_is_refused() {
     let fx = fixture("ac6", "bad", "good", true, GOOD_CHECK);
+    let guard = lock(&[&fx.repo.join(".git/worktrees"), &fx.tmp]);
     for bad in [".git", ".GIT", ".Git", "sub/.gIt/x"] {
         let o = run_with(&fx, &[("program", bad)], &[]);
         refused(&o, "plain names");
         assert_clean(&fx);
     }
+    drop(guard);
     let _ = std::fs::remove_dir_all(fx.root);
 }
 
@@ -418,25 +444,30 @@ fn bad_inputs_are_refused_before_any_tree_exists() {
     let sub = fx.repo.join("ci");
     let sub_s = sub.to_str().unwrap().to_string();
     let wrong = fx.base.clone();
-    let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        ("dash ref", vec![("base", "-x")]),
-        ("blob ref", vec![("base", "HEAD:value.txt")]),
-        ("unknown ref", vec![("base", "no-such-ref")]),
-        ("head not the recorded sha", vec![("recorded", &wrong)]),
-        ("base equal to head", vec![("base", &head)]),
-        ("repo is a subfolder", vec![("repo", &sub_s)]),
-        ("symlink check", vec![("program", "ci/link.sh")]),
-        ("folder check", vec![("program", "ci")]),
-        ("not executable", vec![("program", "ci/plain.sh")]),
-        ("missing check", vec![("program", "ci/missing.sh")]),
-        ("empty check", vec![("program", "")]),
+    let not_exec = "not a regular executable file";
+    let cases: Vec<(&str, Vec<(&str, &str)>, &str)> = vec![
+        ("dash ref", vec![("base", "-x")], "ref malformed"),
+        ("blob ref", vec![("base", "HEAD:value.txt")], "does not resolve to a commit"),
+        ("unknown ref", vec![("base", "no-such-ref")], "does not resolve to a commit"),
+        ("head not the recorded sha", vec![("recorded", &wrong)], "does not match the recorded sha"),
+        ("base equal to head", vec![("base", &head)], "same commit"),
+        ("repo is a subfolder", vec![("repo", &sub_s)], "not the top level"),
+        ("symlink check", vec![("program", "ci/link.sh")], not_exec),
+        ("folder check", vec![("program", "ci")], not_exec),
+        ("not executable", vec![("program", "ci/plain.sh")], not_exec),
+        ("missing check", vec![("program", "ci/missing.sh")], "not in the head commit"),
+        ("empty check", vec![("program", "")], "plain names"),
     ];
-    for (name, params) in cases {
+    // Neither a work tree nor a scratch folder can be made while the lock is on, so a refusal that came after either one would carry a different message.
+    let guard = lock(&[&fx.repo.join(".git/worktrees"), &fx.tmp]);
+    for (name, params, needle) in cases {
         let o = run_with(&fx, &params, &[]);
-        assert!(o.err.is_some(), "case {} was not refused: {}", name, o.raw);
         assert!(!marker.exists(), "case {}: the check ran before the refusal", name);
+        let e = o.err.as_deref().unwrap_or_else(|| panic!("case {} was not refused: {}", name, o.raw));
+        assert!(e.contains(needle), "case {}: refusal {:?} lacks {:?}", name, e, needle);
         assert_clean(&fx);
     }
+    drop(guard);
     // a linked work tree of the scratch repo is refused as the repo path
     let linked = fx.work.join("linked");
     git(&fx.repo, &["worktree", "add", "--detach", linked.to_str().unwrap(), "HEAD"]);
