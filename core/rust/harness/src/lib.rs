@@ -22,6 +22,7 @@ pub mod runner;
 #[cfg(unix)]
 pub mod tree_prep;
 pub mod scan;
+pub mod status;
 pub mod ticket;
 #[cfg(unix)]
 pub mod ticket_gate;
