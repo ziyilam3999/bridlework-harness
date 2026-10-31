@@ -13,6 +13,7 @@ pub mod fixtures;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;
+pub mod intake;
 pub mod overlay;
 pub mod path_map;
 pub mod repo_id;
