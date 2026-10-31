@@ -99,6 +99,7 @@ struct Fx {
     other: PathBuf,
     marker: PathBuf,
     res: PathBuf,
+    caps: PathBuf,
     c0: String,
 }
 
@@ -115,8 +116,8 @@ impl Fx {
 
     fn with(cfg: Cfg) -> Fx {
         let t = Tmp::new();
-        let (repo, other, marker_dir, res) = (t.0.join("r"), t.0.join("o"), t.0.join("marker"), t.0.join("res"));
-        for d in [&repo, &other, &marker_dir, &res] {
+        let (repo, other, marker_dir, res, caps) = (t.0.join("r"), t.0.join("o"), t.0.join("marker"), t.0.join("res"), t.0.join("caps"));
+        for d in [&repo, &other, &marker_dir, &res, &caps] {
             fs::create_dir_all(d).unwrap();
         }
         let mut files: Vec<(String, String, bool)> = vec![
@@ -145,7 +146,7 @@ impl Fx {
         git(&other, &["add", "-A"]);
         git(&other, &["commit", "-q", "-m", "other"]);
         let c0 = git(&repo, &["rev-parse", "HEAD"]);
-        Fx { repo: repo.canonicalize().unwrap(), other: other.canonicalize().unwrap(), marker: marker_dir.join("m.log"), res: res.canonicalize().unwrap(), c0, t }
+        Fx { repo: repo.canonicalize().unwrap(), other: other.canonicalize().unwrap(), marker: marker_dir.join("m.log"), res: res.canonicalize().unwrap(), caps: caps.canonicalize().unwrap(), c0, t }
     }
 
     fn commit(&self, files: &[(&str, &str)]) -> String {
@@ -220,20 +221,25 @@ fn run_args(cwd: &Path, args: &[String], env: &[(&str, &Path)]) -> Output {
     c.output().unwrap()
 }
 
-fn args_for(tf: &Path, repo: &Path, base: &str, res: &str) -> Vec<String> {
-    vec![tf.to_str().unwrap().into(), "--repo-map".into(), format!("r={}", repo.to_str().unwrap()), "--base".into(), base.into(), "--result-dir".into(), res.into()]
+fn args_for(tf: &Path, repo: &Path, base: &str, res: &str, caps: &Path) -> Vec<String> {
+    vec![tf.to_str().unwrap().into(), "--repo-map".into(), format!("r={}", repo.to_str().unwrap()), "--base".into(), base.into(), "--result-dir".into(), res.into(), "--caps-dir".into(), caps.to_str().unwrap().into()]
 }
 
 fn gate_as(fx: &Fx, id: &str, base: &str, res: &Path, cwd: &Path, extra_env: &[(&str, &Path)]) -> Output {
     let tf = ticket_file(fx, &ticket_json("r", id, false));
     let mut env: Vec<(&str, &Path)> = vec![("GATE_MARKER", fx.marker.as_path())];
     env.extend_from_slice(extra_env);
-    run_args(cwd, &args_for(&tf, &fx.repo, base, res.to_str().unwrap()), &env)
+    run_args(cwd, &args_for(&tf, &fx.repo, base, res.to_str().unwrap(), &fx.caps), &env)
 }
 
 /// The default run: ticket `T-1`, from the unrelated repo `o`, into the fixture's result folder.
 fn gate(fx: &Fx, base: &str) -> Output {
     gate_as(fx, "T-1", base, &fx.res, &fx.other, &[])
+}
+
+/// A canonical `fix_rounds=0 in_flight=false` record next to a planted result file (a result without its record is refused as a deleted record).
+fn plant_record(fx: &Fx, id: &str) {
+    fs::write(fx.caps.join(format!("{id}.rounds")), format!("{{\"v\":1,\"ticket\":\"{id}\",\"repo_id\":\"r\",\"fix_rounds\":0,\"in_flight\":false}}\n")).unwrap();
 }
 
 fn out(o: &Output) -> String {
@@ -517,7 +523,7 @@ fn a_result_directory_that_is_not_a_real_outside_directory_is_refused() {
     ];
     for (label, dir) in &cases {
         let tf = ticket_file(&fx, &ticket_json("r", "T-1", false));
-        let o = run_args(&fx.other, &args_for(&tf, &fx.repo, &fx.c0, dir), &[("GATE_MARKER", fx.marker.as_path())]);
+        let o = run_args(&fx.other, &args_for(&tf, &fx.repo, &fx.c0, dir, &fx.caps), &[("GATE_MARKER", fx.marker.as_path())]);
         assert_eq!(code(&o), 2, "{label}: stderr {}", err(&o));
         assert!(out(&o).is_empty(), "{label}: stdout");
         assert!(!leaks(&o, dir), "{label}: the result folder must not be echoed: {}", err(&o));
@@ -539,10 +545,10 @@ fn a_symlinked_repo_folder_is_resolved_once() {
     symlink(&fx.repo, &linked).unwrap();
     let tf = ticket_file(&fx, &ticket_json("r", "T-1", false));
     let inside = fx.repo.join("out").display().to_string();
-    let o = run_args(&fx.other, &args_for(&tf, &linked, &fx.c0, &inside), &[("GATE_MARKER", fx.marker.as_path())]);
+    let o = run_args(&fx.other, &args_for(&tf, &linked, &fx.c0, &inside, &fx.caps), &[("GATE_MARKER", fx.marker.as_path())]);
     errored(&o);
     assert!(listing(&fx.repo.join("out")).is_empty());
-    let o = run_args(&fx.other, &args_for(&tf, &linked, &fx.c0, fx.res.to_str().unwrap()), &[("GATE_MARKER", fx.marker.as_path())]);
+    let o = run_args(&fx.other, &args_for(&tf, &linked, &fx.c0, fx.res.to_str().unwrap(), &fx.caps), &[("GATE_MARKER", fx.marker.as_path())]);
     assert_eq!(code(&o), 0, "twin: the same linked entry with an outside result folder; stderr: {}", err(&o));
     assert!(!leaks(&o, linked.to_str().unwrap()), "the mapped folder is not echoed");
 }
@@ -580,6 +586,7 @@ fn a_result_target_that_is_a_symlink_is_refused() {
     assert!(!leaks(&o, fx.res.to_str().unwrap()));
     fs::remove_file(fx.result_file("T-1")).unwrap();
     fs::write(fx.result_file("T-1"), "old").unwrap();
+    plant_record(&fx, "T-1");
     assert_eq!(code(&gate(&fx, &fx.c0)), 0, "twin: a regular file is replaced");
     assert_eq!(fx.result("T-1").status, Status::Pass);
 }
@@ -658,7 +665,7 @@ fn intake_refusals_exit_1_and_name_no_folder() {
     fx.commit(&[("src/value.txt", "ok")]);
     let run_with = |body: &str, repo_dir: &Path| {
         let tf = ticket_file(&fx, body);
-        run_args(&fx.other, &args_for(&tf, repo_dir, &fx.c0, fx.res.to_str().unwrap()), &[("GATE_MARKER", fx.marker.as_path())])
+        run_args(&fx.other, &args_for(&tf, repo_dir, &fx.c0, fx.res.to_str().unwrap(), &fx.caps), &[("GATE_MARKER", fx.marker.as_path())])
     };
     let o = run_with(&ticket_json("r", "T-1", true), &fx.repo);
     assert_eq!(code(&o), 1, "no repo id: {}", err(&o));
@@ -718,25 +725,28 @@ fn usage_errors_exit_2_and_create_nothing() {
     let tf = ticket_file(&fx, &ticket_json("r", "T-1", false));
     let (f, rm, res) = (tf.to_str().unwrap().to_string(), format!("r={}", fx.repo.display()), fx.res.to_str().unwrap().to_string());
     let b = fx.c0.clone();
+    let cp = fx.caps.to_str().unwrap().to_string();
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
-    let cases: Vec<(&str, Vec<String>)> = vec![
-        ("no arguments", vec![]),
-        ("no ticket file", s(&["--repo-map", &rm, "--base", &b, "--result-dir", &res])),
-        ("missing --base", s(&[&f, "--repo-map", &rm, "--result-dir", &res])),
-        ("missing --result-dir", s(&[&f, "--repo-map", &rm, "--base", &b])),
-        ("repeated --base", s(&[&f, "--repo-map", &rm, "--base", &b, "--base", &b, "--result-dir", &res])),
-        ("repeated --result-dir", s(&[&f, "--repo-map", &rm, "--base", &b, "--result-dir", &res, "--result-dir", &res])),
-        ("unknown option", s(&[&f, "--nope", "--repo-map", &rm, "--base", &b, "--result-dir", &res])),
-        ("two ticket files", s(&[&f, &f, "--repo-map", &rm, "--base", &b, "--result-dir", &res])),
-        ("option without a value", s(&[&f, "--repo-map", &rm, "--base"])),
+    // Every vector carries a valid --caps-dir, so each case fails for its OWN fault (the first stderr line names it), not for a missing option.
+    let cases: Vec<(&str, &str, Vec<String>)> = vec![
+        ("no arguments", "no ticket file given", s(&["--caps-dir", &cp])),
+        ("no ticket file", "no ticket file given", s(&["--repo-map", &rm, "--base", &b, "--result-dir", &res, "--caps-dir", &cp])),
+        ("missing --base", "--base is required", s(&[&f, "--repo-map", &rm, "--result-dir", &res, "--caps-dir", &cp])),
+        ("missing --result-dir", "--result-dir is required", s(&[&f, "--repo-map", &rm, "--base", &b, "--caps-dir", &cp])),
+        ("repeated --base", "given twice", s(&[&f, "--repo-map", &rm, "--base", &b, "--base", &b, "--result-dir", &res, "--caps-dir", &cp])),
+        ("repeated --result-dir", "given twice", s(&[&f, "--repo-map", &rm, "--base", &b, "--result-dir", &res, "--result-dir", &res, "--caps-dir", &cp])),
+        ("unknown option", "unknown option", s(&[&f, "--nope", "--repo-map", &rm, "--base", &b, "--result-dir", &res, "--caps-dir", &cp])),
+        ("two ticket files", "more than one ticket file", s(&[&f, &f, "--repo-map", &rm, "--base", &b, "--result-dir", &res, "--caps-dir", &cp])),
+        ("option without a value", "missing its value", s(&[&f, "--repo-map", &rm, "--caps-dir", &cp, "--base"])),
     ];
-    for (label, args) in &cases {
+    for (label, own_fault, args) in &cases {
         let o = run_args(&fx.other, args, &[("GATE_MARKER", fx.marker.as_path())]);
         assert_eq!(code(&o), 2, "{label}: {}", err(&o));
         assert!(out(&o).is_empty(), "{label}: stdout");
+        assert!(err(&o).lines().next().unwrap_or("").contains(own_fault), "{label}: must fail for its own fault `{own_fault}`: {}", err(&o));
         no_result_file(&fx);
     }
-    let o = run_args(&fx.other, &s(&[&f, "--repo-map", &rm, "--base", &b, "--result-dir", &res]), &[("GATE_MARKER", fx.marker.as_path())]);
+    let o = run_args(&fx.other, &s(&[&f, "--repo-map", &rm, "--base", &b, "--result-dir", &res, "--caps-dir", &cp]), &[("GATE_MARKER", fx.marker.as_path())]);
     assert_eq!(code(&o), 0, "twin: complete; stderr: {}", err(&o));
 }
 
@@ -769,6 +779,7 @@ fn a_case_variant_of_the_result_name_is_refused() {
     let fx = Fx::new();
     fx.commit(&[("src/value.txt", "ok")]);
     fs::write(fx.res.join("EX-1.json"), "old").unwrap();
+    plant_record(&fx, "EX-1");
     let o = gate_as(&fx, "EX-1", &fx.c0, &fx.res, &fx.other, &[]);
     assert_eq!(code(&o), 0, "twin: the exact name is replaced; stderr: {}", err(&o));
     assert_eq!(fx.result("EX-1").status, Status::Pass);
