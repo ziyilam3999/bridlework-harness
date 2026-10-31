@@ -302,10 +302,27 @@ fn ac9_a_directory_a_link_out_of_the_root_and_an_unwritable_log_are_refused() {
     fs::create_dir(&d).unwrap();
     assert_eq!(append(&d, "escalation", "1").status.code(), Some(2));
     let outside = Tmp::new();
+    assert!(ok(&append(&outside.log(), "escalation", "1")), "the outside file exists and holds one event");
+    let outside_before = fs::read(outside.log()).unwrap();
     symlink(outside.log(), t.log()).unwrap();
-    let o = run(&["events", "append", "--log", t.log().to_str().unwrap(), "--root", t.0.to_str().unwrap(), "--kind", "escalation", "--ticket", "t", "--repo", "r", "--reason", "x"], None);
+    let with_root = |log: &Path, root: &Path| {
+        run(&["events", "append", "--log", log.to_str().unwrap(), "--root", root.to_str().unwrap(), "--kind", "escalation", "--ticket", "t", "--repo", "r", "--reason", "x", "--ts-ms", "2"], None)
+    };
+    let o = with_root(&t.log(), &t.0);
     assert_eq!(o.status.code(), Some(2));
-    assert!(!outside.log().exists(), "nothing was written through the link");
+    assert!(err(&o).contains("EVENT NOT RECORDED"));
+    assert_eq!(fs::read(outside.log()).unwrap(), outside_before, "nothing was written through the link");
+    // Twin: the same link with a --root that contains the target is accepted.
+    assert!(ok(&with_root(&t.log(), &outside.0)));
+    assert_eq!(out(&list(&outside.log())).lines().count(), 2);
+    // --root is honoured on its own: a real log is refused when it lies outside the given root.
+    let elsewhere = Tmp::new();
+    let real = elsewhere.log();
+    let before = fs::read(&real).unwrap_or_default();
+    let o = with_root(&real, &t.0);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert_eq!(fs::read(&real).unwrap_or_default(), before);
+    assert!(ok(&with_root(&real, &elsewhere.0)), "twin: the root that contains it accepts");
     let u = Tmp::new();
     assert!(ok(&append(&u.log(), "escalation", "1")));
     fs::set_permissions(u.log(), fs::Permissions::from_mode(0o400)).unwrap();
@@ -350,6 +367,44 @@ fn ac13_ts_ms_is_written_exactly_and_a_bad_one_is_refused_with_the_file_unchange
     let s = out(&list(&t2.log()));
     let ts: u64 = s.split("\"ts_ms\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
     assert!(ts > 0);
+}
+
+#[test]
+fn append_option_errors_say_the_event_was_not_recorded_and_write_nothing() {
+    let t = Tmp::new();
+    let lp = t.log();
+    let lp = lp.to_str().unwrap();
+    let base = ["events", "append", "--log", lp, "--kind", "escalation", "--ticket", "t", "--repo", "r", "--reason", "x"];
+    let with = |extra: &[&str]| -> Vec<String> { base.iter().chain(extra.iter()).map(|s| s.to_string()).collect() };
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("unknown flag", with(&["--bogus", "1"])),
+        ("flag twice", with(&["--kind", "escalation"])),
+        ("flag with no value", with(&["--ts-ms"])),
+    ];
+    for (name, a) in cases {
+        let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let o = run(&refs, None);
+        assert_eq!(o.status.code(), Some(2), "{name}");
+        assert!(err(&o).contains("EVENT NOT RECORDED"), "{name}: {}", err(&o));
+        assert_eq!(out(&o), "", "{name}");
+        assert!(!t.log().exists(), "{name}: nothing written");
+    }
+    assert!(ok(&run(&base, None)), "twin: the clean command passes");
+}
+
+#[test]
+fn a_refused_default_log_append_leaves_no_empty_folder_behind() {
+    let t = Tmp::new();
+    let other = Tmp::new();
+    let a = ["events", "append", "--root", other.0.to_str().unwrap(), "--kind", "escalation", "--ticket", "t", "--repo", "r", "--reason", "x"];
+    let o = run(&a, Some(&t.0));
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("EVENT NOT RECORDED"));
+    assert!(!t.0.join(".harness").exists(), "the refusal came before any folder was made");
+    // Twin: a root that contains the working folder is accepted and creates the folder.
+    let a = ["events", "append", "--root", t.0.to_str().unwrap(), "--kind", "escalation", "--ticket", "t", "--repo", "r", "--reason", "x"];
+    assert!(ok(&run(&a, Some(&t.0))));
+    assert!(t.0.join(".harness/events.jsonl").is_file());
 }
 
 #[test]

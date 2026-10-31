@@ -136,7 +136,11 @@ fn events_cmd(a: &[String]) -> i32 {
         "append" => {
             let o = match take_event_opts(rest, &["log", "root", "kind", "ticket", "repo", "reason", "ts-ms"]) {
                 Ok(o) => o,
-                Err(e) => return fail(&e),
+                Err(e) => {
+                    eprintln!("harness: error: {}", e);
+                    eprintln!("harness: EVENT NOT RECORDED");
+                    return 2;
+                }
             };
             let need = |k: &str| o.get(k).cloned().ok_or_else(|| format!("--{} is required", k));
             let built = (|| -> Result<Event, String> {
@@ -168,6 +172,19 @@ fn events_cmd(a: &[String]) -> i32 {
             };
             if default_log {
                 if let Some(dir) = log.parent() {
+                    // The default folder is created inside the working folder, so it must lie under the root: check that BEFORE
+                    // creating anything, so a refused append leaves no empty folder behind.
+                    if !dir.exists() {
+                        let inside = match (std::path::Path::new(".").canonicalize(), root.canonicalize()) {
+                            (Ok(cwd), Ok(r)) => cwd.starts_with(r),
+                            _ => false,
+                        };
+                        if !inside {
+                            eprintln!("harness: error: log path refused: the working folder is outside the root");
+                            eprintln!("harness: EVENT NOT RECORDED");
+                            return 2;
+                        }
+                    }
                     if let Err(e) = std::fs::create_dir_all(dir) {
                         eprintln!("harness: error: cannot create the default log folder: {}", e.kind());
                         eprintln!("harness: EVENT NOT RECORDED");
