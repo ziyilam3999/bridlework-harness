@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # PreToolUse hook on TaskUpdate: refuse a completion claim unless the gate result for the current head is PASS (V5).
 # Reads the tool call as JSON on stdin (only tool_name and tool_input.status are used). Inputs by environment: HARNESS_BIN,
-# HARNESS_TICKET_FILE, HARNESS_REPO_MAP (exactly one <repo_id>=<absolute dir> entry), HARNESS_RESULT_DIR.
+# HARNESS_TICKET_FILE, HARNESS_REPO_MAP (exactly one <repo_id>=<absolute dir> entry), HARNESS_RESULT_DIR, HARNESS_CAPS_DIR
+# (the same folder every `ticket gate` run in the session passes as --caps-dir).
 # Exit 0 = allow (stdout and stderr empty). Exit 2 = refuse, one reason line on stderr, nothing on stdout.
 # Any failure of the hook itself is converted to exit 2 (only exit 2 blocks in Claude Code).
 # The `# G:<name>` tags mark each guard; the mutation proof disables one tag at a time.
@@ -76,6 +77,7 @@ def env_abs(name):
 bin_path = env_abs("HARNESS_BIN")
 ticket_path = env_abs("HARNESS_TICKET_FILE")
 result_path = env_abs("HARNESS_RESULT_DIR")
+caps_path = env_abs("HARNESS_CAPS_DIR")
 repo_map = os.environ.get("HARNESS_REPO_MAP", "")
 m = re.match(r"^([a-z0-9._-]+)=(/[^\x00-\x1f\x7f]*)\Z", repo_map)
 if m is None:  # G:map_shape
@@ -90,6 +92,8 @@ if root == "/":
 # Anti-spoof: the guard's own inputs must live outside the repo (resolved once each).
 if inside(root, os.path.realpath(result_path)):  # G:spoof_result
     refuse("refused: HARNESS_RESULT_DIR is inside the repo")
+if inside(root, os.path.realpath(caps_path)):  # G:spoof_caps
+    refuse("refused: HARNESS_CAPS_DIR is inside the repo")
 if inside(root, os.path.realpath(ticket_path)):  # G:spoof_ticket
     refuse("refused: HARNESS_TICKET_FILE is inside the repo")
 if inside(root, os.path.realpath(bin_path)):  # G:spoof_bin
@@ -100,7 +104,7 @@ if inside(root, os.path.realpath(sys.argv[1])):  # G:spoof_hook
 # ---- 3. The engine call: `harness status` prints one fixed line; the hook adds no result parser.
 try:
     cp = subprocess.run(
-        [bin_path, "status", ticket_path, "--repo-map", repo_map, "--result-dir", result_path],
+        [bin_path, "status", ticket_path, "--repo-map", repo_map, "--result-dir", result_path, "--caps-dir", caps_path],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/",
         timeout=ENGINE_TIMEOUT,  # G:timeout
     )
@@ -108,7 +112,7 @@ except (OSError, subprocess.SubprocessError):
     refuse("refused: the status command could not run in time")
 if cp.returncode != 0:  # G:status_exit
     line = cp.stderr.decode("utf-8", "replace").strip().split("\n")[0][:200] if cp.stderr else ""
-    shown = not any(d in line for d in (root, map_dir, result_path, ticket_path, bin_path))
+    shown = not any(d in line for d in (root, map_dir, result_path, caps_path, ticket_path, bin_path))
     if line.startswith("harness: ") and not has_control(line) and shown:  # G:reason_filter
         refuse("refused: status: " + line)
     refuse("refused: the status command did not accept the ticket")

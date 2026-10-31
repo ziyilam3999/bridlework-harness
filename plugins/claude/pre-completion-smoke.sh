@@ -5,18 +5,34 @@
 #   no argument: every case; exit 0 only if all pass. With a case name: that case only.
 #   --print-registration: print the ONE PreToolUse entry the operator appends (writes nothing, needs no engine).
 # Needs the built engine: cargo build --locked (in core/rust) first; exit 2 if it is absent.
-# SMOKE_HOOK (test-only) points the smoke at another copy of the hook, e.g. a mutant in a scratch folder.
+# The hook reads five operator variables: HARNESS_BIN, HARNESS_TICKET_FILE, HARNESS_REPO_MAP, HARNESS_RESULT_DIR, HARNESS_CAPS_DIR.
+# The smoke's HARNESS_CAPS_DIR is the same $CAPS folder its gate() passes as --caps-dir (any other folder is the W3 state).
+# SMOKE_HOOK and SMOKE_MANIFEST (test-only) point the smoke at another copy of the hook or manifest, e.g. a mutant in a scratch folder.
 # Everything lives under one mktemp folder; a trap removes it even when a case fails.
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$HERE/../.." && pwd)
 HOOK_SRC=${SMOKE_HOOK:-$HERE/pre-completion-hook.sh}
-MANIFEST=$HERE/pre-completion-manifest.json
+MANIFEST=${SMOKE_MANIFEST:-$HERE/pre-completion-manifest.json}
 BIN_SRC=$ROOT/core/rust/target/debug/harness
 
 if [ "${1:-}" = "--print-registration" ]; then
   if [ "$#" -ne 1 ]; then echo "usage: pre-completion-smoke.sh --print-registration" >&2; exit 2; fi
   echo 'append this object to the existing `hooks.PreToolUse` array of <build-launch-folder>/.claude/settings.local.json (the file the operator step names)' >&2
+  printf '%s\n' \
+    'this text supersedes the four-variable steps 3, 4 and 6 of the P1A-16 operator list (print only: nothing is written).' \
+    'the session env block takes FIVE variables: HARNESS_BIN, HARNESS_TICKET_FILE, HARNESS_REPO_MAP, HARNESS_RESULT_DIR, HARNESS_CAPS_DIR.' \
+    'HARNESS_CAPS_DIR must be the SAME folder every `ticket gate` run in that session passes as --caps-dir, and it must be outside the repo.' \
+    'safe order, three steps (the old hook ignores a variable it does not know, so step 1 is harmless):' \
+    '  step 1: add HARNESS_CAPS_DIR to the session env block and relaunch the build session.' \
+    '  step 2: only then install the new engine AND the new ~/.harness/claude/pre-completion-hook.sh copy together, in one command line;' \
+    '          replace each one atomically: write a temp name in the same folder, then rename it over the target (never copy over in place).' \
+    '  step 3: run the five-variable confirm and the live probe below.' \
+    'confirm, one command: d=$(mktemp -d); c=$(mktemp -d); printf %s '"'"'{"tool_name":"TaskUpdate","tool_input":{"taskId":"1","status":"completed"}}'"'"' | env HARNESS_BIN=<bin> HARNESS_TICKET_FILE=<ticket> HARNESS_REPO_MAP=<id=dir> HARNESS_RESULT_DIR="$d" HARNESS_CAPS_DIR="$c" bash ~/.harness/claude/pre-completion-hook.sh; echo "exit=$?"; rmdir "$d" "$c"' \
+    '  it must print exactly one line containing `no result`, then exit=2; any other reason means a typed value is wrong.' \
+    'live probe: in a freshly launched build session whose HARNESS_RESULT_DIR and HARNESS_CAPS_DIR are both empty folders, set a throwaway task completed: it must be refused with `no result`; then set it deleted.' \
+    'the confirm and the live probe run no gate, so they cannot detect a caps-folder mismatch; detection is the refusal reason `cap record is missing` at the first completion after a gate run.' \
+    'a session started before step 1 refuses every completion (naming HARNESS_CAPS_DIR) until it is relaunched with the fifth variable.' >&2
   printf '%s\n' '{"matcher":"TaskUpdate","hooks":[{"type":"command","command":"~/.harness/claude/pre-completion-hook.sh","timeout":120}]}'
   exit 0
 fi
@@ -93,7 +109,7 @@ new_world() { # [pass|fail]
   git init -q "$O" >/dev/null 2>&1; echo o > "$O/o.txt"; git_q "$O" add -A; git_q "$O" commit -q -m o
   cp "$HOOK_SRC" "$EXT/hook.sh"; link_bin "$EXT/harness"; chmod +x "$EXT/hook.sh"
   printf '%s\n' "$TICKET_JSON" > "$EXT/ticket.json"
-  H_BIN=$EXT/harness; H_TICKET=$EXT/ticket.json; H_MAP="demo=$R"; H_RES=$RES; H_HOOK=$EXT/hook.sh
+  H_BIN=$EXT/harness; H_TICKET=$EXT/ticket.json; H_MAP="demo=$R"; H_RES=$RES; H_CAPS=$CAPS; H_HOOK=$EXT/hook.sh
   HPATH=; HCWD=; HEXTRA=()
 }
 
@@ -127,6 +143,7 @@ run_hook_file() { # stdin-file
   [ "$H_TICKET" != "$UNSET" ] && a+=("HARNESS_TICKET_FILE=$H_TICKET")
   [ "$H_MAP" != "$UNSET" ] && a+=("HARNESS_REPO_MAP=$H_MAP")
   [ "$H_RES" != "$UNSET" ] && a+=("HARNESS_RESULT_DIR=$H_RES")
+  [ "$H_CAPS" != "$UNSET" ] && a+=("HARNESS_CAPS_DIR=$H_CAPS")
   [ "${#HEXTRA[@]}" -gt 0 ] && a+=("${HEXTRA[@]}")
   "$PY" -I -c "$PYRUN" "${HCWD:-$W/home}" "$1" "$W/out" "$W/err" 45 "$ENVBIN" -i "${a[@]}" "$BASHBIN" "$H_HOOK"
   RC=$?
@@ -243,6 +260,8 @@ refuse_case_twin() {
   no_done case-twin-result ""
   mv "$RES/ex-1.json" "$W/moved-ex"
   pass_json "$HEAD1" > "$RES/Ex-1.json"
+  no_done "exact-case note without a cap record" "cap record is missing"
+  printf '{"v":1,"ticket":"Ex-1","repo_id":"demo","fix_rounds":0,"in_flight":false}\n' > "$CAPS/Ex-1.rounds"
   ok_done exact-case-twin
 }
 
@@ -368,6 +387,12 @@ refuse_inputs_inside_repo() {
   stub permissive "echo '$(good_line)'"; H_BIN=$EXT/permissive
   mkdir "$R/results"; H_RES=$R/results; no_done "13 result dir inside" HARNESS_RESULT_DIR
   ln -s "$R/results" "$EXT/reslink"; H_RES=$EXT/reslink; no_done "13 result dir link into repo" HARNESS_RESULT_DIR
+  # caps dir inside the repo (an EMPTY folder, so the tree check cannot refuse for it), and a link into the repo
+  H_RES=$RES
+  ok_done twin-caps-outside
+  mkdir "$R/capsdir"; H_CAPS=$R/capsdir; no_done "13 caps dir inside" HARNESS_CAPS_DIR
+  ln -s "$R/capsdir" "$EXT/capslink"; H_CAPS=$EXT/capslink; no_done "13 caps dir link into repo" HARNESS_CAPS_DIR
+  H_CAPS=$CAPS
 }
 
 # ---------------------------------------------------------------- AC 14
@@ -380,6 +405,7 @@ refuse_bad_env() {
     H_BIN=$bad; no_done "14 HARNESS_BIN '$bad'" HARNESS_BIN; H_BIN=$EXT/harness
     H_TICKET=$bad; no_done "14 HARNESS_TICKET_FILE '$bad'" HARNESS_TICKET_FILE; H_TICKET=$EXT/ticket.json
     H_RES=$bad; no_done "14 HARNESS_RESULT_DIR '$bad'" HARNESS_RESULT_DIR; H_RES=$RES
+    H_CAPS=$bad; no_done "14 HARNESS_CAPS_DIR '$bad'" HARNESS_CAPS_DIR; H_CAPS=$CAPS
   done
   for bad in "$UNSET" "" "demo=relative/dir" "demo" "DEMO=$R" "$(printf 'demo=%s\nother=%s' "$R" "$O")"; do
     H_MAP=$bad; no_done "14 HARNESS_REPO_MAP '$bad'" HARNESS_REPO_MAP
@@ -461,6 +487,9 @@ reason_text_is_filtered() {
   stub leakdir "echo \"harness: error: $R is odd\" >&2; exit 2"; H_BIN=$EXT/leakdir
   no_done "17 a line with the mapped folder is not echoed" "did not accept"
   expect_no_text "17 folder line" "is odd"
+  stub leakcaps "echo \"harness: error: $CAPS is odd\" >&2; exit 2"; H_BIN=$EXT/leakcaps
+  no_done "17 a line with the caps folder is not echoed" "did not accept"
+  expect_no_text "17 caps line" "is odd"
   stub nopre "echo 'plain leaky words' >&2; exit 2"; H_BIN=$EXT/nopre
   no_done "17 a line without the prefix is not echoed" "did not accept"
   expect_no_text "17 no-prefix line" leaky
@@ -496,7 +525,7 @@ h = os.path.join(sys.argv[2], m["hook"])
 assert os.path.isfile(h) and os.access(h, os.X_OK), "hook file"
 assert m["event"] == "PreToolUse" and m["requires"] == ["python3"], "event/requires"
 assert m["tools"] == ["TaskUpdate"], "tools"
-assert m["env"] == ["HARNESS_BIN", "HARNESS_TICKET_FILE", "HARNESS_REPO_MAP", "HARNESS_RESULT_DIR"], "env"
+assert m["env"] == ["HARNESS_BIN", "HARNESS_TICKET_FILE", "HARNESS_REPO_MAP", "HARNESS_RESULT_DIR", "HARNESS_CAPS_DIR"], "env"
 assert m["exit_allow"] == 0 and m["exit_refuse"] == 2, "exits"
 assert os.path.basename(m["hook"]) == m["hook"], "hook is a bare name"
 def strings(x):
@@ -525,6 +554,285 @@ manifest_matches_script() {
   run_hook '{"tool_name":"Bash","tool_input":{"status":"completed"}}'; expect_refuse "unlisted Bash" "not TaskUpdate"
 }
 
+# ---------------------------------------------------------------- AC 15 (fix_rounds is opaque)
+fix_rounds_is_opaque() {
+  new_world fail; gate 1
+  local line
+  line=$(cd "$W/home" && "$EXT/harness" status "$EXT/ticket.json" --repo-map "demo=$R" --result-dir "$RES" --caps-dir "$CAPS" 2>/dev/null)
+  case "$line" in *" fix_rounds=1") ;; *) fail "15 the real status line after one FAIL does not end in fix_rounds=1: $line";; esac
+  no_done "15 real FAIL, fix_rounds=1" fail
+  new_world
+  stub fr2 "echo 'ticket=T-1 repo_id=demo head=$SHA40 last_gate=pass gate_head=$SHA40 gate_current=yes failure_class=none fix_rounds=2'"
+  H_BIN=$EXT/fr2; ok_done "15 stand-in fix_rounds=2 over PASS-current"
+  stub fru "echo 'ticket=T-1 repo_id=demo head=$SHA40 last_gate=pass gate_head=$SHA40 gate_current=yes failure_class=none fix_rounds=unrecorded'"
+  H_BIN=$EXT/fru; ok_done "15 stand-in fix_rounds=unrecorded over PASS-current"
+  stub frd "echo 'ticket=T-1 repo_id=demo head=$SHA40 last_gate=pass gate_head=$SHA40 gate_current=yes fix_rounds=1 fix_rounds=1'"
+  H_BIN=$EXT/frd; no_done "15 twin: duplicate fix_rounds" malformed
+}
+
+# ---------------------------------------------------------------- AC 16 (manifest and hook agree)
+envcheck() { # manifest hook: every manifest env name is read by the hook and every HARNESS_ name the hook reads is listed
+  "$PY" -I -c 'import json, re, sys
+m = json.load(open(sys.argv[1]))
+reads = set(re.findall(r"(?:env_abs|os\.environ\.get)\(\s*\"(HARNESS_[A-Z_]+)\"", open(sys.argv[2]).read()))
+assert set(m["env"]) == reads and len(m["env"]) == len(reads), "env names differ from the names the hook reads"' "$1" "$2"
+}
+manifest_env_matches_hook() {
+  new_world
+  envcheck "$MANIFEST" "$HOOK_SRC" || fail "manifest env names do not match the names the hook reads"
+  "$PY" -I -c 'import json, sys; m = json.load(open(sys.argv[1])); m["env"] = m["env"][:4]; json.dump(m, open(sys.argv[2], "w"))' "$MANIFEST" "$W/m-four.json"
+  envcheck "$W/m-four.json" "$HOOK_SRC" 2>/dev/null && fail "twin: a four-name manifest passed"
+  "$PY" -I -c 'import json, sys; m = json.load(open(sys.argv[1])); m["env"] = m["env"] + ["HARNESS_NEVER_READ"]; json.dump(m, open(sys.argv[2], "w"))' "$MANIFEST" "$W/m-six.json"
+  envcheck "$W/m-six.json" "$HOOK_SRC" 2>/dev/null && fail "twin: a manifest with a name the hook never reads passed"
+  return 0
+}
+
+# ---------------------------------------------------------------- AC 18a-18d (the refuse-all windows)
+frozen_old_hook() { # the PR-38 hook, frozen: four variables, no --caps-dir
+cat <<'FROZEN_PR38_HOOK_EOF'
+#!/usr/bin/env bash
+# PreToolUse hook on TaskUpdate: refuse a completion claim unless the gate result for the current head is PASS (V5).
+# Reads the tool call as JSON on stdin (only tool_name and tool_input.status are used). Inputs by environment: HARNESS_BIN,
+# HARNESS_TICKET_FILE, HARNESS_REPO_MAP (exactly one <repo_id>=<absolute dir> entry), HARNESS_RESULT_DIR.
+# Exit 0 = allow (stdout and stderr empty). Exit 2 = refuse, one reason line on stderr, nothing on stdout.
+# Any failure of the hook itself is converted to exit 2 (only exit 2 blocks in Claude Code).
+# The `# G:<name>` tags mark each guard; the mutation proof disables one tag at a time.
+set -u
+
+here="${BASH_SOURCE[0]:-$0}"
+
+refuse() {
+  printf '%s\n' "$1" >&2
+  exit 2
+}
+
+if ! command -v python3 >/dev/null 2>&1; then refuse "refused: python3 is missing"; fi # G:py_missing
+
+PROG=''
+read -r -d '' PROG <<'PYEOF'
+import json, os, re, subprocess, sys
+
+ENGINE_TIMEOUT = 20
+GIT_TIMEOUT = 20
+STDIN_CAP = 1024 * 1024
+STATUS_CAP = 4096
+NONCOMPLETING = ("pending", "in_progress", "deleted")
+SHA = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+
+
+def refuse(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(2)
+
+
+def has_control(s):
+    return any(ord(c) < 32 or ord(c) == 127 for c in s)
+
+
+def inside(root, p):
+    # the folder itself or strictly below it, component-wise (root + "/" prefix)
+    return p == root or p.startswith(root + "/")
+
+
+# ---- 1. The tool call: only tool_name and tool_input.status are read.
+data = sys.stdin.buffer.read(STDIN_CAP + 1)
+if len(data) > STDIN_CAP:  # G:stdin_cap
+    refuse("refused: the tool call is too large")
+try:
+    call = json.loads(data.decode("utf-8"))
+except (ValueError, UnicodeDecodeError):  # G:stdin_json
+    refuse("refused: the tool call is not valid JSON")
+if not isinstance(call, dict):
+    refuse("refused: the tool call is not an object")
+tool = call.get("tool_name")
+if tool != "TaskUpdate":  # G:tool_allowlist
+    refuse("refused: the tool is not TaskUpdate")
+tin = call.get("tool_input")
+if not isinstance(tin, dict):
+    refuse("refused: the tool input is missing")
+# A completion claim is anything but a known non-completing value (or no status key at all).
+st = tin.get("status")
+claim = ("status" in tin) and not (isinstance(st, str) and st in NONCOMPLETING)  # G:status_allowlist
+if not claim:
+    sys.exit(0)
+
+
+# ---- 2. Inputs and environment.
+def env_abs(name):
+    v = os.environ.get(name, "")
+    if v == "" or has_control(v) or not v.startswith("/"):  # G:env_valid
+        refuse("refused: " + name + " must be set to an absolute path")
+    return v
+
+
+bin_path = env_abs("HARNESS_BIN")
+ticket_path = env_abs("HARNESS_TICKET_FILE")
+result_path = env_abs("HARNESS_RESULT_DIR")
+repo_map = os.environ.get("HARNESS_REPO_MAP", "")
+m = re.match(r"^([a-z0-9._-]+)=(/[^\x00-\x1f\x7f]*)\Z", repo_map)
+if m is None:  # G:map_shape
+    refuse("refused: HARNESS_REPO_MAP must be exactly one repo_id=absolute-dir entry")
+map_id, map_dir = m.group(1), m.group(2)
+
+# The one root: resolved once, used for every later comparison.
+root = os.path.realpath(map_dir)
+if root == "/":
+    refuse("refused: the repo root is not a usable folder")
+
+# Anti-spoof: the guard's own inputs must live outside the repo (resolved once each).
+if inside(root, os.path.realpath(result_path)):  # G:spoof_result
+    refuse("refused: HARNESS_RESULT_DIR is inside the repo")
+if inside(root, os.path.realpath(ticket_path)):  # G:spoof_ticket
+    refuse("refused: HARNESS_TICKET_FILE is inside the repo")
+if inside(root, os.path.realpath(bin_path)):  # G:spoof_bin
+    refuse("refused: HARNESS_BIN is inside the repo")
+if inside(root, os.path.realpath(sys.argv[1])):  # G:spoof_hook
+    refuse("refused: the hook script is inside the repo")
+
+# ---- 3. The engine call: `harness status` prints one fixed line; the hook adds no result parser.
+try:
+    cp = subprocess.run(
+        [bin_path, "status", ticket_path, "--repo-map", repo_map, "--result-dir", result_path],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/",
+        timeout=ENGINE_TIMEOUT,  # G:timeout
+    )
+except (OSError, subprocess.SubprocessError):
+    refuse("refused: the status command could not run in time")
+if cp.returncode != 0:  # G:status_exit
+    line = cp.stderr.decode("utf-8", "replace").strip().split("\n")[0][:200] if cp.stderr else ""
+    shown = not any(d in line for d in (root, map_dir, result_path, ticket_path, bin_path))
+    if line.startswith("harness: ") and not has_control(line) and shown:  # G:reason_filter
+        refuse("refused: status: " + line)
+    refuse("refused: the status command did not accept the ticket")
+
+
+def parse_status(out):
+    if len(out) > STATUS_CAP or not out.endswith(b"\n") or out.count(b"\n") != 1:
+        return None
+    try:
+        line = out[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    d = {}
+    for tok in line.split(" "):
+        mt = re.fullmatch(r"([a-z_]+)=([A-Za-z0-9._-]+)", tok)
+        if mt is None or mt.group(1) in d:
+            return None
+        d[mt.group(1)] = mt.group(2)
+    for k in ("ticket", "repo_id", "head", "last_gate", "gate_head", "gate_current"):
+        if k not in d:
+            return None
+    if re.fullmatch(r"[a-z0-9._-]+", d["repo_id"]) is None or re.fullmatch(SHA, d["head"]) is None:
+        return None
+    if d["last_gate"] == "none":
+        if d["gate_head"] != "none" or d["gate_current"] != "none":
+            return None
+    elif (
+        d["last_gate"] not in ("pass", "fail")
+        or re.fullmatch(SHA, d["gate_head"]) is None
+        or d["gate_current"] not in ("yes", "no")
+    ):
+        return None
+    return d
+
+
+f = parse_status(cp.stdout)
+if f is None:  # G:status_parse
+    refuse("refused: the status output is malformed")
+if f["repo_id"] != map_id:  # G:repo_id_cmp
+    refuse("refused: the status repo id differs from the repo map")
+
+
+def check_tree():
+    # Clean means what the gate means: empty `git status --porcelain=v1 -z --untracked-files=all`, pinned like the gate's own call.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}  # G:git_env
+    argv = [
+        "git", "--no-optional-locks", "--git-dir", os.path.join(root, ".git"), "--work-tree", root,
+        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+        "status", "--porcelain=v1", "-z",
+        "--untracked-files=all",  # G:untracked_all
+        # G:no_ignored
+    ]
+    try:
+        gp = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=root, env=env,
+            timeout=GIT_TIMEOUT,  # G:git_timeout
+        )
+    except (OSError, subprocess.SubprocessError):
+        refuse("refused: git status could not run in time")
+    if gp.returncode != 0:  # G:git_exit
+        refuse("refused: git status failed")
+    if gp.stdout != b"":  # G:clean_tree
+        refuse("refused: the repo has uncommitted or untracked changes")
+
+
+# ---- 4. The verdict, then (last) the tree.
+# G:reason_order
+if f["last_gate"] == "none":  # G:none_refused
+    refuse("refused: no result: the gate has not run for this ticket")
+if f["last_gate"] != "pass":  # G:last_pass
+    refuse("refused: the last gate result is fail")
+if f["gate_current"] != "yes":  # G:gate_current
+    refuse("refused: the last gate result is stale (it is about another commit)")
+if f["gate_head"] != f["head"]:  # G:head_eq
+    refuse("refused: the last gate result is stale (it is about another commit)")
+check_tree()
+sys.exit(0)
+PYEOF
+
+# G:catch_all  (any python failure other than a clean refusal becomes exit 2)
+err=$(python3 -I -c "$PROG" "$here" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  exit 0
+fi
+if [ "$rc" -eq 2 ]; then
+  reason=$(printf '%s\n' "$err" | head -n 1 | cut -c1-300)
+  if [ -n "$reason" ]; then refuse "$reason"; fi
+fi
+refuse "refused: internal error in the pre-completion hook" # G:catch_all
+FROZEN_PR38_HOOK_EOF
+}
+w1_old_hook_new_engine() {
+  new_world; gate
+  ok_done twin-new-hook-five-variables
+  frozen_old_hook > "$EXT/old-hook.sh"; chmod +x "$EXT/old-hook.sh"
+  if command grep -q 'HARNESS_CAPS_DIR' "$EXT/old-hook.sh"; then fail "18a the frozen copy mentions HARNESS_CAPS_DIR (it is not the old hook)"; fi
+  H_HOOK=$EXT/old-hook.sh; H_CAPS=$UNSET
+  no_done "18a old hook, new engine" "--caps-dir is required"
+  local raw
+  for raw in '"pending"' '"in_progress"' '"deleted"'; do
+    claim "$raw"; expect_allow "18a non-completing $raw"
+  done
+}
+engine_usage_error_is_refused() {
+  new_world
+  stub permissive "echo '$(good_line)'"; H_BIN=$EXT/permissive
+  ok_done twin-stand-in-exit-0
+  stub usageerr "echo 'harness: error: usage: harness status <ticket-file> ...' >&2; exit 2"; H_BIN=$EXT/usageerr
+  no_done "18b engine usage error, all five variables set" "status"
+}
+w2_new_hook_old_env() {
+  new_world; gate
+  ok_done twin-five-variables
+  H_CAPS=$UNSET
+  no_done "18c four variables" HARNESS_CAPS_DIR
+  local raw
+  for raw in '"pending"' '"in_progress"' '"deleted"'; do
+    claim "$raw"; expect_allow "18c non-completing $raw"
+  done
+}
+w3_caps_folder_mismatch() {
+  new_world; gate
+  ok_done twin-same-caps-folder
+  mkdir "$W/capsB"; H_CAPS=$W/capsB
+  no_done "18d hook caps folder differs from the gate's" "cap record is missing"
+  local raw
+  for raw in '"pending"' '"in_progress"' '"deleted"'; do
+    claim "$raw"; expect_allow "18d non-completing $raw"
+  done
+}
+
 # ---------------------------------------------------------------- AC 19
 print_registration_is_safe() {
   new_world
@@ -535,6 +843,11 @@ print_registration_is_safe() {
   [ "$before" = "$after" ] || fail "print-registration changed the scratch folder"
   [ "$gbefore" = "$gafter" ] || fail "print-registration changed the repo"
   command grep -q 'hooks.PreToolUse' "$W/reg.err" || fail "print-registration omits the append sentence"
+  local sub
+  for sub in HARNESS_BIN HARNESS_TICKET_FILE HARNESS_REPO_MAP HARNESS_RESULT_DIR HARNESS_CAPS_DIR 'FIVE variables' 'step 1' 'step 2' 'step 3' \
+    'mktemp -d' 'rmdir' 'live probe' 'SAME folder' 'temp name in the same folder' 'cannot detect' 'cap record is missing' 'supersedes' 'steps 3, 4 and 6'; do
+    command grep -qF -- "$sub" "$W/reg.err" || fail "print-registration text omits '$sub'"
+  done
   eng=$(command grep -E '^ENGINE_TIMEOUT = [0-9]+$' "$HOOK_SRC" | sed 's/.*= //')
   git_t=$(command grep -E '^GIT_TIMEOUT = [0-9]+$' "$HOOK_SRC" | sed 's/.*= //')
   [ -n "$eng" ] && [ -n "$git_t" ] || { fail "timeout constants not found"; return; }
@@ -572,9 +885,10 @@ premise_status_merged() {
   out=$("$BIN_SRC" status 2>&1 < /dev/null); rc=$?
   [ "$rc" -eq 2 ] || fail "status with no arguments exited $rc, expected 2"
   case "$out" in *"usage: harness status"*) ;; *) fail "status usage line missing";; esac
+  case "$out" in *"--caps-dir"*) ;; *) fail "status usage line does not name --caps-dir";; esac
 }
 
-CASES="allow_pass_current refuse_fail_result refuse_stale_result refuse_no_result refuse_bad_result_files refuse_linked_result refuse_case_twin refuse_dirty_tree refuse_completion_spellings refuse_other_tools refuse_bad_stdin extra_keys_do_not_decide other_task_same_verdict refuse_inputs_inside_repo refuse_bad_env refuse_forged_status crash_is_exit_2 engine_failures_are_exit_2 engine_hang_is_exit_2 git_hang_is_exit_2 reason_text_is_filtered refuse_reasons_in_order manifest_shape manifest_matches_script print_registration_is_safe smoke_sandbox_safety premise_status_merged"
+CASES="allow_pass_current refuse_fail_result refuse_stale_result refuse_no_result refuse_bad_result_files refuse_linked_result refuse_case_twin refuse_dirty_tree refuse_completion_spellings refuse_other_tools refuse_bad_stdin extra_keys_do_not_decide other_task_same_verdict refuse_inputs_inside_repo refuse_bad_env refuse_forged_status crash_is_exit_2 engine_failures_are_exit_2 engine_hang_is_exit_2 git_hang_is_exit_2 reason_text_is_filtered refuse_reasons_in_order manifest_shape manifest_matches_script manifest_env_matches_hook fix_rounds_is_opaque w1_old_hook_new_engine engine_usage_error_is_refused w2_new_hook_old_env w3_caps_folder_mismatch print_registration_is_safe smoke_sandbox_safety premise_status_merged"
 
 run_case() {
   FAILN=0
