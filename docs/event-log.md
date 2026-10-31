@@ -53,7 +53,7 @@ harness events list   [--log <path>]
 harness events verify [--log <path>]
 ```
 
-The default log is `.harness/events.jsonl` in the working folder, which is git-ignored. Without `--root`, the root is the log's parent folder. Without `--ts-ms`, the wall clock is written. Exit codes: `0` ok; `1` the log has a torn tail or corruption (`list` still prints the intact events first); `2` a usage error or a refusal.
+The default log is `.harness/events.jsonl` in the working folder, which is git-ignored. Without `--root`, the root is the working folder when the default log is used, and the log's parent folder when `--log` is given. Without `--ts-ms`, the wall clock is written. Exit codes: `0` ok; `1` the log has a torn tail or corruption (`list` still prints the intact events first); `2` a usage error or a refusal.
 
 ## What v1 does not promise
 

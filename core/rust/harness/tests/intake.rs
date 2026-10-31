@@ -277,6 +277,65 @@ fn broken_tickets_are_refused_and_name_the_field() {
     assert_eq!(code(&go(&b, &tf, &[("b", &b)])), 0, "twin: the valid control ticket is accepted");
 }
 
+/// Feed `total` bytes (a marker first, then filler) to a ticket-file path that is a named pipe, and report how many bytes the
+/// reader took before it let go. A reader with a read cap stops near the cap; one without it drains everything.
+fn run_on_pipe(t: &Tmp, total: usize, marker: &str) -> (Output, usize, PathBuf) {
+    let fifo = t.0.join("pipe-ticket.json");
+    let made = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo is available").success();
+    assert!(made, "mkfifo made the pipe");
+    let (tx, rx) = std::sync::mpsc::channel::<usize>();
+    let (path, head) = (fifo.clone(), marker.as_bytes().to_vec());
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut w = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut sent = 0usize;
+        let mut chunk = head;
+        chunk.resize(64 * 1024, b' ');
+        while sent < total {
+            if w.write_all(&chunk).is_err() {
+                break;
+            }
+            sent += chunk.len();
+            chunk.iter_mut().for_each(|b| *b = b' ');
+        }
+        let _ = tx.send(sent);
+    });
+    let b = t.dir("pipe-cwd");
+    let o = intake_in(&b, &[fifo.to_str().unwrap()], &[]);
+    let sent = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(n) => n,
+        Err(_) => {
+            // The command never opened the pipe, so the writer is still waiting for a reader: let it go, then fail loudly.
+            drop(fs::File::open(&fifo));
+            usize::MAX
+        }
+    };
+    (o, sent, fifo)
+}
+
+// The 1 MiB read cap: an oversize ticket is refused (exit 1, the size reason), the reader stops reading near the cap instead of
+// draining the whole file, and neither the file's content nor its path reaches any output. Twin: a small file on the same path shape
+// (an under-cap stream) is read to its end, so the early stop comes from the cap and not from the pipe.
+#[test]
+fn an_oversize_ticket_is_refused_and_read_only_up_to_the_cap() {
+    let marker = "PLANTED-TICKET-CONTENT-MARKER";
+    let t = Tmp::new();
+    let total = 16 * MAX;
+    let (o, sent, fifo) = run_on_pipe(&t, total, marker);
+    refused(&o);
+    assert!(err(&o).contains("1 MiB"), "stderr must give the size reason: {}", err(&o));
+    assert!(!leaks_o(&o, marker), "no file content in the output");
+    assert!(!leaks_o(&o, fifo.to_str().unwrap()), "no file path in the output");
+    assert!(!leaks_o(&o, "pipe-ticket"), "no file name in the output");
+    assert!(sent != usize::MAX, "the command opened the ticket file");
+    assert!(sent <= 2 * MAX, "the reader took {sent} of {total} bytes: the read cap is gone");
+    // Twin: the same run shape with the whole stream under the cap is read to the end (the writer is never cut short).
+    let t2 = Tmp::new();
+    let (o2, sent2, _) = run_on_pipe(&t2, MAX / 2, marker);
+    refused(&o2);
+    assert_eq!(sent2, MAX / 2, "twin: an under-cap stream is fully read");
+}
+
 // AC 5 and AC 10: a folder that is not the top of a repo is refused naming only the id, never the folder; the top level is accepted.
 #[test]
 fn a_folder_that_is_not_a_repo_top_is_refused_without_naming_it() {
