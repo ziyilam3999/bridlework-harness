@@ -1,3 +1,4 @@
 target/
 .claude/
 .ai-workspace/
+.harness/
