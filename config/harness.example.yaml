@@ -1,1 +1,23 @@
-# Example harness configuration. Keys are added by later tickets.
+# Example harness configuration. Placeholders only: no repo entries, no real folder or name.
+# The real file lives outside this repo. The contract is docs/config-contract.md.
+# Every budget and token value is 1 on purpose: an unseeded install stops instead of overspending.
+
+repos:
+
+budgets:
+  s_wall_seconds: 1
+  s_tokens: 1
+  m_wall_seconds: 1
+  m_tokens: 1
+  l_wall_seconds: 1
+  l_tokens: 1
+
+shadow:
+  p1a_cap: 5
+  p4a_cap: 10
+  d2a_cap: 20
+  p7_cap: 10
+  p1a_token_budget: 1
+  p4a_token_budget: 1
+  d2a_token_budget: 1
+  p7_token_budget: 1
