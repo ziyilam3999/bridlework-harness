@@ -13,6 +13,7 @@ pub mod gates;
 pub mod gitio;
 pub mod overlay;
 pub mod path_map;
+pub mod repo_id;
 pub mod runner;
 #[cfg(unix)]
 pub mod tree_prep;
