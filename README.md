@@ -10,6 +10,20 @@ and refuses the push when a value of a protected class is found.
 - `.githooks/` : the pre-push hook that calls the engine.
 - `ci/` : entry scripts and lints that CI runs.
 - `.github/workflows/` : the workflows that call those scripts.
+- `dashboard/` : the dashboard (placeholder).
+- `schemas/` : data schemas (placeholder).
+- `skills/` : skills (placeholder).
+- `hooks/` : hooks (placeholder).
+- `gates/` : verification, architecture and security gates, and the path-to-check map (placeholder).
+- `wiki/hub/` : the wiki hub (placeholder).
+- `wiki/lesson-store/` : the lesson store (placeholder).
+- `providers/anthropic/`, `providers/zai/`, `providers/openai/`, `providers/jev/` : model provider adapters (placeholders).
+- `plugins/claude/`, `plugins/openai/` : thin host plugin packages (placeholders).
+- `mcp/` : MCP servers (placeholder).
+- `evals/` : evaluations (placeholder).
+- `examples/` : examples (placeholder).
+- `config/` : example configuration files.
+- `docs/` : documentation (placeholder).
 
 ## Build
 
