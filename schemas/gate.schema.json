@@ -1,0 +1,15 @@
+{
+  "title": "gate",
+  "description": "One gate definition, gates/<id>.json. A human and tool mirror of the loader's six-key shape; the crate does not interpret this file, and a test pins its required set to the loader's.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "program", "args", "timeout_ms", "max_output_bytes", "both_ends"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "description": "Equals the file name stem." },
+    "program": { "type": "string", "minLength": 1, "description": "Repo-relative, '/'-separated path of the check, any language." },
+    "args": { "type": "array", "items": { "type": "string" } },
+    "timeout_ms": { "type": "integer", "minimum": 1 },
+    "max_output_bytes": { "type": "integer", "minimum": 1 },
+    "both_ends": { "type": "boolean", "description": "true: the gate must fail at base and pass at head." }
+  }
+}
