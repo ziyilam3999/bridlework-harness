@@ -25,7 +25,14 @@ repo=${1:-"$here/.."}
 repo=$(CDPATH= cd -- "$repo" && pwd -P) || { echo "final-gate: repo folder not found" >&2; exit 2; }
 
 (cd "$here/../core/rust" && cargo build --locked) || { echo "final-gate: engine build failed" >&2; exit 2; }
-bin="$here/../core/rust/target/debug/harness"
+# cargo puts the binary under CARGO_TARGET_DIR when it is set (a relative value is relative to core/rust, where cargo runs).
+tdir=${CARGO_TARGET_DIR:-}
+case $tdir in
+  "") tdir="$here/../core/rust/target" ;;
+  /*) ;;
+  *) tdir="$here/../core/rust/$tdir" ;;
+esac
+bin="$tdir/debug/harness"
 
 base=$(git -C "$repo" rev-parse --verify --quiet 'HEAD^1^{commit}' 2>/dev/null) || base=""
 case "$base" in
@@ -46,6 +53,8 @@ out=$("$bin" ticket gate "$work/ticket.json" --repo-map "core=$repo" --base "$ba
 rc=$?
 printf '%s\n' "$out"
 if [ "$rc" -eq 0 ]; then
-  sed -n 's/.*"message":"\(checks passed: [^"]*\)".*/\1/p' "$work/result/ci-pr.json"
+  msg=$(sed -n 's/.*"message":"\(checks passed: [^"]*\)".*/\1/p' "$work/result/ci-pr.json")
+  # printf adds the final newline the result file lacks, so a following line never joins this one.
+  [ -z "$msg" ] || printf '%s\n' "$msg"
 fi
 exit "$rc"

@@ -19,7 +19,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/final-gate-smoke.XXXXXX") || exit 2
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 fails=0
-ok() { echo "ok   $1"; }
+oks=0
+ok() { echo "ok   $1"; oks=$((oks + 1)); }
 bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 has() { case $1 in *"$2"*) return 0 ;; esac; return 1; }
 G() { git -c user.name=ci -c user.email=ci -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
@@ -55,7 +56,14 @@ run_entry() { out=$(sh "$entry" "$1" 2>&1); rc=$?; }
 
 # ---------------------------------------------------------------- engine
 (cd "$root/core/rust" && cargo build --locked >/dev/null 2>&1) || { echo "smoke: engine build failed" >&2; exit 2; }
-bin="$root/core/rust/target/debug/harness"
+# the binary sits under CARGO_TARGET_DIR when it is set (a relative value is relative to core/rust, where cargo ran)
+tdir=${CARGO_TARGET_DIR:-}
+case $tdir in
+  "") tdir="$root/core/rust/target" ;;
+  /*) ;;
+  *) tdir="$root/core/rust/$tdir" ;;
+esac
+bin="$tdir/debug/harness"
 
 # ---------------------------------------------------------------- B1 planted failing gate / clean twin
 mkrepo "$tmp/b1f" "$fx/map-fail.json" fixture-fail fixture-clean && chg "$tmp/b1f" area-fail/f.txt || exit 2
@@ -203,7 +211,14 @@ b=$(wf_bad "$wf")
 if [ -z "$b" ]; then ok B5-real-workflow-checklist-clean; else bad B5-real-workflow-checklist-clean; fi
 if wf_order "$wf"; then ok B11-lint-step-before-smoke-before-gate; else bad B11-lint-step-before-smoke-before-gate; fi
 if names_ok "$root/.github/workflows"; then ok B2-reported-names; else bad B2-reported-names; fi
-if G -C "$root" diff --quiet origin/master -- .github/workflows/privacy-gate.yml .github/workflows/privacy-text.yml .github/workflows/rust-test.yml 2>/dev/null || ! G -C "$root" rev-parse --verify -q origin/master >/dev/null; then
+# base for the old-workflow comparison: origin/master when present, else the first parent (CI checks out only the PR merge
+# commit, so there is no origin/master); with neither, print skip rather than a silent ok.
+if G -C "$root" rev-parse --verify -q origin/master >/dev/null; then oldbase=origin/master
+elif G -C "$root" rev-parse --verify -q 'HEAD^1' >/dev/null; then oldbase='HEAD^1'
+else oldbase=""; fi
+if [ -z "$oldbase" ]; then
+  echo "skip B2-old-workflows-untouched (no base to compare with)"
+elif G -C "$root" diff --quiet "$oldbase" -- .github/workflows/privacy-gate.yml .github/workflows/privacy-text.yml .github/workflows/rust-test.yml 2>/dev/null; then
   ok B2-old-workflows-untouched
 else
   bad B2-old-workflows-untouched
@@ -260,8 +275,113 @@ ntwin yaml_ext
 mkdir "$tmp/lintw" && sed 's/^    runs-on: ubuntu-latest$/    runs-on: ubuntu-latest\n    continue-on-error: true/' "$root/.github/workflows/rust-test.yml" > "$tmp/lintw/rust-test.yml"
 if sh "$here/workflow-lint.sh" "$tmp/lintw/rust-test.yml" >/dev/null; then bad B11-twin-lint-refuses-soft-fail; else ok B11-twin-lint-refuses-soft-fail; fi
 
+# ---------------------------------------------------------------- R1 fresh caps folder every run, R2 final newline
+# Five runs on the failing fixture: a caps folder reused across runs would hit the fix-round cap on the fifth and say something other than result=fail.
+ok_all=1
+for i in 1 2 3 4 5; do
+  run_entry "$tmp/b1f"
+  if [ "$rc" -eq 0 ] || ! has "$out" "result=fail done=refused"; then ok_all=0; fi
+done
+if [ "$ok_all" -eq 1 ]; then ok R1-caps-fresh-each-run-five-fails; else bad R1-caps-fresh-each-run-five-fails; fi
+sh "$entry" "$tmp/b1c" > "$tmp/nl.out" 2>&1
+if [ "$(tail -c 1 "$tmp/nl.out" | od -An -tx1 | tr -d ' ')" = "0a" ] && grep -q '^checks passed: ' "$tmp/nl.out"; then ok R2-output-ends-with-newline; else bad R2-output-ends-with-newline; fi
+
+# ---------------------------------------------------------------- C (P1A-14c) workflow lint rules, each with a planted failing twin
+# ltwin NAME SRC DEST SED-EXPR RULE... : a scratch copy of workflow SRC saved as DEST with one change; the lint must exit 1 and print DEST:<line>:<RULE> for every RULE.
+ltwin() {
+  n=$1; src=$2; dst=$3; e=$4; shift 4
+  d="$tmp/lt-$n"; mkdir "$d" || { bad "C-twin-$n-not-built"; return; }
+  sed -E "$e" "$root/.github/workflows/$src" > "$d/$dst"
+  if cmp -s "$root/.github/workflows/$src" "$d/$dst"; then bad "C-twin-$n-not-built"; return; fi
+  lo=$(sh "$here/workflow-lint.sh" "$d/$dst" 2>&1); lrc=$?
+  miss=""
+  for r in "$@"; do printf '%s\n' "$lo" | grep -qE "^$dst:[0-9]+:$r\$" || miss="$miss $r"; done
+  if [ "$lrc" -eq 1 ] && [ -z "$miss" ]; then ok "C-twin-$n-refused"; else bad "C-twin-$n-refused"; fi
+}
+# lclean NAME SRC DST SED-EXPR : a changed scratch copy that must NOT be refused (clean twin).
+lclean() {
+  n=$1; src=$2; dst=$3; e=$4
+  d="$tmp/lc-$n"; mkdir "$d" || { bad "C-clean-$n-not-built"; return; }
+  sed -E "$e" "$root/.github/workflows/$src" > "$d/$dst"
+  if cmp -s "$root/.github/workflows/$src" "$d/$dst"; then bad "C-clean-$n-not-built"; return; fi
+  if sh "$here/workflow-lint.sh" "$d/$dst" >/dev/null 2>&1; then ok "C-clean-$n-passes"; else bad "C-clean-$n-passes"; fi
+}
+FG=final-gate.yml
+G_STEP='^(      - name: Final gate)$'
+G_RUN='(run: sh ci/final-gate\.sh)$'
+PRL='^  pull_request:$'
+
+# C1 the real workflows pass (clean twin of every row below); privacy-text.yml has pull_request_target / pull_request_review `types:`
+if sh "$here/workflow-lint.sh" "$root"/.github/workflows/*.yml >/dev/null 2>&1; then ok C1-real-workflows-clean; else bad C1-real-workflows-clean; fi
+if sh "$here/workflow-lint.sh" "$root/.github/workflows/privacy-text.yml" >/dev/null 2>&1; then ok C2-clean-types-outside-pull_request; else bad C2-clean-types-outside-pull_request; fi
+
+# C2 trigger filters under pull_request
+ltwin pr-paths $FG $FG "s#$PRL#  pull_request:\n    paths: [\"core/**\"]#" pull-request-filter
+ltwin pr-paths-ignore $FG $FG "s#$PRL#  pull_request:\n    paths-ignore: [\"docs/**\"]#" pull-request-filter
+ltwin pr-branches $FG $FG "s#$PRL#  pull_request:\n    branches: [master]#" pull-request-filter
+ltwin pr-branches-ignore $FG $FG "s#$PRL#  pull_request:\n    branches-ignore: [x]#" pull-request-filter
+ltwin pr-types $FG $FG "s#$PRL#  pull_request:\n    types: [labeled]#" pull-request-filter
+ltwin pr-filter-in-other-workflow rust-test.yml rust-test.yml "s#$PRL#  pull_request:\n    paths: [\"core/**\"]#" pull-request-filter
+lclean push-branches $FG $FG "s#$PRL#  pull_request:\n  push:\n    branches: [master]#"
+
+# C2b any if: in final-gate.yml, whatever the key spelling
+ltwin if-gate-step $FG $FG "s#$G_STEP#\1\n        if: false#" if-in-final-gate
+ltwin if-gate-step-quoted $FG $FG "s#$G_STEP#\1\n        \"if\": false#" if-in-final-gate
+ltwin if-gate-step-single-quoted $FG $FG "s#$G_STEP#\1\n        'if': false#" if-in-final-gate
+ltwin if-gate-step-space-colon $FG $FG "s#$G_STEP#\1\n        if : false#" if-in-final-gate
+ltwin if-lint-step $FG $FG "s#^(      - name: Workflow lint)\$#\1\n        if: always()#" if-in-final-gate
+ltwin if-job-level $FG $FG "s#^(    timeout-minutes: 60)\$#\1\n    if: false#" if-in-final-gate job-level-if
+ltwin job-level-if-quoted rust-test.yml rust-test.yml "s#^(    runs-on: ubuntu-latest)\$#\1\n    \"if\": false#" job-level-if
+
+# C2c .yaml workflows are read too
+ltwin yaml-final-gate-name $FG x.yaml 's#^name: final-gate$#name: x#' required-name-final-gate
+ltwin yaml-continue-on-error rust-test.yml x.yaml "s#^(    runs-on: ubuntu-latest)\$#\1\n    continue-on-error: true#" continue-on-error
+mkdir "$tmp/dl" "$tmp/dl/ci" "$tmp/dl/.github" "$tmp/dl/.github/workflows" && cp "$here/workflow-lint.sh" "$tmp/dl/ci/" && cp "$root"/.github/workflows/*.yml "$tmp/dl/.github/workflows/" || exit 2
+if sh "$tmp/dl/ci/workflow-lint.sh" >/dev/null 2>&1; then ok C2c-default-list-clean-without-yaml; else bad C2c-default-list-clean-without-yaml; fi
+sed 's/^    runs-on: ubuntu-latest$/    runs-on: ubuntu-latest\n    continue-on-error: true/' "$root/.github/workflows/rust-test.yml" > "$tmp/dl/.github/workflows/x.yaml"
+lo=$(sh "$tmp/dl/ci/workflow-lint.sh" 2>&1); lrc=$?
+if [ "$lrc" -eq 1 ] && printf '%s\n' "$lo" | grep -qE '^x\.yaml:[0-9]+:continue-on-error$'; then ok C2c-default-list-reads-yaml; else bad C2c-default-list-reads-yaml; fi
+
+# C-coe: continue-on-error anywhere in final-gate.yml
+ltwin coe-gate-step $FG $FG "s#$G_STEP#\1\n        continue-on-error: true#" continue-on-error
+ltwin coe-quoted-key $FG $FG "s#$G_STEP#\1\n        \"continue-on-error\": true#" continue-on-error
+
+# C3 fail-swallow (any workflow)
+ltwin swallow-or-true rust-test.yml rust-test.yml 's#(run: sh ci/rust-test\.sh)$#\1 || true#' fail-swallow
+ltwin swallow-or-exit-0 rust-test.yml rust-test.yml 's#(run: sh ci/rust-test\.sh)$#\1 || exit 0#' fail-swallow
+
+# C3b the exit code cannot be swallowed in final-gate.yml
+ltwin or-colon $FG $FG "s#$G_RUN#\1 || :#" final-gate-or
+ltwin or-echo $FG $FG "s#$G_RUN#\1 || echo ok#" final-gate-or
+ltwin set-plus-e $FG $FG 's#run: sh ci/final-gate\.sh$#run: set +e; sh ci/final-gate.sh#' final-gate-set-plus-e
+ltwin shell-key $FG $FG "s#$G_STEP#\1\n        shell: bash {0}#" final-gate-shell
+ltwin multiline-run $FG $FG 's#^(        run: sh ci/final-gate\.sh)$#        run: |\n          sh ci/final-gate.sh\n          true#' final-gate-run-allowlist final-gate-block-scalar
+ltwin allow-tee $FG $FG "s#$G_RUN#\1 | tee gate.log#" final-gate-run-allowlist
+ltwin allow-and-true $FG $FG "s#$G_RUN#\1 \&\& echo ok; true#" final-gate-run-allowlist
+ltwin allow-bang-true $FG $FG 's#run: sh ci/final-gate\.sh$#run: ! sh ci/final-gate.sh; true#' final-gate-run-allowlist
+ltwin allow-quoted-newline $FG $FG 's#run: sh ci/final-gate\.sh$#run: "sh ci/final-gate.sh\\ntrue"#' final-gate-run-allowlist
+ltwin allow-subshell $FG $FG 's#run: sh ci/final-gate\.sh$#run: echo $(sh ci/final-gate.sh)#' final-gate-run-allowlist
+ltwin allow-background $FG $FG "s#$G_RUN#\1 \&#" final-gate-run-allowlist
+# A1 key-spelling evasions: a quoted run key with a decoy run line inside a block-scalar env value
+ltwin quoted-run-key-decoy $FG $FG 's#^        run: sh ci/final-gate\.sh$#        "run": sh ci/final-gate.sh | tee gate.log\n        env:\n          X: |\n            run: sh ci/final-gate.sh#' final-gate-quoted-key final-gate-block-scalar final-gate-run-allowlist
+ltwin env-bash-env $FG $FG "s#$G_STEP#\1\n        env:\n          BASH_ENV: ci/x.sh#" final-gate-shell-env
+ltwin env-env $FG $FG "s#$G_STEP#\1\n        env:\n          ENV: ci/x.sh#" final-gate-shell-env
+ltwin flow-step $FG $FG 's#^      - name: Final gate$#      - {name: Final gate, "if": false}#' final-gate-flow-style
+
+# C4 caches and required-name collisions
+ltwin cache-actions $FG $FG "s#$G_STEP#      - uses: actions/cache@v4\n\1#" cache-action
+ltwin cache-swatinem $FG $FG "s#$G_STEP#      - uses: Swatinem/rust-cache@v2\n\1#" cache-action
+ltwin cache-input $FG $FG 's#^(          fetch-depth: 2)$#\1\n          cache: npm#' cache-input
+ltwin name-gate-other-workflow rust-test.yml rust-test.yml 's#^  test:$#  test:\n    name: gate#' required-name-gate
+ltwin job-id-gate $FG $FG 's#^  final-gate:$#  gate:#' required-name-gate final-gate-job-name
+ltwin name-final-gate-other-workflow rust-test.yml rust-test.yml 's#^  test:$#  test:\n    name: final-gate#' required-name-final-gate
+ltwin job-id-final-gate-other-workflow rust-test.yml rust-test.yml 's#^  test:$#  final-gate:#' required-name-final-gate
+ltwin final-gate-job-renamed $FG $FG 's#^    runs-on: ubuntu-latest$#    name: Final gate\n    runs-on: ubuntu-latest#' final-gate-job-name
+lclean step-named-gate rust-test.yml rust-test.yml 's#name: Build and test#name: gate#'
+lclean step-named-final-gate rust-test.yml rust-test.yml 's#name: Build and test#name: final-gate#'
+
 if [ "$fails" -eq 0 ]; then
-  echo "final-gate smoke: all arms ok"
+  echo "final-gate smoke: all arms ok ($oks arms)"
   exit 0
 fi
 echo "final-gate smoke: $fails arm(s) FAILED"
