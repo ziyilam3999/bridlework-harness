@@ -2,7 +2,7 @@
   "hook": "pre-completion-hook.sh",
   "event": "PreToolUse",
   "tools": ["TaskUpdate"],
-  "env": ["HARNESS_BIN", "HARNESS_TICKET_FILE", "HARNESS_REPO_MAP", "HARNESS_RESULT_DIR"],
+  "env": ["HARNESS_BIN", "HARNESS_TICKET_FILE", "HARNESS_REPO_MAP", "HARNESS_RESULT_DIR", "HARNESS_CAPS_DIR"],
   "requires": ["python3"],
   "exit_allow": 0,
   "exit_refuse": 2
