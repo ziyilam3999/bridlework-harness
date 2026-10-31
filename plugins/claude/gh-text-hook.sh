@@ -839,7 +839,10 @@ def main():
     if not maybe:
         for tok in re.split(r"[\s;&|()<>]+", joined):
             base = tok.rsplit("/", 1)[-1].replace("'", "").replace('"', "").replace("\\", "")
-            if any(ch in base for ch in "*?[{"):
+            if "{" in tok:  # G:brace_prefilter  (the whole word: a slash inside the braces must not hide it)
+                maybe = True  # brace expansion (lists, ranges, nesting) can spell the program word; never try to decide
+                break
+            if any(ch in base for ch in "*?["):
                 if glob_could_be_gh(base):
                     maybe = True
                     break
@@ -973,8 +976,12 @@ def glob_could_be_gh(base):
                     nxt.append(p[:m2.start()] + alt + p[m2.end():])
             else:
                 nxt.append(p)
-        pats = nxt[:64]
+        if len(nxt) > 64:
+            return True  # a cap was hit: "cannot decide" means maybe, never no
+        pats = nxt
     for p in pats:
+        if re.search(r"\{[^{}]*\}|\([^()]*\)", p):
+            return True  # still unexpanded after the passes: maybe
         if fnmatch.fnmatchcase("gh", p) or fnmatch.fnmatchcase("GH", p.upper()):
             return True
     return False

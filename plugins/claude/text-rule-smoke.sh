@@ -484,6 +484,13 @@ gh $M" deny-token
   no bslash-newline-gh "g\\
 h $M" # G:bslash_newline
   no zsh-alternation-gh "/usr/bin/g(h|x) $M" # G:zsh_paren
+  no brace-range-gh "g{h..h} $M" # G:brace_prefilter
+  no brace-range-lead "{g..g}h $M" # G:brace_prefilter
+  no brace-range-env "env g{h..h} $M" # G:brace_prefilter
+  no brace-range-other-repo "g{h..h} pr comment 1 -R other/x --body '$M_PROFILE'" # G:brace_prefilter
+  no brace-five-siblings "g{h,}{,}{,}{,}{,} $M" # G:brace_prefilter
+  no brace-five-nested "{{{{{g,},},},},}h $M" # G:brace_prefilter
+  no brace-slash-inside "{/usr/bin/g,x}h $M" # G:brace_prefilter
 }
 
 # ---------------------------------------------------------------- AC 12

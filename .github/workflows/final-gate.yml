@@ -1,0 +1,23 @@
+name: final-gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  final-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Workflow lint
+        run: sh ci/workflow-lint.sh
+      - name: Smoke
+        run: sh ci/final-gate-smoke.sh
+      - name: Final gate
+        run: sh ci/final-gate.sh
