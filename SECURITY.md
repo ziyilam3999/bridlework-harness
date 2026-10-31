@@ -1,3 +1,3 @@
 # Security
 
-Report a vulnerability privately through this repository's GitHub security advisories page.
+The security policy for this repository is not written yet.
