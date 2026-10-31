@@ -399,8 +399,15 @@ mod tests {
         let ok = PathMap::parse("{ \"a\" : [ \"c\" , \"d\" ] ,\n \"b/c\" : [\"e\"] }\n").unwrap();
         assert_eq!(ok.checks_for("a/x"), ["c".to_string(), "d".to_string()]);
         let seed = PathMap::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")).expect("the committed seed map loads");
-        assert_eq!(seed.checks_for("core/rust/harness/src/lib.rs"), ["cargo-test".to_string()]);
-        assert_eq!(seed.checks_for("gates/path-map.json"), ["cargo-test".to_string()]);
+        for probe in ["core/rust/harness/src/lib.rs", "gates/path-map.json"] {
+            let got = seed.checks_for(probe);
+            assert!(
+                got.contains(&"cargo-test".to_string()) && got.contains(&"core-layering".to_string()),
+                "{} must select both cargo-test and core-layering, got {:?}",
+                probe,
+                got
+            );
+        }
     }
 
     #[test]
