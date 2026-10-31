@@ -286,12 +286,7 @@ fn config_cmd(a: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    if let Some(id) = &id {
-        if cfg.repo_dir(id).is_none() {
-            eprintln!("harness: repo_id {} is not in the config map", id.as_str());
-            return 1;
-        }
-    }
+    // A bad size is a command-line error (2) and is decided BEFORE the repo lookup (1), so a bad size never reads as a lookup refusal.
     let budget_line = match size {
         Some(s) => match cfg.budget(s) {
             Some(b) => Some(format!("budget size={} wall_seconds={} tokens={}", s, b.wall_seconds, b.tokens)),
@@ -299,6 +294,12 @@ fn config_cmd(a: &[String]) -> i32 {
         },
         None => None,
     };
+    if let Some(id) = &id {
+        if cfg.repo_dir(id).is_none() {
+            eprintln!("harness: repo_id {} is not in the config map", id.as_str());
+            return 1;
+        }
+    }
     println!("config ok repos={} shadow=ok", cfg.repo_count());
     if let Some(id) = &id {
         println!("repo_id={} mapped", id.as_str());

@@ -149,6 +149,8 @@ fn an_empty_flag_does_not_fall_back_to_the_variable() {
     let good = t.file("ok.yaml", valid());
     let o = run(&["config", "check", "--config", ""], Some(good.to_str().unwrap()), None);
     refused_clean(&o);
+    // The empty-source guard is pinned by its own message: the loader would also refuse "", with a different one.
+    assert!(err(&o).contains("config source is empty"), "{}", err(&o));
     // Twin: the variable alone loads, and the flag wins over a bad variable.
     assert_eq!(code(&run(&["config", "check"], Some(good.to_str().unwrap()), None)), 0);
     let o = run(&["config", "check", "--config", good.to_str().unwrap()], Some("/no/such/file"), None);
@@ -161,6 +163,20 @@ fn an_empty_variable_does_not_fall_back_to_the_example() {
     let beside = Path::new(EXAMPLE).parent().unwrap();
     let o = run(&["config", "check"], Some(""), Some(beside));
     refused_clean(&o);
+    assert!(err(&o).contains("config source is empty"), "{}", err(&o));
+}
+
+#[test]
+fn a_bad_size_is_exit_two_even_when_the_repo_is_unmapped() {
+    let t = Tmp::new();
+    let f = t.file("ok.yaml", valid());
+    // Bad size + unmapped repo: a command-line error, exit 2, nothing on stdout.
+    refused_clean(&check(&f, &["--repo", "c", "--budget", "XL"]));
+    refused_clean(&check(&f, &["--budget", "XL", "--repo", "c"]));
+    // Twin: a good size + the same unmapped repo is the lookup refusal, exit 1.
+    let o = check(&f, &["--repo", "c", "--budget", "S"]);
+    assert_eq!(code(&o), 1);
+    assert!(out(&o).is_empty());
 }
 
 // ---- AC 3: bad files are refused ----
