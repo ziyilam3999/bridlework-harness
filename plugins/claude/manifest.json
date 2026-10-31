@@ -1,0 +1,9 @@
+{
+  "hook": "path-restriction-hook.sh",
+  "event": "PreToolUse",
+  "tools": ["Edit", "Write", "MultiEdit", "NotebookEdit"],
+  "env": ["HARNESS_BIN", "HARNESS_TICKET_FILE", "HARNESS_REPO_MAP", "HARNESS_SCOPE_FILE"],
+  "requires": ["python3"],
+  "exit_allow": 0,
+  "exit_refuse": 2
+}
