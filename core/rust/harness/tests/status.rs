@@ -558,8 +558,8 @@ fn ac16_the_line_has_exactly_the_eight_keys_and_no_invented_round() {
 #[test]
 fn ac17_status_reads_what_the_real_gate_wrote() {
     let t = Tmp::new();
-    let (repo, other, res) = (t.0.join("r"), t.0.join("other-repo-zz9"), t.0.join("res"));
-    for d in [&repo, &other, &res] {
+    let (repo, other, res, caps) = (t.0.join("r"), t.0.join("other-repo-zz9"), t.0.join("res"), t.0.join("caps"));
+    for d in [&repo, &other, &res, &caps] {
         fs::create_dir_all(d).unwrap();
     }
     git(&repo, &["init", "-q"]);
@@ -578,13 +578,14 @@ fn ac17_status_reads_what_the_real_gate_wrote() {
     write_file(&other.join("o.txt"), "other", false);
     git(&other, &["add", "-A"]);
     git(&other, &["commit", "-q", "-m", "other"]);
-    let (repo, other, res) = (repo.canonicalize().unwrap(), other.canonicalize().unwrap(), res.canonicalize().unwrap());
+    let (repo, other, res, caps) = (repo.canonicalize().unwrap(), other.canonicalize().unwrap(), res.canonicalize().unwrap(), caps.canonicalize().unwrap());
     let tf = t.0.join("ticket.json");
     fs::write(&tf, ticket_json("r", "EX-1", false)).unwrap();
     let gate = |base: &str| {
         let mut a = args_for(&tf, &repo, res.to_str().unwrap());
         a.insert(3, base.to_string());
         a.insert(3, "--base".to_string());
+        a.extend(["--caps-dir".to_string(), caps.to_str().unwrap().to_string()]);
         run_sub("ticket", &other, &[vec!["gate".to_string()], a].concat())
     };
     let st = || run_sub("status", &other, &args_for(&tf, &repo, res.to_str().unwrap()));

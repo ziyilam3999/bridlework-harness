@@ -7,6 +7,7 @@
 //! No error or stdout line repeats a mapped or result folder.
 
 use crate::both_ends;
+use crate::caps::{self, Caps, LockError, Record};
 use crate::gate_result::{GateResult, Status};
 use crate::gates::{self, Gates};
 use crate::intake::{intake, RepoMap};
@@ -18,7 +19,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: harness ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir>";
+pub const USAGE: &str = "usage: harness ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
 /// The folded result's gate id.
 pub const GATE_ID: &str = "ticket-gate";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
@@ -40,6 +41,7 @@ struct Args {
     map: RepoMap,
     base: String,
     result_dir: PathBuf,
+    caps_dir: PathBuf,
 }
 
 fn base_ok(s: &str) -> bool {
@@ -47,7 +49,7 @@ fn base_ok(s: &str) -> bool {
 }
 
 /// 1-64 bytes of `A-Z a-z 0-9 . _ -`, not starting with `.`, no `..`: usable as a file name and as nothing else.
-fn ticket_id_ok(s: &str) -> bool {
+pub(crate) fn ticket_id_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -63,7 +65,7 @@ fn result_dir_arg_ok(s: &str) -> bool {
 
 fn parse_args(a: &[String]) -> Result<Args, Stop> {
     let mut map = RepoMap::new();
-    let (mut file, mut base, mut dir): (Option<&str>, Option<&str>, Option<&str>) = (None, None, None);
+    let (mut file, mut base, mut dir, mut caps_dir): (Option<&str>, Option<&str>, Option<&str>, Option<&str>) = (None, None, None, None);
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
@@ -74,6 +76,7 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
             }
             "--base" => &mut base,
             "--result-dir" => &mut dir,
+            "--caps-dir" => &mut caps_dir,
             s if s.starts_with("--") => return Err(usage_err("unknown option")),
             _ => {
                 if file.replace(arg.as_str()).is_some() {
@@ -90,13 +93,17 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
     let file = file.ok_or_else(|| usage_err("no ticket file given"))?;
     let base = base.ok_or_else(|| usage_err("--base is required"))?;
     let dir = dir.ok_or_else(|| usage_err("--result-dir is required"))?;
+    let caps_dir = caps_dir.ok_or_else(|| usage_err("--caps-dir is required"))?;
     if !base_ok(base) {
         return Err(usage_err("--base must be a full lowercase hex commit sha (a ref name is refused)"));
     }
     if !result_dir_arg_ok(dir) {
         return Err(usage_err("--result-dir must be an absolute path with no `..` component"));
     }
-    Ok(Args { ticket_file: file.to_string(), map, base: base.to_string(), result_dir: PathBuf::from(dir) })
+    if !result_dir_arg_ok(caps_dir) {
+        return Err(usage_err("--caps-dir must be an absolute path with no `..` component"));
+    }
+    Ok(Args { ticket_file: file.to_string(), map, base: base.to_string(), result_dir: PathBuf::from(dir), caps_dir: PathBuf::from(caps_dir) })
 }
 
 /// One git call: no hooks, no inherited `GIT_*` name, no stdin, pinned to the canonical root's own `.git`. Same shape as `path_map::changed_paths`.
@@ -245,9 +252,17 @@ struct Outcome {
     result: GateResult,
     /// The gate that decided a FAIL (the first failing result's own gate id).
     failing_gate: String,
+    /// True when this FAIL used the last allowed round, so the next run will be refused.
+    cap_reached: bool,
 }
 
-fn run(a: &[String]) -> Result<Outcome, Stop> {
+/// What a call ended with: a verdict, or a refusal to run at all (the fix-round cap).
+enum Ran {
+    Verdict(Outcome),
+    Refused { ticket_id: String, head: String, reason: &'static str },
+}
+
+fn run(a: &[String]) -> Result<Ran, Stop> {
     // 1. Arguments.
     let args = parse_args(a)?;
 
@@ -279,6 +294,35 @@ fn run(a: &[String]) -> Result<Outcome, Stop> {
     let rdir = resolve_result_dir(&args.result_dir, &root)?;
     let target = check_target(&rdir, &format!("{}.json", ticket.id))?;
 
+    // 3b. The cap (point B): the caps folder and record name pass the same rules, a stale result temp is refused BEFORE a round is paid, the
+    // per-ticket lock is taken without waiting and held to the end of the run, and the record is read strictly. A ticket already at the cap is refused.
+    let caps = Caps::open(&args.caps_dir, &root).map_err(err2)?;
+    match std::fs::symlink_metadata(rdir.join(format!(".{}.json.tmp", ticket.id))) {
+        Ok(_) => return Err(err2("a stale result temp file is present in the result directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(err2("the result temp name could not be inspected")),
+    }
+    caps.check_names(&ticket.id).map_err(err2)?;
+    let lock = caps.lock(&ticket.id).map_err(|e| match e {
+        LockError::Busy => err2("a run for this ticket is in progress"),
+        LockError::Other(m) => err2(m),
+    })?;
+    let used = match caps.read(&ticket.id, &repo_id).map_err(err2)? {
+        Some(r) => r.rounds(),
+        None => {
+            // No record is 0 rounds only when the ticket has never produced a result; a result without its record is a deleted record.
+            if std::fs::symlink_metadata(&target).is_ok() {
+                return Err(err2("a result file exists but the cap record is missing"));
+            }
+            0
+        }
+    };
+    if let Err(refusal) = caps::may_start(used) {
+        caps.escalate(&refusal, &ticket.id, &repo_id)
+            .map_err(|m| Stop(2, format!("harness: ESCALATION NOT RECORDED reason={} ({})", refusal.reason, m)))?;
+        return Ok(Ran::Refused { ticket_id: ticket.id, head, reason: refusal.reason });
+    }
+
     // 4. Clean tree: head-only checks run in the repo folder, so the folder must BE the head.
     clean_tree(&root)?;
 
@@ -289,6 +333,7 @@ fn run(a: &[String]) -> Result<Outcome, Stop> {
 
     let mut decided: Option<(GateResult, String)> = None;
     let mut passed: Vec<String> = Vec::new();
+    let mut plan: Option<(Vec<String>, Gates, BTreeMap<String, Check>)> = None;
     if verdict.status == Status::Fail {
         decided = Some((fold_fail(&verdict, &head), verdict.gate_id.clone()));
     } else if changed.is_empty() {
@@ -308,8 +353,15 @@ fn run(a: &[String]) -> Result<Outcome, Stop> {
             }
         }
 
-        // 6. Run, fail fast, sorted id order.
-        for id in &ids {
+        plan = Some((ids, all, checks));
+    }
+
+    // 5b. PAY the round (point C), durably, before the first check runs. If the write fails nothing runs. Only a decided PASS refunds it.
+    caps.write(&Record { ticket: ticket.id.clone(), repo_id: repo_id.clone(), fix_rounds: used, in_flight: true }, &lock).map_err(err2)?;
+
+    // 6. Run, fail fast, sorted id order.
+    if let Some((ids, all, checks)) = &plan {
+        for id in ids {
             let gate = all.get(id).ok_or_else(|| err2("a selected gate is missing"))?;
             let r = if gate.both_ends {
                 gates::with_spec(gate, |spec| both_ends::judge(&root, &args.base, &head, &head, spec)).and_then(|x| x).map_err(err2)?
@@ -333,19 +385,27 @@ fn run(a: &[String]) -> Result<Outcome, Stop> {
         return Err(err2("the repo head moved while the checks ran"));
     }
 
-    // 8. One result.
+    // 8. The verdict's count first (a FAIL keeps its round, a PASS refunds it), THEN one result.
     let (result, failing_gate) = match decided {
         Some((r, g)) => (r, g),
         None => (fold_pass(&passed, &head), GATE_ID.to_string()),
     };
+    let fixed = if result.status == Status::Pass { used } else { used + 1 };
+    caps.write(&Record { ticket: ticket.id.clone(), repo_id: repo_id.clone(), fix_rounds: fixed, in_flight: false }, &lock).map_err(err2)?;
     write_result(&rdir, &ticket.id, &target, &result)?;
-    Ok(Outcome { ticket_id: ticket.id, head, result, failing_gate })
+    drop(lock);
+    Ok(Ran::Verdict(Outcome { ticket_id: ticket.id, head, result, failing_gate, cap_reached: fixed >= caps::MAX_FIX_ROUNDS }))
 }
 
 /// `harness ticket gate ...` (the arguments after `gate`). Exit 0 only for a written PASS; 1 a FAIL (written) or a ticket refusal; 2 any error.
 pub fn gate_cmd(a: &[String]) -> i32 {
     match run(a) {
-        Ok(o) => {
+        Ok(Ran::Refused { ticket_id, head, reason }) => {
+            println!("ticket={} head={} result=refused done=refused reason={}", ticket_id, head, reason);
+            eprintln!("harness: gate REFUSED reason={}", reason);
+            1
+        }
+        Ok(Ran::Verdict(o)) => {
             // The line is built from fixed fields only, never from a check's output.
             if o.result.status == Status::Pass {
                 println!("ticket={} head={} result=pass done=allowed", o.ticket_id, o.head);
@@ -353,6 +413,9 @@ pub fn gate_cmd(a: &[String]) -> i32 {
             } else {
                 println!("ticket={} head={} result=fail done=refused", o.ticket_id, o.head);
                 eprintln!("harness: gate FAIL class={} gate={}", o.result.failure_class.as_deref().unwrap_or("unknown"), o.failing_gate);
+                if o.cap_reached {
+                    eprintln!("harness: fix-round cap reached; the next run is refused and escalated");
+                }
                 1
             }
         }
@@ -416,23 +479,34 @@ mod tests {
     #[test]
     fn arguments_need_every_flag_exactly_once() {
         let b = SHA.to_string();
-        let good = s(&["t.json", "--repo-map", "r=/x", "--base", &b, "--result-dir", "/res"]);
+        let good = s(&["t.json", "--repo-map", "r=/x", "--base", &b, "--result-dir", "/res", "--caps-dir", "/caps"]);
         assert!(parse_args(&good).is_ok(), "twin: a complete command line");
-        let cases: Vec<Vec<String>> = vec![
-            s(&[]),
-            s(&["--repo-map", "r=/x", "--base", &b, "--result-dir", "/res"]),
-            s(&["t.json", "--repo-map", "r=/x", "--result-dir", "/res"]),
-            s(&["t.json", "--repo-map", "r=/x", "--base", &b]),
-            s(&["t.json", "--base", &b, "--base", &b, "--result-dir", "/res"]),
-            s(&["t.json", "--base", &b, "--result-dir", "/res", "--result-dir", "/res2"]),
-            s(&["t.json", "--nope", "--base", &b, "--result-dir", "/res"]),
-            s(&["t.json", "u.json", "--base", &b, "--result-dir", "/res"]),
-            s(&["t.json", "--base"]),
-            s(&["t.json", "--base", "master", "--result-dir", "/res"]),
-            s(&["t.json", "--base", &b, "--result-dir", "res"]),
+        // Every vector carries a valid --caps-dir, so each one fails for its OWN fault (named in the message), not for a missing option.
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("no ticket file", s(&["--caps-dir", "/caps"])),
+            ("no ticket file", s(&["--repo-map", "r=/x", "--base", &b, "--result-dir", "/res", "--caps-dir", "/caps"])),
+            ("--base is required", s(&["t.json", "--repo-map", "r=/x", "--result-dir", "/res", "--caps-dir", "/caps"])),
+            ("--result-dir is required", s(&["t.json", "--repo-map", "r=/x", "--base", &b, "--caps-dir", "/caps"])),
+            ("given twice", s(&["t.json", "--base", &b, "--base", &b, "--result-dir", "/res", "--caps-dir", "/caps"])),
+            ("given twice", s(&["t.json", "--base", &b, "--result-dir", "/res", "--result-dir", "/res2", "--caps-dir", "/caps"])),
+            ("unknown option", s(&["t.json", "--nope", "--base", &b, "--result-dir", "/res", "--caps-dir", "/caps"])),
+            ("more than one ticket file", s(&["t.json", "u.json", "--base", &b, "--result-dir", "/res", "--caps-dir", "/caps"])),
+            ("missing its value", s(&["t.json", "--caps-dir", "/caps", "--base"])),
+            ("--base must be", s(&["t.json", "--base", "master", "--result-dir", "/res", "--caps-dir", "/caps"])),
+            ("--result-dir must be", s(&["t.json", "--base", &b, "--result-dir", "res", "--caps-dir", "/caps"])),
         ];
-        for c in &cases {
-            assert!(matches!(parse_args(c), Err(Stop(2, _))), "{c:?} must be a usage error");
+        for (needle, c) in &cases {
+            match parse_args(c) {
+                Err(Stop(2, m)) => assert!(m.lines().next().unwrap().contains(needle), "{c:?} must fail for its own fault `{needle}`: {m}"),
+                _ => panic!("{c:?} must be a usage error"),
+            }
+        }
+        // The new option's own faults.
+        let without = s(&["t.json", "--repo-map", "r=/x", "--base", &b, "--result-dir", "/res"]);
+        assert!(matches!(parse_args(&without), Err(Stop(2, m)) if m.contains("--caps-dir is required")));
+        for bad in ["caps", "/caps/../x"] {
+            let v = s(&["t.json", "--base", &b, "--result-dir", "/res", "--caps-dir", bad]);
+            assert!(matches!(parse_args(&v), Err(Stop(2, m)) if m.contains("--caps-dir must be")), "{bad:?}");
         }
     }
 
