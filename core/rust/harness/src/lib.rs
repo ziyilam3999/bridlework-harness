@@ -4,6 +4,7 @@
 pub mod both_ends;
 pub mod classes;
 pub mod cli;
+pub mod core_layering;
 pub mod decode;
 pub mod detect;
 pub mod explain;
