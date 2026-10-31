@@ -367,6 +367,20 @@ ltwin quoted-run-key-decoy $FG $FG 's#^        run: sh ci/final-gate\.sh$#      
 ltwin env-bash-env $FG $FG "s#$G_STEP#\1\n        env:\n          BASH_ENV: ci/x.sh#" final-gate-shell-env
 ltwin env-env $FG $FG "s#$G_STEP#\1\n        env:\n          ENV: ci/x.sh#" final-gate-shell-env
 ltwin flow-step $FG $FG 's#^      - name: Final gate$#      - {name: Final gate, "if": false}#' final-gate-flow-style
+# C3c strict line shape (final-gate.yml): YAML syntax the line matcher cannot see is refused (continuation, explicit key, anchor, alias, tag, merge key, odd line breaks)
+ltwin shape-continuation-tee $FG $FG 's#^(        run: sh ci/final-gate\.sh)$#\1\n          | tee gate.log#' final-gate-line-shape
+ltwin shape-continuation-true $FG $FG 's#^(        run: sh ci/final-gate\.sh)$#\1\n          ; true#' final-gate-line-shape
+ltwin shape-explicit-key-if $FG $FG 's#^(      - name: Final gate)$#\1\n        ? if\n        : false#' final-gate-line-shape
+ltwin shape-anchor-key $FG $FG 's#^(      - name: Final gate)$#\1\n        \&a if: false#' final-gate-line-shape
+ltwin shape-anchor-value $FG $FG 's#^(  pull_request:)$#\1 \&p#' final-gate-line-shape
+ltwin shape-alias-value $FG $FG 's#^(    timeout-minutes: 60)$#\1\n    needs: *p#' final-gate-line-shape
+ltwin shape-tag-key $FG $FG 's#^(      - name: Final gate)$#\1\n        !!str if: false#' final-gate-line-shape
+ltwin shape-tag-value $FG $FG 's#^(    timeout-minutes: 60)$#    timeout-minutes: !!int 60#' final-gate-line-shape
+ltwin shape-merge-key $FG $FG 's#^(      - name: Final gate)$#\1\n        <<: *p#' final-gate-line-shape
+ltwin shape-lone-cr $FG $FG "s#$G_RUN#\1$(printf '\r')| tee gate.log#" final-gate-line-shape
+ltwin shape-unicode-line-sep $FG $FG "s#$G_RUN#\1$(printf '\342\200\250')| tee gate.log#" final-gate-line-shape
+ltwin shape-doc-marker $FG $FG 's#^(name: final-gate)$#---\n\1#' final-gate-line-shape
+lclean shape-comments-and-blank-lines $FG $FG 's#^(        run: sh ci/final-gate\.sh)$#\1  \# trailing comment\n\n        \# a comment line#'
 
 # C4 caches and required-name collisions
 ltwin cache-actions $FG $FG "s#$G_STEP#      - uses: actions/cache@v4\n\1#" cache-action

@@ -20,6 +20,8 @@ ALLOWED_PERMS = {"contents", "issues", "pull-requests"}
 FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore", "types"}
 # A YAML mapping key, with optional quotes and optional space before the colon: `if: x`, `"if": x`, `'if' : x`.
 KEY_RE = re.compile(r"""^(\s*)(-\s+)?(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))\s*:(?:\s+(.*))?$""")
+# final-gate.yml only: the one line shape allowed, an unquoted ASCII key, optional `- ` before it, optional value (never `<<`).
+STRICT_RE = re.compile(r"^ *(?:- +)?[A-Za-z0-9_.-]+:(?: +(.*))?$")
 PR_FLOW = re.compile(r"pull_request[\"']?\s*:\s*\{[^}]*\b(paths|paths-ignore|branches|branches-ignore|types)\b")
 
 
@@ -123,6 +125,12 @@ def lint_14c(path, cl):
             bad.append((n, "final-gate-shell-env"))
         if "{" in re.sub(r"\$\{\{.*?\}\}", "", c):
             bad.append((n, "final-gate-flow-style"))
+        # strict line shape: the matcher only sees plain `key:` / `- key:` lines, so refuse any YAML syntax it cannot see
+        # (plain-scalar continuation, `? ` explicit key, anchor, alias, tag, `<<` merge key, directive, document marker,
+        # tab, and any non-ASCII or control char, since NEL / LS / PS / lone CR are YAML line breaks too).
+        sm = STRICT_RE.match(c)
+        if not sm or (sm.group(1) or "")[:1] in ("&", "*", "!", "?") or re.search(r"[^\x20-\x7e]", c):
+            bad.append((n, "final-gate-line-shape"))
     # job reported names (the name: when set, else the job id) that collide with a required check
     sec = section(cl, "jobs")
     if sec:
