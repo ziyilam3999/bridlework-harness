@@ -1,0 +1,16 @@
+{
+  "id": "EX-1",
+  "repo_id": "scratch-1",
+  "title": "Example ticket",
+  "group": "examples",
+  "size": "S",
+  "objective": "Show the eleven-field ticket shape that the strict reader accepts.",
+  "acceptance_criteria": [
+    "The reader loads this file.",
+    "Every field comes back as written."
+  ],
+  "dependencies": ["EX-0"],
+  "risk": "normal",
+  "owner_role": "execution_verification",
+  "evidence_links": ["docs/ticket-contract.md"]
+}
