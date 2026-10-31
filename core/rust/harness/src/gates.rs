@@ -786,7 +786,7 @@ mod tests {
     fn the_committed_seed_gate_and_schema_match_the_loader() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let gates = Gates::load(&repo).expect("the committed gates folder loads");
-        assert_eq!(gates.ids(), vec!["cargo-test"], "path-map.json is reserved, the carrier and README are ignored");
+        assert_eq!(gates.ids(), vec!["cargo-test", "core-layering"], "path-map.json is reserved, the carrier and README are ignored");
         let seed = gates.get("cargo-test").unwrap();
         assert!(!seed.both_ends);
         assert!(to_check(&repo, seed).is_ok(), "the seed's program resolves under the repo");
