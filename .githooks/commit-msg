@@ -1,0 +1,25 @@
+#!/bin/sh
+# commit-msg privacy gate. Scans the whole raw message file (comment lines included) with the engine's text mode
+# and refuses the commit when the engine reports a hit or cannot decide (fail closed). No switch, no bypass.
+msg="$1"
+if [ -z "$msg" ] || [ ! -f "$msg" ] || [ ! -r "$msg" ]; then
+  echo "commit-msg: message file missing or unreadable; refusing" >&2
+  exit 1
+fi
+top=$(git rev-parse --show-toplevel) || exit 1
+eng="$top/core/rust/target/release/harness"
+if [ ! -x "$eng" ]; then
+  echo "commit-msg: privacy engine missing; build it with: cd core/rust && cargo build --release" >&2
+  exit 1
+fi
+out=$("$eng" privacy scan --text --surface commit_message <"$msg" 2>/dev/null); rc=$?
+if [ "$rc" -eq 0 ]; then
+  exit 0
+fi
+if [ "$rc" -eq 1 ]; then
+  "$eng" privacy explain --text --surface commit_message <"$msg" >&2 2>/dev/null
+else
+  echo "commit-msg: engine error (exit $rc); refusing" >&2
+fi
+echo "commit-msg: refused by the privacy gate" >&2
+exit 1

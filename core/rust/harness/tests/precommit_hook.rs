@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 const HOOK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.githooks/pre-commit");
+const MSG_HOOK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.githooks/commit-msg");
 const README: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../README.md");
 
 fn j(parts: &[&str]) -> String {
@@ -111,6 +112,15 @@ impl Scratch {
         assert_eq!(self.git(&["config", "core.hooksPath", ".githooks"]).0, 0);
     }
 
+    /// Turn only the message hook on, so a message test can be judged by that hook alone.
+    fn enable_msg_hook(&self) {
+        let d = self.dir.join(".githooks");
+        fs::create_dir_all(&d).unwrap();
+        fs::copy(MSG_HOOK, d.join("commit-msg")).unwrap();
+        chmod(&d.join("commit-msg"), 0o755);
+        assert_eq!(self.git(&["config", "core.hooksPath", ".githooks"]).0, 0);
+    }
+
     /// Seed a first commit with no hook on (so a planted string can already sit in history).
     fn seed(&self, rel: &str, content: &str) {
         self.stage(rel, content);
@@ -127,8 +137,12 @@ impl Scratch {
     }
 
     fn commit_with(&self, msg: &str) -> (i32, String) {
+        self.run_commit(&["-m", msg])
+    }
+
+    fn run_commit(&self, args: &[&str]) -> (i32, String) {
         let mut c = self.cmd("git");
-        c.args(["commit", "-q", "-m", msg]);
+        c.arg("commit").arg("-q").args(args);
         if let Some(l) = &self.list {
             c.env("HARNESS_PRIVACY_LIST_SECRET", l);
         }
@@ -507,4 +521,332 @@ fn ac10_readme_has_map_line_and_turn_on_line() {
     let r = fs::read_to_string(README).unwrap();
     assert!(r.contains("`.githooks/pre-commit`"), "map line for the hook is missing");
     assert_eq!(r.matches("git config core.hooksPath .githooks").count(), 1, "turn-on line must appear exactly once");
+}
+
+// ================= Q1-2: the commit-msg hook =================
+// These tests turn on the message hook alone, so every refusal below comes from it.
+
+fn msg_ready(name: &str, root: bool) -> Scratch {
+    let s = scratch(name);
+    s.install_engine();
+    if !root {
+        s.seed("seed.txt", CLEAN);
+    }
+    s.enable_msg_hook();
+    s
+}
+
+impl Scratch {
+    /// Commit the staged change with `msg`, passed by `-m` or by a message file (`-F`).
+    fn commit_message(&self, msg: &str, by_file: bool) -> (i32, String) {
+        if !by_file {
+            return self.run_commit(&["-m", msg]);
+        }
+        let p = self.dir.with_extension("msg");
+        fs::write(&p, format!("{}\n", msg)).unwrap();
+        let r = self.run_commit(&["-F", p.to_str().unwrap()]);
+        let _ = fs::remove_file(&p);
+        r
+    }
+
+    /// Refused: non-zero exit, state identical, the report names the class and the message surface, no matched bytes.
+    fn assert_msg_refused(&self, msg: &str, by_file: bool, class: &str, marker: &str) -> String {
+        let before = self.state();
+        let (rc, t) = self.commit_message(msg, by_file);
+        assert_ne!(rc, 0, "{}: message was not refused (file={})", class, by_file);
+        assert_eq!(before, self.state(), "{}: state changed by a refused commit", class);
+        assert!(t.contains(&format!("class={}", class)), "{}: class not named in: {}", class, t);
+        assert!(t.contains("commit_message"), "{}: report does not name the message surface: {}", class, t);
+        if !marker.is_empty() {
+            assert!(!t.contains(marker), "{}: output carried the matched bytes", class);
+        }
+        t
+    }
+
+    fn assert_msg_commits(&self, msg: &str, by_file: bool, why: &str) {
+        let n = |s: &Scratch| s.git(&["rev-list", "--all", "--count"]).1.trim().parse::<i32>().unwrap();
+        let before = n(self);
+        let (rc, t) = self.commit_message(msg, by_file);
+        assert_eq!(rc, 0, "{}: clean message refused: {}", why, t);
+        assert_eq!(n(self), before + 1, "{}: HEAD did not advance by one", why);
+    }
+
+    /// Run the message hook directly on a message file, from inside the scratch repo.
+    fn run_msg_hook(&self, arg: Option<&Path>) -> (i32, String) {
+        let mut c = self.cmd("sh");
+        c.arg(self.dir.join(".githooks/commit-msg"));
+        if let Some(a) = arg {
+            c.arg(a);
+        }
+        if let Some(l) = &self.list {
+            c.env("HARNESS_PRIVACY_LIST_SECRET", l);
+        }
+        for (k, v) in &self.extra_env {
+            c.env(k, v);
+        }
+        let o = c.output().unwrap();
+        let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+        t.push_str(&String::from_utf8_lossy(&o.stderr));
+        (o.status.code().unwrap(), t)
+    }
+}
+
+// ---- AC 12: message carries a string ----
+
+fn msg_cases() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("home-raw", "home-path"),
+        ("home-dash", "home-path"),
+        ("email", "email"),
+        ("deny-profile", "deny-token"),
+        ("deny-employer", "deny-token"),
+        ("regulated", "regulated-id"),
+        ("credential", "credential"),
+    ]
+}
+
+#[test]
+fn ac12_message_carries_a_string_by_flag_and_by_file() {
+    for (fixture, class) in msg_cases() {
+        for by_file in [false, true] {
+            let s = msg_ready(&format!("m12-{}-{}", fixture, by_file), false);
+            s.stage("f.txt", CLEAN);
+            let planted = format!("change\n\n{}", fx_line(fixture));
+            s.assert_msg_refused(&planted, by_file, class, &fx_marker(fixture));
+            // the same staged change with a clean message goes through
+            s.assert_msg_commits("change", by_file, &format!("{} clean twin", fixture));
+        }
+    }
+}
+
+#[test]
+fn ac12_upper_case_list_tokens_in_message_are_refused() {
+    for fixture in ["deny-profile", "regulated"] {
+        let s = msg_ready(&format!("m12up-{}", fixture), false);
+        s.stage("f.txt", CLEAN);
+        let m = fx_marker(fixture);
+        let class = if fixture == "regulated" { "regulated-id" } else { "deny-token" };
+        s.assert_msg_refused(&format!("note {}", m.to_uppercase()), false, class, &m.to_uppercase());
+    }
+}
+
+#[test]
+fn ac12_message_judged_alone_staged_content_is_not_its_business() {
+    // a planted line already in the staged change does not stop the message hook (the file hook owns that)
+    let s = msg_ready("m12-staged-plant", false);
+    s.stage("f.txt", &fx_line("home-raw"));
+    s.assert_msg_commits("change", false, "message hook ignores staged content");
+    // a removal-only commit with a clean message commits
+    let s = scratch("m12-removal");
+    s.install_engine();
+    s.seed("f.txt", &fx_line("home-raw"));
+    s.enable_msg_hook();
+    s.stage("f.txt", CLEAN);
+    s.assert_msg_commits("remove the planted line", false, "removal-only commit");
+}
+
+#[test]
+fn ac12_root_commit_message() {
+    let s = msg_ready("m12-root", true);
+    assert_ne!(s.git(&["rev-parse", "-q", "--verify", "HEAD"]).0, 0, "scratch repo must start unborn");
+    s.stage("f.txt", CLEAN);
+    s.assert_msg_refused(&fx_line("home-raw"), false, "home-path", &fx_marker("home-raw"));
+    s.assert_msg_commits("first", false, "root clean twin");
+    assert_eq!(s.git(&["rev-list", "--all", "--count"]).1.trim(), "1");
+}
+
+// ---- AC 13: trailers ----
+
+#[test]
+fn ac13_session_trailer_and_coauthor_trailers() {
+    let s = msg_ready("m13", false);
+    s.stage("f.txt", CLEAN);
+    let link = fx_marker("session-link");
+    let session = format!("change\n\n{}{}", j(&["Claude-", "Session: "]), link);
+    s.assert_msg_refused(&session, false, "session-link", &link);
+    let personal = format!("change\n\n{}", engine_out(&["fixtures", "extra", "coauthor-trailer"]));
+    s.assert_msg_refused(&personal, false, "coauthor-personal", &engine_out(&["fixtures", "extra", "addr"]));
+    let noreply = j(&["Co-authored", "-by: Fixture <", "12345+fixture", "@", "users.", "noreply.github.com", ">"]);
+    s.assert_msg_commits(&format!("change\n\n{}", noreply), false, "noreply co-author trailer");
+}
+
+// ---- AC 14: the scan cannot decide ----
+
+fn undecided_msg(name: &str) -> Scratch {
+    let s = msg_ready(name, false);
+    s.stage("f.txt", CLEAN);
+    s
+}
+
+fn assert_msg_undecided(s: &Scratch, why: &str) {
+    let before = s.state();
+    let (rc, _) = s.commit_message("change", false);
+    assert_ne!(rc, 0, "{}: commit was not refused", why);
+    assert_eq!(before, s.state(), "{}: state changed by a refused commit", why);
+}
+
+#[test]
+fn ac14_engine_missing() {
+    let s = scratch("m14-no-engine");
+    s.seed("seed.txt", CLEAN);
+    s.enable_msg_hook();
+    s.stage("f.txt", CLEAN);
+    let before = s.state();
+    let (rc, t) = s.commit_message("change", false);
+    assert_ne!(rc, 0);
+    assert_eq!(before, s.state());
+    assert!(t.contains("engine missing"), "{}", t);
+}
+
+#[test]
+fn ac14_list_not_configured_or_blank() {
+    let mut s = undecided_msg("m14-no-list");
+    s.list = None;
+    assert_msg_undecided(&s, "list not configured");
+    for blank in ["", "   \n\t\n", "# only a comment\n"] {
+        s.list = Some(blank.to_string());
+        assert_msg_undecided(&s, "blank list text");
+    }
+    s.list = None;
+    let empty = s.dir.join("empty.list");
+    fs::write(&empty, "").unwrap();
+    s.extra_env = vec![("HARNESS_PRIVACY_LIST".to_string(), empty.to_string_lossy().into_owned())];
+    assert_msg_undecided(&s, "empty list file");
+}
+
+#[test]
+fn ac14_unreadable_list_file() {
+    let mut s = undecided_msg("m14-bad-list");
+    s.list = None;
+    let missing = s.dir.join("absent.list");
+    s.extra_env = vec![("HARNESS_PRIVACY_LIST".to_string(), missing.to_string_lossy().into_owned())];
+    assert_msg_undecided(&s, "list path missing");
+    let locked = s.dir.join("locked.list");
+    fs::write(&locked, synth_list()).unwrap();
+    chmod(&locked, 0o000);
+    s.extra_env = vec![("HARNESS_PRIVACY_LIST".to_string(), locked.to_string_lossy().into_owned())];
+    assert_msg_undecided(&s, "list file unreadable");
+    chmod(&locked, 0o600);
+}
+
+#[test]
+fn ac14_engine_stub_with_no_verdict() {
+    for code in [2, 3, 127] {
+        let s = scratch(&format!("m14-stub{}", code));
+        s.install_stub_engine(code);
+        s.seed("seed.txt", CLEAN);
+        s.enable_msg_hook();
+        s.stage("f.txt", CLEAN);
+        assert_msg_undecided(&s, &format!("stub engine exit {}", code));
+    }
+}
+
+#[test]
+fn ac14_message_file_missing_unreadable_or_not_utf8() {
+    let s = undecided_msg("m14-msgfile");
+    let (rc, _) = s.run_msg_hook(None);
+    assert_ne!(rc, 0, "no argument must refuse");
+    let (rc, _) = s.run_msg_hook(Some(&s.dir.join("absent.msg")));
+    assert_ne!(rc, 0, "missing message file must refuse");
+    let (rc, _) = s.run_msg_hook(Some(&s.dir));
+    assert_ne!(rc, 0, "a folder in place of the message file must refuse");
+    let locked = s.dir.join("locked.msg");
+    fs::write(&locked, b"clean words\n").unwrap();
+    chmod(&locked, 0o000);
+    let (rc, _) = s.run_msg_hook(Some(&locked));
+    assert_ne!(rc, 0, "unreadable message file must refuse");
+    chmod(&locked, 0o600);
+    let bad = s.dir.join("bad.msg");
+    let mut b = b"plain words ".to_vec();
+    b.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    b.extend_from_slice(b" more words\n");
+    fs::write(&bad, &b).unwrap();
+    let (rc, _) = s.run_msg_hook(Some(&bad));
+    assert_ne!(rc, 0, "message file that is not valid UTF-8 must refuse");
+    // the same hook on a clean readable message file is the control: it passes
+    let good = s.dir.join("good.msg");
+    fs::write(&good, b"clean words\n").unwrap();
+    let (rc, t) = s.run_msg_hook(Some(&good));
+    assert_eq!(rc, 0, "control: clean message refused: {}", t);
+}
+
+// ---- AC 15: no bypass ----
+
+#[test]
+fn ac15a_no_environment_switch_for_messages() {
+    for (fixture, class) in msg_cases() {
+        let mut s = msg_ready(&format!("m15a-{}", fixture), false);
+        s.extra_env = switch_env();
+        s.stage("f.txt", CLEAN);
+        s.assert_msg_refused(&fx_line(fixture), false, class, &fx_marker(fixture));
+    }
+    // the test-mode value would admit the synthetic marker class if the hook honoured it; it must not
+    let mut s = msg_ready("m15a-synthetic", false);
+    s.extra_env = switch_env();
+    s.stage("f.txt", CLEAN);
+    let before = s.state();
+    let (rc, _) = s.commit_message(&engine_out(&["fixtures", "extra", "synthetic"]), false);
+    assert_ne!(rc, 0, "synthetic marker admitted by the test-mode variable");
+    assert_eq!(before, s.state());
+}
+
+#[test]
+fn ac15b_inline_skip_markers_in_message_change_nothing() {
+    let shapes = [
+        "privacy-ok", "# nosec", "harness-skip", "allow-privacy", "NOQA: privacy", "[skip hook]", "no-verify",
+    ];
+    for (fixture, class) in msg_cases() {
+        let s = msg_ready(&format!("m15b-{}", fixture), false);
+        s.stage("f.txt", CLEAN);
+        let mut body = shapes.join("\n");
+        body.push('\n');
+        body.push_str(&fx_line(fixture));
+        s.assert_msg_refused(&body, false, class, &fx_marker(fixture));
+    }
+}
+
+#[test]
+fn ac15c_message_hook_source_has_no_variable_or_testmode_door() {
+    let src = fs::read_to_string(MSG_HOOK).unwrap();
+    assert!(!src.contains(&j(&["HARNESS", "_"])), "hook mentions an engine variable");
+    assert!(!src.contains(&j(&["--test", "mode"])), "hook passes the test-mode argument");
+    assert!(!src.contains(&j(&["test", "mode"])), "hook mentions test mode");
+    assert!(!src.contains("--no-verify"));
+}
+
+#[test]
+fn ac15d_message_hook_uses_text_mode_only_and_rewrites_nothing() {
+    let src = fs::read_to_string(MSG_HOOK).unwrap();
+    for other in ["--staged", "--range", "--tree", "--tag", "git add", "update-index", "checkout", "reset", "git rm", "write-tree"] {
+        assert!(!src.contains(other), "hook uses {}", other);
+    }
+    assert!(src.contains("privacy scan --text"));
+    let s = undecided_msg("m15d");
+    let planted = s.dir.join("planted.msg");
+    let body = format!("change\n\n{}\n", fx_line("home-raw"));
+    fs::write(&planted, &body).unwrap();
+    let index = s.git(&["ls-files", "-s"]).1;
+    let (rc, t) = s.run_msg_hook(Some(&planted));
+    assert_eq!(rc, 1, "{}", t);
+    assert_eq!(fs::read_to_string(&planted).unwrap(), body, "hook rewrote the message file");
+    assert_eq!(index, s.git(&["ls-files", "-s"]).1, "index changed by the hook");
+}
+
+// ---- AC 16: comment lines are not exempt (OQ4 answered: the raw message file is judged) ----
+
+#[test]
+fn ac16_comment_looking_lines_are_judged_raw() {
+    let s = undecided_msg("m16");
+    let planted = s.dir.join("c.msg");
+    fs::write(&planted, format!("change\n\n# {}\n", fx_line("home-raw"))).unwrap();
+    let (rc, t) = s.run_msg_hook(Some(&planted));
+    assert_eq!(rc, 1, "comment line planted: {}", t);
+    assert!(t.contains("class=home-path"), "{}", t);
+    // through git, the comment line is still judged raw (git strips it only after this hook has run)
+    let before = s.state();
+    let (rc, t) = s.commit_message(&format!("change\n\n# {}", fx_line("home-raw")), true);
+    assert_ne!(rc, 0, "comment-looking planted line let through: {}", t);
+    assert_eq!(before, s.state());
+    // clean twin: an ordinary comment line commits
+    s.assert_msg_commits("change\n\n# an ordinary note", true, "ordinary comment line");
 }
