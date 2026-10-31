@@ -554,6 +554,26 @@ fn errors_after_the_pay_point_cost_a_round() {
     assert_eq!(fx.rec("T-1"), canon("T-1", 2, false), "the dead run is folded first");
 }
 
+// AC 7 (fold-late mutants): a dead 4th run (fix_rounds=3, in_flight=true) is folded in BEFORE the cap is decided, so the
+// next run is refused. Deciding on fix_rounds alone, or folding after the verdict, would let it run. Twin: AC 1 (3, false) runs.
+#[test]
+fn a_dead_fourth_run_is_folded_in_before_the_cap_is_decided() {
+    let (fx, c1) = Fx::failing();
+    assert_eq!(code(&gate(&fx)), 1, "one real run leaves T-1.json in place");
+    assert!(fx.result_file("T-1").exists());
+    fx.plant("T-1", 3, true);
+    let (before_markers, before_rec, before_result) = (fx.markers(), fx.rec("T-1"), fs::read(fx.result_file("T-1")).unwrap());
+    assert_eq!(before_rec, canon("T-1", 3, true));
+    assert!(!fx.caps.join("events.jsonl").exists(), "no refusal yet, so no event");
+    let o = gate(&fx);
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    assert_eq!(out(&o), refused_line("T-1", &c1));
+    assert_eq!(fx.markers(), before_markers, "no check ran");
+    assert_eq!(fx.rec("T-1"), before_rec, "the record is unchanged");
+    assert_eq!(fs::read(fx.result_file("T-1")).unwrap(), before_result, "the result file is untouched");
+    assert_eq!(event_lines(&fx).len(), 1, "exactly one escalation event");
+}
+
 // AC 8: verdicts that run no check still cost a round. Twin: a check-failed FAIL (AC 1).
 #[test]
 fn verdicts_that_run_no_check_count_as_rounds() {
