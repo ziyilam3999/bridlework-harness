@@ -231,6 +231,11 @@ impl Gate {
     }
 }
 
+/// The one shape of a per-file refusal: it always names the file.
+fn refuse(name: &str, why: &str) -> String {
+    format!("gates/{}: {}", name, why)
+}
+
 /// Every gate under `<repo_root>/gates/`, sorted by id.
 #[derive(Debug)]
 pub struct Gates {
@@ -257,26 +262,26 @@ impl Gates {
                 continue;
             }
             let path = dir.join(&name);
-            let meta = std::fs::metadata(&path).map_err(|_| format!("gates/{}: unreadable", name))?;
+            let meta = std::fs::metadata(&path).map_err(|_| refuse(&name, "unreadable"))?;
             if !meta.is_file() {
-                return Err(format!("gates/{}: not a regular file", name));
+                return Err(refuse(&name, "not a regular file"));
             }
             let stem = match name.strip_suffix(".json") {
                 Some(s) => s,
                 None => continue,
             };
-            let real = path.canonicalize().map_err(|_| format!("gates/{}: unreadable", name))?;
+            let real = path.canonicalize().map_err(|_| refuse(&name, "unreadable"))?;
             if !real.starts_with(&root) {
-                return Err(format!("gates/{}: escapes the repo", name));
+                return Err(refuse(&name, "escapes the repo"));
             }
-            let f = std::fs::File::open(&real).map_err(|_| format!("gates/{}: unreadable", name))?;
+            let f = std::fs::File::open(&real).map_err(|_| refuse(&name, "unreadable"))?;
             let mut bytes = Vec::new();
-            f.take(MAX_GATE_BYTES + 1).read_to_end(&mut bytes).map_err(|_| format!("gates/{}: unreadable", name))?;
+            f.take(MAX_GATE_BYTES + 1).read_to_end(&mut bytes).map_err(|_| refuse(&name, "unreadable"))?;
             if bytes.len() as u64 > MAX_GATE_BYTES {
-                return Err(format!("gates/{}: too large", name));
+                return Err(refuse(&name, "too large"));
             }
-            let text = String::from_utf8(bytes).map_err(|_| format!("gates/{}: not utf-8", name))?;
-            gates.push(Gate::parse(&text, stem).map_err(|e| format!("gates/{}: {}", name, e))?);
+            let text = String::from_utf8(bytes).map_err(|_| refuse(&name, "not utf-8"))?;
+            gates.push(Gate::parse(&text, stem).map_err(|e| refuse(&name, &e))?);
         }
         if gates.is_empty() {
             return Err("gates folder holds no gate files".to_string());
@@ -510,6 +515,7 @@ mod tests {
             ("args NUL escape", sw(VALID, r#""args":[]"#, r#""args":["a\u0000b"]"#), "NUL byte"),
             ("args not an array", sw(VALID, r#""args":[]"#, r#""args":"x""#), "expected '['"),
             ("unknown key", sw(VALID, r#""both_ends":false"#, r#""both_ends":false,"extra":1"#), "unknown key"),
+            ("missing colon after a key", sw(VALID, r#""id":"g1""#, r#""id" "g1""#), "expected ':'"),
             ("duplicate key", sw(VALID, r#""both_ends":false"#, r#""both_ends":false,"id":"g1""#), "duplicate key"),
             ("trailing garbage", format!("{}x", VALID), "trailing bytes"),
             ("bad escape", sw(VALID, "ci/c.sh", r"a\qb"), "bad escape"),
@@ -525,7 +531,7 @@ mod tests {
             assert!(e.contains("g1.json"), "arm {}: file named: {}", name, e);
             assert!(e.contains(why), "arm {} refused for the wrong reason: {}", name, e);
             let field = match name.split(' ').next().unwrap() {
-                "id" => Some("`id`"),
+                "id" | "missing" | "duplicate" => Some("`id`"),
                 "program" | "bad" | "lone" | "signed" | "short" => Some("`program`"),
                 "timeout" => Some("`timeout_ms`"),
                 "max" => Some("`max_output_bytes`"),
@@ -597,6 +603,23 @@ mod tests {
         assert!(e.contains("Cargo-Test.json") && e.contains("`id`"), "{}", e);
         #[cfg(unix)]
         {
+            let d = Scratch::new("dangling");
+            put(&d.0, "gates/g1.json", VALID.as_bytes());
+            std::os::unix::fs::symlink(d.0.join("nowhere"), d.0.join("gates/d.json")).unwrap();
+            let e = Gates::load(&d.0).unwrap_err();
+            assert!(e.contains("gates/d.json"), "a dangling symlink is refused naming the file: {}", e);
+            let z = Scratch::new("noread");
+            put(&z.0, "gates/g1.json", VALID.as_bytes());
+            put(&z.0, "gates/z.json", sw(VALID, r#""id":"g1""#, r#""id":"z""#).as_bytes());
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(z.0.join("gates/z.json"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            // a process that can read a mode-000 file (root) cannot plant this arm
+            if std::fs::File::open(z.0.join("gates/z.json")).is_err() {
+                let e = Gates::load(&z.0).unwrap_err();
+                assert!(e.contains("gates/z.json"), "an unreadable file is refused naming the file: {}", e);
+            }
             let f = Scratch::new("fifo");
             put(&f.0, "gates/g1.json", VALID.as_bytes());
             let made = Command::new("mkfifo").arg(f.0.join("gates/pipe")).status().expect("mkfifo runs");
@@ -712,6 +735,21 @@ mod tests {
             assert_eq!((spec.budget, spec.max_output), (Duration::from_millis(20000), 4000));
         })
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_and_building_a_check_run_nothing() {
+        let s = Scratch::new("norun");
+        let marker = s.0.join("ran.txt");
+        put(&s.0, "gates/mark.json", sw(VALID, r#""id":"g1""#, r#""id":"mark""#).replace("ci/c.sh", "mark.sh").as_bytes());
+        put_exec(&s.0, "mark.sh", &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+        let gates = Gates::load(&s.0).expect("the gate loads");
+        assert!(!marker.exists(), "load ran a gate's program");
+        let _check = to_check(&s.0, gates.get("mark").unwrap()).expect("the check builds");
+        assert!(!marker.exists(), "building a check ran the program");
+        let _ = with_spec(gates.get("mark").unwrap(), |_| ()).unwrap();
+        assert!(!marker.exists(), "building a spec ran the program");
     }
 
     #[test]
