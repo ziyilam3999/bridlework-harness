@@ -6,6 +6,10 @@
 # only, never the matched text), nothing on stdout. Any failure of the hook itself is converted to exit 2
 # (only exit 2 blocks in Claude Code). Not a firewall for other repos: a write that provably targets another
 # repo passes unscanned. If the hook is not sure it says no.
+# Program-word rule: a command is waved through unread only when its text has no "gh" and every word is made of
+# safe characters. Every other command is parsed, and the program word of every command (also inside $(..),
+# backticks and <(..)) must be a plain literal from a small safe set; an allowed prefix (env, command, ...) followed
+# by any option is refused. Unparseable text is refused. No pattern matcher is ever asked "could this be gh?".
 # Test-only override named here (the smoke names its own in its header): HARNESS_TEST_SWAP_FILE, a path; when it
 # equals the body file being read, the hook rewrites that file between its two stats, which can only force a
 # refusal. It does nothing when unset.
@@ -54,14 +58,12 @@ def has_control(s):
 
 # ------------------------------------------------------------------ tokenizer
 class W(object):
-    __slots__ = ("text", "raw", "dyn", "glob", "quoted", "ansi")
+    __slots__ = ("text", "raw", "dyn", "quoted")
 
     def __init__(self):
-        self.ansi = False     # an unquoted $'...' or $"..." inside the word
         self.text = ""
-        self.raw = ""
+        self.raw = ""         # the source slice of the word, exactly as written (quotes and backslashes included)
         self.dyn = False      # any expansion, glob, brace, leading ~ or =, process substitution
-        self.glob = False     # unquoted glob or brace character
         self.quoted = False   # a quote or backslash inside the word
 
 
@@ -70,11 +72,60 @@ class Parsed(object):
         self.cmds = []
         self.heredoc = False
         self.paren = False
+        self.subs = []        # (kind, text): "cmd" = the inside of $(..), backticks, <(..); "nest" = a group whose commands are not run
+        self.pats = set()     # indexes into cmds of case-pattern words (the words before an unmatched ")")
+
+
+def heredoc_start(s, i):
+    # s[i:i+2] == "<<" and s[i+2] is not "<": return (delimiter, strip_tabs, index after the delimiter word), or None
+    n = len(s)
+    j = i + 2
+    strip = False
+    if j < n and s[j] == "-":
+        strip = True
+        j += 1
+    while j < n and s[j] in " \t":
+        j += 1
+    d = []
+    while j < n:
+        c = s[j]
+        if c in "'\"":
+            k = s.find(c, j + 1)
+            if k < 0:
+                return None
+            d.append(s[j + 1:k])
+            j = k + 1
+            continue
+        if c == "\\" and j + 1 < n:
+            d.append(s[j + 1])
+            j += 2
+            continue
+        if c in " \t\n;&|()<>":
+            break
+        d.append(c)
+        j += 1
+    if not d:
+        return None
+    return "".join(d), strip, j
+
+
+def heredoc_skip(s, i, delim, strip):
+    # i is just after a newline: return the index after the line that closes the here-document (or the end)
+    n = len(s)
+    while i < n:
+        j = s.find("\n", i)
+        line = s[i:] if j < 0 else s[i:j]
+        nxt = n if j < 0 else j + 1
+        if (line.lstrip("\t") if strip else line) == delim:
+            return nxt
+        i = nxt
+    return n
 
 
 def skip_paren(s, i, st):
     # s[i] == "(": return the index after its matching ")"; a quote-aware scan, unbalanced is unparseable
     depth = 0
+    pending = []
     n = len(s)
     while i < n:
         c = s[i]
@@ -93,8 +144,22 @@ def skip_paren(s, i, st):
                 i += 2 if s[i] == "\\" else 1
             i += 1
             continue
+        if c == "\n" and pending:  # G:heredoc_skip
+            i += 1
+            for d, sp in pending:
+                i = heredoc_skip(s, i, d, sp)
+            pending = []
+            continue
         if c == "<" and s[i:i + 2] == "<<":
             st.heredoc = True
+            if s[i:i + 3] == "<<<":
+                i += 3
+                continue
+            hs = heredoc_start(s, i)
+            if hs is not None:
+                pending.append((hs[0], hs[1]))
+                i = hs[2]
+                continue
         if c == "(":
             depth += 1
         elif c == ")":
@@ -118,12 +183,25 @@ def skip_backtick(s, i):
     refuse("refused: gh text: unparseable command (backtick)")
 
 
+def note_paren(st, s, p, k):
+    # s[p] == "(" opened a substitution that ends at k (after its ")"). $((..)) is arithmetic: only what is nested in it runs.
+    if s[p + 1:p + 2] == "(":
+        k2 = skip_paren(s, p + 1, st)
+        if k2 == k - 1:
+            st.subs.append(("nest", s[p + 2:k2 - 1]))
+            return
+    st.subs.append(("cmd", s[p + 1:k - 1]))
+
+
 def tokenize(s):
     st = Parsed()
     cur = []
+    chain = []
     w = None
     wstart = 0
     redir = False
+    depth = 0
+    pending = []
     i = 0
     n = len(s)
 
@@ -142,9 +220,11 @@ def tokenize(s):
     def endcmd():
         nonlocal cur, redir
         redir = False
+        added = bool(cur)
         if cur:
             st.cmds.append(cur)
         cur = []
+        return added
 
     def begin(pos):
         nonlocal w, wstart
@@ -162,7 +242,12 @@ def tokenize(s):
         if c == "\n":  # G:chain_split
             endword(i)
             endcmd()
+            chain.clear()
             i += 1
+            if pending:  # G:heredoc_skip  (a here-document body is data, not commands)
+                for d, sp in pending:
+                    i = heredoc_skip(s, i, d, sp)
+                pending = []
             continue
         if c == "\\" and i + 1 < n and s[i + 1] == "\n":
             i += 2
@@ -173,7 +258,12 @@ def tokenize(s):
             continue
         if c in ";|":  # G:chain_split
             endword(i)
-            endcmd()
+            single_pipe = c == "|" and s[i + 1:i + 2] not in ("|", "&")
+            added = endcmd()
+            if single_pipe and added:
+                chain.append(len(st.cmds) - 1)   # a case pattern list is a | b | c)
+            else:
+                chain.clear()
             i += 1
             while i < n and s[i] in ";|&":
                 i += 1
@@ -189,6 +279,7 @@ def tokenize(s):
             if True:  # G:chain_split
                 endword(i)
                 endcmd()
+                chain.clear()
                 i += 1
                 while i < n and s[i] in ";|&":
                     i += 1
@@ -197,11 +288,17 @@ def tokenize(s):
             if i + 1 < n and s[i + 1] == "(":
                 x = begin(i)
                 x.dyn = True
-                i = skip_paren(s, i + 1, st)
+                k = skip_paren(s, i + 1, st)
+                note_paren(st, s, i + 1, k)
+                i = k
                 continue
             endword(i)
             if s[i:i + 2] == "<<":
                 st.heredoc = True
+                if s[i:i + 3] != "<<<":
+                    hs = heredoc_start(s, i)
+                    if hs is not None:
+                        pending.append((hs[0], hs[1]))
             redir = True
             i += 1
             while i < n and s[i] in "<>&|-":
@@ -209,9 +306,30 @@ def tokenize(s):
                     break
                 i += 1
             continue
+        if c == "(" and w is not None and s[i + 1:i + 2] != ")":  # G:glued_paren
+            # a "(" touching a word is part of that word: a zsh glob group (g(h|x), /abs/(g)h) or an array value (a=(b c))
+            x = w
+            x.dyn = True
+            k = skip_paren(s, i, st)
+            x.text += s[i:k]
+            st.subs.append(("nest", s[i + 1:k - 1]))
+            i = k
+            continue
         if c in "()":
             endword(i)
-            endcmd()
+            if c == "(":
+                depth += 1
+                endcmd()
+                chain.clear()
+            elif depth > 0:
+                depth -= 1
+                endcmd()
+                chain.clear()
+            else:  # an unmatched ")" ends a case pattern list: those words are patterns, not program words
+                if endcmd():
+                    chain.append(len(st.cmds) - 1)
+                st.pats.update(chain)
+                chain.clear()
             st.paren = True
             i += 1
             continue
@@ -251,6 +369,7 @@ def tokenize(s):
                     x.dyn = True
                     k = skip_backtick(s, i)
                     x.text += s[i:k]
+                    st.subs.append(("cmd", s[i + 1:k - 1]))
                     i = k
                     continue
                 if d == "$":
@@ -259,6 +378,7 @@ def tokenize(s):
                         x.dyn = True
                         k = skip_paren(s, i + 1, st)
                         x.text += s[i:k]
+                        note_paren(st, s, i + 1, k)
                         i = k
                         continue
                     if nx and (nx.isalnum() or nx in "_@*#?!$-{["):
@@ -280,6 +400,7 @@ def tokenize(s):
             x.dyn = True
             k = skip_backtick(s, i)
             x.text += s[i:k]
+            st.subs.append(("cmd", s[i + 1:k - 1]))
             i = k
             continue
         if c == "$":
@@ -288,11 +409,11 @@ def tokenize(s):
                 x.dyn = True
                 k = skip_paren(s, i + 1, st)
                 x.text += s[i:k]
+                note_paren(st, s, i + 1, k)
                 i = k
                 continue
             if nx == "'":
                 x.dyn = True
-                x.ansi = True
                 x.quoted = True
                 j = i + 2
                 while j < n and s[j] != "'":
@@ -304,14 +425,11 @@ def tokenize(s):
                 continue
             if nx and (nx.isalnum() or nx in "_@*#?!$-{[\"'"):
                 x.dyn = True
-            if nx == '"':
-                x.ansi = True
             x.text += c
             i += 1
             continue
         if c in "*?[{":
             x.dyn = True
-            x.glob = True
             x.text += c
             i += 1
             continue
@@ -321,6 +439,7 @@ def tokenize(s):
             x.dyn = True
             k = skip_paren(s, i + 1, st)
             x.text += s[i:k]
+            note_paren(st, s, i + 1, k)
             i = k
             continue
         x.text += c
@@ -438,6 +557,14 @@ RO_GROUPS = {"pr", "issue", "run", "release", "workflow", "repo", "gist", "label
 RO_SUBS = {"list", "view", "status", "checks", "diff", "watch", "download", "checkout", "ready"}
 RO_TOP = {"browse", "search", "status"}
 PREFIXES = {"command", "env", "exec", "time", "nohup", "builtin", "sudo"}
+# Words after which the next word is a command again (if/while conditions, then/else/do bodies, group and negation).
+KEYWORDS = {"if", "elif", "while", "until", "then", "else", "do", "!", "{", "coproc"}
+# A program word is a plain literal only if every character is in this set (no glob, bracket, brace, group, quote,
+# dollar, backtick, backslash, tilde, equals, control or non-ASCII character).
+SAFE_WORD = re.compile(r"[A-Za-z0-9_./+@:%,-]+")
+SAFE_TOKEN = re.compile(r"[A-Za-z0-9_./+@:%,-][A-Za-z0-9_./+@:%,=-]*")
+PROGRAM_OK = {"[", "[[", "{", "}", "!"}   # one-character words that no pattern can turn into a two-letter name
+MAX_DEPTH = 8
 API_BAD_LONG = {"--method", "--field", "--raw-field", "--input"}
 
 # ------------------------------------------------------------------ repo grammar
@@ -485,7 +612,8 @@ class Call(object):
 
 
 def is_assign(w):
-    return (not w.quoted) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\+)?=", w.raw) is not None
+    # the name is literal by the pattern on the source slice; the value may carry quotes (FOO="a b" cmd)
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\+)?=", w.raw) is not None
 
 
 def is_prefix(w):
@@ -495,13 +623,64 @@ def is_prefix(w):
     return base in PREFIXES
 
 
-def flag_name(word):
-    t = word.text
-    if t.startswith("--"):
-        if "=" in t:
-            return t.split("=", 1)[0], t.split("=", 1)[1], True
-        return t, None, False
-    return t, None, False
+def lead_index(ws, skip_keywords):
+    """Index of the program word of one command: after assignments, allowed prefixes and (when asked) shell keywords.
+    An allowed prefix followed by any option is refused: its option can change which word is the program."""
+    i = 0
+    n = len(ws)
+    while i < n:
+        w = ws[i]
+        if is_assign(w):
+            i += 1
+            continue
+        if skip_keywords and (not w.quoted) and w.raw in KEYWORDS:  # G:keyword_skip
+            i += 1
+            continue
+        if skip_keywords and (not w.quoted) and w.raw == "function":  # G:keyword_skip
+            i += 2  # function NAME
+            continue
+        if is_prefix(w):  # G:wrapper
+            i += 1
+            if i < n and (ws[i].raw.startswith("-") or ws[i].text.startswith("-")):  # G:prefix_option
+                refuse("refused: gh text: an option after a command prefix")
+            continue
+        break
+    return i if i < n else None
+
+
+def program_ok(p):
+    """A program word is accepted only as a plain literal: every character in the safe set, nothing quoted or expanded.
+    Anything else could be spelling the GitHub CLI by glob, bracket, brace, group, quote, expansion or escape."""
+    if p.raw in PROGRAM_OK:
+        return True
+    return (not p.quoted) and (not p.dyn) and SAFE_WORD.fullmatch(p.raw) is not None
+
+
+def check_program_words(st, depth, nest=False):
+    """Default deny: every command, including those inside $(..), backticks and <(..), must run a plain literal program."""
+    if depth > MAX_DEPTH:  # G:sub_depth
+        refuse("refused: gh text: command substitution nested too deeply")
+    if not nest:
+        for idx, ws in enumerate(st.cmds):
+            if idx in st.pats:  # G:case_pattern
+                continue
+            i = lead_index(ws, True)
+            if i is None:
+                continue
+            if not program_ok(ws[i]):  # G:progword_literal
+                refuse("refused: gh text: a program word that is not a plain literal")
+    for kind, text in st.subs:  # G:sub_recurse
+        check_program_words(tokenize(text), depth + 1, kind == "nest")
+
+
+def plain_command(cmd):
+    """True when nothing in the text can spell the GitHub CLI: no 'gh' anywhere and every word made of safe characters."""
+    if "gh" in cmd.lower():
+        return False
+    for tok in re.split(r"[ \t\n;&|<>]+", cmd):
+        if tok != "" and SAFE_TOKEN.fullmatch(tok) is None:
+            return False
+    return True
 
 
 def analyse_api(ws):
@@ -829,37 +1008,25 @@ def main():
     if not isinstance(cmd, str) or cmd == "":  # G:command_missing
         refuse("refused: the tool input has no command")
 
-    # Is any `gh` possibly in play? A bare mention, or a glob or brace word that could expand to it.
-    joined = cmd
-    if "\\\n" in cmd:  # G:bslash_newline
-        joined = cmd.replace("\\\n", "")
-    maybe = MENTION.search(cmd) is not None or MENTION.search(re.sub(r"['\"\\]", "", joined)) is not None
-    if "$'" in cmd or '$"' in cmd:  # G:ansi_prefilter
-        maybe = True  # an ANSI-C or locale quote can spell the program word in a way no scan here decodes
-    if not maybe:
-        for tok in re.split(r"[\s;&|()<>]+", joined):
-            base = tok.rsplit("/", 1)[-1].replace("'", "").replace('"', "").replace("\\", "")
-            if "{" in tok:  # G:brace_prefilter  (the whole word: a slash inside the braces must not hide it)
-                maybe = True  # brace expansion (lists, ranges, nesting) can spell the program word; never try to decide
-                break
-            if any(ch in base for ch in "*?["):
-                if glob_could_be_gh(base):
-                    maybe = True
-                    break
-    if not maybe:
-        # zsh glob grouping and alternation, such as g(h|x): the split above cuts the word at the parenthesis
-        for tok in re.split(r"[\s;&<>]+|\|(?![^()]*\))", joined):
-            base = tok.rsplit("/", 1)[-1].replace("'", "").replace('"', "").replace("\\", "")
-            if re.search(r"[A-Za-z0-9_*?\]}]\(", base) and not base.startswith(("$", "(", "=")):
-                if glob_could_be_gh(base):  # G:zsh_paren
-                    maybe = True
-                    break
-    if not maybe:
+    # Is the GitHub CLI possibly in play? A bare mention of it, or any command this hook cannot read as plain words.
+    # Nothing is let through on a "no" from pattern matching: only a text with no "gh" in it and nothing but safe
+    # characters in every word is waved through unread; every other command is parsed and every program word must be
+    # a plain literal (unparseable means cannot decide, and cannot decide means refuse).
+    mention = MENTION.search(cmd) is not None or MENTION.search(re.sub(r"['\"\\]", "", cmd)) is not None
+    if not mention and plain_command(cmd):  # G:plain_fast
         return
-    if has_control(cmd):
+    if mention and has_control(cmd):
         refuse("refused: gh text: control characters in the command")
 
-    st = tokenize(cmd)
+    try:
+        st = tokenize(cmd)
+    except Refuse:
+        if True:  # G:cannot_decide
+            raise
+        return
+    check_program_words(st, 0)
+    if not mention:
+        return
     if st.heredoc:  # G:heredoc
         refuse("refused: gh text: heredoc in a gh command")
     if st.paren:  # G:wrapper
@@ -870,35 +1037,17 @@ def main():
     stray = False
     chain_has_cd = False
     for ws in st.cmds:
-        i = 0
-        n = len(ws)
-        while i < n:
-            w = ws[i]
-            if is_assign(w):
-                i += 1
-                continue
-            if is_prefix(w):  # G:wrapper
-                i += 1
-                continue
-            break
-        if i >= n:
+        i = lead_index(ws, False)
+        if i is None:
             continue
         p = ws[i]
         if p.text in ("cd", "pushd", "popd"):
             chain_has_cd = True
-        if p.ansi:  # G:ansi_word
-            refuse("refused: gh text: a quote form inside a program word")
-        if p.glob and p.raw not in ("[", "[["):  # G:program_glob
-            refuse("refused: gh text: glob or brace in a program word")
         for w in ws:
             if w.raw.startswith("=") and not w.quoted:  # G:zsh_equals
                 refuse("refused: gh text: zsh equals expansion")
         is_gh = p.text == "gh" or (p.text.endswith("/gh") and p.text.startswith("/") and re.fullmatch(r"[A-Za-z0-9_./+@-]+", p.text) is not None)
         if is_gh:
-            if p.quoted:  # G:word_gh
-                refuse("refused: gh text: a quoted program word")
-            if p.dyn:
-                refuse("refused: gh text: expansion in a program word")
             analysed += 1
             c = parse_gh_call(ws[i + 1:])
             if c is not None:
@@ -958,33 +1107,6 @@ def main():
             txt = read_body_file(path, surface, chain_has_cd)
             fields.append((surface, txt))  # G:bodyfile_scan
     scan_fields(fields)
-
-
-def glob_could_be_gh(base):
-    import fnmatch
-    pats = [base]
-    for _ in range(4):
-        nxt = []
-        for p in pats:
-            m = re.search(r"\{([^{}]*)\}", p)
-            m2 = re.search(r"\(([^()]*)\)", p)
-            if m:
-                for alt in m.group(1).split(","):
-                    nxt.append(p[:m.start()] + alt + p[m.end():])
-            elif m2:
-                for alt in m2.group(1).split("|"):
-                    nxt.append(p[:m2.start()] + alt + p[m2.end():])
-            else:
-                nxt.append(p)
-        if len(nxt) > 64:
-            return True  # a cap was hit: "cannot decide" means maybe, never no
-        pats = nxt
-    for p in pats:
-        if re.search(r"\{[^{}]*\}|\([^()]*\)", p):
-            return True  # still unexpanded after the passes: maybe
-        if fnmatch.fnmatchcase("gh", p) or fnmatch.fnmatchcase("GH", p.upper()):
-            return True
-    return False
 
 
 try:

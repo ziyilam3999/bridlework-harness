@@ -472,25 +472,127 @@ gh $M" deny-token
   no carrier-python "python3 -c \"x=['gh','pr']\""
   no carrier-comment "echo hi # gh $C"
   no zsh-equals-gh "=gh $C"
-  no program-glob "/usr/bin/g? $C"
-  no program-brace "g{h,h} $C"
-  no program-glob-star "/usr/bin/g* $C"
+  no program-glob "/usr/bin/g? $C" # G:progword_literal
+  no program-brace "g{h,h} $C" # G:progword_literal
+  no program-glob-star "/usr/bin/g* $C" # G:progword_literal
   no gh-path-arg "echo /usr/bin/gh"
-  no ansi-quote-gh "g\$'h' $M" # G:ansi_prefilter
-  no ansi-quote-empty "g\$''h $M"
-  no ansi-quote-octal "\$'\\147\\150' $M"
-  no ansi-locale-quote "g\$\"\"h $M"
-  no ansi-quote-chain "gh $C; g\$'h' $M" # G:ansi_word
+  # quote forms of the program word (ANSI-C, locale, split, escaped, backslash-newline)
+  no ansi-quote-gh "g\$'h' $M" # G:progword_literal
+  no ansi-quote-empty "g\$''h $M" # G:progword_literal
+  no ansi-quote-octal "\$'\\147\\150' $M" # G:progword_literal
+  no ansi-locale-quote "g\$\"\"h $M" # G:progword_literal
+  no ansi-quote-chain "gh $C; g\$'h' $M" # G:progword_literal
   no bslash-newline-gh "g\\
-h $M" # G:bslash_newline
-  no zsh-alternation-gh "/usr/bin/g(h|x) $M" # G:zsh_paren
-  no brace-range-gh "g{h..h} $M" # G:brace_prefilter
-  no brace-range-lead "{g..g}h $M" # G:brace_prefilter
-  no brace-range-env "env g{h..h} $M" # G:brace_prefilter
-  no brace-range-other-repo "g{h..h} pr comment 1 -R other/x --body '$M_PROFILE'" # G:brace_prefilter
-  no brace-five-siblings "g{h,}{,}{,}{,}{,} $M" # G:brace_prefilter
-  no brace-five-nested "{{{{{g,},},},},}h $M" # G:brace_prefilter
-  no brace-slash-inside "{/usr/bin/g,x}h $M" # G:brace_prefilter
+h $M" # G:progword_literal
+  no zsh-alternation-gh "/usr/bin/g(h|x) $M" # G:progword_literal
+  # brace forms of the program word
+  no brace-range-gh "g{h..h} $M" # G:progword_literal
+  no brace-range-lead "{g..g}h $M" # G:progword_literal
+  no brace-range-env "env g{h..h} $M" # G:progword_literal
+  no brace-range-other-repo "g{h..h} pr comment 1 -R other/x --body '$M_PROFILE'" # G:progword_literal
+  no brace-five-siblings "g{h,}{,}{,}{,}{,} $M" # G:progword_literal
+  no brace-five-nested "{{{{{g,},},},},}h $M" # G:progword_literal
+  no brace-slash-inside "{/usr/bin/g,x}h $M" # G:progword_literal
+  # bracket forms of the program word, against the real folder that holds the stand-in
+  no bracket-negate "$SINK/g[^a-g] $M" # G:progword_literal
+  no bracket-negate-bang "$SINK/g[!a-g] $M" # G:progword_literal
+  no bracket-class-alpha "$SINK/g[[:alpha:]] $M" # G:progword_literal
+  no bracket-class-lower "$SINK/g[[:lower:]] $M" # G:progword_literal
+  no bracket-class-lead "$SINK/[[:alpha:]]h $M" # G:progword_literal
+  no bracket-class-both "$SINK/[[:alnum:]][[:alnum:]] $M" # G:progword_literal
+  no bracket-negate-both "$SINK/[^a-f][^a-g] $M" # G:progword_literal
+  no bracket-negate-class "$SINK/g[^[:upper:]] $M" # G:progword_literal
+  no bracket-collating "$SINK/g[[.h.]] $M" # G:progword_literal
+  no bracket-equivalence "$SINK/g[[=h=]] $M" # G:progword_literal
+  no bracket-bslash-newline "$SINK/g\\
+[^a-g] $M" # G:progword_literal
+  no bracket-plain "$SINK/g[h] $M" # G:progword_literal
+  no question-mark "$SINK/g? $M" # G:progword_literal
+  no star-lead "$SINK/*h $M" # G:progword_literal
+  # a "(" touching the last path segment is a zsh group, part of the word
+  no zsh-group-lead "$SINK/(g)h $M" # G:glued_paren
+  no zsh-group-alt-lead "$SINK/(g|x)h $M" # G:glued_paren
+  no zsh-group-two "$SINK/(g|x)(h|y) $M" # G:glued_paren
+  no zsh-group-bare "$SINK/(g)(h) $M" # G:glued_paren
+  # an allowed prefix followed by any option: the option can change which word runs
+  no env-dash-i "env -i $SINK/g? $M" # G:prefix_option
+  no env-dash-u "env -u HOME $SINK/g? $M" # G:prefix_option
+  no env-dashdash "env -- $SINK/g? $M" # G:prefix_option
+  no env-dash-i-path "env -i PATH=$SINK g{h..h} $M" # G:prefix_option
+  no env-dash-s-attached "env -Sgh $M" # G:prefix_option
+  no command-dash-p "command -p $SINK/g? $M" # G:prefix_option
+  no exec-dash-a "exec -a x $SINK/g? $M" # G:prefix_option
+  no time-dash-p "time -p $SINK/g? $M" # G:prefix_option
+  no sudo-dash-n "sudo -n $SINK/g? $M" # G:prefix_option
+  no assign-then-command-dash-p "X=1 command -p $SINK/g? $M" # G:prefix_option
+  # shell keywords hand the program position to the next word
+  no keyword-then "if true; then g{h..h} $M; fi" # G:keyword_skip
+  no keyword-do "for i in 1; do g{h..h} $M; done" # G:keyword_skip
+  no keyword-else "if false; then echo a; else $SINK/g? $M; fi" # G:keyword_skip
+  no keyword-elif "if false; then echo a; elif true; then $SINK/g? $M; fi" # G:keyword_skip
+  no keyword-if-condition "if g{h..h} $M; then echo a; fi" # G:keyword_skip
+  no keyword-while "while g{h..h} $M; do break; done" # G:keyword_skip
+  no keyword-until "until g{h..h} $M; do echo a; done" # G:keyword_skip
+  no keyword-bang "! $SINK/g? $M" # G:keyword_skip
+  no keyword-brace-group "{ g{h..h} $M; }" # G:keyword_skip
+  no keyword-function "function f { $SINK/g? $M; }; f" # G:keyword_skip
+  no keyword-case-body "case x in x) $SINK/g? $M;; esac" # G:keyword_skip
+  # a program inside a substitution is still a program word
+  no sub-dollar-paren "echo \$($SINK/g? $M)" # G:sub_recurse
+  no sub-backtick "echo \`g{h..h} $M\`" # G:sub_recurse
+  no sub-assign "x=\$(g{h..h} $M)" # G:sub_recurse
+  no sub-dquote "echo \"\$(g{h..h} $M)\"" # G:sub_recurse
+  no sub-procsubst "cat <(g{h..h} $M)" # G:sub_recurse
+  no sub-nested "echo \$(echo \$(echo \$(g{h..h} $M)))" # G:sub_recurse
+  no sub-arith-nested "echo \$(( \$(g{h..h} $M) + 1 ))" # G:sub_recurse
+  no sub-array "arr=(\$(g{h..h} $M)); echo" # G:sub_recurse
+  # a program word made by an expansion cannot be read
+  no expansion-at "g\$@h $M" # G:progword_literal
+  no expansion-positional "g\$1h $M" # G:progword_literal
+  no expansion-empty-backtick "g\`\`h $M" # G:progword_literal
+  no expansion-default "\${x:-g}h $M" # G:progword_literal
+  no expansion-subst-lead "\$(echo g)h $M" # G:progword_literal
+  no expansion-var-whole "\$X $M" # G:progword_literal
+  no tilde-program "~/bin/x $M" # G:progword_literal
+  no non-ascii-program "g$(printf '\303\251')h $M" # G:progword_literal
+  # text the parser cannot read is not text it can clear
+  no unparseable-quote "echo 'unterminated" # G:cannot_decide
+  no unparseable-dquote "echo \"unterminated" # G:cannot_decide
+  no unparseable-paren "echo \$(echo hi" # G:cannot_decide
+  no unparseable-backtick "echo \`echo hi" # G:cannot_decide
+  no unparseable-backslash "echo hi \\" # G:cannot_decide
+  local deep="echo hi" k
+  for k in 1 2 3 4 5 6 7 8 9 10; do deep="echo \$($deep)"; done
+  no sub-too-deep "$deep" # G:sub_depth
+  # twins: patterns, expansions and groups that are NOT program words stay allowed
+  ok twin-ls-glob "ls *.md"
+  ok twin-ls-dir-glob "ls -d $SINK/z*"
+  ok twin-echo-home "echo \$HOME"
+  ok twin-echo-quoted "echo \"a b\" > /dev/null"
+  ok twin-subst-args "echo \"\$(echo hi)\" \$(echo hi)"
+  ok twin-arith-star "echo \$(( 6 * 7 )) \$((6*7))"
+  ok twin-test-brackets "[ -f /nonexistent ] || [[ -n x ]] || echo none"
+  ok twin-assign-quoted "FOO=\"a b\" ls > /dev/null"
+  ok twin-for-glob "for f in *.md; do echo \"\$f\"; done"
+  ok twin-brace-group "{ echo a; echo b; }"
+  ok twin-subshell "(cd / && ls > /dev/null)"
+  ok twin-function-def "f() { echo hi; }; f"
+  ok twin-array "arr=(a b c); echo \${arr[1]}"
+  ok twin-find-exec "find . -name '*.nothing' -exec ls {} +"
+  ok twin-nightly "echo nightly high"
+  ok twin-command-v "command -v ls" # G:plain_fast
+  ok twin-time-p "time -p ls > /dev/null" # G:plain_fast
+  ok twin-case-pattern "case x in *.md) echo md;; *.txt|*.rst) echo t;; esac" # G:case_pattern
+  ok twin-heredoc-body "cat <<'EOF' > /dev/null
+it's fine * [x] \$(not run) g?
+EOF" # G:heredoc_skip
+  ok twin-heredoc-in-subst "echo \"\$(cat <<'EOF'
+it's fine * [x] g{h..h}
+EOF
+)\"" # G:heredoc_skip
+  ok twin-heredoc-tab-strip "cat <<-EOF > /dev/null
+	it's fine *
+	EOF" # G:heredoc_skip
 }
 
 # ---------------------------------------------------------------- AC 12
