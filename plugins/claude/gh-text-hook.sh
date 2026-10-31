@@ -54,9 +54,10 @@ def has_control(s):
 
 # ------------------------------------------------------------------ tokenizer
 class W(object):
-    __slots__ = ("text", "raw", "dyn", "glob", "quoted")
+    __slots__ = ("text", "raw", "dyn", "glob", "quoted", "ansi")
 
     def __init__(self):
+        self.ansi = False     # an unquoted $'...' or $"..." inside the word
         self.text = ""
         self.raw = ""
         self.dyn = False      # any expansion, glob, brace, leading ~ or =, process substitution
@@ -291,6 +292,7 @@ def tokenize(s):
                 continue
             if nx == "'":
                 x.dyn = True
+                x.ansi = True
                 x.quoted = True
                 j = i + 2
                 while j < n and s[j] != "'":
@@ -302,6 +304,8 @@ def tokenize(s):
                 continue
             if nx and (nx.isalnum() or nx in "_@*#?!$-{[\"'"):
                 x.dyn = True
+            if nx == '"':
+                x.ansi = True
             x.text += c
             i += 1
             continue
@@ -455,7 +459,7 @@ def reduce_repo(v):
         m = p.match(v)
         if m:
             o, nm = m.group(1), m.group(2)
-            if nm.endswith(".git"):  # G:target_normalise
+            if nm.lower().endswith(".git"):  # G:target_normalise
                 nm = nm[:-4]
             if o in (".", "..") or nm in ("", ".", ".."):
                 return None
@@ -826,12 +830,25 @@ def main():
         refuse("refused: the tool input has no command")
 
     # Is any `gh` possibly in play? A bare mention, or a glob or brace word that could expand to it.
-    maybe = MENTION.search(cmd) is not None or MENTION.search(re.sub(r"['\"\\]", "", cmd)) is not None
+    joined = cmd
+    if "\\\n" in cmd:  # G:bslash_newline
+        joined = cmd.replace("\\\n", "")
+    maybe = MENTION.search(cmd) is not None or MENTION.search(re.sub(r"['\"\\]", "", joined)) is not None
+    if "$'" in cmd or '$"' in cmd:  # G:ansi_prefilter
+        maybe = True  # an ANSI-C or locale quote can spell the program word in a way no scan here decodes
     if not maybe:
-        for tok in re.split(r"[\s;&|()<>]+", cmd):
+        for tok in re.split(r"[\s;&|()<>]+", joined):
             base = tok.rsplit("/", 1)[-1].replace("'", "").replace('"', "").replace("\\", "")
             if any(ch in base for ch in "*?[{"):
                 if glob_could_be_gh(base):
+                    maybe = True
+                    break
+    if not maybe:
+        # zsh glob grouping and alternation, such as g(h|x): the split above cuts the word at the parenthesis
+        for tok in re.split(r"[\s;&<>]+|\|(?![^()]*\))", joined):
+            base = tok.rsplit("/", 1)[-1].replace("'", "").replace('"', "").replace("\\", "")
+            if re.search(r"[A-Za-z0-9_*?\]}]\(", base) and not base.startswith(("$", "(", "=")):
+                if glob_could_be_gh(base):  # G:zsh_paren
                     maybe = True
                     break
     if not maybe:
@@ -866,6 +883,8 @@ def main():
         p = ws[i]
         if p.text in ("cd", "pushd", "popd"):
             chain_has_cd = True
+        if p.ansi:  # G:ansi_word
+            refuse("refused: gh text: a quote form inside a program word")
         if p.glob and p.raw not in ("[", "[["):  # G:program_glob
             refuse("refused: gh text: glob or brace in a program word")
         for w in ws:
@@ -914,8 +933,6 @@ def main():
                 unscanned = True
         if unscanned:
             for wtxt in c.words:
-                if wtxt in c.repos:
-                    continue
                 if pub in wtxt.lower():  # G:target_repo
                     unscanned = False
                     break
@@ -947,9 +964,13 @@ def glob_could_be_gh(base):
         nxt = []
         for p in pats:
             m = re.search(r"\{([^{}]*)\}", p)
+            m2 = re.search(r"\(([^()]*)\)", p)
             if m:
                 for alt in m.group(1).split(","):
                     nxt.append(p[:m.start()] + alt + p[m.end():])
+            elif m2:
+                for alt in m2.group(1).split("|"):
+                    nxt.append(p[:m2.start()] + alt + p[m2.end():])
             else:
                 nxt.append(p)
         pats = nxt[:64]

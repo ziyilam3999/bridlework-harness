@@ -149,6 +149,9 @@ expect_refuse() { # label [required substring]
   [ "$SINKN" -eq 0 ] || fail "$1: the sink recorded a call"
   if [ -n "$2" ] && ! command grep -qF -- "$2" "$W/err"; then fail "$1: reason does not contain '$2'"; fi
 }
+mono() { "$PY" -I -c 'import time; print(time.monotonic())'; }
+elapsed() { "$PY" -I -c 'import sys; print(round(float(sys.argv[2]) - float(sys.argv[1]), 1))' "$1" "$2"; }
+under_13() { "$PY" -I -c 'import sys; sys.exit(0 if float(sys.argv[2]) - float(sys.argv[1]) < 13.0 else 1)' "$1" "$2"; }
 ok() { drive "$2"; expect_allow "$1"; }
 no() { drive "$2"; expect_refuse "$1" "$3"; }
 raw_no() { printf '%s' "$2" > "$W/in.json"; SINKN=0; run_hook_file "$W/in.json"; expect_refuse "$1" "$3"; }
@@ -473,6 +476,14 @@ gh $M" deny-token
   no program-brace "g{h,h} $C"
   no program-glob-star "/usr/bin/g* $C"
   no gh-path-arg "echo /usr/bin/gh"
+  no ansi-quote-gh "g\$'h' $M" # G:ansi_prefilter
+  no ansi-quote-empty "g\$''h $M"
+  no ansi-quote-octal "\$'\\147\\150' $M"
+  no ansi-locale-quote "g\$\"\"h $M"
+  no ansi-quote-chain "gh $C; g\$'h' $M" # G:ansi_word
+  no bslash-newline-gh "g\\
+h $M" # G:bslash_newline
+  no zsh-alternation-gh "/usr/bin/g(h|x) $M" # G:zsh_paren
 }
 
 # ---------------------------------------------------------------- AC 12
@@ -513,6 +524,9 @@ ac12_target() {
   no env-export-other-repo "export GH_REPO=other/y ; gh $C -R other/x $B" deny-token
   no env-prefix-other-repo "env GH_TOKEN=t gh $C -R other/x $B" deny-token
   no public-word-in-body "gh $C -R other/x --body '$M_PROFILE see $PUB'" deny-token
+  no dotgit-upper "gh $C -R $PUB.GIT $B" deny-token # G:target_normalise
+  no dotgit-mixed "gh $C -R $PUB.Git $B" deny-token
+  no repo-value-contains-public "gh $C -R $PUB-fork $B" deny-token # G:target_repo
   ok other-repo-clean "gh $C -R other/repo --body clean"
 }
 
@@ -677,8 +691,8 @@ ac20_fields() {
   ok eight-fields-mixed "$c"
   stub hang "sleep 30"; H_BIN=$EXT/hang
   local t0 t1
-  t0=$(date +%s); no hang-refused "gh pr comment 1 --body clean"; t1=$(date +%s)
-  [ $((t1 - t0)) -lt 13 ] || fail "hanging engine: refused after $((t1 - t0)) s"
+  t0=$(mono); no hang-refused "gh pr comment 1 --body clean"; t1=$(mono)
+  under_13 "$t0" "$t1" || fail "hanging engine: refused after $(elapsed "$t0" "$t1") s"
   H_BIN=$EXT/harness
   [ "$("$PY" -I -c 'import json,sys; print("timeout" in json.load(open(sys.argv[1])))' "$MANIFEST")" = False ] || fail "the manifest has a timeout key"
 }
@@ -688,8 +702,8 @@ ac20_deadline() {
   local i c t0 t1
   stub slow "sleep 2; exit 0"; H_BIN=$EXT/slow
   c="gh pr comment 1"; for i in 1 2 3 4 5 6 7 8; do c="$c --body s$i"; done
-  t0=$(date +%s); no deadline-refused "$c"; t1=$(date +%s)
-  [ $((t1 - t0)) -lt 13 ] || fail "slow engine: refused after $((t1 - t0)) s"
+  t0=$(mono); no deadline-refused "$c"; t1=$(mono)
+  under_13 "$t0" "$t1" || fail "slow engine: refused after $(elapsed "$t0" "$t1") s"
   H_BIN=$EXT/harness
   ok twin-after "gh pr comment 1 --body clean"
 }
