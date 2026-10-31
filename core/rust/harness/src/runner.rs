@@ -24,11 +24,23 @@ pub struct Check {
 }
 
 impl Check {
+    /// The id, budget and output cap, checked on their own (so a caller can refuse a bad spec before it creates anything).
+    pub fn load_limits(id: &str, budget: Duration, max_output: usize) -> Result<(), String> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')) {
+            return Err("check id malformed".to_string());
+        }
+        if max_output == 0 || budget.is_zero() {
+            return Err("budget and output cap must be above zero".to_string());
+        }
+        Ok(())
+    }
+
     /// Resolve `program` (a path relative to the repo root) with realpath and refuse anything that lands outside the repo.
     pub fn load(repo_root: &Path, id: &str, program: &str, args: &[&str], budget: Duration, max_output: usize) -> Result<Check, String> {
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')) {
             return Err("check id malformed".to_string());
         }
+        Check::load_limits(id, budget, max_output)?;
         if program.is_empty() || Path::new(program).is_absolute() {
             return Err("check path must be relative to the repo".to_string());
         }
@@ -39,9 +51,6 @@ impl Check {
         }
         if !real.is_file() {
             return Err("check path is not a file".to_string());
-        }
-        if max_output == 0 || budget.is_zero() {
-            return Err("budget and output cap must be above zero".to_string());
         }
         Ok(Check { id: id.to_string(), program: real, args: args.iter().map(|s| s.to_string()).collect(), budget, max_output, poll: Duration::from_millis(10) })
     }
@@ -70,20 +79,51 @@ fn result(check: &Check, head_sha: &str, status: Status, class: Option<&str>, me
     GateResult { status, gate_id: check.id.clone(), head_sha: head_sha.to_string(), failure_class: class.map(|c| c.to_string()), message, file: None, line: None }
 }
 
+/// How the check's process ended. A signal is never shown as an exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// Exited on its own with this code.
+    Exit(i32),
+    /// Killed by this signal (not by us).
+    Signal(i32),
+    /// Ran past its budget and was killed by the runner.
+    TimedOut,
+    /// Could not be started.
+    NotStarted,
+    /// The runner could not tell (a wait error).
+    Unknown,
+}
+
 /// Run the check in `repo_root`. Never panics on a check's behavior; every outcome is a normalized result.
 pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
+    run_ended(repo_root, check, head_sha).0
+}
+
+/// Like `run`, also reporting how the process ended. The child gets the inherited environment minus every `GIT_*` name.
+pub fn run_ended(repo_root: &Path, check: &Check, head_sha: &str) -> (GateResult, Ended) {
     // The budget clock starts before spawn, so spawn and reader setup count against it.
     let start = Instant::now();
-    let mut child = match Command::new(&check.program)
-        .args(&check.args)
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return result(check, head_sha, Status::Fail, Some("spawn-error"), "check could not be started".to_string()),
+    let mut cmd = Command::new(&check.program);
+    cmd.args(&check.args).current_dir(repo_root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(k);
+        }
+    }
+    // A file written just before the run can be briefly "text file busy" while another thread forks; retry a few times, then fail.
+    let mut tries = 0;
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(c) => break c,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 10 => {
+                tries += 1;
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let m = format!("check could not be started ({:?})", e.kind());
+                return (result(check, head_sha, Status::Fail, Some("spawn-error"), m), Ended::NotStarted);
+            }
+        }
     };
     let buf = Arc::new(Mutex::new(Vec::new()));
     let cut = Arc::new(Mutex::new(false));
@@ -135,13 +175,30 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
         message.push_str(&format!("\n[output cut at {} bytes]", check.max_output));
     }
     if timed_out {
-        return result(check, head_sha, Status::Fail, Some("timeout"), message);
+        return (result(check, head_sha, Status::Fail, Some("timeout"), message), Ended::TimedOut);
     }
     match status {
-        Some(s) if s.success() => result(check, head_sha, Status::Pass, None, message),
-        Some(_) => result(check, head_sha, Status::Fail, Some("check-failed"), message),
-        None => result(check, head_sha, Status::Fail, Some("run-error"), message),
+        Some(s) if s.success() => (result(check, head_sha, Status::Pass, None, message), Ended::Exit(0)),
+        Some(s) => {
+            let ended = match s.code() {
+                Some(c) => Ended::Exit(c),
+                None => signal_of(&s),
+            };
+            (result(check, head_sha, Status::Fail, Some("check-failed"), message), ended)
+        }
+        None => (result(check, head_sha, Status::Fail, Some("run-error"), message), Ended::Unknown),
     }
+}
+
+#[cfg(unix)]
+fn signal_of(s: &std::process::ExitStatus) -> Ended {
+    use std::os::unix::process::ExitStatusExt;
+    s.signal().map(Ended::Signal).unwrap_or(Ended::Unknown)
+}
+
+#[cfg(not(unix))]
+fn signal_of(_s: &std::process::ExitStatus) -> Ended {
+    Ended::Unknown
 }
 
 #[cfg(test)]
