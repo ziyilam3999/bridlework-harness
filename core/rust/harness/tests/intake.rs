@@ -70,6 +70,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
 fn repo(t: &Tmp, name: &str, msg: &str) -> PathBuf {
     let d = t.dir(name);
     git(&d, &["init", "-q"]);
+    // Git's own background upkeep (auto maintenance and gc, detached) can create files such as `.git/objects/maintenance.lock` at any moment,
+    // which flaked the before/after tree comparisons. Turn it off in the repo's own config before the first commit, so no upkeep is ever started
+    // and the strict whole-tree snapshot in `intake_is_read_only` stays strict.
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&d, &["config", k, v]);
+    }
     fs::write(d.join("f.txt"), msg).unwrap();
     git(&d, &["add", "f.txt"]);
     git(&d, &["commit", "-q", "-m", msg]);
