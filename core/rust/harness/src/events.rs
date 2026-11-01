@@ -937,16 +937,57 @@ pub fn append_record(root: &Path, log: &Path, rec: &Record) -> Result<(), Append
     write_locked(&mut f, line.as_bytes(), true)
 }
 
-/// Open the log for appending under the module's exclusive advisory lock: path check, open (creating it only when `create`
+/// Open the checked path for appending, creating it only when `create`, then re-bind the path check to the OPENED
+/// HANDLE (the check resolved the path and the open resolves it a second time; the old window between the two — a
+/// final-component symlink swapped in after the check, pointing the open outside the root — is closed here). All
+/// three writers go through this seam: `append`/`append_impl` and `append_record` (both create = true) and
+/// `append_under_run` (create = inherited.is_none(), so the create branch is exercised by the production caller too).
+fn open_checked(path: &Path, create: bool) -> Result<File, AppendError> {
+    let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
+    let f = OpenOptions::new().read(true).append(true).create(create).open(path).map_err(io)?;
+    verify_opened_handle(&f, path)?;
+    Ok(f)
+}
+
+/// Prove the opened handle is the very file that passed the path check: fstat the handle (the file the bytes will
+/// actually reach) and lstat the checked path (which does not follow the final component), and refuse when they
+/// disagree. The check-then-open race on the final component is closed by this re-bind, not by the check alone.
+/// Honest limits (std-only, so no O_NOFOLLOW/O_EXCL and no per-component walk):
+/// - the create branch may still CREATE an empty file at the symlink's destination before refusing (the open has
+///   already happened; only the write is refused);
+/// - a parent-directory component swapped to a symlink during the same window can alias for both the open and the
+///   lstat (lstat follows parents), so the promise is the final component only;
+/// - a concurrent plain RENAME of the log between open and lstat now refuses where the old code appended to the
+///   renamed inode — a deliberate tightening;
+/// - hard links are indistinguishable (the root is a path boundary, not an inode label).
+#[cfg(unix)]
+fn verify_opened_handle(f: &File, path: &Path) -> Result<(), AppendError> {
+    use std::os::unix::fs::MetadataExt;
+    let bad = |m: &str| AppendError::Path(m.to_string());
+    let h = f.metadata().map_err(|e| AppendError::Io(e.kind().to_string()))?;
+    let p = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        // An lstat error (e.g. the file removed between open and verify) is a REFUSAL, never a panic.
+        Err(_) => return Err(bad("path changed between check and open")),
+    };
+    if p.file_type().is_symlink() {
+        return Err(bad("path changed to a symlink between check and open"));
+    }
+    if (h.dev(), h.ino()) != (p.dev(), p.ino()) {
+        return Err(bad("opened file is not the checked path"));
+    }
+    Ok(())
+}
+
+/// Open the log for appending under the module's exclusive advisory lock: path check, open through the re-checked
+/// seam (creating it only when `create`
 /// — an inherited-id check must never conjure an empty log into existence), lock, then the torn-tail check on the last
 /// byte. The handle is left readable at position 0, so a caller may read the settled file through the SAME lock before
 /// writing — no concurrent writer of this module can be caught mid-append.
 fn open_locked(root: &Path, log: &Path, create: bool) -> Result<File, AppendError> {
     let path = check_log_path(root, log)?;
     let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
-    // NOTE for 6b: `check_log_path` resolves the path and `open` resolves it again, so a symlink swapped in between could
-    // point the open outside the root. Not closed here (out of scope for 6a); re-check the opened file's identity if needed.
-    let mut f = OpenOptions::new().read(true).append(true).create(create).open(&path).map_err(io)?;
+    let mut f = open_checked(&path, create)?;
     // Exclusive advisory lock across check + write + sync, so the torn-tail check only ever sees a settled file (another
     // writer of this module is never caught mid-append). Held until `f` drops. It does not bind a writer outside this module.
     f.lock().map_err(|e| AppendError::Io(e.to_string()))?;
@@ -1553,6 +1594,83 @@ mod tests {
         std::os::unix::fs::symlink(&real, &inside).unwrap();
         append(&root.0, &inside, &ev(Kind::Escalation, 1)).unwrap();
         assert_eq!(read_log(&real).unwrap().events.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn race_final_component_symlink_swap_refused() {
+        use std::os::unix::fs::symlink;
+        // The attacker's move placed exactly inside the window: after check_log_path has resolved the path (and so
+        // proven the final component was a regular file), the final component is replaced by a symlink pointing
+        // outside the root. Both branches of the open (existing file / create) must refuse through the handle re-check.
+        let root = Tmp::new();
+        let outside = Tmp::new();
+        // Existing-file branch: the checked real log is removed and a symlink is planted on its name.
+        fs::write(root.log(), b"").unwrap();
+        let checked = check_log_path(&root.0, &root.log()).unwrap();
+        assert!(checked.starts_with(&root.0), "the check resolved the log inside the root");
+        fs::remove_file(root.log()).unwrap();
+        symlink(outside.log(), root.log()).unwrap();
+        let r = open_checked(&checked, true);
+        let state = if outside.log().exists() { "outside target created" } else { "outside target absent" };
+        match &r {
+            Err(AppendError::Path(m)) => assert!(
+                m.contains("symlink"),
+                "existing branch: refusal {m:?} must name the swapped-in symlink"
+            ),
+            Err(other) => panic!("existing branch: expected a Path refusal, got {other:?}"),
+            Ok(_) => panic!("existing branch: the open succeeded through the swap ({state})"),
+        }
+        assert!(!outside.log().exists() || fs::metadata(outside.log()).unwrap().len() == 0, "existing branch: no byte through the link");
+        // Create branch: the checked name does not exist yet and a symlink is planted on it before the create.
+        let absent = root.0.join("absent.jsonl");
+        let checked_absent = check_log_path(&root.0, &absent).unwrap();
+        assert!(checked_absent.starts_with(&root.0), "the check resolved the absent name inside the root");
+        symlink(outside.0.join("victim.jsonl"), &absent).unwrap();
+        let r = open_checked(&checked_absent, true);
+        let victim = outside.0.join("victim.jsonl");
+        let state = if victim.exists() { "outside target created" } else { "outside target absent" };
+        match &r {
+            Err(AppendError::Path(m)) => assert!(
+                m.contains("symlink"),
+                "create branch: refusal {m:?} must name the swapped-in symlink"
+            ),
+            Err(other) => panic!("create branch: expected a Path refusal, got {other:?}"),
+            Ok(_) => panic!("create branch: the open succeeded through the swap ({state})"),
+        }
+        assert!(!victim.exists() || fs::metadata(victim).unwrap().len() == 0, "create branch: no byte through the link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn race_a_regular_file_replaced_or_removed_after_the_open_is_refused() {
+        // The other two arms of the re-check, each ALONE: the final component is a REGULAR file (or gone) at verify
+        // time, so neither the outside-root check nor the symlink arm can refuse — only the fstat/lstat identity
+        // comparison, or the lstat error, stands between the handle and the write.
+        let t = Tmp::new();
+        fs::write(t.log(), b"").unwrap();
+        let checked = check_log_path(&t.0, &t.log()).unwrap();
+        // A different regular file now sits at the checked path (the concurrent-rename tightening): the handle and
+        // the path disagree on (dev, ino) while the lstat is a perfectly regular in-root file.
+        let f = open_checked(&checked, false).unwrap();
+        fs::remove_file(t.log()).unwrap();
+        fs::write(t.log(), b"x").unwrap();
+        match verify_opened_handle(&f, &checked) {
+            Err(AppendError::Path(m)) => assert!(
+                m.contains("not the checked path"),
+                "rename branch: refusal {m:?} must name the identity mismatch"
+            ),
+            Err(other) => panic!("rename branch: expected a Path refusal, got {other:?}"),
+            Ok(()) => panic!("rename branch: a handle to a removed inode was accepted for the checked path"),
+        }
+        // The file is gone entirely between open and verify: the lstat error maps to a REFUSAL, never a panic.
+        let f = open_checked(&checked, false).unwrap();
+        fs::remove_file(t.log()).unwrap();
+        match verify_opened_handle(&f, &checked) {
+            Err(AppendError::Path(_)) => {}
+            Err(other) => panic!("removed branch: expected a Path refusal, got {other:?}"),
+            Ok(()) => panic!("removed branch: a handle to a deleted path was accepted"),
+        }
     }
 
     #[cfg(unix)]
