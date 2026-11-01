@@ -33,6 +33,10 @@ pub const REPLAN_AFTER: u8 = 2;
 pub const STREAK_VERSION: u64 = 1;
 /// The longest signature: a 250-byte gate id, `:`, and a class token (well under 64 bytes) are at most 265 bytes, so no legal gate reaches this.
 pub const SIG_MAX: usize = 320;
+/// The reason token of the per-ticket wall-time budget refusal.
+pub const REASON_WALL_TIME_BUDGET: &str = "wall-time-budget";
+/// The budget file schema version this reader accepts.
+pub const BUDGET_VERSION: u64 = 1;
 
 /// What a ticket's record says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +181,68 @@ pub fn advance(prev: Option<&Streak>, ticket: &str, repo_id: &str, fail: Option<
     Some(Streak { ticket: ticket.to_string(), repo_id: repo_id.to_string(), sig: sig.to_string(), head: head.to_string(), count })
 }
 
+/// The wall-time meter of a ticket: written once, at the first paid run, and never rewritten. `size` is pinned at that moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Budget {
+    pub ticket: String,
+    pub repo_id: String,
+    /// `S`, `M` or `L`.
+    pub size: String,
+    /// Milliseconds since the epoch, 1..=u64::MAX.
+    pub started_ms: u64,
+}
+
+impl Budget {
+    pub fn size_ok(size: &str) -> bool {
+        matches!(size, "S" | "M" | "L")
+    }
+
+    /// The canonical bytes, newline included.
+    pub fn encode(&self) -> String {
+        format!(
+            "{{\"v\":{},\"ticket\":\"{}\",\"repo_id\":\"{}\",\"size\":\"{}\",\"started_ms\":{}}}\n",
+            BUDGET_VERSION, self.ticket, self.repo_id, self.size, self.started_ms
+        )
+    }
+
+    /// Strict decode: the bytes must equal the canonical encoding of a valid budget for exactly this ticket and repo. `started_ms` is canonical
+    /// digits (no sign, no leading zero, not 0, at most 20 digits) that fit u64; a larger value is refused, never wrapped or saturated.
+    pub fn decode(bytes: &[u8], ticket: &str, repo_id: &str) -> Result<Budget, String> {
+        let refused = || "the budget file is not the canonical budget for this ticket and repo".to_string();
+        let text = std::str::from_utf8(bytes).map_err(|_| refused())?;
+        let lead = format!("{{\"v\":{},\"ticket\":\"{}\",\"repo_id\":\"{}\",\"size\":\"", BUDGET_VERSION, ticket, repo_id);
+        let rest = text.strip_prefix(lead.as_str()).ok_or_else(refused)?;
+        let (size, rest) = rest.split_at(rest.find('"').ok_or_else(refused)?);
+        let digits = rest.strip_prefix("\",\"started_ms\":").and_then(|r| r.strip_suffix("}\n")).ok_or_else(refused)?;
+        let canonical = !digits.is_empty() && digits.len() <= 20 && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit());
+        if !canonical || !Budget::size_ok(size) {
+            return Err(refused());
+        }
+        let started_ms = digits.parse::<u64>().map_err(|_| refused())?;
+        let b = Budget { ticket: ticket.to_string(), repo_id: repo_id.to_string(), size: size.to_string(), started_ms };
+        if b.encode().as_bytes() != bytes {
+            return Err(refused());
+        }
+        Ok(b)
+    }
+}
+
+/// One read of the wall clock in milliseconds since the epoch. A clock before the epoch is an error (never 0).
+pub fn now_ms() -> Result<u64, String> {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "the clock is before the epoch".to_string())?;
+    Ok(d.as_millis().min(u64::MAX as u128) as u64)
+}
+
+/// Is the wall-time budget spent? `started_ms` is `None` when the clock has not started (not spent). A clock behind the start is an error (fail
+/// closed, never elapsed 0). `now - start >= limit` is spent; `start + limit` is never computed, and `wall_seconds * 1000` saturates.
+pub fn budget_spent(started_ms: Option<u64>, now_ms: u64, wall_seconds: u64) -> Result<bool, String> {
+    let Some(start) = started_ms else { return Ok(false) };
+    if now_ms < start {
+        return Err("the clock is behind the ticket's budget start".to_string());
+    }
+    Ok(now_ms - start >= wall_seconds.saturating_mul(1000))
+}
+
 /// Read at most `RECORD_READ_LIMIT` bytes from `r`; more than 4 KiB is refused.
 pub fn read_bounded<R: Read>(r: R) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
@@ -206,6 +272,18 @@ pub fn may_start(rounds: u8) -> Result<(), Refusal> {
 pub fn start_check(rounds: u8, streak: Option<&Streak>) -> Result<(), Refusal> {
     if streak.map(|s| s.latched()).unwrap_or(false) {
         return Err(Refusal { kind: Kind::ReplanRequired, reason: REASON_REPLAN_THRESHOLD });
+    }
+    may_start(rounds)
+}
+
+/// May a run start, with the wall-time budget known? Order: a latched streak (`replan-threshold`), then a spent budget (`wall-time-budget`), then
+/// the fix-round cap.
+pub fn start_check_budget(rounds: u8, streak: Option<&Streak>, spent: bool) -> Result<(), Refusal> {
+    if streak.map(|s| s.latched()).unwrap_or(false) {
+        return Err(Refusal { kind: Kind::ReplanRequired, reason: REASON_REPLAN_THRESHOLD });
+    }
+    if spent {
+        return Err(Refusal { kind: Kind::BudgetExceeded, reason: REASON_WALL_TIME_BUDGET });
     }
     may_start(rounds)
 }
@@ -387,6 +465,70 @@ impl Caps {
         }
         fs::remove_file(&target).map_err(|_| "the streak file could not be removed".to_string())?;
         File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|_| "the caps directory could not be synced".to_string())
+    }
+
+    fn budget_name(id: &str) -> String {
+        format!("{}.budget", id)
+    }
+
+    /// The same rule for the budget file name. Used only by the budget reader and writer (`check_names` is not widened).
+    fn check_budget_case_twin(&self, id: &str) -> Result<(), String> {
+        self.twin_of(&Caps::budget_name(id), "a budget file whose name differs only by letter case already exists")
+    }
+
+    /// The budget reader: `Ok(None)` when the clock has not started, `Ok(Some)` for a canonical budget for this ticket and repo, `Err` for anything
+    /// else (a link, a non-regular entry, an oversize or malformed file, a wrong identity, a case twin). Never read as "not started".
+    pub fn read_budget(&self, id: &str, repo_id: &str) -> Result<Option<Budget>, String> {
+        Caps::id_ok(id)?;
+        self.check_budget_case_twin(id)?;
+        let path = self.dir.join(Caps::budget_name(id));
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err("the budget file exists and is not a regular file".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("the budget file could not be inspected".to_string()),
+        }
+        let f = File::open(&path).map_err(|_| "the budget file could not be opened".to_string())?;
+        if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Err("the budget file exists and is not a regular file".to_string());
+        }
+        let bytes = read_bounded(f)?;
+        Budget::decode(&bytes, id, repo_id).map(Some)
+    }
+
+    /// Write the budget once, with the lock held: `Ok(true)` when written, `Ok(false)` when a regular file already exists (left untouched, never
+    /// rewritten). A stale temp is removed by name (never opened for truncation); then `create_new`, sync, rename, folder sync.
+    pub fn write_budget_once(&self, b: &Budget, _held: &Lock) -> Result<bool, String> {
+        Caps::id_ok(&b.ticket)?;
+        if !Budget::size_ok(&b.size) || b.started_ms == 0 {
+            return Err("the budget state is out of range".to_string());
+        }
+        self.check_budget_case_twin(&b.ticket)?;
+        let target = self.dir.join(Caps::budget_name(&b.ticket));
+        let tmp = self.dir.join(format!(".{}.budget.tmp", b.ticket));
+        match fs::symlink_metadata(&target) {
+            Ok(m) if m.file_type().is_file() => return Ok(false),
+            Ok(_) => return Err("the budget file exists and is not a regular file".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("the budget file could not be inspected".to_string()),
+        }
+        match fs::symlink_metadata(&tmp) {
+            Ok(_) => fs::remove_file(&tmp).map_err(|_| "a stale budget temp file could not be removed".to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("the budget temp file could not be inspected".to_string()),
+        }
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|_| "the budget file could not be created".to_string())?;
+        if f.write_all(b.encode().as_bytes()).and_then(|_| f.sync_all()).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return Err("the budget file could not be written".to_string());
+        }
+        drop(f);
+        if fs::rename(&tmp, &target).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return Err("the budget file could not be put in place".to_string());
+        }
+        File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|_| "the caps directory could not be synced".to_string())?;
+        Ok(true)
     }
 
     /// The per-ticket lock `.<id>.lock`, taken without waiting. The file is created once and never deleted. A link or non-regular entry is refused.
@@ -732,5 +874,165 @@ mod tests {
         drop(held);
         assert!(caps.lock("EX-1").is_ok(), "released with the guard");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    fn bud(size: &str, started_ms: u64) -> Budget {
+        Budget { ticket: "EX-1".to_string(), repo_id: "r".to_string(), size: size.to_string(), started_ms }
+    }
+
+    // A1: the golden bytes of the budget file and the round trip for each size.
+    #[test]
+    fn the_budget_bytes_are_pinned_and_round_trip() {
+        assert_eq!(bud("M", 1761955200000).encode(), "{\"v\":1,\"ticket\":\"EX-1\",\"repo_id\":\"r\",\"size\":\"M\",\"started_ms\":1761955200000}\n");
+        assert_eq!(bud("S", 1).encode(), "{\"v\":1,\"ticket\":\"EX-1\",\"repo_id\":\"r\",\"size\":\"S\",\"started_ms\":1}\n");
+        for size in ["S", "M", "L"] {
+            for ms in [1, 1761955200000, u64::MAX] {
+                let b = bud(size, ms);
+                assert_eq!(Budget::decode(b.encode().as_bytes(), "EX-1", "r"), Ok(b), "round trip {size} {ms}");
+            }
+        }
+    }
+
+    // A2: the strict decoder.
+    #[test]
+    fn the_budget_decoder_is_strict() {
+        let good = bud("M", 1761955200000).encode();
+        assert!(Budget::decode(good.as_bytes(), "EX-1", "r").is_ok(), "twin: the canonical bytes");
+        let with = |from: &str, to: &str| good.replace(from, to).into_bytes();
+        let bad: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"nope\n".to_vec(),
+            with("\"v\":1", "\"v\":2"),
+            with("\"M\"", "\"s\""),
+            with("\"M\"", "\"XL\""),
+            with("\"M\"", "\"\""),
+            with("1761955200000", "0"),
+            with("1761955200000", "-1"),
+            with("1761955200000", "01761955200000"),
+            with("1761955200000", "\"5\""),
+            with("1761955200000", "18446744073709551616"),
+            with("1761955200000", "184467440737095516150"),
+            with("1761955200000", ""),
+            with("\"started_ms\":1761955200000}", "\"started_ms\":1761955200000,\"x\":1}"),
+            with("\"size\":\"M\",\"started_ms\":1761955200000", "\"started_ms\":1761955200000,\"size\":\"M\""),
+            with("\"v\":1,\"ticket\":\"EX-1\"", "\"ticket\":\"EX-1\",\"v\":1"),
+            with(",\"started_ms\":1761955200000", ""),
+            format!("{good}{good}").into_bytes(),
+            good.trim_end().as_bytes().to_vec(),
+            [good.as_bytes(), b"\0"].concat(),
+            vec![0xff, 0xfe],
+            vec![b'x'; 4097],
+        ];
+        for b in &bad {
+            assert!(Budget::decode(b, "EX-1", "r").is_err(), "{:?} must be refused", String::from_utf8_lossy(b));
+        }
+        assert!(Budget::decode(bud("M", u64::MAX).encode().as_bytes(), "EX-1", "r").is_ok(), "u64::MAX itself is legal");
+        assert!(Budget::decode(good.as_bytes(), "EX-2", "r").is_err(), "another ticket's file");
+        assert!(Budget::decode(good.as_bytes(), "EX-1", "q").is_err(), "another repo's file");
+        assert!(read_bounded(&vec![b'x'; 4097][..]).is_err(), "the reader's cap is 4 KiB");
+    }
+
+    // A3: the spent rule over a table.
+    #[test]
+    fn the_spent_rule_is_pinned() {
+        assert_eq!(budget_spent(None, 5, 60), Ok(false), "absent: the clock has not started");
+        let (start, secs) = (1_000_000u64, 60u64);
+        let limit = secs * 1000;
+        assert_eq!(budget_spent(Some(start), start + limit - 1, secs), Ok(false), "one ms inside");
+        assert_eq!(budget_spent(Some(start), start + limit, secs), Ok(true), "exactly at the limit is spent");
+        assert_eq!(budget_spent(Some(start), start, secs), Ok(false), "elapsed 0");
+        assert!(budget_spent(Some(start), start - 1, secs).is_err(), "clock behind the start");
+        assert!(budget_spent(Some(u64::MAX), 5, secs).is_err(), "a start of u64::MAX is behind, no panic");
+        assert_eq!(budget_spent(Some(u64::MAX), u64::MAX, secs), Ok(false), "equal to u64::MAX: elapsed 0, no overflow");
+        let big = 999_999_999_999_999u64;
+        assert_eq!(budget_spent(Some(1), 1 + big * 1000 - 1, big), Ok(false), "15-digit seconds, exact x 1000");
+        assert_eq!(budget_spent(Some(1), 1 + big * 1000, big), Ok(true));
+        assert_eq!(budget_spent(Some(1), u64::MAX, u64::MAX), Ok(false), "a huge limit saturates and never overflows");
+        assert!(now_ms().unwrap() > 1_000_000_000_000, "the real clock reads");
+    }
+
+    // A4: the start order over rounds x latched x spent.
+    #[test]
+    fn the_start_order_is_replan_then_budget_then_cap() {
+        let open = streak("t:check-failed", H1, 1);
+        let latched = streak("t:check-failed", H2, 2);
+        for rounds in 0..=MAX_FIX_ROUNDS {
+            for (st, is_latched) in [(None, false), (Some(&open), false), (Some(&latched), true)] {
+                for spent in [false, true] {
+                    let got = start_check_budget(rounds, st, spent);
+                    let want = if is_latched {
+                        Err((Kind::ReplanRequired, "replan-threshold"))
+                    } else if spent {
+                        Err((Kind::BudgetExceeded, "wall-time-budget"))
+                    } else if rounds >= MAX_FIX_ROUNDS {
+                        Err((Kind::Escalation, "fix-round-cap"))
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(got.map_err(|r| (r.kind, r.reason)), want, "rounds {rounds} latched {is_latched} spent {spent}");
+                }
+            }
+        }
+        assert_eq!(REASON_WALL_TIME_BUDGET, "wall-time-budget");
+        assert_eq!(start_check(MAX_FIX_ROUNDS, None).unwrap_err().reason, "fix-round-cap", "the merged rule is unchanged");
+    }
+
+    // A5: the writer under the lock, the reader, and the case-twin scan.
+    #[test]
+    fn the_budget_file_is_written_once_and_never_through_a_link() {
+        let d = scratch();
+        let outside = scratch();
+        let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
+        assert_eq!(caps.read_budget("EX-1", "r"), Ok(None));
+        let held = caps.lock("EX-1").unwrap();
+        let b = bud("M", 1761955200000);
+        assert_eq!(caps.write_budget_once(&b, &held), Ok(true), "twin: the plain write");
+        assert_eq!(fs::read_to_string(d.join("EX-1.budget")).unwrap(), b.encode());
+        assert_eq!(caps.read_budget("EX-1", "r"), Ok(Some(b.clone())));
+        assert!(caps.read_budget("EX-1", "q").is_err(), "another repo");
+        assert_eq!(caps.write_budget_once(&bud("L", 5), &held), Ok(false), "written once: a second write changes nothing");
+        assert_eq!(fs::read_to_string(d.join("EX-1.budget")).unwrap(), b.encode());
+        // a stale regular temp is removed by name, a temp link is removed and its target left alone
+        let d2 = scratch();
+        let caps2 = Caps::open(&d2, Path::new("/nonexistent-root")).unwrap();
+        let held2 = caps2.lock("EX-1").unwrap();
+        fs::write(d2.join(".EX-1.budget.tmp"), "junk").unwrap();
+        assert_eq!(caps2.write_budget_once(&b, &held2), Ok(true));
+        assert!(!d2.join(".EX-1.budget.tmp").exists(), "a stale temp is removed");
+        fs::remove_file(d2.join("EX-1.budget")).unwrap();
+        fs::write(outside.join("victim"), "victim bytes").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), d2.join(".EX-1.budget.tmp")).unwrap();
+        assert_eq!(caps2.write_budget_once(&b, &held2), Ok(true));
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "victim bytes", "the temp link's target is untouched");
+        assert_eq!(fs::read_to_string(d2.join("EX-1.budget")).unwrap(), b.encode());
+        // a link or a directory at the budget name is refused (reader and writer)
+        let d3 = scratch();
+        let caps3 = Caps::open(&d3, Path::new("/nonexistent-root")).unwrap();
+        let held3 = caps3.lock("EX-1").unwrap();
+        fs::write(outside.join("valid"), b.encode()).unwrap();
+        std::os::unix::fs::symlink(outside.join("valid"), d3.join("EX-1.budget")).unwrap();
+        assert!(caps3.read_budget("EX-1", "r").is_err(), "reader: a link to a valid file");
+        assert!(caps3.write_budget_once(&b, &held3).is_err(), "writer: a link");
+        fs::remove_file(d3.join("EX-1.budget")).unwrap();
+        fs::create_dir(d3.join("EX-1.budget")).unwrap();
+        assert!(caps3.read_budget("EX-1", "r").is_err() && caps3.write_budget_once(&b, &held3).is_err(), "a directory");
+        // a directory at the temp name makes the write fail
+        let d4 = scratch();
+        let caps4 = Caps::open(&d4, Path::new("/nonexistent-root")).unwrap();
+        let held4 = caps4.lock("EX-1").unwrap();
+        fs::create_dir(d4.join(".EX-1.budget.tmp")).unwrap();
+        assert!(caps4.write_budget_once(&b, &held4).is_err());
+        assert!(!d4.join("EX-1.budget").exists());
+        // a case twin is refused by name, for the reader and the writer; the merged check_names is not widened
+        let d5 = scratch();
+        let caps5 = Caps::open(&d5, Path::new("/nonexistent-root")).unwrap();
+        let held5 = caps5.lock("EX-1").unwrap();
+        fs::write(d5.join("ex-1.budget"), "x").unwrap();
+        assert!(caps5.read_budget("EX-1", "r").is_err() && caps5.write_budget_once(&b, &held5).is_err(), "a case twin");
+        assert!(caps5.check_names("EX-1").is_ok(), "check_names does not scan budget names");
+        assert!(caps5.read_budget("EX-2", "r").is_ok(), "twin: another ticket");
+        for p in [&d, &d2, &d3, &d4, &d5, &outside] {
+            let _ = fs::remove_dir_all(p);
+        }
     }
 }
