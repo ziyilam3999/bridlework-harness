@@ -100,7 +100,7 @@ fn fixtures_cmd(a: &[String]) -> i32 {
     0
 }
 
-const EVENTS_USAGE: &str = "usage: harness events append [--log <path>] [--root <dir>] --kind <kind> --ticket <t> --repo <r> --reason <x> [--ts-ms <n>] | events list|verify [--log <path>]";
+const EVENTS_USAGE: &str = "usage: harness events append [--log <path>] [--root <dir>] --kind <kind> --ticket <t> --repo <r> --reason <x> --role <r> --model <m> [--ts-ms <n>] | events list|verify [--log <path>] (role/model also from HARNESS_ROLE/HARNESS_MODEL; run id from HARNESS_RUN_ID or self-issued)";
 /// Default log, relative to the working folder (the ticket's repo). Git-ignored (`.harness/`).
 const EVENTS_DEFAULT_LOG: &str = ".harness/events.jsonl";
 
@@ -134,7 +134,7 @@ fn events_cmd(a: &[String]) -> i32 {
     };
     match sub.as_str() {
         "append" => {
-            let o = match take_event_opts(rest, &["log", "root", "kind", "ticket", "repo", "reason", "ts-ms"]) {
+            let o = match take_event_opts(rest, &["log", "root", "kind", "ticket", "repo", "reason", "role", "model", "ts-ms"]) {
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("harness: error: {}", e);
@@ -143,6 +143,16 @@ fn events_cmd(a: &[String]) -> i32 {
                 }
             };
             let need = |k: &str| o.get(k).cloned().ok_or_else(|| format!("--{} is required", k));
+            // Role and model come from the flag or the environment, never a default; a missing or non-token value refuses the event.
+            let flag_or_env = |k: &str, env: &str| -> Result<String, String> {
+                if let Some(v) = o.get(k) {
+                    return Ok(v.clone());
+                }
+                match std::env::var_os(env) {
+                    Some(v) => Ok(v.to_string_lossy().to_string()),
+                    None => Err(format!("--{k} is required (or set {env}); the role and model of the run are never guessed")),
+                }
+            };
             let built = (|| -> Result<Event, String> {
                 let kind = Kind::parse(&need("kind")?).ok_or("unknown kind")?;
                 let ts_ms = match o.get("ts-ms") {
@@ -150,7 +160,14 @@ fn events_cmd(a: &[String]) -> i32 {
                     Some(_) => return Err("--ts-ms must be a non-negative integer".to_string()),
                     None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "clock is before the epoch".to_string())?.as_millis() as u64,
                 };
-                Ok(Event { kind, ts_ms, ticket: need("ticket")?, repo: need("repo")?, reason: need("reason")? })
+                let role = flag_or_env("role", "HARNESS_ROLE")?;
+                let model = flag_or_env("model", "HARNESS_MODEL")?;
+                for (name, v) in [("role", &role), ("model", &model)] {
+                    if !crate::events::token_ok(v) {
+                        return Err(format!("--{name} must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"));
+                    }
+                }
+                Ok(Event { kind, ts_ms, run_id: String::new(), ticket: need("ticket")?, repo: need("repo")?, reason: need("reason")?, role, model })
             })();
             let ev = match built {
                 Ok(e) => e,
@@ -192,8 +209,11 @@ fn events_cmd(a: &[String]) -> i32 {
                     }
                 }
             }
-            match events::append(&root, &log, &ev) {
-                Ok(()) => 0,
+            // The run id: inherited from HARNESS_RUN_ID only when this log shows it was issued, else self-issued here
+            // (a `run_issued` line is appended first). `append_under_run` refuses an unissued or malformed id and writes nothing.
+            let inherited = std::env::var_os("HARNESS_RUN_ID").map(|v| v.to_string_lossy().to_string());
+            match events::append_under_run(&root, &log, &ev, inherited.as_deref()) {
+                Ok(_) => 0,
                 Err(e) => {
                     eprintln!("harness: error: {}", e);
                     eprintln!("harness: EVENT NOT RECORDED");

@@ -288,9 +288,35 @@ pub fn start_check_budget(rounds: u8, streak: Option<&Streak>, spent: bool) -> R
     may_start(rounds)
 }
 
-/// The event that records a refusal. The `ticket` field is the lowercased id (an event ticket is a lowercase token).
-pub fn event_for(r: &Refusal, ticket: &str, repo_id: &str, ts_ms: u64) -> Event {
-    Event { kind: r.kind, ts_ms, ticket: ticket.to_ascii_lowercase(), repo: repo_id.to_string(), reason: r.reason.to_string() }
+/// The event that records a refusal. The `ticket` field is the lowercased id (an event ticket is a lowercase token), and
+/// `role`/`model` come from the caller (never defaulted); the run id is filled by the v2 writer, never here.
+pub fn event_for(r: &Refusal, ticket: &str, repo_id: &str, ts_ms: u64, role: &str, model: &str) -> Event {
+    Event {
+        kind: r.kind,
+        ts_ms,
+        run_id: String::new(),
+        ticket: ticket.to_ascii_lowercase(),
+        repo: repo_id.to_string(),
+        reason: r.reason.to_string(),
+        role: role.to_string(),
+        model: model.to_string(),
+    }
+}
+
+/// One event-identity field read from the environment: a missing value or a non-token value is refused (the event is not
+/// recorded), because `role` and `model` are never guessed or defaulted.
+fn env_field(name: &str) -> Result<String, String> {
+    match std::env::var_os(name) {
+        None => Err(format!("EVENT NOT RECORDED: {name} is not set; the role and model of the run are never guessed")),
+        Some(v) => {
+            let s = v.to_string_lossy().to_string();
+            if events::token_ok(&s) {
+                Ok(s)
+            } else {
+                Err(format!("EVENT NOT RECORDED: {name} must be a plain token (lowercase letters, digits, '-', '_', '.')"))
+            }
+        }
+    }
 }
 
 /// A per-ticket lock, held while this value lives.
@@ -591,8 +617,18 @@ impl Caps {
     }
 
     /// Record a refusal in `<caps>/events.jsonl`. The log entry itself must be absent or a regular file: `events::append` would follow a link that
-    /// resolves inside this folder (for example onto a record).
+    /// resolves inside this folder (for example onto a record). The run identity comes from the environment: `HARNESS_RUN_ID` when set (accepted only
+    /// if this log shows it was issued), else a self-issued id whose `run_issued` line is written first. `HARNESS_ROLE` and `HARNESS_MODEL` must be set
+    /// and be plain tokens; a missing or bad value refuses the EVENT (which stays refused: a failed write never turns a refusal into a pass).
     pub fn escalate(&self, r: &Refusal, id: &str, repo_id: &str) -> Result<(), String> {
+        let role = env_field("HARNESS_ROLE")?;
+        let model = env_field("HARNESS_MODEL")?;
+        let inherited = std::env::var_os("HARNESS_RUN_ID").map(|v| v.to_string_lossy().to_string());
+        self.escalate_with(r, id, repo_id, &role, &model, inherited.as_deref()).map(|_| ())
+    }
+
+    /// `escalate` with the identity given explicitly (used by the env-reading wrapper above and by tests); returns the run id.
+    pub fn escalate_with(&self, r: &Refusal, id: &str, repo_id: &str, role: &str, model: &str, inherited: Option<&str>) -> Result<String, String> {
         let log = self.dir.join(EVENTS_FILE);
         match fs::symlink_metadata(&log) {
             Ok(m) if m.file_type().is_file() => {}
@@ -601,7 +637,8 @@ impl Caps {
             Err(_) => return Err("the event log entry could not be inspected".to_string()),
         }
         let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        events::append(&self.dir, &log, &event_for(r, id, repo_id, ts_ms)).map_err(|e| e.to_string())
+        let ev = event_for(r, id, repo_id, ts_ms, role, model);
+        events::append_under_run(&self.dir, &log, &ev, inherited).map_err(|e| e.to_string())
     }
 }
 
@@ -715,20 +752,52 @@ mod tests {
         assert_eq!((r.kind, r.reason), (Kind::Escalation, "fix-round-cap"));
     }
 
-    // AC 21: the shared writer encodes a refusal of each existing kind.
+    // AC 21: the shared writer encodes a refusal of each existing kind, each under its own self-issued run.
     #[test]
     fn the_refusal_writer_is_not_tied_to_the_escalation_kind() {
         let d = scratch();
         let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
         for (kind, reason) in [(Kind::Escalation, "fix-round-cap"), (Kind::ReplanRequired, "replan-threshold"), (Kind::BudgetExceeded, "budget-spent")] {
             let r = Refusal { kind, reason };
-            let e = event_for(&r, "EX-1", "r", 7);
-            assert_eq!((e.kind, e.ticket.as_str(), e.repo.as_str(), e.reason.as_str(), e.ts_ms), (kind, "ex-1", "r", reason, 7));
-            caps.escalate(&r, "EX-1", "r").unwrap();
+            let e = event_for(&r, "EX-1", "r", 7, "executor", "m-1");
+            assert_eq!(
+                (e.kind, e.ticket.as_str(), e.repo.as_str(), e.reason.as_str(), e.ts_ms, e.role.as_str(), e.model.as_str()),
+                (kind, "ex-1", "r", reason, 7, "executor", "m-1")
+            );
+            caps.escalate_with(&r, "EX-1", "r", "executor", "m-1", None).unwrap();
         }
         let got = events::read_log(&d.join(EVENTS_FILE)).unwrap();
         assert!(got.is_clean());
-        assert_eq!(got.events.iter().map(|e| e.kind).collect::<Vec<_>>(), vec![Kind::Escalation, Kind::ReplanRequired, Kind::BudgetExceeded]);
+        assert_eq!(
+            got.events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![Kind::RunIssued, Kind::Escalation, Kind::RunIssued, Kind::ReplanRequired, Kind::RunIssued, Kind::BudgetExceeded],
+            "each self-issued refusal writes its run_issued line first"
+        );
+        let ids: Vec<&str> = got.events.iter().map(|e| e.run_id.as_str()).collect();
+        assert!(ids[0] != ids[2] && ids[2] != ids[4], "each invocation issues its own id");
+        for e in &got.events {
+            assert_eq!((e.role.as_str(), e.model.as_str(), e.ticket.as_str()), ("executor", "m-1", "ex-1"));
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // An inherited id is reused for the escalation only when this log shows it was issued.
+    #[test]
+    fn an_escalation_under_an_inherited_run_id_reuses_it_or_refuses() {
+        let d = scratch();
+        let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
+        let r = Refusal { kind: Kind::Escalation, reason: REASON_FIX_ROUND_CAP };
+        let id = caps.escalate_with(&r, "EX-1", "r", "executor", "m-1", None).unwrap();
+        // Issued id: exactly one new line, no new run_issued.
+        caps.escalate_with(&r, "EX-1", "r", "reviewer", "m-2", Some(&id)).unwrap();
+        let got = events::read_log(&d.join(EVENTS_FILE)).unwrap();
+        assert_eq!(got.events.len(), 3);
+        assert_eq!(got.events.iter().filter(|e| e.kind == Kind::RunIssued).count(), 1);
+        assert_eq!((got.events[2].run_id.as_str(), got.events[2].role.as_str(), got.events[2].model.as_str()), (id.as_str(), "reviewer", "m-2"));
+        // Unissued id: refused, nothing written; the refusal itself is the caller's to keep.
+        let before = fs::read(d.join(EVENTS_FILE)).unwrap();
+        assert!(caps.escalate_with(&r, "EX-1", "r", "executor", "m-1", Some("never-issued")).is_err());
+        assert_eq!(fs::read(d.join(EVENTS_FILE)).unwrap(), before);
         let _ = fs::remove_dir_all(&d);
     }
 

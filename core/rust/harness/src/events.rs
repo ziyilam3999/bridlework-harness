@@ -1,5 +1,7 @@
 //! Event log core (std only): the append-only JSON Lines file the caps' refusals are recorded in.
-//! One event per line, compact, fixed key order, every key present, `v` (schema version) on every line.
+//! One event per line, compact, fixed key order, every key present, `v` (schema version) on every line. Since v2 every
+//! event also carries its run identity: `run_id` (who issued the run this line belongs to), `role` and `model`; the first
+//! line of a self-issued run is a `run_issued` event. An event missing any of these is refused, never guessed or defaulted.
 //! Reader: every complete line must be a valid event (else CORRUPTION, the read stops there); a final fragment with no
 //! trailing newline is a TORN TAIL, reported and never parsed. Writer: one `write()` of the whole line, then `sync_all`;
 //! refuses to append onto a torn tail (it would fuse a new event onto garbage). Recovery of a torn tail is not here.
@@ -8,30 +10,37 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Schema version written on every line and the only one this reader accepts.
-pub const SCHEMA_VERSION: u64 = 1;
+/// Schema version written on every line and the only one this reader accepts. A v1 line (no run identity) is refused
+/// with the line and `v` named, never upgraded by guess.
+pub const SCHEMA_VERSION: u64 = 2;
 /// Largest accepted line in bytes, newline included. Keeps each append one small write.
 pub const LINE_CAP: usize = 4096;
 
-/// Keys of every v1 kind, in canonical order.
-const KEYS_V1: [&str; 6] = ["v", "kind", "ts_ms", "ticket", "repo", "reason"];
+/// Keys of every v2 kind, in canonical order.
+const KEYS_V2: [&str; 9] = ["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"];
+
+/// The reason token of the `run_issued` line a self-issuing invocation appends before its first event.
+pub const REASON_RUN_ISSUED: &str = "self-issue";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Escalation,
     ReplanRequired,
     BudgetExceeded,
+    RunIssued,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::Escalation, Kind::ReplanRequired, Kind::BudgetExceeded];
+    pub const ALL: [Kind; 4] = [Kind::Escalation, Kind::ReplanRequired, Kind::BudgetExceeded, Kind::RunIssued];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Kind::Escalation => "escalation",
             Kind::ReplanRequired => "replan_required",
             Kind::BudgetExceeded => "budget_exceeded",
+            Kind::RunIssued => "run_issued",
         }
     }
 
@@ -41,7 +50,7 @@ impl Kind {
 
     /// The exact key set of this kind at the current schema version, in canonical order.
     pub fn keys(&self) -> &'static [&'static str] {
-        &KEYS_V1
+        &KEYS_V2
     }
 }
 
@@ -50,9 +59,14 @@ pub struct Event {
     pub kind: Kind,
     /// Caller-supplied milliseconds since the epoch.
     pub ts_ms: u64,
+    /// The run identity this event belongs to; never guessed, never defaulted.
+    pub run_id: String,
     pub ticket: String,
     pub repo: String,
     pub reason: String,
+    /// The role and the model of the run that writes the event; never defaulted.
+    pub role: String,
+    pub model: String,
 }
 
 /// An id or reason token: lowercase letters, digits, `-`, `_`, `.`; never empty, never `.` or `..`.
@@ -62,7 +76,14 @@ pub fn token_ok(s: &str) -> bool {
 
 impl Event {
     pub fn validate(&self) -> Result<(), String> {
-        for (name, v) in [("ticket", &self.ticket), ("repo", &self.repo), ("reason", &self.reason)] {
+        for (name, v) in [
+            ("run_id", &self.run_id),
+            ("ticket", &self.ticket),
+            ("repo", &self.repo),
+            ("reason", &self.reason),
+            ("role", &self.role),
+            ("model", &self.model),
+        ] {
             if !token_ok(v) {
                 return Err(format!("{name} must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"));
             }
@@ -75,13 +96,16 @@ impl Event {
         self.validate().map_err(AppendError::Invalid)?;
         // Every string field is a validated token, so none needs escaping.
         let line = format!(
-            "{{\"v\":{},\"kind\":\"{}\",\"ts_ms\":{},\"ticket\":\"{}\",\"repo\":\"{}\",\"reason\":\"{}\"}}\n",
+            "{{\"v\":{},\"kind\":\"{}\",\"ts_ms\":{},\"run_id\":\"{}\",\"ticket\":\"{}\",\"repo\":\"{}\",\"reason\":\"{}\",\"role\":\"{}\",\"model\":\"{}\"}}\n",
             SCHEMA_VERSION,
             self.kind.as_str(),
             self.ts_ms,
+            self.run_id,
             self.ticket,
             self.repo,
-            self.reason
+            self.reason,
+            self.role,
+            self.model
         );
         if line.len() > LINE_CAP {
             return Err(AppendError::TooLong(line.len()));
@@ -131,7 +155,16 @@ impl Event {
             Some(Val::Num(n)) => *n,
             _ => return Err("ts_ms has the wrong type".to_string()),
         };
-        let ev = Event { kind, ts_ms, ticket: text("ticket")?, repo: text("repo")?, reason: text("reason")? };
+        let ev = Event {
+            kind,
+            ts_ms,
+            run_id: text("run_id")?,
+            ticket: text("ticket")?,
+            repo: text("repo")?,
+            reason: text("reason")?,
+            role: text("role")?,
+            model: text("model")?,
+        };
         ev.validate()?;
         Ok(ev)
     }
@@ -388,6 +421,76 @@ fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool) -> Result<(),
     Ok(())
 }
 
+// ---------------------------------------------------------------- run identity (v2)
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// A fresh run id: `run-<ms>-<pid>-<seq>`, a plain token, unique per call. The wall clock is only the first part: the
+/// process id separates concurrent invocations and the process-wide sequence separates two issues inside one process
+/// inside one millisecond, so two appends back-to-back never share an id.
+pub fn new_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!("run-{}-{}-{}", now_ms(), std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+/// Write one event under one run identity (the v2 writer).
+///
+/// Without `inherited` (the caller had no `HARNESS_RUN_ID`) a fresh id is self-issued: a `run_issued` line is appended
+/// first, carrying the same `ts_ms`, `ticket`, `repo`, `role` and `model` as the event, then the event itself — two lines.
+///
+/// With `inherited` (the value of `HARNESS_RUN_ID`), that exact id is accepted only when this same log is readable, clean,
+/// and already holds a `run_issued` line for it; then exactly ONE line (the event) is appended. An unissued, malformed or
+/// unshowable id is refused and nothing is written — an id from the environment is inherited, never trusted on faith.
+///
+/// The event's own `run_id` field is ignored (overwritten by the resolved id); every other field is validated as usual.
+pub fn append_under_run(root: &Path, log: &Path, ev: &Event, inherited: Option<&str>) -> Result<String, AppendError> {
+    let bad = |m: String| AppendError::Invalid(m);
+    let run_id = match inherited {
+        None => new_run_id(),
+        Some(id) => {
+            if !token_ok(id) {
+                return Err(bad(format!(
+                    "HARNESS_RUN_ID {id:?} must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"
+                )));
+            }
+            let read = read_log(log).map_err(|m| bad(format!("HARNESS_RUN_ID is set, so the log must be read to show that id was issued: {m}")))?;
+            if let Some(c) = &read.corrupt {
+                return Err(bad(format!("HARNESS_RUN_ID is set, but the log is corrupt at line {} ({})", c.line, c.msg)));
+            }
+            if let Some(t) = &read.torn_tail {
+                return Err(bad(format!("HARNESS_RUN_ID is set, but the log has a torn tail at line {}", t.line)));
+            }
+            if !read.events.iter().any(|e| e.kind == Kind::RunIssued && e.run_id == id) {
+                return Err(bad(format!("HARNESS_RUN_ID {id:?} was not issued in this log; an unissued id is never written under")));
+            }
+            id.to_string()
+        }
+    };
+    let under = Event { run_id: run_id.clone(), ..ev.clone() };
+    // Validate and encode BOTH lines before writing either: a refused event (bad token, over the cap) must leave no
+    // orphaned run_issued line behind. The appends below re-encode; the bytes are already known to be writable.
+    under.encode()?;
+    let issue = Event {
+        kind: Kind::RunIssued,
+        ts_ms: under.ts_ms,
+        run_id: run_id.clone(),
+        ticket: under.ticket.clone(),
+        repo: under.repo.clone(),
+        reason: REASON_RUN_ISSUED.to_string(),
+        role: under.role.clone(),
+        model: under.model.clone(),
+    };
+    issue.encode()?;
+    if inherited.is_none() {
+        append(root, log, &issue)?;
+    }
+    append(root, log, &under)?;
+    Ok(run_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,11 +523,21 @@ mod tests {
     }
 
     fn ev(kind: Kind, n: u64) -> Event {
-        Event { kind, ts_ms: n, ticket: "t-1".to_string(), repo: "my-repo".to_string(), reason: "cap.hit".to_string() }
+        Event {
+            kind,
+            ts_ms: n,
+            run_id: "run-1".to_string(),
+            ticket: "t-1".to_string(),
+            repo: "my-repo".to_string(),
+            reason: "cap.hit".to_string(),
+            role: "executor".to_string(),
+            model: "m-1".to_string(),
+        }
     }
 
+    /// The three cap kinds (run_issued has its own tests below); three lines, so a torn tail is always the third.
     fn three(t: &Tmp) -> Vec<u8> {
-        for (i, k) in Kind::ALL.iter().enumerate() {
+        for (i, k) in Kind::ALL.iter().take(3).enumerate() {
             append(&t.0, &t.log(), &ev(*k, i as u64 + 1)).unwrap();
         }
         fs::read(t.log()).unwrap()
@@ -441,17 +554,17 @@ mod tests {
         assert_eq!(r.events.len(), 3);
         let again: String = r.events.iter().map(|e| e.encode().unwrap()).collect();
         assert_eq!(again.as_bytes(), &bytes[..], "re-encoding the read events is byte-identical");
-        assert_eq!(r.events.iter().map(|e| e.kind).collect::<Vec<_>>(), Kind::ALL.to_vec());
+        assert_eq!(r.events.iter().map(|e| e.kind).collect::<Vec<_>>(), Kind::ALL[..3].to_vec());
         assert_eq!(
             ev(Kind::BudgetExceeded, 7).encode().unwrap(),
-            "{\"v\":1,\"kind\":\"budget_exceeded\",\"ts_ms\":7,\"ticket\":\"t-1\",\"repo\":\"my-repo\",\"reason\":\"cap.hit\"}\n"
+            "{\"v\":2,\"kind\":\"budget_exceeded\",\"ts_ms\":7,\"run_id\":\"run-1\",\"ticket\":\"t-1\",\"repo\":\"my-repo\",\"reason\":\"cap.hit\",\"role\":\"executor\",\"model\":\"m-1\"}\n"
         );
     }
 
     #[test]
-    fn ac1_planted_a_fourth_kind_is_refused_on_read_and_cannot_be_constructed() {
+    fn ac1_planted_a_fifth_kind_is_refused_on_read_and_cannot_be_constructed() {
         assert_eq!(Kind::parse("surprise"), None);
-        let l = "{\"v\":1,\"kind\":\"surprise\",\"ts_ms\":1,\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\"}";
+        let l = "{\"v\":2,\"kind\":\"surprise\",\"ts_ms\":1,\"run_id\":\"run-1\",\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"m-1\"}";
         assert!(Event::decode(l).unwrap_err().contains("unknown kind"));
         // The twin: the same line with a real kind decodes.
         assert!(Event::decode(&l.replace("surprise", "escalation")).is_ok());
@@ -536,12 +649,13 @@ mod tests {
     fn ac4_unknown_or_missing_v_is_refused_naming_v_and_yields_no_event() {
         let good = ev(Kind::Escalation, 1).encode().unwrap();
         let good = good.trim_end();
-        assert!(Event::decode(good).is_ok(), "twin: v=1 passes");
+        assert!(Event::decode(good).is_ok(), "twin: v=2 passes");
         for (bad, want) in [
-            (good.replace("\"v\":1", "\"v\":2"), "unsupported v 2"),
-            (good.replace("\"v\":1", "\"v\":0"), "unsupported v 0"),
-            (good.replace("\"v\":1,", ""), "v missing"),
-            (good.replace("\"v\":1", "\"v\":\"1\""), "v has the wrong type"),
+            (good.replace("\"v\":2", "\"v\":3"), "unsupported v 3"),
+            (good.replace("\"v\":2", "\"v\":1"), "unsupported v 1"),
+            (good.replace("\"v\":2", "\"v\":0"), "unsupported v 0"),
+            (good.replace("\"v\":2,", ""), "v missing"),
+            (good.replace("\"v\":2", "\"v\":\"2\""), "v has the wrong type"),
         ] {
             assert_eq!(Event::decode(&bad).unwrap_err(), want, "{bad}");
             let log = format!("{good}\n{bad}\n{good}\n");
@@ -551,8 +665,11 @@ mod tests {
             assert_eq!(c.line, 2);
             assert_eq!(c.msg, want);
         }
-        // v is checked before the rest, so a v2 line with an unknown kind still names v.
-        assert_eq!(Event::decode(&good.replace("\"v\":1", "\"v\":2").replace("escalation", "future")).unwrap_err(), "unsupported v 2");
+        // v is checked before the rest, so a v3 line with an unknown kind still names v. A v1 line (no run identity) is
+        // refused the same way: it is never upgraded by guess.
+        assert_eq!(Event::decode(&good.replace("\"v\":2", "\"v\":3").replace("escalation", "future")).unwrap_err(), "unsupported v 3");
+        let v1 = "{\"v\":1,\"kind\":\"escalation\",\"ts_ms\":1,\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\"}";
+        assert_eq!(Event::decode(v1).unwrap_err(), "unsupported v 1");
     }
 
     // AC5 corruption is refused, not skipped
@@ -607,7 +724,10 @@ mod tests {
 
     #[test]
     fn ac5_an_over_cap_complete_line_is_corruption() {
-        let long = format!("{{\"v\":1,\"kind\":\"escalation\",\"ts_ms\":1,\"ticket\":\"{}\",\"repo\":\"r\",\"reason\":\"x\"}}", "a".repeat(LINE_CAP));
+        let long = format!(
+            "{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":1,\"run_id\":\"run-1\",\"ticket\":\"{}\",\"repo\":\"r\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"m-1\"}}",
+            "a".repeat(LINE_CAP)
+        );
         let r = parse_log(format!("{long}\n").as_bytes());
         assert!(r.events.is_empty());
         assert!(r.corrupt.unwrap().msg.contains("cap"));
@@ -626,7 +746,7 @@ mod tests {
                 std::thread::spawn(move || {
                     b.wait();
                     for i in 0..PER {
-                        let e = Event { kind: Kind::Escalation, ts_ms: i as u64, ticket: format!("w{w}"), repo: "r".to_string(), reason: "x".to_string() };
+                        let e = Event { kind: Kind::Escalation, ts_ms: i as u64, run_id: format!("run-{w}"), ticket: format!("w{w}"), repo: "r".to_string(), reason: "x".to_string(), role: "executor".to_string(), model: "m-1".to_string() };
                         write_one(&root, &log, &e);
                     }
                 })
@@ -796,12 +916,15 @@ mod tests {
     fn ac9_bad_tokens_are_refused_and_nothing_is_created() {
         let t = Tmp::new();
         for bad in ["", "Upper", "has space", "nl\n", "q\"uote", "back\\slash", ".", "..", "a/b", "tab\t", "uni\u{e9}"] {
-            for field in 0..3 {
+            for field in 0..6 {
                 let mut e = ev(Kind::Escalation, 1);
                 match field {
-                    0 => e.ticket = bad.to_string(),
-                    1 => e.repo = bad.to_string(),
-                    _ => e.reason = bad.to_string(),
+                    0 => e.run_id = bad.to_string(),
+                    1 => e.ticket = bad.to_string(),
+                    2 => e.repo = bad.to_string(),
+                    3 => e.reason = bad.to_string(),
+                    4 => e.role = bad.to_string(),
+                    _ => e.model = bad.to_string(),
                 }
                 assert!(matches!(append(&t.0, &t.log(), &e).unwrap_err(), AppendError::Invalid(_)), "{bad:?} field {field}");
             }
@@ -868,14 +991,100 @@ mod tests {
     }
 
     #[test]
-    fn every_kind_has_the_exact_v1_key_set_and_encodes_exactly_those_keys() {
+    fn every_kind_has_the_exact_v2_key_set_and_encodes_exactly_those_keys() {
         for k in Kind::ALL {
-            assert_eq!(k.keys(), &["v", "kind", "ts_ms", "ticket", "repo", "reason"]);
+            assert_eq!(k.keys(), &["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"]);
             let line = ev(k, 1).encode().unwrap();
             let mut p = P { b: line.trim_end().as_bytes(), i: 0 };
             let keys: Vec<String> = p.object().unwrap().into_iter().map(|(k, _)| k).collect();
             assert_eq!(keys, k.keys());
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }
+    }
+
+    // ---------------------------------------------------------------- run identity (v2)
+
+    #[test]
+    fn run_ids_are_unique_tokens_even_back_to_back() {
+        let a = new_run_id();
+        let b = new_run_id();
+        let c = new_run_id();
+        assert!(a != b && b != c && a != c, "three issues in one millisecond differ: {a} {b} {c}");
+        for id in [a, b, c] {
+            assert!(token_ok(&id), "{id} is a plain token");
+            assert!(id.starts_with("run-"), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_self_issued_write_appends_run_issued_then_the_event_under_one_id() {
+        let t = Tmp::new();
+        let id = append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 5), None).unwrap();
+        assert!(token_ok(&id));
+        let r = read_log(&t.log()).unwrap();
+        assert!(r.is_clean());
+        assert_eq!(r.events.len(), 2, "exactly two lines: run_issued, then the event");
+        assert_eq!((r.events[0].kind, r.events[0].run_id.as_str(), r.events[0].reason.as_str()), (Kind::RunIssued, id.as_str(), REASON_RUN_ISSUED));
+        assert_eq!(
+            (r.events[1].kind, r.events[1].run_id.as_str(), r.events[1].ts_ms, r.events[1].ticket.as_str(), r.events[1].role.as_str(), r.events[1].model.as_str()),
+            (Kind::Escalation, id.as_str(), 5, "t-1", "executor", "m-1")
+        );
+        // The issue line carries the event's own stamp and identity, not a second clock read.
+        assert_eq!(r.events[0].ts_ms, r.events[1].ts_ms);
+        assert_eq!((r.events[0].ticket.as_str(), r.events[0].repo.as_str(), r.events[0].role.as_str(), r.events[0].model.as_str()), ("t-1", "my-repo", "executor", "m-1"));
+    }
+
+    #[test]
+    fn an_inherited_issued_id_adds_exactly_one_line_and_no_new_issue() {
+        let t = Tmp::new();
+        let id = append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 1), None).unwrap();
+        append_under_run(&t.0, &t.log(), &ev(Kind::ReplanRequired, 2), Some(&id)).unwrap();
+        let r = read_log(&t.log()).unwrap();
+        assert_eq!(r.events.len(), 3, "issue + two events");
+        assert_eq!(r.events.iter().filter(|e| e.kind == Kind::RunIssued).count(), 1, "no second run_issued");
+        assert_eq!(r.events[2].run_id, id);
+        // The same id issued in a DIFFERENT log is not inherited there: the issue is per log.
+        let other = Tmp::new();
+        assert!(append_under_run(&other.0, &other.log(), &ev(Kind::Escalation, 1), Some(&id)).is_err());
+        assert!(!other.log().exists(), "the refusal left no file");
+    }
+
+    #[test]
+    fn an_unissued_or_malformed_inherited_id_is_refused_and_writes_nothing() {
+        let t = Tmp::new();
+        append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 1), None).unwrap();
+        let before = fs::read(t.log()).unwrap();
+        for bad in ["never-issued", "Bad_ID", "", ".", "..", "run-1 "] {
+            let e = append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 2), Some(bad)).unwrap_err();
+            assert!(matches!(e, AppendError::Invalid(_)), "{bad:?}: {e}");
+            assert_eq!(fs::read(t.log()).unwrap(), before, "{bad:?}: nothing was written");
+        }
+        // Twin: the issued id itself passes.
+        let id = read_log(&t.log()).unwrap().events[0].run_id.clone();
+        assert!(append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 3), Some(&id)).is_ok());
+        // An inherited id with no log at all is refused (the issue cannot be shown), never treated as fresh.
+        let empty = Tmp::new();
+        assert!(append_under_run(&empty.0, &empty.log(), &ev(Kind::Escalation, 1), Some("run-x")).is_err());
+        assert!(!empty.log().exists());
+    }
+
+    #[test]
+    fn an_inherited_id_over_a_torn_or_corrupt_log_is_refused() {
+        let t = Tmp::new();
+        let id = append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 1), None).unwrap();
+        let bytes = fs::read(t.log()).unwrap();
+        fs::write(t.log(), &bytes[..bytes.len() - 1]).unwrap();
+        assert!(append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 2), Some(&id)).is_err(), "torn tail");
+        fs::write(t.log(), format!("garbage\n{}", String::from_utf8_lossy(&bytes))).unwrap();
+        assert!(append_under_run(&t.0, &t.log(), &ev(Kind::Escalation, 2), Some(&id)).is_err(), "corruption");
+    }
+
+    #[test]
+    fn a_self_issued_event_with_a_bad_role_or_model_is_refused_and_the_issue_is_not_written() {
+        let t = Tmp::new();
+        let mut bad = ev(Kind::Escalation, 1);
+        bad.role = "Executor".to_string();
+        assert!(append_under_run(&t.0, &t.log(), &bad, None).is_err());
+        assert!(!t.log().exists(), "neither the run_issued line nor the event was written");
     }
 }

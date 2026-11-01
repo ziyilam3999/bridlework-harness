@@ -245,12 +245,21 @@ fn ticket_file(fx: &Fx, body: &str) -> PathBuf {
 fn command(cwd: &Path, args: &[String], env: &[(&str, &Path)]) -> Command {
     let mut c = Command::new(BIN);
     c.arg("ticket").arg("gate").args(args).current_dir(cwd).stdin(Stdio::null());
-    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "HARNESS_RUN_ID"] {
         c.env_remove(k);
     }
+    // The run identity of an escalation (v2): the role and model of the gate run, never defaulted by the harness.
+    c.env("HARNESS_ROLE", "executor").env("HARNESS_MODEL", "m-1");
     for (k, v) in env {
         c.env(k, v);
     }
+    c
+}
+
+/// The same gate child WITHOUT an event identity: an escalation then cannot be recorded (and the refusal stays a refusal).
+fn command_no_identity(cwd: &Path, args: &[String], env: &[(&str, &Path)]) -> Command {
+    let mut c = command(cwd, args, env);
+    c.env_remove("HARNESS_ROLE").env_remove("HARNESS_MODEL");
     c
 }
 
@@ -375,7 +384,8 @@ fn runs_one_to_four_execute_and_run_five_is_refused() {
     assert_eq!(fs::read(fx.result_file("T-1")).unwrap(), before_result, "the result file is untouched");
     assert_eq!(fx.rec("T-1"), before_rec, "no round was paid for the refusal");
     assert!(!leaks(&o, fx.caps.to_str().unwrap()) && !leaks(&o, fx.res.to_str().unwrap()), "no folder is echoed");
-    assert_eq!(event_lines(&fx).len(), 1, "exactly one escalation event");
+    assert_eq!(event_lines(&fx).iter().filter(|l| l.contains("\"escalation\"")).count(), 1, "exactly one escalation event");
+    assert_eq!(event_lines(&fx).len(), 2, "its run_issued line and the escalation");
 }
 
 // AC 3: the event is a valid escalation with the lowercased id; each refused call appends one. Twin: a ticket under the cap writes no log.
@@ -400,12 +410,39 @@ fn the_refusal_writes_a_valid_escalation_event() {
     }
     let read = events::read_log(&log).unwrap();
     assert!(read.is_clean());
-    assert_eq!(read.events.len(), 1);
-    let e = &read.events[0];
+    assert_eq!(read.events.len(), 2, "the self-issued run_issued line plus the escalation");
+    assert_eq!(read.events[0].kind.as_str(), "run_issued");
+    let e = &read.events[1];
     assert_eq!((e.kind.as_str(), e.ticket.as_str(), e.repo.as_str(), e.reason.as_str()), ("escalation", "ex-1", "r", "fix-round-cap"));
     assert!(e.ts_ms > 0);
+    // v2 identity: both lines carry the same run id, the role and the model of the gate run.
+    assert_eq!(read.events[0].run_id, e.run_id);
+    assert_eq!((e.role.as_str(), e.model.as_str()), ("executor", "m-1"));
+    assert_eq!((read.events[0].role.as_str(), read.events[0].model.as_str()), ("executor", "m-1"));
     assert_eq!(code(&gate_id(&fx, "EX-1", &[])), 1);
-    assert_eq!(event_lines(&fx).len(), 2, "a second refused call appends a second event");
+    assert_eq!(event_lines(&fx).len(), 4, "a second refused call appends another run (run_issued + escalation)");
+}
+
+// PRE-B: without HARNESS_ROLE/HARNESS_MODEL the escalation event cannot be recorded, and the run is an error (never a
+// pass); the cap refusal itself is kept. Twin: with the identity, the same refusal records its event.
+#[test]
+fn an_escalation_without_a_role_or_model_is_not_recorded_and_the_refusal_stands() {
+    let (fx, c1) = Fx::failing();
+    fx.plant("T-1", 4, false);
+    let before_rec = fx.rec("T-1");
+    let args = full_args(&fx, "T-1");
+    let env: Vec<(&str, &Path)> = vec![("GATE_MARKER", fx.marker.as_path())];
+    let o = command_no_identity(&fx.other, &args, &env).output().unwrap();
+    errored(&o);
+    assert!(err(&o).contains("ESCALATION NOT RECORDED") && err(&o).contains("fix-round-cap"), "{}", err(&o));
+    assert!(fx.markers().is_empty(), "nothing ran");
+    assert_eq!(fx.rec("T-1"), before_rec, "no round was paid");
+    assert!(!fx.caps.join("events.jsonl").exists(), "no event and no run_issued line was written");
+    // Twin: the same capped ticket WITH the identity is refused normally and records its run.
+    let o = gate(&fx);
+    assert_eq!(code(&o), 1);
+    assert_eq!(out(&o), refused_line("T-1", &c1));
+    assert_eq!(event_lines(&fx).len(), 2);
 }
 
 // AC 4: the count is per ticket. Twin: the capped ticket itself.
@@ -429,7 +466,7 @@ fn the_count_is_per_ticket() {
     assert_eq!(out(&o), fail_line(&c1), "T-1 at two rounds still runs");
     assert!(fx.markers().len() > before, "its checks ran");
     assert_eq!(fx.rec("T-1"), canon("T-1", 3, false));
-    assert_eq!(event_lines(&fx).len(), 1, "only T-2's refusal is an event");
+    assert_eq!(event_lines(&fx).iter().filter(|l| l.contains("\"escalation\"")).count(), 1, "only T-2's refusal is an event");
 }
 
 // AC 5 + 22: a PASS keeps the count; the public reader says 2, 3, 0. Twin: a FAIL keeps its round.
@@ -579,7 +616,7 @@ fn a_dead_fourth_run_is_folded_in_before_the_cap_is_decided() {
     assert_eq!(fx.markers(), before_markers, "no check ran");
     assert_eq!(fx.rec("T-1"), before_rec, "the record is unchanged");
     assert_eq!(fs::read(fx.result_file("T-1")).unwrap(), before_result, "the result file is untouched");
-    assert_eq!(event_lines(&fx).len(), 1, "exactly one escalation event");
+    assert_eq!(event_lines(&fx).iter().filter(|l| l.contains("\"escalation\"")).count(), 1, "exactly one escalation event");
 }
 
 // AC 8: verdicts that run no check still cost a round. Twin: a check-failed FAIL (AC 1).
@@ -707,7 +744,7 @@ fn links_are_never_followed() {
     fx.plant("T-1", 4, false);
     fs::write(fx.caps.join("events.jsonl"), "").unwrap();
     assert_eq!(code(&gate(&fx)), 1);
-    assert_eq!(event_lines(&fx).len(), 1);
+    assert_eq!(event_lines(&fx).len(), 2, "run_issued plus the escalation");
 }
 
 // AC 11: --caps-dir is refused unless absolute, real, outside the repo. Twin: such a folder.
@@ -940,7 +977,7 @@ fn an_escalation_that_cannot_be_written_is_an_error() {
     fx.plant("T-1", 4, false);
     let o = gate(&fx);
     assert_eq!((code(&o), out(&o)), (1, refused_line("T-1", &c1)), "twin: a healthy log");
-    assert_eq!(event_lines(&fx).len(), 1);
+    assert_eq!(event_lines(&fx).len(), 2, "run_issued plus the escalation");
 }
 
 // AC 25: the PASS refund is written before the result; a FAIL is counted before it. Twin: a writable result folder.

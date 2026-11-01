@@ -107,15 +107,16 @@ fn the_committed_schema_matches_the_event_loader() {
 #[test]
 fn planted_a_schema_that_drifted_from_the_loader_is_caught() {
     let good = schema_text();
-    let first_required = "\"required\": [\"v\", \"kind\", \"ts_ms\", \"ticket\", \"repo\", \"reason\"]";
+    let first_required = "\"required\": [\"v\", \"kind\", \"ts_ms\", \"run_id\", \"ticket\", \"repo\", \"reason\", \"role\", \"model\"]";
     assert!(good.contains(first_required));
     let mutants = [
-        ("a key removed from one kind", good.replacen(first_required, "\"required\": [\"v\", \"kind\", \"ts_ms\", \"ticket\", \"repo\"]", 1)),
-        ("an extra required key", good.replacen(first_required, "\"required\": [\"v\", \"kind\", \"ts_ms\", \"ticket\", \"repo\", \"reason\", \"extra\"]", 1)),
-        ("a wrong v const", good.replacen("\"v\": { \"const\": 1,", "\"v\": { \"const\": 2,", 1)),
+        ("a key removed from one kind", good.replacen(first_required, "\"required\": [\"v\", \"kind\", \"ts_ms\", \"run_id\", \"ticket\", \"repo\", \"reason\", \"role\"]", 1)),
+        ("the run identity removed", good.replacen(first_required, "\"required\": [\"v\", \"kind\", \"ts_ms\", \"ticket\", \"repo\", \"reason\"]", 1)),
+        ("an extra required key", good.replacen(first_required, "\"required\": [\"v\", \"kind\", \"ts_ms\", \"run_id\", \"ticket\", \"repo\", \"reason\", \"role\", \"model\", \"extra\"]", 1)),
+        ("a wrong v const", good.replacen("\"v\": { \"const\": 2,", "\"v\": { \"const\": 3,", 1)),
         ("a kind const that no longer matches", good.replacen("\"kind\": { \"const\": \"escalation\" }", "\"kind\": { \"const\": \"escalate\" }", 1)),
         ("extra keys allowed", good.replacen("\"additionalProperties\": false", "\"additionalProperties\": true", 1)),
-        ("a kind branch missing", good.replacen("\"title\": \"budget_exceeded\"", "\"title\": \"budget\"", 1)),
+        ("a kind branch missing", good.replacen("\"title\": \"run_issued\"", "\"title\": \"run\"", 1)),
         ("an extra optional property the loader does not know", good.replacen("\"reason\": {", "\"note\": { \"type\": \"string\" },\n        \"reason\": {", 1)),
         ("a stale line cap", good.replace("4096 bytes", "8192 bytes")),
     ];
