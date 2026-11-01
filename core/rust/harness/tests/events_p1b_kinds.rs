@@ -667,7 +667,7 @@ fn v7_a_log_of_only_good_lines_verifies_clean() {
     assert_eq!(v.status.code(), Some(0), "{}", err(&v));
 }
 
-/// R3-F1 (+ held-out v1-v4): a caller who passes a reserved envelope name (`ts_ms`, `kind`) as a field is refused at
+/// R3-F1 (+ held-out v1-v4): a caller who passes a reserved envelope name (`v`, `ts_ms`, `kind`) as a field is refused at
 /// the build door AND at the append door, the error names the key, and the log is never written. Pairs come from
 /// `pairs_for`, so the extra reserved pair is the only defect. Case variants (v3) follow today's rule: not a declared
 /// key, so refused as an unexpected key naming it. The reserved name given twice (v4) is refused, never accepted once.
@@ -679,6 +679,7 @@ fn r3f1_a_caller_field_named_ts_ms_or_kind_is_refused_at_build_and_at_append() {
             ("ts_ms", Field::Str("x".to_string())),
             ("kind", Field::Str(kind.as_str().to_string())),
             ("kind", Field::Num(7)),
+            ("v", Field::Str("2".to_string())),
             ("TS_MS", Field::Num(7)),
             ("Kind", Field::Str("x".to_string())),
         ] {
