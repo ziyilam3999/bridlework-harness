@@ -330,6 +330,76 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
+const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new]";
+
+/// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
+/// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->`); 1 the name is
+/// refused (stdout empty, one stderr line naming the name and the reason); 2 usage or config error
+/// (stdout empty). The config source is resolved exactly as `harness config check` resolves it:
+/// `--config`, else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
+/// The lane bound is the config's `lanes.count` only. Read-only: no file is written, no event logged.
+fn session_cmd(a: &[String]) -> i32 {
+    use crate::config::Config;
+    use crate::session_name;
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    if a.first().map(|s| s.as_str()) != Some("check-name") {
+        eprintln!("{}", SESSION_USAGE);
+        return 2;
+    }
+    let mut name: Option<&str> = None;
+    let mut file: Option<&str> = None;
+    let mut new_only = false;
+    let mut it = a[1..].iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--new" => new_only = true,
+            "--config" => {
+                let Some(v) = it.next() else { return fail("--config is missing its value") };
+                if file.replace(v.as_str()).is_some() {
+                    return fail("--config was given twice");
+                }
+            }
+            s if s.starts_with("--") => return fail("unknown option"),
+            s => {
+                if name.replace(s).is_some() {
+                    return fail("more than one session name given");
+                }
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("{}", SESSION_USAGE);
+        return 2;
+    };
+    let path = match file {
+        Some(f) => std::ffi::OsString::from(f),
+        None => match std::env::var_os("HARNESS_CONFIG") {
+            Some(v) => v,
+            None => return fail("no config configured (pass --config <file> or set HARNESS_CONFIG)"),
+        },
+    };
+    if path.is_empty() {
+        return fail("the config source is empty");
+    }
+    let cfg = match Config::load(std::path::Path::new(&path)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    match session_name::check(name, cfg.lane_count(), new_only) {
+        Ok(v) => {
+            println!("{}", v.line());
+            0
+        }
+        Err(reason) => {
+            eprintln!("harness: session name refused: {}: {}", name, reason);
+            1
+        }
+    }
+}
+
 const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
@@ -415,6 +485,9 @@ pub fn run(mut args: Vec<String>) -> i32 {
     }
     if !args.is_empty() && args[0] == "config" {
         return config_cmd(&args[1..]);
+    }
+    if !args.is_empty() && args[0] == "session" {
+        return session_cmd(&args[1..]);
     }
     if !args.is_empty() && args[0] == "ticket" {
         return ticket_cmd(&args[1..]);
