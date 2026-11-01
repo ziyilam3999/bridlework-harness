@@ -27,6 +27,8 @@ pub mod tree_prep;
 pub mod scan;
 pub mod session_name;
 pub mod status;
+#[cfg(unix)]
+pub mod supervisor;
 pub mod ticket;
 #[cfg(unix)]
 pub mod ticket_gate;
