@@ -214,6 +214,17 @@ fn dangling_link_is_refused() {
     // the query half of the same rule: a path that does not resolve answers not owned, never an error-free guess
     let q = run(&["manifest", "owns", "t-1", "--dir", d.to_str().unwrap(), "--path", &r.join("dangling").to_string_lossy()], None);
     assert_eq!(code(&q), 1, "an unresolvable owns query is not owned: {}", err(&q));
+    // the same rule INSIDE a live entry: a dangling link under R/x must not fold to its raw path and answer owned
+    fs::create_dir_all(r.join("x")).unwrap();
+    std::os::unix::fs::symlink(r.join("missing-target"), r.join("x/dangle")).unwrap();
+    for p in [r.join("x/dangle").to_string_lossy().into_owned(), format!("{}/x/dangle/..", r.display())] {
+        let q = run(&["manifest", "owns", "t-1", "--dir", d.to_str().unwrap(), "--path", &p], None);
+        assert_eq!(code(&q), 1, "an unresolvable path inside a live entry is not owned ({p}): {}", err(&q));
+    }
+    // must-not-fire: a plain live file inside the entry is owned
+    fs::write(r.join("x/ok"), b"").unwrap();
+    let ok = run(&["manifest", "owns", "t-1", "--dir", d.to_str().unwrap(), "--path", &r.join("x/ok").to_string_lossy()], None);
+    assert_eq!(code(&ok), 0, "a live file inside the entry is owned: {}", err(&ok));
 }
 
 /// Odd but legal shapes are accepted: a hex-like id and ticket are plain tokens, and a path may contain spaces.
@@ -397,6 +408,42 @@ fn class_must_match_the_target_flag() {
     assert_eq!(out(&l).lines().count(), 1, "none of the mismatched adds landed");
 }
 
+/// Each class/target mismatch and each malformed number, with the RIGHT flag present, so that only the one defect
+/// can refuse it (per-condition, not per-arm).
+#[test]
+fn single_defect_adds_are_refused() {
+    let t = Tmp::new();
+    let (r, _o, d) = seeded(&t, "t-1");
+    let dir = d.to_str().unwrap();
+    let file = t.file(&d, "t-1");
+    let q = r.join("q").to_string_lossy().into_owned();
+    let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+    let live_pid = sleeper.id().to_string();
+    let base = ["manifest", "add", "t-1", "--dir", dir, "--id", "z"];
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["--class", "temp_dir", "--path", &q, "--port", "80"],
+        vec!["--class", "process", "--pid", &live_pid, "--port", "80"],
+        vec!["--class", "port", "--port", "81", "--path", &q],
+        vec!["--class", "temp_dir", "--path", &q, "--pid", "abc"],
+        vec!["--class", "temp_dir", "--path", &q, "--pid", "99999999999999999999"],
+        vec!["--class", "temp_dir", "--path", &q, "--ts-ms", "99999999999999999999"],
+    ];
+    for extra in &cases {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend(extra.iter().copied());
+        refuses_leaving_file_untouched(&args, &file);
+    }
+    // must-not-fire: a valid small --ts-ms is accepted and written
+    let ok = run(&["manifest", "add", "t-1", "--dir", dir, "--class", "temp_dir", "--id", "ok", "--path", &q, "--ts-ms", "5"], None);
+    assert_eq!(code(&ok), 0, "a valid small --ts-ms is accepted: {}", err(&ok));
+    let l = run(&["manifest", "list", "t-1", "--dir", dir], None);
+    assert!(out(&l).contains("ok\ttemp_dir\t"), "the valid entry was written");
+    let v = run(&["manifest", "verify", "t-1", "--dir", dir], None);
+    assert_eq!(code(&v), 0, "verify with no stray flag on a live manifest: {}", err(&v));
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
 /// pid bounds (0, 1) and port bounds (0, 65536), and non-integer or empty values, are refused.
 #[test]
 fn pid_and_port_bounds_are_refused() {
@@ -489,6 +536,10 @@ fn option_hygiene_is_enforced() {
         vec!["manifest", "owns", "t-1", "--dir", dir, "--pid", "123", "--port", "80"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x").to_string_lossy().into_owned(), "--port", "80"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--pid", "abc"],
+        vec!["manifest", "list", "t-1", "--dir", dir, "--pid", "123"],
+        vec!["manifest", "verify", "t-1", "--dir", dir, "--port", "80"],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--id", "a", "--path", &r.join("x/y").to_string_lossy().into_owned()],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x/y").to_string_lossy().into_owned(), "--pid", "123"],
     ] {
         let o = run(&args, None);
         assert_eq!(code(&o), 2, "expected a usage error for {:?}", args);
