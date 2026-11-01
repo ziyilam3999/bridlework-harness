@@ -20,11 +20,14 @@
 //! the signal and the `remove` (the next stop sees `already-gone`).
 //!
 //! Exit codes: `0` started / stopped; `2` a usage error or any refusal (nothing started, nothing signalled, the
-//! MANIFEST not written — a refused operation still creates the per-ticket lock file `<ticket>.proc.lock`); `3` the
-//! recorded process is already gone (`already-gone`) or the pid was re-used (`pid-reused`) — the entries are removed
-//! and nothing was signalled. Every input is validated before the first spawn or write: `--port` must be an integer
+//! MANIFEST not written — a refused operation still creates the per-ticket lock file `<ticket>.proc.lock`), with ONE
+//! exception: when the manifest `remove` fails AFTER the signal, `stop` still answers `2` but the group is already
+//! dead — the message names that case, and the next stop is safe to repeat (`already-gone`); `3` the recorded
+//! process is already gone (`already-gone`) or the pid was re-used (`pid-reused`) — the entries are removed and
+//! nothing was signalled. Every input is validated before the first spawn or write: `--port` must be an integer
 //! in 1..=65535 (checked in the parser, so an out-of-range port is refused with nothing run), and the port-free bind
-//! check covers 127.0.0.1 only.
+//! check covers 127.0.0.1 only — a bind refused for privilege (ports below 1024 need privilege even on 127.0.0.1)
+//! is reported as its error kind, not as "already bound"; only `AddrInUse` says "already bound".
 
 use crate::manifest::{self, ManifestRead, Target};
 use std::fs::{File, OpenOptions};
@@ -294,9 +297,21 @@ fn start_cmd(a: &[String]) -> i32 {
         if read.live.iter().any(|e| matches!(&e.target, Target::Port(n) if *n == p)) {
             return fail(&format!("port {} is already live in ticket {}", p, args.ticket));
         }
+        // Only AddrInUse means "taken": the bind can also fail for reasons of privilege (an unprivileged bind on
+        // 127.0.0.1 below 1024 is EACCES on macOS/BSD and EPERM on Linux), which is not a claim on the port —
+        // so the refusal names the error kind instead of a false "already bound".
         match TcpListener::bind(("127.0.0.1", p as u16)) {
             Ok(l) => drop(l),
-            Err(_) => return fail(&format!("port {} is already bound on 127.0.0.1", p)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return fail(&format!("port {} is already bound on 127.0.0.1", p));
+            }
+            Err(e) => {
+                return fail(&format!(
+                    "cannot check port {} on 127.0.0.1: {} (ports below 1024 need privilege for the bind check)",
+                    p,
+                    e.kind()
+                ));
+            }
         }
     }
     // Spawn in its OWN process group (group id = its pid), stdin closed, output discarded, PORT in the environment.
@@ -476,7 +491,12 @@ fn stop_cmd(a: &[String]) -> i32 {
         let _ = wait_group_empty(pid, KILL_SETTLE_MS);
     }
     if let Err(e) = remove_entries(&dir, &args.ticket, &id, port_live, ts_ms) {
-        return fail(&e);
+        // This 2 is NOT "nothing signalled": the group above is already dead. The message says so, and the next
+        // stop is safe to repeat (it sees `already-gone`, exit 3, and clears the sheet once the write works).
+        return fail(&format!(
+            "the group was signalled and is dead, but the manifest remove failed: {} (re-run stop: the next one reports already-gone)",
+            e
+        ));
     }
     println!("stopped\t{}\t{}", id, pid);
     0

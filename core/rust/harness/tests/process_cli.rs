@@ -9,10 +9,12 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -97,8 +99,9 @@ fn group_alive(pgid: u32) -> bool {
 }
 
 /// Call `f` every 25 ms until it answers true or `ms` runs out; the answer when the budget ran out.
-fn poll(ms: u64, f: impl Fn() -> bool) -> bool {
+fn poll(ms: u64, f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
+    let mut f = f;
     while Instant::now() < deadline {
         if f() {
             return true;
@@ -108,20 +111,62 @@ fn poll(ms: u64, f: impl Fn() -> bool) -> bool {
     f()
 }
 
+/// The pid in a pid file, once the file PARSES as exactly one whole number. The writer's own shell redirection
+/// (`echo $$ > file`) creates the file EMPTY first, so existence alone proves nothing: reading it before the
+/// write lands parses the empty string and panics (the round-2 flake). Everything a spawned process writes is
+/// read through a poll on one of these parse-gated readers, never on `exists()`.
+fn read_pid(f: &Path) -> Option<u32> {
+    fs::read_to_string(f).ok()?.trim().parse().ok()
+}
+
+/// The two pids (leader and grandchild) in a pids file, once it parses as exactly two numbers.
+fn read_pids(f: &Path) -> Option<Vec<u32>> {
+    let v: Vec<u32> = fs::read_to_string(f)
+        .ok()?
+        .split_whitespace()
+        .map(|x| x.parse().ok())
+        .collect::<Option<_>>()?;
+    (v.len() == 2).then_some(v)
+}
+
+/// A file's trimmed content once it is non-empty (the writer's redirection creates it empty first).
+fn read_when_set(f: &Path) -> Option<String> {
+    let t = fs::read_to_string(f).ok()?;
+    let t = t.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// Kills the whole process group of every registered pid when dropped (TERM, then KILL), so a failed test run
-/// leaves nothing behind. Only pids spawned in their OWN group (process_group(0)) may be registered.
+/// leaves nothing behind. Only pids spawned in their OWN group (process_group(0)) may be registered. A test may
+/// also register a PID FILE a spawn writes itself: drop then reads it (polling until it parses, because the
+/// writer may still be mid-write) and kills that group too, so a panic anywhere after the spawn — before the
+/// test ever parsed the pid — still kills what the spawn made.
 #[derive(Default)]
-struct Guard(Vec<u32>);
+struct Guard {
+    pids: Vec<u32>,
+    pid_file: Option<PathBuf>,
+}
 
 impl Guard {
     fn add(&mut self, pid: u32) {
-        self.0.push(pid);
+        self.pids.push(pid);
+    }
+
+    fn watch_pid_file(&mut self, f: PathBuf) {
+        self.pid_file = Some(f);
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        for (pid, sig) in self.0.iter().flat_map(|p| [(*p, "TERM"), (*p, "KILL")]) {
+        if let Some(f) = &self.pid_file {
+            if poll(2_000, || read_pid(f).is_some()) {
+                if let Some(pid) = read_pid(f) {
+                    self.pids.push(pid);
+                }
+            }
+        }
+        for (pid, sig) in self.pids.iter().flat_map(|p| [(*p, "TERM"), (*p, "KILL")]) {
             let _ = Command::new("kill")
                 .arg(format!("-{}", sig))
                 .arg("--")
@@ -180,6 +225,22 @@ fn start(ticket: &str, id: &str, cwd: &Path, port: Option<u64>, d: &Path, prog: 
     (o, pid)
 }
 
+/// `start` with `--port` set to a fresh free port, retrying (bounded) with a new port when the snapshot port is
+/// taken between `free_port()` and `start`'s own bind check — `free_port()` releases the socket, so any other
+/// process may grab it in between, and the supervisor's check is a snapshot too. Only the `already bound`
+/// refusal (which leaves nothing started, so a retry is clean) is retried; every other outcome is returned for
+/// the caller to assert. Answers (run, pid, the port actually used).
+fn start_free_port(ticket: &str, id: &str, cwd: &Path, d: &Path, prog: &[&str]) -> (Output, u32, u64) {
+    for _ in 0..5 {
+        let port = free_port();
+        let (o, pid) = start(ticket, id, cwd, Some(port), d, prog);
+        if !(code(&o) == 2 && err(&o).contains("already bound")) {
+            return (o, pid, port);
+        }
+    }
+    panic!("5 free ports in a row were taken between free_port() and start's own bind check");
+}
+
 /// The wall clock in ms since the epoch (for hand-written pid_start_ms values).
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -194,10 +255,9 @@ fn start_records_process_and_port() {
     let t = Tmp::new();
     let (r, _o, d) = t.fence();
     init_manifest("t-1", &r, &d);
-    let port = free_port();
     let mut guard = Guard::default();
 
-    let (s, pid) = start("t-1", "p-1", &r, Some(port), &d, &["sleep", "30"]);
+    let (s, pid, port) = start_free_port("t-1", "p-1", &r, &d, &["sleep", "30"]);
     assert_eq!(code(&s), 0, "start: {}", err(&s));
     assert!(pid > 1, "start printed no pid: stdout={:?} stderr={:?}", out(&s), err(&s));
     guard.add(pid);
@@ -234,22 +294,23 @@ fn stop_ends_process_and_its_children() {
     let t = Tmp::new();
     let (r, _o, d) = t.fence();
     init_manifest("t-2", &r, &d);
-    let port = free_port();
     let mut guard = Guard::default();
 
     // /bin/sh stays as the group leader, forks `sleep 300` in the SAME group, and writes both pids into the root.
     let pids_file = r.join("pids");
     let script = format!("sleep 300 & echo \"$$ $!\" > {}; wait", pids_file.to_string_lossy());
-    let (s, leader) = start("t-2", "c-1", &r, Some(port), &d, &["/bin/sh", "-c", &script]);
+    let (s, leader, _port) = start_free_port("t-2", "c-1", &r, &d, &["/bin/sh", "-c", &script]);
     assert_eq!(code(&s), 0, "start: {}", err(&s));
     assert!(leader > 1);
     guard.add(leader);
+    // Poll until the file PARSES as the two pids, not until it exists: the shell's redirection creates it
+    // empty first, and reading an empty file panics on the parse.
     assert!(
-        poll(10_000, || pids_file.exists()),
-        "the program never wrote its pids file"
+        poll(10_000, || read_pids(&pids_file).is_some()),
+        "the program never wrote a parseable pids file"
     );
+    let pids = read_pids(&pids_file).unwrap();
     let written = fs::read_to_string(&pids_file).unwrap();
-    let pids: Vec<u32> = written.split_whitespace().map(|x| x.parse().unwrap()).collect();
     assert_eq!(pids.len(), 2, "pids file holds leader and grandchild: {:?}", written);
     assert_eq!(pids[0], leader, "the group leader the supervisor recorded is the shell");
     let grandchild = pids[1];
@@ -469,12 +530,18 @@ fn refused_start_leaves_nothing_running() {
     // (b) a cwd outside every root
     let b = start("t-8", "m-1", &o, None, &d, &["/bin/sh", "-c", &script]);
     assert_eq!(code(&b.0), 2, "a cwd outside every root refuses the start: stdout {:?} stderr {:?}", out(&b.0), err(&b.0));
-    // (c) a port already bound on 127.0.0.1
-    let bound = free_port();
-    let held = TcpListener::bind(("127.0.0.1", bound as u16)).unwrap();
+    // (c) a port already bound on 127.0.0.1. Bind port 0 and KEEP the listener: a free-port-then-rebind has a
+    // take-over window between the release and the re-bind (anything can grab the socket in between and the
+    // re-bind then fails AddrInUse — the round-2 suite flake), while a held listener makes the port provably
+    // taken for as long as the case needs.
+    let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let bound = held.local_addr().unwrap().port() as u64;
     let c = start("t-8", "m-2", &r, Some(bound), &d, &["/bin/sh", "-c", &script]);
-    assert_eq!(code(&c.0), 2, "a bound port refuses the start: stdout {:?} stderr {:?}", out(&c.0), err(&c.0));
     drop(held);
+    assert_eq!(code(&c.0), 2, "a bound port refuses the start: stdout {:?} stderr {:?}", out(&c.0), err(&c.0));
+    // And the refusal is the AddrInUse message, not the privilege one (fix round 2, finding 3).
+    assert!(err(&c.0).contains("already bound"), "a taken port names already bound: stderr {:?}", err(&c.0));
+    assert!(!err(&c.0).contains("cannot check port"), "a taken port is not a bind-check failure: stderr {:?}", err(&c.0));
 
     assert!(!marker.exists(), "a refused start ran the program");
     assert_eq!(fs::read(&file).unwrap(), before, "a refused start changed the manifest");
@@ -517,8 +584,8 @@ fn port_out_of_range_refuses_before_spawn() {
     let (s, pid) = start("t-9", "w-1", &r, Some(65535), &d, &["/bin/sh", "-c", &script]);
     assert_eq!(code(&s), 0, "start with --port 65535: {}", err(&s));
     guard.add(pid);
-    assert!(poll(10_000, || seen.exists()), "the child never wrote its PORT");
-    assert_eq!(fs::read_to_string(&seen).unwrap().trim(), "65535", "the child saw PORT");
+    assert!(poll(10_000, || read_when_set(&seen).is_some()), "the child never wrote its PORT");
+    assert_eq!(read_when_set(&seen).unwrap(), "65535", "the child saw PORT");
     let stop = run(&["process", "stop", "t-9", "--id", "w-1", "--dir", d.to_str().unwrap(), "--grace-ms", "3000"]);
     assert_eq!(code(&stop), 0, "cleanup stop: {}", err(&stop));
 
@@ -558,43 +625,79 @@ fn append_failure_after_process_line_is_rolled_back() {
     let (r, _o, d) = t.fence();
     init_manifest("t-c", &r, &d);
     let mut guard = Guard::default();
-    let port = free_port();
-    let file = d.join("t-c.jsonl");
-
-    // Hold the manifest lock across the whole pre-check window: start's read (a plain fs::read) sees a clean
-    // sheet, but its first `apply` blocks here until the injection below is in place.
-    let mut lock = OpenOptions::new().read(true).append(true).open(&file).unwrap();
-    lock.lock().unwrap();
-
     let pid_file = r.join("pid");
-    let script = format!("echo $$ > {}; sleep 300", pid_file.to_string_lossy());
-    let r2 = r.to_string_lossy().into_owned();
-    let d2 = d.to_string_lossy().into_owned();
-    let port_s = port.to_string();
-    let h = thread::spawn(move || {
-        run(&[
-            "process", "start", "t-c", "--id", "w-1", "--cwd", &r2, "--port", &port_s,
-            "--dir", &d2, "--", "/bin/sh", "-c", &script,
-        ])
-    });
+    // The spawn writes its own pid file; the guard reads that file on drop (polling until it PARSES, because
+    // the shell's redirection creates it empty first), so a panic anywhere after the spawn — before this test
+    // ever parses the pid — still kills the group. A leaked process after a failed run is itself a defect.
+    guard.watch_pid_file(pid_file.clone());
 
-    // The program runs only after start's pre-checks read the sheet, so once its pid file exists the pre-checks
-    // are past (they can no longer see the injection) and start is blocked on the lock inside the process-line
-    // append.
-    assert!(poll(10_000, || pid_file.exists()), "the program never started");
-    let pid: u32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    // Up to 5 attempts, each with a fresh free port. The only retried outcome is the `already bound` refusal
+    // of the snapshot port BEFORE the spawn (a free-port-then-check race, the same class as finding 2): that
+    // refusal starts nothing and writes nothing, so the attempt repeats cleanly on a new port.
+    let mut done: Option<(Output, u32)> = None;
+    for _attempt in 0..5 {
+        let port = free_port();
+        let file = d.join("t-c.jsonl");
+
+        // Hold the manifest lock across the whole pre-check window: start's read (a plain fs::read) sees a
+        // clean sheet, but its first `apply` blocks here until the injection below is in place.
+        let mut lock = OpenOptions::new().read(true).append(true).open(&file).unwrap();
+        lock.lock().unwrap();
+
+        let script = format!("echo $$ > {}; sleep 300", pid_file.to_string_lossy());
+        let r2 = r.to_string_lossy().into_owned();
+        let d2 = d.to_string_lossy().into_owned();
+        let port_s = port.to_string();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(run(&[
+                "process", "start", "t-c", "--id", "w-1", "--cwd", &r2, "--port", &port_s,
+                "--dir", &d2, "--", "/bin/sh", "-c", &script,
+            ]));
+        });
+
+        // The program runs only after start's pre-checks read the sheet, so once its pid file PARSES as a pid
+        // the pre-checks are past (they can no longer see the injection) and start is blocked on the lock
+        // inside the process-line append. A run that answers the port race instead (refused `already bound`
+        // before any spawn) moves to the next attempt; existence of the file alone proves nothing (round-2
+        // finding 1: the empty first write panicked the parse 9 runs in 30 under contention).
+        let mut refused: Option<Output> = None;
+        let started = poll(10_000, || {
+            if read_pid(&pid_file).is_some() {
+                return true;
+            }
+            match rx.try_recv() {
+                Ok(o) => {
+                    refused = Some(o);
+                    true
+                }
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(mpsc::TryRecvError::Disconnected) => true,
+            }
+        });
+        if let Some(o) = refused {
+            assert_eq!(code(&o), 2, "an early refusal must be the port race: stdout {:?} stderr {:?}", out(&o), err(&o));
+            assert!(err(&o).contains("already bound"), "an early refusal must be the port race: stderr {:?}", err(&o));
+            continue;
+        }
+        assert!(started, "the program never started and the run never answered");
+        let pid = read_pid(&pid_file).expect("polled until the pid file parses");
+
+        // Inject a live `w-1.port` line through the locked handle, then release: start appends the process
+        // line, then its port append is refused as a duplicate live id.
+        let inject = format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-c\",\"id\":\"w-1.port\",\"class\":\"port\",\"port\":{port},\"ts_ms\":1730000000002}}\n"
+        );
+        lock.write_all(inject.as_bytes()).unwrap();
+        lock.sync_all().unwrap();
+        drop(lock);
+
+        let s = rx.recv().expect("the run answers once unblocked");
+        done = Some((s, pid));
+        break;
+    }
+    let (s, pid) = done.expect("5 attempts in a row hit the already-bound port race");
     guard.add(pid);
-
-    // Inject a live `w-1.port` line through the locked handle, then release: start appends the process line,
-    // then its port append is refused as a duplicate live id.
-    let inject = format!(
-        "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-c\",\"id\":\"w-1.port\",\"class\":\"port\",\"port\":{port},\"ts_ms\":1730000000002}}\n"
-    );
-    lock.write_all(inject.as_bytes()).unwrap();
-    lock.sync_all().unwrap();
-    drop(lock);
-
-    let s = h.join().unwrap();
     assert_eq!(code(&s), 2, "the refused port append must answer 2: stdout {:?} stderr {:?}", out(&s), err(&s));
     assert!(err(&s).contains("duplicate live id"), "the port append was refused by the manifest, not by the range check: stderr {:?}", err(&s));
     assert!(poll(10_000, || !alive(pid)), "the group the refused start made is still alive");
@@ -605,4 +708,86 @@ fn append_failure_after_process_line_is_rolled_back() {
     let text = out(&l);
     assert!(!text.contains("process"), "the refused start left a process line listed: {}", text);
     assert!(text.contains("w-1.port"), "only the test's own injected port line stays live: {}", text);
+}
+
+// ---------------------------------------------------------------- fix round 2: the bind error kind is named
+
+/// Fix round 2, finding 3: a bind error that is NOT `AddrInUse` is not reported as "already bound". On macOS an
+/// unprivileged bind on 127.0.0.1 below 1024 is EACCES (and EPERM on Linux), so `--port 1` on a FREE port must
+/// name the error kind (`PermissionDenied`, ports below 1024 need privilege) — or, under privilege, start
+/// cleanly and stop cleanly. Either way it must never claim the free port is "already bound".
+#[test]
+fn low_port_names_the_bind_error_kind() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-p", &r, &d);
+    let mut guard = Guard::default();
+
+    let marker = r.join("marker");
+    let script = format!("echo ran > {}", marker.to_string_lossy());
+    let (s, pid) = start("t-p", "l-1", &r, Some(1), &d, &["/bin/sh", "-c", &script]);
+    if code(&s) == 0 {
+        // A privileged environment lets the bind through; that is the other documented outcome.
+        assert!(pid > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+        guard.add(pid);
+        let stop = run(&["process", "stop", "t-p", "--id", "l-1", "--dir", d.to_str().unwrap(), "--grace-ms", "3000"]);
+        assert_eq!(code(&stop), 0, "cleanup stop: {}", err(&stop));
+    } else {
+        assert_eq!(code(&s), 2, "port 1 must start or refuse 2: stdout {:?} stderr {:?}", out(&s), err(&s));
+        assert!(err(&s).contains("permission denied"), "a privilege refusal names the kind: stderr {:?}", err(&s));
+        assert!(err(&s).contains("below 1024"), "a privilege refusal names the low-port rule: stderr {:?}", err(&s));
+        assert!(!err(&s).contains("already bound"), "a free low port is not 'already bound': stderr {:?}", err(&s));
+        assert!(!marker.exists(), "the refused start ran the program");
+    }
+}
+
+// ---------------------------------------------------------------- fix round 2: the 2 that comes after the signal
+
+/// Fix round 2, finding 4 (X6): when the manifest `remove` fails AFTER the signal (the manifest file made
+/// unwritable mid-run), `stop` answers 2 but the group is already dead — the message must say so (its own
+/// case, not the plain "nothing signalled" refusal). The stop is safe to repeat: once the write works again,
+/// the next stop reports `already-gone` (3) and clears the sheet. Under privilege (root ignores the mode) the
+/// remove succeeds instead; that branch is pinned too, so the test holds on both kinds of host.
+#[test]
+fn stop_remove_failure_after_signal_is_named() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-l", &r, &d);
+    let mut guard = Guard::default();
+
+    let (s, pid) = start("t-l", "r-1", &r, None, &d, &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+
+    // Make the manifest readable but unwritable after the start, before the stop (readable so the pre-checks
+    // still pass; unwritable so the remove append fails only after the signal).
+    let file = d.join("t-l.jsonl");
+    let mode = fs::metadata(&file).unwrap().permissions().mode();
+    fs::set_permissions(&file, fs::Permissions::from_mode(mode & !0o222)).unwrap();
+    let stop = run(&["process", "stop", "t-l", "--id", "r-1", "--dir", d.to_str().unwrap(), "--grace-ms", "3000"]);
+    let refused_remove = code(&stop) == 2;
+    if refused_remove {
+        assert!(
+            err(&stop).contains("signalled") && err(&stop).contains("remove failed"),
+            "the post-signal 2 names its own case (signalled, remove failed): stderr {:?}",
+            err(&stop)
+        );
+    } else {
+        assert_eq!(code(&stop), 0, "a privileged remove succeeds: {}", err(&stop));
+    }
+    // Either way the group the stop made is dead: the 2 did not mean "nothing signalled" here.
+    assert!(poll(5_000, || !alive(pid)), "the stopped group still lives");
+
+    // Restore the write and repeat: already-gone (3) and a cleared sheet, or (privileged) not a live entry (2).
+    fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+    let again = run(&["process", "stop", "t-l", "--id", "r-1", "--dir", d.to_str().unwrap(), "--grace-ms", "2000"]);
+    if refused_remove {
+        assert_eq!(code(&again), 3, "the repeat stop is already-gone: stdout {:?} stderr {:?}", out(&again), err(&again));
+        assert!(out(&again).contains("already-gone"), "the repeat stop prints already-gone: stdout {:?}", out(&again));
+    } else {
+        assert_eq!(code(&again), 2, "after a clean stop the id is not a live entry: stdout {:?} stderr {:?}", out(&again), err(&again));
+    }
+    let l = run(&["manifest", "list", "t-l", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert_eq!(out(&l), "", "the sheet is cleared once the write works again");
 }

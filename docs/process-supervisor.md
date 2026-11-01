@@ -22,20 +22,22 @@ harness process stop  <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <
 
 ## start, in order
 
-1. Take the per-ticket supervisor lock (`<manifest-dir>/<ticket>.proc.lock`, the std exclusive file lock the
+1. Validate `--port` in the parser: an integer in 1..=65535, else **exit 2** with nothing run — this runs BEFORE
+   the lock, the manifest read, the bind check or the spawn.
+2. Take the per-ticket supervisor lock (`<manifest-dir>/<ticket>.proc.lock`, the std exclusive file lock the
    manifest already uses) and hold it for the whole operation.
-2. Read the manifest. Missing, torn or corrupt: **exit 2**, nothing started.
-3. Refuse (**exit 2**, nothing started) when `--port` is not an integer in 1..=65535 (a usage error checked in
-   the parser, before the lock, the manifest read or the spawn), when `--id` — or `<id>.port`, if `--port` is
-   given — is already live, when `--cwd` does not resolve inside one of the ticket's roots, when `--port` is
-   already live in the manifest, or when `--port` is already bound on 127.0.0.1 (checked with a bind-then-release
-   snapshot).
-4. Spawn the program in its OWN process group (group id = its pid), stdin closed, stdout and stderr discarded
+3. Read the manifest. Missing, torn or corrupt: **exit 2**, nothing started.
+4. Refuse (**exit 2**, nothing started) when `--id` — or `<id>.port`, if `--port` is given — is already live,
+   when `--cwd` does not resolve inside one of the ticket's roots, when `--port` is already live in the manifest,
+   or when `--port` is already bound on 127.0.0.1 (checked with a bind-then-release snapshot). Only `AddrInUse`
+   is reported as "already bound": a bind refused for privilege names the error kind instead — ports below 1024
+   need privilege for the bind check even on 127.0.0.1 (macOS/BSD give `PermissionDenied`, Linux `EPERM`).
+5. Spawn the program in its OWN process group (group id = its pid), stdin closed, stdout and stderr discarded
    (capture is P1B-08), and `PORT=<n>` in its environment when `--port` is given.
-5. Read the pid's start time, append the process line, then the port line. If either append fails, the whole
+6. Read the pid's start time, append the process line, then the port line. If either append fails, the whole
    group it just made is stopped and **exit 2**; a failure AFTER the process line (the port append) also appends
    `remove` for that process line, so a refused start leaves nothing running and nothing listed.
-6. Print `id<TAB>pid<TAB>pid_start_ms`, exit 0.
+7. Print `id<TAB>pid<TAB>pid_start_ms`, exit 0.
 
 ## stop: ownership first, signal second
 
@@ -60,10 +62,12 @@ When the recorded process is provably gone, nothing is signalled and the entries
 | recorded pid has no process now | `already-gone` | 3 |
 | pid alive but its start time differs (pid re-used) | `pid-reused` | 3 |
 | usage error or any refusal (not on this sheet, torn manifest, refused start) | — (stderr names it) | 2 |
+| the manifest `remove` failed AFTER the signal (the group is dead; the stderr says so) | — (stderr names it) | 2 |
 
-A refusal never writes the MANIFEST, but it does create the per-ticket lock file `<manifest-dir>/<ticket>.proc.lock`
-(step 1 of `start` and of `stop` takes it before anything is read or refused); the lock file is a std file lock
-helper, not a record — it holds no data and is safe to delete between commands.
+The second exit-2 row is the one case where a `2` does not mean "nothing signalled": `stop` signals the group,
+the group dies, and only then does the `remove` append fail (for example an unwritable manifest mid-run). The
+message names that case, and the stop is safe to repeat — once the write works again, the next stop reports
+`already-gone` (exit 3) and clears the sheet.
 
 Two stops of one id at once serialise on the supervisor lock: one exits 0, the other finds the id not live and
 exits 2, and the manifest holds exactly one `remove` line. A crash after the signal but before the `remove` is
@@ -82,6 +86,10 @@ safe to repeat: the next stop sees `already-gone` (exit 3) and removes the entri
 - **Port check is a snapshot, and 127.0.0.1 only.** "Free at start" can change before the child binds; the
   supervisor records the declared port and does not prove the child listens on it. A port already bound on another
   address (for example `0.0.0.0`) but free on 127.0.0.1 passes the check.
+- **The lock file.** A refusal never writes the MANIFEST, but every `start` and `stop` still creates the
+  per-ticket lock file `<manifest-dir>/<ticket>.proc.lock` (step 2 of `start` and step 1 of `stop` take it
+  before anything is read or refused). It is a std file-lock helper, not a record — it holds no data and is safe
+  to delete between commands.
 - **No output capture** (stdout, stderr, exit codes, timing, traces: P1B-08), **no timeouts or step limits**
   (P1B-06), **no worker-death record** (P1B-07), **no orphan reaping** (P2), **no network allow-list** (G1b/P4a),
   **no finalize/teardown** (P1B-14).

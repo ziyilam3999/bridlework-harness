@@ -1,0 +1,871 @@
+//! Process-level tests for `harness workspace create` (P1B-03). Every check runs the real binary as a child process
+//! against scratch repos under the system temp folder, so the exit-code contract (0 created, 1 a ticket refusal at
+//! intake, 2 every other refusal), the write-ahead manifest, the git worktree registration and the no-folder-on-the-
+//! terminal rule are all exercised end to end. One test per acceptance criterion (AC 2-8); each refusal test also
+//! pins that NOTHING was written (the folders stay empty, the repo's worktree list and branches are unchanged).
+#![cfg(unix)]
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const BIN: &str = env!("CARGO_BIN_EXE_harness");
+static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// One scratch layout: the RAW temp path (what a caller would type) and its canonical spelling are both kept,
+/// because on this platform they differ and neither may ever appear on stdout or stderr.
+struct Tmp {
+    raw: PathBuf,
+    canon: PathBuf,
+}
+
+impl Tmp {
+    fn new() -> Tmp {
+        let raw = std::env::temp_dir().join(format!("wcli-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+        let _ = fs::remove_dir_all(&raw);
+        fs::create_dir_all(&raw).unwrap();
+        let canon = raw.canonicalize().unwrap();
+        Tmp { raw, canon }
+    }
+
+    /// Both spellings of a child path (the raw one is passed on the command line; the canonical one is what git prints).
+    fn both(&self, rel: &str) -> (PathBuf, PathBuf) {
+        (self.raw.join(rel), self.canon.join(rel))
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.raw);
+        let _ = fs::remove_dir_all(&self.canon);
+    }
+}
+
+/// One git call in a scratch repo: no hooks, no inherited repo-redirecting names, no stdin, fixed identity.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let mut c = Command::new("git");
+    let contact = format!("user.email=t{}scratch", '@');
+    c.arg("-C").arg(dir).args(["-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", contact.as_str()]).args(args);
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+        c.env_remove(k);
+    }
+    let out = c.stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "scratch git call failed: {:?} {:?}", args, String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A scratch repo with one tracked file and one commit, upkeep off (a background gc would flake before/after snapshots).
+fn repo(t: &Tmp, name: &str, msg: &str) -> PathBuf {
+    let (d, _) = t.both(name);
+    fs::create_dir_all(&d).unwrap();
+    git(&d, &["init", "-q"]);
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&d, &["config", k, v]);
+    }
+    fs::write(d.join("f.txt"), msg).unwrap();
+    git(&d, &["add", "f.txt"]);
+    git(&d, &["commit", "-q", "-m", msg]);
+    d.canonicalize().unwrap()
+}
+
+fn head(d: &Path) -> String {
+    git(d, &["rev-parse", "HEAD"])
+}
+
+fn worktree_porcelain(r: &Path) -> String {
+    git(r, &["worktree", "list", "--porcelain"])
+}
+
+fn worktree_count(r: &Path) -> usize {
+    worktree_porcelain(r).lines().filter(|l| l.starts_with("worktree ")).count()
+}
+
+/// A valid ticket file for `id` naming repo `repo_id` (the strict reader's eleven fields, all legal values).
+fn ticket(t: &Tmp, id: &str, repo_id: &str) -> PathBuf {
+    let (f, _) = t.both(&format!("{id}.json"));
+    fs::write(&f, format!("{{\"id\":\"{id}\",\"repo_id\":\"{repo_id}\",\"title\":\"A title\",\"group\":\"grp\",\"size\":\"M\",\"objective\":\"An objective\",\"acceptance_criteria\":[\"one\"],\"dependencies\":[],\"risk\":\"normal\",\"owner_role\":\"execution_verification\",\"evidence_links\":[]}}")).unwrap();
+    f
+}
+
+fn run(args: &[String], cwd: Option<&Path>) -> Output {
+    let mut c = Command::new(BIN);
+    c.args(args).stdin(Stdio::null());
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    c.output().unwrap()
+}
+
+fn code(o: &Output) -> i32 {
+    o.status.code().unwrap_or(-1)
+}
+
+fn out(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).to_string()
+}
+
+fn err(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).to_string()
+}
+
+/// The full `workspace create` line for one ticket. `r` and the folders are the RAW spellings.
+fn create_args(t: &Tmp, ticket_file: &str, r: &Path, base: &str, ws: &str, md: &str) -> Vec<String> {
+    let (f, _) = t.both(ticket_file);
+    vec![
+        "workspace".to_string(),
+        "create".to_string(),
+        f.to_str().unwrap().to_string(),
+        "--repo-map".to_string(),
+        format!("r={}", r.display()),
+        "--base".to_string(),
+        base.to_string(),
+        "--workspace-root".to_string(),
+        t.raw.join(ws).to_str().unwrap().to_string(),
+        "--manifest-dir".to_string(),
+        t.raw.join(md).to_str().unwrap().to_string(),
+    ]
+}
+
+/// AC 8: neither stdout nor stderr may carry the text of `R`, `W`, `M` (given or canonicalized) or `W/t1`.
+fn assert_no_folder(label: &str, o: &Output, t: &Tmp, r: &Path) {
+    let text = format!("{}{}", out(o), err(o));
+    let (w_raw, w_canon) = t.both("W");
+    let (m_raw, m_canon) = t.both("M");
+    let (_, c) = t.both("W/t1");
+    let probes = [
+        r.to_string_lossy().into_owned(),
+        r.canonicalize().unwrap().to_string_lossy().into_owned(),
+        w_raw.to_string_lossy().into_owned(),
+        w_canon.to_string_lossy().into_owned(),
+        m_raw.to_string_lossy().into_owned(),
+        m_canon.to_string_lossy().into_owned(),
+        w_raw.join("t1").to_string_lossy().into_owned(),
+        c.to_string_lossy().into_owned(),
+    ];
+    for probe in probes {
+        assert!(!text.contains(&probe), "{label}: output carries a folder text");
+    }
+}
+
+fn empty(p: &Path) -> bool {
+    fs::read_dir(p).map(|d| d.count() == 0).unwrap_or(true)
+}
+
+// ---------------------------------------------------------------- AC 2: create makes one listed worktree
+
+#[test]
+fn ac2_create_makes_one_listed_worktree() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let args = create_args(&t, "t1.json", &r_raw, &s, "W", "M");
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // One stdout line of fixed fields, starting with the required prefix.
+    let stdout_text = out(&o);
+    let lines: Vec<&str> = stdout_text.lines().collect();
+    assert_eq!(lines.len(), 1, "create printed more than one line");
+    assert!(lines[0].starts_with("workspace=created ticket=t1"), "line: {}", lines[0]);
+    assert_eq!(lines[0], format!("workspace=created ticket=t1 repo_id=r base={s} branch=ws/t1"));
+    // The worktree is registered in R's own list, on branch ws/t1, at the base sha.
+    let (_, tree) = t.both("W/t1/tree");
+    let por = worktree_porcelain(&r);
+    assert!(por.contains(&format!("worktree {}\nHEAD {}\nbranch refs/heads/ws/t1", tree.display(), s)), "porcelain:\n{}", por);
+    // The manifest lists exactly two live entries with the fixed names, and both paths exist.
+    let (m, _) = t.both("M");
+    let (_, tmp) = t.both("W/t1/tmp");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    let binding = out(&l);
+    let listed: Vec<&str> = binding.lines().collect();
+    assert_eq!(listed.len(), 2, "manifest list:\n{}", out(&l));
+    assert_eq!(listed[0], format!("worktree\tworktree\t{}", tree.display()));
+    assert_eq!(listed[1], format!("tmp\ttemp_dir\t{}", tmp.display()));
+    assert!(tree.is_dir() && tmp.is_dir(), "a listed path is missing");
+    // The ticket root and the scratch folder are owner-only.
+    let (root, _) = t.both("W/t1");
+    for p in [&root, &tmp] {
+        let mode = fs::metadata(p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "folder not 0700");
+    }
+    assert_no_folder("ac2", &o, &t, &r);
+}
+
+// ---------------------------------------------------------------- AC 3: a second workspace is refused
+
+#[test]
+fn ac3_second_and_racing_creates_give_exactly_one() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t1", "r");
+    ticket(&t, "t2", "r");
+    let first = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&first), 0, "first create: {}", err(&first));
+    let (m, _) = t.both("M");
+    let before_list = out(&run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None));
+    let before_por = worktree_porcelain(&r);
+    let before_file = fs::read(m.join("t1.jsonl")).unwrap();
+    // A second workspace for one ticket is refused, changing nothing.
+    let second = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&second), 2, "second create: {} {}", out(&second), err(&second));
+    let after_list = out(&run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None));
+    assert_eq!(before_list, after_list, "manifest list changed");
+    assert_eq!(before_por, worktree_porcelain(&r), "worktree list changed");
+    assert_eq!(before_file, fs::read(m.join("t1.jsonl")).unwrap(), "manifest file changed");
+    assert_no_folder("ac3-second", &second, &t, &r);
+    // Two creates for a fresh ticket started at the same time: exactly one exit 0.
+    let args = create_args(&t, "t2.json", &r_raw, &s, "W", "M");
+    let a = Command::new(BIN).args(&args).stdin(Stdio::null()).spawn().unwrap();
+    let b = Command::new(BIN).args(&args).stdin(Stdio::null()).spawn().unwrap();
+    let (ca, cb) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
+    let zeros = [code(&ca), code(&cb)].iter().filter(|c| **c == 0).count();
+    assert_eq!(zeros, 1, "racing creates gave {} exits 0 ({} / {})", zeros, code(&ca), code(&cb));
+    assert_eq!(worktree_count(&r), 3, "exactly one new worktree");
+    let l2 = run(&["manifest".into(), "list".into(), "t2".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l2), 0, "t2 manifest list: {}", err(&l2));
+    assert_eq!(out(&l2).lines().count(), 2, "t2 manifest has more than the two entries");
+}
+
+// ---------------------------------------------------------------- AC 4: unknown repo, nothing written
+
+#[test]
+fn ac4_unknown_repo_refused_writing_nothing() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    let (nr, _) = t.both("notrepo");
+    fs::create_dir_all(&nr).unwrap();
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    // A ticket whose repo id is not in the map.
+    let nope = ticket(&t, "tnope", "nope");
+    let o = run(
+        &["workspace".into(), "create".into(), nope.to_str().unwrap().into(), "--repo-map".into(), format!("r={}", r_raw.display()), "--base".into(), s.clone(), "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        None,
+    );
+    assert_eq!(code(&o), 1, "unknown repo id: {} {}", out(&o), err(&o));
+    // A map entry pointing at a folder that is not a git repo.
+    let nq = ticket(&t, "tnq", "q");
+    let o2 = run(
+        &["workspace".into(), "create".into(), nq.to_str().unwrap().into(), "--repo-map".into(), format!("q={}", nr.display()), "--base".into(), s, "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        None,
+    );
+    assert_eq!(code(&o2), 1, "non-repo map entry: {} {}", out(&o2), err(&o2));
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    assert!(empty(&w) && empty(&m), "a refusal wrote something");
+    assert_eq!(worktree_count(&r), 1);
+    assert_no_folder("ac4", &o, &t, &r);
+    assert_no_folder("ac4b", &o2, &t, &r);
+}
+
+// ---------------------------------------------------------------- AC 5: outside the fence is refused
+
+#[test]
+fn ac5_paths_outside_the_fence_refused() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M", "W/md", "elsewhere"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    fs::create_dir_all(r_raw.join("sub")).unwrap();
+    ticket(&t, "t3", "r");
+    let before_por = worktree_porcelain(&r);
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("ws-root inside the repo", vec!["--ws".to_string(), r_raw.join("sub").to_str().unwrap().to_string()]),
+        ("ws-root is /", vec!["--ws".to_string(), "/".to_string()]),
+        ("relative ws-root", vec!["--rel-ws".to_string()]),
+        ("manifest-dir inside W", vec!["--md".to_string(), t.raw.join("W/md").to_str().unwrap().to_string()]),
+    ];
+    for (label, tweak) in cases {
+        let mut args = create_args(&t, "t3.json", &r_raw, &s, "W", "M");
+        match tweak[0].as_str() {
+            "--ws" => {
+                let i = args.iter().position(|a| a == "--workspace-root").unwrap();
+                args[i + 1] = tweak[1].clone();
+            }
+            "--rel-ws" => {
+                let i = args.iter().position(|a| a == "--workspace-root").unwrap();
+                args[i + 1] = "relws".to_string();
+            }
+            "--md" => {
+                let i = args.iter().position(|a| a == "--manifest-dir").unwrap();
+                args[i + 1] = tweak[1].clone();
+            }
+            _ => unreachable!(),
+        }
+        let o = run(&args, None);
+        assert_eq!(code(&o), 2, "{label}: exit {} stdout {} stderr {}", code(&o), out(&o), err(&o));
+        assert_eq!(worktree_porcelain(&r), before_por, "{label}: worktree list changed");
+        assert_no_folder(label, &o, &t, &r);
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    // Only the probe's own `md` child sits in W; M is untouched; nothing new in the repo.
+    let names: Vec<String> = fs::read_dir(&w).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec!["md".to_string()], "a refusal wrote into W");
+    assert!(empty(&m), "a refusal wrote into M");
+    // A planted symlink at the ticket's name: the exclusive create fails, nothing is written through the link.
+    let (elsewhere, _) = t.both("elsewhere");
+    let (link, _) = t.both("W/t3");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    let o = run(&create_args(&t, "t3.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "symlinked ticket root: exit {}", code(&o));
+    assert!(empty(&elsewhere), "something was written through the link");
+    assert_eq!(worktree_porcelain(&r), before_por, "symlink case: worktree list changed");
+    assert!(fs::read_dir(&m).unwrap().count() == 0, "symlink case: manifest dir gained a file");
+    assert_no_folder("ac5-symlink", &o, &t, &r);
+}
+
+// ---------------------------------------------------------------- AC 6: other refusals
+
+#[test]
+fn ac6_other_refusals_write_nothing() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    let before_por = worktree_porcelain(&r);
+    // A ticket id that is not a plain token is refused, never rewritten.
+    let upper = ticket(&t, "T-1", "r");
+    let o = run(
+        &["workspace".into(), "create".into(), upper.to_str().unwrap().into(), "--repo-map".into(), format!("r={}", r_raw.display()), "--base".into(), s.clone(), "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        None,
+    );
+    assert_eq!(code(&o), 2, "upper-case id: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "upper-case id wrote something");
+    assert_no_folder("ac6-id", &o, &t, &r);
+    ticket(&t, "t3", "r");
+    // A --base that is not a full sha; and a full sha that is not in R.
+    for bad in ["HEAD".to_string(), format!("{:040x}", 0xdeadbeefu64)] {
+        let o = run(&create_args(&t, "t3.json", &r_raw, &bad, "W", "M"), None);
+        assert_eq!(code(&o), 2, "base {bad}: {} {}", out(&o), err(&o));
+        assert!(empty(&w) && empty(&m), "a bad base wrote something");
+        assert_eq!(worktree_porcelain(&r), before_por);
+        assert_no_folder("ac6-base", &o, &t, &r);
+    }
+    // A linked worktree of another repo passed as the mapped repo.
+    let p = repo(&t, "P", "parent");
+    let (lw, _) = t.both("linked");
+    git(&p, &["worktree", "add", "--detach", lw.to_str().unwrap(), &head(&p)]);
+    // The base is P's OWN head, so it resolves fine in the linked worktree: with the linked check
+    // present it is refused by that check alone; nothing else can refuse this input first.
+    let o = run(
+        &["workspace".into(), "create".into(), t.raw.join("t3.json").to_str().unwrap().into(), "--repo-map".into(), format!("r={}", lw.display()), "--base".into(), head(&p), "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        None,
+    );
+    assert_eq!(code(&o), 2, "linked worktree: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "linked worktree case wrote something");
+    assert_eq!(worktree_count(&p), 2, "the linked worktree's parent repo gained a worktree");
+    assert_no_folder("ac6-linked", &o, &t, &r);
+    // A branch that already exists: refused, left at its old commit, nothing written.
+    ticket(&t, "t4", "r");
+    git(&r, &["branch", "ws/t4", &head(&r)]);
+    let o = run(&create_args(&t, "t4.json", &r_raw, &head(&r), "W", "M"), None);
+    assert_eq!(code(&o), 2, "existing branch: {} {}", out(&o), err(&o));
+    assert_eq!(git(&r, &["rev-parse", "ws/t4"]), head(&r), "the branch moved");
+    assert!(empty(&w) && empty(&m), "existing-branch case wrote something");
+    assert_eq!(worktree_porcelain(&r).lines().filter(|l| l.starts_with("worktree ")).count(), 1);
+    assert_no_folder("ac6-branch", &o, &t, &r);
+}
+
+// --------------------------------------- git failure after the seed: only listed things remain
+
+#[test]
+fn git_failure_after_the_seed_leaves_only_listed_children() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t5", "r");
+    // A branch literally named `ws` makes `git worktree add -b ws/t5 ...` fail AFTER the write-ahead
+    // seed (a git failure the plan allows from step 6 on). The refusal must still leave both entries
+    // on the manifest and no UNLISTED child under the ticket root — never an orphan.
+    git(&r, &["branch", "ws", &s]);
+    let o = run(&create_args(&t, "t5.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "git failure after the seed: {} {}", out(&o), err(&o));
+    assert_no_folder("seed-fail", &o, &t, &r);
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t5".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list t5: {}", err(&l));
+    let listed = out(&l);
+    let entries: Vec<&str> = listed.lines().collect();
+    assert_eq!(entries.len(), 2, "the seed must have written both entries:\n{}", listed);
+    let want_tree = format!("worktree\tworktree\t{}", t.both("W/t5/tree").1.display());
+    let want_tmp = format!("tmp\ttemp_dir\t{}", t.both("W/t5/tmp").1.display());
+    assert!(entries.contains(&want_tree.as_str()), "worktree entry:\n{}", listed);
+    assert!(entries.contains(&want_tmp.as_str()), "tmp entry:\n{}", listed);
+    // Every child of the ticket root is one of the listed paths: no unlisted thing may sit there.
+    let (root, _) = t.both("W/t5");
+    let targets: Vec<PathBuf> = entries.iter().map(|e| PathBuf::from(e.split('\t').nth(2).unwrap_or(""))).collect();
+    for child in fs::read_dir(&root).unwrap().flatten() {
+        let child = child.path().canonicalize().unwrap();
+        assert!(targets.contains(&child), "an unlisted child sits in the ticket root: {:?}", child.file_name());
+    }
+}
+
+// --------------------------- an out-of-range --ts-ms is refused before anything is written
+
+#[test]
+fn out_of_range_ts_ms_is_refused_before_anything_is_written() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "tts", "r");
+    let mut args = create_args(&t, "tts.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push("99999999999999999999999".into()); // 23 digits: over u64
+    let o = run(&args, None);
+    assert_eq!(code(&o), 2, "out-of-range ts-ms: {} {}", out(&o), err(&o));
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    assert!(!w.join("tts").exists(), "a usage error left a ticket folder behind");
+    assert!(empty(&w) && empty(&m), "a usage error wrote something");
+    assert_no_folder("ts-ms-range", &o, &t, &r);
+    // The ticket is not blocked: a re-run without the flag still succeeds.
+    let o2 = run(&create_args(&t, "tts.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o2), 0, "re-run after refused ts-ms: {} {}", out(&o2), err(&o2));
+}
+
+// ----------------- held-out refusal and acceptance variants (executor round 2, none from review)
+
+#[test]
+fn heldout_refusal_and_acceptance_variants() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    // must-fire 1: a base that resolves only via ANOTHER repo's linked worktree. The mapped repo is a
+    // linked worktree L of P and the base is a commit made INSIDE L (so it exists in P's object store
+    // and resolves from L): only the main-work-tree check can refuse it.
+    let p = repo(&t, "P", "parent");
+    let (lw, _) = t.both("linked2");
+    git(&p, &["worktree", "add", "--detach", lw.to_str().unwrap(), &head(&p)]);
+    fs::write(lw.join("g.txt"), "in linked").unwrap();
+    git(&lw, &["add", "g.txt"]);
+    git(&lw, &["commit", "-q", "-m", "in linked"]);
+    ticket(&t, "hl", "r");
+    let o = run(
+        &["workspace".into(), "create".into(), t.raw.join("hl.json").to_str().unwrap().into(), "--repo-map".into(), format!("r={}", lw.display()), "--base".into(), head(&lw), "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        None,
+    );
+    assert_eq!(code(&o), 2, "base from a linked worktree: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "linked-base case wrote something");
+    assert_eq!(worktree_count(&p), 2, "P gained a worktree");
+    assert_no_folder("heldout-linked-base", &o, &t, &r);
+    // must-fire 2: a ts-ms with a plus sign (digits-only is refused, before anything is written).
+    ticket(&t, "hplus", "r");
+    let mut args = create_args(&t, "hplus.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push("+1".into());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 2, "signed ts-ms: {} {}", out(&o), err(&o));
+    assert!(!w.join("hplus").exists(), "a signed ts-ms left a ticket folder behind");
+    assert!(empty(&w) && empty(&m), "signed ts-ms wrote something");
+    assert_no_folder("heldout-signed-ts", &o, &t, &r);
+    // must-fire 3: an id that is a legal token but an illegal branch name (`a..b`): refused before
+    // anything is written, not half-made by a git failure after the seed.
+    ticket(&t, "a..b", "r");
+    let o = run(&create_args(&t, "a..b.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "illegal branch name: {} {}", out(&o), err(&o));
+    assert!(!w.join("a..b").exists(), "an illegal branch name left a ticket folder behind");
+    assert!(empty(&w) && empty(&m), "illegal branch name wrote something");
+    assert_eq!(worktree_count(&r), 1, "the refused id registered a worktree");
+    assert_no_folder("heldout-branch-name", &o, &t, &r);
+    // must-not-fire 1: ts-ms exactly u64::MAX is accepted.
+    ticket(&t, "hmax", "r");
+    let mut args = create_args(&t, "hmax.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push(u64::MAX.to_string());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "ts-ms u64::MAX: {} {}", out(&o), err(&o));
+    // must-not-fire 2: ts-ms zero is accepted.
+    ticket(&t, "hzero", "r");
+    let mut args = create_args(&t, "hzero.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push("0".into());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "ts-ms zero: {} {}", out(&o), err(&o));
+    // must-not-fire 3: an ordinary id on a repo that already has other worktrees is accepted.
+    let q = repo(&t, "Q", "many");
+    let (qw, _) = t.both("qextra");
+    git(&q, &["worktree", "add", "--detach", qw.to_str().unwrap(), &head(&q)]);
+    ticket(&t, "hmany", "q");
+    let (q_raw, _) = t.both("Q");
+    let mut args = create_args(&t, "hmany.json", &q_raw, &head(&q), "W", "M");
+    let i = args.iter().position(|a| a == "--repo-map").unwrap();
+    args[i + 1] = format!("q={}", q_raw.display());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "repo with existing worktrees: {} {}", out(&o), err(&o));
+    assert_eq!(worktree_count(&q), 3, "Q should hold its main tree, the detached one and the new workspace");
+}
+
+// ---------------------------------------------------------------- AC 7: the repo comes from the ticket
+
+#[test]
+fn ac7_repo_comes_from_the_ticket_not_the_working_folder() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let r2 = repo(&t, "R2", "two");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t1", "r");
+    // Run from INSIDE R2 with the map naming R: the worktree lands in R's list, never R2's.
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), Some(&r2));
+    assert_eq!(code(&o), 0, "create from another repo's folder: {}", err(&o));
+    let (_, tree) = t.both("W/t1/tree");
+    assert!(worktree_porcelain(&r).contains(&format!("worktree {}", tree.display())), "R's list lacks the worktree");
+    assert_eq!(worktree_count(&r2), 1, "R2 gained a worktree");
+    assert_no_folder("ac7", &o, &t, &r);
+}
+
+// ---------------------------------------------------------------- AC 8: no folder is printed
+
+#[test]
+fn ac8_no_folder_on_stdout_or_stderr() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t1", "r");
+    ticket(&t, "tnope", "nope");
+    ticket(&t, "T-1x", "r");
+    let (w_raw, _) = t.both("W");
+    fs::create_dir_all(r_raw.join("inside")).unwrap();
+    // A successful create; a second one; an unknown repo; a non-token id; a bad base; a mis-placed root.
+    let flows: Vec<(&str, Vec<String>)> = vec![
+        ("ok", create_args(&t, "t1.json", &r_raw, &s, "W", "M")),
+        ("again", create_args(&t, "t1.json", &r_raw, &s, "W", "M")),
+        ("unknown-repo", vec!["workspace".into(), "create".into(), t.raw.join("tnope.json").to_str().unwrap().into(), "--repo-map".into(), format!("r={}", r_raw.display()), "--base".into(), s.clone(), "--workspace-root".into(), w_raw.to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()]),
+        ("non-token-id", create_args(&t, "T-1x.json", &r_raw, &s, "W", "M")),
+        ("bad-base", create_args(&t, "t1.json", &r_raw, "HEAD", "W", "M")),
+        ("bad-root", {
+            let mut a = create_args(&t, "t1.json", &r_raw, &s, "W", "M");
+            let i = a.iter().position(|x| x == "--workspace-root").unwrap();
+            a[i + 1] = r_raw.join("inside").to_str().unwrap().to_string();
+            a
+        }),
+        ("no-args", vec!["workspace".into(), "create".into()]),
+    ];
+    for (label, args) in flows {
+        let o = run(&args, None);
+        assert_no_folder(label, &o, &t, &r);
+    }
+}
+
+// ================================================================ P1B-04: the node_modules link
+
+/// A primary whose top level holds a REAL `node_modules` directory (untracked; one package inside).
+fn repo_with_node_modules(t: &Tmp) -> PathBuf {
+    let r = repo(t, "R", "one");
+    fs::create_dir_all(r.join("node_modules").join("pkg")).unwrap();
+    fs::write(r.join("node_modules").join("pkg").join("f.txt"), "pkg").unwrap();
+    r
+}
+
+/// AC 2 (P1B-04): a primary with a real `node_modules` dir gets a link to it, listed as a third entry.
+#[test]
+fn p1b04_link_made_and_listed() {
+    let t = Tmp::new();
+    let r = repo_with_node_modules(&t);
+    let (r_raw, _) = t.both("R");
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // The link: a no-follow stat says symlink, and its target text IS the primary's canonical node_modules.
+    let (_, tree) = t.both("W/t1/tree");
+    let link = tree.join("node_modules");
+    let meta = fs::symlink_metadata(&link).expect("no node_modules link was made");
+    assert!(meta.file_type().is_symlink(), "tree/node_modules is not a link");
+    assert_eq!(fs::read_link(&link).unwrap(), r.join("node_modules"), "the link points elsewhere");
+    // The link is usable: the package is visible THROUGH it.
+    assert!(fs::metadata(link.join("pkg").join("f.txt")).unwrap().is_file(), "the link does not resolve to the primary's folder");
+    // The manifest lists THREE entries, the third naming the link under class temp_dir.
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    let binding = out(&l);
+    let listed: Vec<&str> = binding.lines().collect();
+    assert_eq!(listed.len(), 3, "manifest list:\n{}", out(&l));
+    assert_eq!(listed[0], format!("worktree\tworktree\t{}", tree.display()));
+    assert_eq!(listed[1], format!("tmp\ttemp_dir\t{}", t.both("W/t1/tmp").1.display()));
+    assert_eq!(listed[2], format!("node_modules\ttemp_dir\t{}", link.display()));
+    assert_no_folder("p1b04-link", &o, &t, &r);
+}
+
+/// AC 3 (P1B-04): a primary with NO `node_modules` gets no link and no third entry (behaviour identical to P1B-03).
+#[test]
+fn p1b04_no_node_modules_no_link() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // Nothing at <tree>/node_modules: a NO-FOLLOW stat fails (an exists() would also miss a dangling link).
+    let (_, tree) = t.both("W/t1/tree");
+    assert!(fs::symlink_metadata(tree.join("node_modules")).is_err(), "something sits at tree/node_modules");
+    // The manifest lists exactly the two P1B-03 entries.
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    let binding = out(&l);
+    let listed: Vec<&str> = binding.lines().collect();
+    assert_eq!(listed.len(), 2, "manifest list:\n{}", out(&l));
+    assert_eq!(listed[0], format!("worktree\tworktree\t{}", tree.display()));
+    assert_eq!(listed[1], format!("tmp\ttemp_dir\t{}", t.both("W/t1/tmp").1.display()));
+    assert_no_folder("p1b04-none", &o, &t, &r);
+}
+
+/// AC 4 (P1B-04): a symlinked primary `node_modules` is refused (to a dir inside the repo AND to one outside),
+/// with nothing written and no folder on the terminal.
+#[test]
+fn p1b04_symlinked_primary_node_modules_refused() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    let before_por = worktree_porcelain(&r);
+    // Case A: the symlink points at a directory INSIDE the repo.
+    fs::create_dir_all(r.join("real_nm")).unwrap();
+    std::os::unix::fs::symlink(r.join("real_nm"), r.join("node_modules")).unwrap();
+    ticket(&t, "ta", "r");
+    let oa = run(&create_args(&t, "ta.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&oa), 2, "symlink inside: exit {} stdout {} stderr {}", code(&oa), out(&oa), err(&oa));
+    assert!(empty(&w) && empty(&m), "the inside-symlink refusal wrote something");
+    assert_eq!(worktree_porcelain(&r), before_por, "the inside-symlink refusal touched the repo");
+    assert_no_folder("p1b04-symlink-in", &oa, &t, &r);
+    // Case B: the symlink points at a directory OUTSIDE the repo.
+    fs::remove_file(r.join("node_modules")).unwrap();
+    let (outside, _) = t.both("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, r.join("node_modules")).unwrap();
+    ticket(&t, "tb", "r");
+    let ob = run(&create_args(&t, "tb.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&ob), 2, "symlink outside: exit {} stdout {} stderr {}", code(&ob), out(&ob), err(&ob));
+    assert!(empty(&w) && empty(&m), "the outside-symlink refusal wrote something");
+    assert_eq!(worktree_porcelain(&r), before_por, "the outside-symlink refusal touched the repo");
+    assert!(outside.read_dir().unwrap().count() == 0, "something was written through the symlink");
+    assert_no_folder("p1b04-symlink-out", &ob, &t, &r);
+}
+
+/// AC 5 (P1B-04): a base commit that tracks `node_modules/x` is not shadowed — the tree keeps its own real
+/// directory, and the manifest keeps exactly the two P1B-03 entries.
+#[test]
+fn p1b04_tracked_node_modules_not_shadowed() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    // The primary's node_modules exists too (untracked pkg) — the base tracking one still means NO link.
+    fs::create_dir_all(r.join("node_modules").join("pkg")).unwrap();
+    fs::write(r.join("node_modules").join("x"), "tracked").unwrap();
+    git(&r, &["add", "node_modules/x"]);
+    git(&r, &["commit", "-q", "-m", "add tracked node_modules"]);
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // The tree's node_modules is the base commit's own REAL directory holding x, not a link.
+    let (_, tree) = t.both("W/t1/tree");
+    let nm = tree.join("node_modules");
+    let meta = fs::symlink_metadata(&nm).expect("the tree has no node_modules");
+    assert!(meta.file_type().is_dir(), "the tree's node_modules was replaced or is not a real directory");
+    assert!(fs::metadata(nm.join("x")).unwrap().is_file(), "the tracked x is missing from the tree");
+    // Two entries only: the link was never listed.
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    assert_eq!(out(&l).lines().count(), 2, "a link entry was listed for a tracked node_modules:\n{}", out(&l));
+    // The primary's own folder was untouched: x and pkg both still there.
+    assert!(fs::metadata(r.join("node_modules").join("x")).unwrap().is_file());
+    assert!(fs::metadata(r.join("node_modules").join("pkg")).unwrap().is_dir());
+    assert_no_folder("p1b04-tracked", &o, &t, &r);
+}
+
+/// AC 6 (P1B-04): the link's manifest entry is written BEFORE the link (or the tree) exists. The `ws` branch
+/// trick makes `git worktree add` fail after the seed; the entry must already be listed, no link may exist, and
+/// every child of the ticket root must be one of the listed paths.
+#[test]
+fn p1b04_entry_listed_before_link_exists() {
+    let t = Tmp::new();
+    let r = repo_with_node_modules(&t);
+    let (r_raw, _) = t.both("R");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t6", "r");
+    git(&r, &["branch", "ws", &s]);
+    let o = run(&create_args(&t, "t6.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "git failure after the seed: {} {}", out(&o), err(&o));
+    assert_no_folder("p1b04-seed-fail", &o, &t, &r);
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t6".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list t6: {}", err(&l));
+    let listed = out(&l);
+    let entries: Vec<&str> = listed.lines().collect();
+    assert_eq!(entries.len(), 3, "the seed must have written all three entries:\n{}", listed);
+    let (_, tree) = t.both("W/t6/tree");
+    let want_nm = format!("node_modules\ttemp_dir\t{}", tree.join("node_modules").display());
+    assert!(entries.contains(&want_nm.as_str()), "the node_modules entry is missing:\n{}", listed);
+    // No link exists (the tree itself may not even exist): the entry was written FIRST.
+    assert!(fs::symlink_metadata(tree.join("node_modules")).is_err(), "a link already exists at tree/node_modules");
+    // Every child of the ticket root is one of the listed paths: no unlisted thing may sit there.
+    let (root, _) = t.both("W/t6");
+    let targets: Vec<PathBuf> = entries.iter().map(|e| PathBuf::from(e.split('\t').nth(2).unwrap_or(""))).collect();
+    for child in fs::read_dir(&root).unwrap().flatten() {
+        let child = child.path().canonicalize().unwrap();
+        assert!(targets.contains(&child), "an unlisted child sits in the ticket root: {:?}", child.file_name());
+    }
+}
+
+// --------------------- P1B-04 held-out refusal and acceptance variants (executor round 1, none from review)
+
+#[test]
+fn p1b04_heldout_refusal_and_acceptance_variants() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    let before_por = worktree_porcelain(&r);
+    // must-fire 1: a FILE at the primary's node_modules is refused, writing nothing.
+    fs::write(r.join("node_modules"), "a file").unwrap();
+    ticket(&t, "hf", "r");
+    let o = run(&create_args(&t, "hf.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "file at node_modules: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the file case wrote something");
+    assert_eq!(worktree_porcelain(&r), before_por, "the file case touched the repo");
+    assert_no_folder("p1b04-file", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-fire 2: a DANGLING symlink at node_modules (target missing) is refused, never chased.
+    std::os::unix::fs::symlink(r.join("gone"), r.join("node_modules")).unwrap();
+    ticket(&t, "hd", "r");
+    let o = run(&create_args(&t, "hd.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "dangling symlink: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the dangling-symlink case wrote something");
+    assert_no_folder("p1b04-dangling", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-fire 3: a symlink pointing at a FILE is refused (the link class is refused whatever the target is).
+    fs::write(r.join("nmfile"), "target file").unwrap();
+    std::os::unix::fs::symlink(r.join("nmfile"), r.join("node_modules")).unwrap();
+    ticket(&t, "ht", "r");
+    let o = run(&create_args(&t, "ht.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "symlink to a file: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the symlink-to-file case wrote something");
+    assert_no_folder("p1b04-link-to-file", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-fire 4: a FILE at the primary's node_modules is refused EVEN when the base tracks node_modules —
+    // the plan's decision order runs the no-follow stat refusal BEFORE the tracked exemption.
+    fs::write(r.join("node_modules"), "tracked file").unwrap();
+    git(&r, &["add", "node_modules"]);
+    git(&r, &["commit", "-q", "-m", "tracked node_modules file"]);
+    let s2 = head(&r);
+    ticket(&t, "h1", "r");
+    let o = run(&create_args(&t, "h1.json", &r_raw, &s2, "W", "M"), None);
+    assert_eq!(code(&o), 2, "file at node_modules with a tracking base: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the tracked-file case wrote something");
+    assert_no_folder("p1b04-file-tracked", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-not-fire 1: a base that tracks node_modules while the primary has NONE — the fresh tree brings its
+    // own real directory, no link, no third entry.
+    ticket(&t, "h1b", "r");
+    let o = run(&create_args(&t, "h1b.json", &r_raw, &s2, "W", "M"), None);
+    assert_eq!(code(&o), 0, "tracked node_modules, no primary folder: {} {}", out(&o), err(&o));
+    let (_, tree1) = t.both("W/h1b/tree");
+    let meta = fs::symlink_metadata(tree1.join("node_modules")).expect("the tracked file is missing from the tree");
+    assert!(meta.file_type().is_file(), "the tree's node_modules is not the tracked file");
+    let l = run(&["manifest".into(), "list".into(), "h1b".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list h1b: {}", err(&l));
+    assert_eq!(out(&l).lines().count(), 2, "a link entry was listed for a tracked file:\n{}", out(&l));
+    // must-not-fire 2: a second ticket on the same repo also gets a link to the SAME primary folder.
+    fs::create_dir_all(r.join("node_modules").join("pkg")).unwrap();
+    ticket(&t, "h2", "r");
+    let o = run(&create_args(&t, "h2.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "second ticket: {} {}", out(&o), err(&o));
+    let (_, tree2) = t.both("W/h2/tree");
+    assert_eq!(fs::read_link(tree2.join("node_modules")).unwrap(), r.join("node_modules"), "the second link points elsewhere");
+    // must-not-fire 3: the base is an OLD commit from before node_modules appeared in the working tree —
+    // trackedness is keyed on the BASE, so the link is still made and listed.
+    ticket(&t, "h3", "r");
+    let o = run(&create_args(&t, "h3.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "old base with node_modules present: {} {}", out(&o), err(&o));
+    let (_, tree3) = t.both("W/h3/tree");
+    assert!(fs::symlink_metadata(tree3.join("node_modules")).unwrap().file_type().is_symlink(), "no link for the old-base ticket");
+    let l = run(&["manifest".into(), "list".into(), "h3".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(out(&l).lines().count(), 3, "the old-base ticket's manifest:\n{}", out(&l));
+}
