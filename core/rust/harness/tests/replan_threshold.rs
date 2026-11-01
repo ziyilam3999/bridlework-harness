@@ -252,9 +252,11 @@ fn ticket_file(fx: &Fx, body: &str) -> PathBuf {
 fn run_args(cwd: &Path, args: &[String], env: &[(&str, &Path)]) -> Output {
     let mut c = Command::new(BIN);
     c.arg("ticket").arg("gate").args(args).current_dir(cwd).stdin(Stdio::null());
-    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "HARNESS_RUN_ID"] {
         c.env_remove(k);
     }
+    // The run identity of a refusal event (v2): the role and model of the gate run, never defaulted by the harness.
+    c.env("HARNESS_ROLE", "executor").env("HARNESS_MODEL", "m-1");
     for (k, v) in env {
         c.env(k, v);
     }
@@ -375,11 +377,14 @@ fn a_latched_ticket_is_refused_before_anything_runs() {
     assert_eq!(fx.rec("T-1"), rec, "no round was paid for the refusal");
     assert_eq!(fx.streak("T-1"), streak, "the streak is untouched");
     assert!(!leaks(&o, fx.caps.to_str().unwrap()) && !leaks(&o, fx.res.to_str().unwrap()), "no folder is echoed");
-    assert_eq!(fx.events().len(), 1, "exactly one event");
-    assert!(fx.events()[0].contains("replan_required") && fx.events()[0].contains("replan-threshold"), "{}", fx.events()[0]);
-    // A second call is another refusal and another event; the ticket stays latched.
+    assert_eq!(fx.events().iter().filter(|l| l.contains("\"replan_required\"")).count(), 1, "exactly one replan event");
+    assert_eq!(fx.events().len(), 2, "its run_issued line and the event");
+    let lines = fx.events();
+    let replan = lines.iter().find(|l| l.contains("\"replan_required\"")).unwrap();
+    assert!(replan.contains("replan-threshold"), "{replan}");
+    // A second call is another refusal and another run (run_issued + event); the ticket stays latched.
     replan_refused(&gate(&fx), "T-1", &c3);
-    assert_eq!(fx.events().len(), 2);
+    assert_eq!(fx.events().len(), 4);
 }
 
 // AC 3: a failure that changes gate keeps going; only CONSECUTIVE identical failures latch. Twin: AC 1.
@@ -454,12 +459,16 @@ fn the_refusal_writes_a_valid_replan_event() {
     }
     let read = events::read_log(&log).unwrap();
     assert!(read.is_clean());
-    assert_eq!(read.events.len(), 1);
-    let e = &read.events[0];
+    assert_eq!(read.events.len(), 2, "the self-issued run_issued line plus the event");
+    assert_eq!(read.events[0].kind.as_str(), "run_issued");
+    let e = &read.events[1];
     assert_eq!((e.kind.as_str(), e.ticket.as_str(), e.repo.as_str(), e.reason.as_str()), ("replan_required", "ex-1", "r", "replan-threshold"));
     assert!(e.ts_ms > 0);
+    // v2 identity: both lines carry the same run id, the role and the model of the gate run.
+    assert_eq!(read.events[0].run_id, e.run_id);
+    assert_eq!((e.role.as_str(), e.model.as_str()), ("executor", "m-1"));
     assert_eq!(code(&gate_id(&fx, "EX-1", &[])), 1);
-    assert_eq!(fx.events().len(), 2, "a second refused call appends a second event");
+    assert_eq!(fx.events().len(), 4, "a second refused call appends another run (run_issued + event)");
 }
 
 // AC 6: a plain re-run of one head is not a fix attempt; the cap still bounds it. Twin: AC 1 (two heads latch).
@@ -477,8 +486,8 @@ fn a_rerun_of_the_same_head_does_not_extend_the_streak() {
     let o = gate(&fx);
     assert_eq!(code(&o), 1);
     assert_eq!(out(&o), refused_line("T-1", &c1, "fix-round-cap"), "the 5th run is the cap's, not the re-plan's");
-    assert_eq!(fx.events().len(), 1);
-    assert!(fx.events()[0].contains("escalation"));
+    assert_eq!(fx.events().iter().filter(|l| l.contains("\"escalation\"")).count(), 1);
+    assert_eq!(fx.events().len(), 2, "run_issued plus the escalation");
 }
 
 // AC 7: an empty commit is a new head and counts. Twin: AC 6 (the same head does not).
@@ -628,8 +637,9 @@ fn the_cap_and_the_threshold_together_write_one_replan_event() {
     assert_eq!(fx.rec("T-1"), canon("T-1", 4, false));
     replan_refused(&gate(&fx), "T-1", &c2);
     let lines = fx.events();
-    assert_eq!(lines.len(), 1, "exactly one event: {lines:?}");
-    assert!(lines[0].contains("replan_required") && !lines[0].contains("escalation"), "{}", lines[0]);
+    assert_eq!(lines.len(), 2, "one run: run_issued plus the event: {lines:?}");
+    let replan = lines.iter().find(|l| l.contains("\"replan_required\"")).unwrap();
+    assert!(!replan.contains("escalation"), "{replan}");
     // Twin: failures that change gate reach the cap, as in P1A-09.
     let fx = Fx::with_u();
     fx.plant("T-1", 2, false);
@@ -641,7 +651,7 @@ fn the_cap_and_the_threshold_together_write_one_replan_event() {
     assert!(err(&o).contains(CAP_HINT) && !hint(&o), "{}", err(&o));
     let o = gate(&fx);
     assert_eq!(out(&o), refused_line("T-1", &c2, "fix-round-cap"));
-    assert!(fx.events().len() == 1 && fx.events()[0].contains("escalation"));
+    assert!(fx.events().len() == 2 && fx.events().iter().any(|l| l.contains("escalation")));
 }
 
 // AC 12: the signature ignores the message. Intended coarse behaviour (plan Open question 6): a repo whose whole suite is one gate latches after any
