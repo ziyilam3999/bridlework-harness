@@ -666,3 +666,41 @@ fn v7_a_log_of_only_good_lines_verifies_clean() {
     let v = verify(&t.log());
     assert_eq!(v.status.code(), Some(0), "{}", err(&v));
 }
+
+/// R3-F1 (+ held-out v1-v4): a caller who passes a reserved envelope name (`ts_ms`, `kind`) as a field is refused at
+/// the build door AND at the append door, the error names the key, and the log is never written. Pairs come from
+/// `pairs_for`, so the extra reserved pair is the only defect. Case variants (v3) follow today's rule: not a declared
+/// key, so refused as an unexpected key naming it. The reserved name given twice (v4) is refused, never accepted once.
+#[test]
+fn r3f1_a_caller_field_named_ts_ms_or_kind_is_refused_at_build_and_at_append() {
+    for kind in Kind::ALL {
+        for (name, value) in [
+            ("ts_ms", Field::Num(7)),
+            ("ts_ms", Field::Str("x".to_string())),
+            ("kind", Field::Str(kind.as_str().to_string())),
+            ("kind", Field::Num(7)),
+            ("TS_MS", Field::Num(7)),
+            ("Kind", Field::Str("x".to_string())),
+        ] {
+            let mut pairs = pairs_for(kind);
+            pairs.push((name, value.clone()));
+            let t = Tmp::new();
+            match Record::build(kind, TS, &pairs) {
+                Err(e) => assert!(e.contains(name), "{}: build error must name {name}: {e}", kind.as_str()),
+                Ok(rec) => {
+                    // The build door let it through: the append door must still refuse and leave the log alone.
+                    let r = append_record(&t.0, &t.log(), &rec);
+                    let wrote = fs::read(t.log()).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+                    panic!("{}: build accepted a caller {name}; append gave {r:?}; log now {wrote:?}", kind.as_str());
+                }
+            }
+            assert!(!t.log().exists(), "{}: refused {name} leaves no log", kind.as_str());
+        }
+        // v4: the reserved name twice.
+        let mut twice = pairs_for(kind);
+        twice.push(("ts_ms", Field::Num(1)));
+        twice.push(("ts_ms", Field::Num(2)));
+        let e = Record::build(kind, TS, &twice).expect_err("a doubled ts_ms must be refused");
+        assert!(e.contains("ts_ms"), "{}: {e}", kind.as_str());
+    }
+}
