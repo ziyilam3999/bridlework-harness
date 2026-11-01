@@ -10,6 +10,10 @@
 # safe characters. Every other command is parsed, and the program word of every command (also inside $(..),
 # backticks and <(..)) must be a plain literal from a small safe set; an allowed prefix (env, command, ...) followed
 # by any option is refused. Unparseable text is refused. No pattern matcher is ever asked "could this be gh?".
+# Unknown-word rule (T-146): in a command whose own program is not a plain everyday one (a small default-deny set), no
+# word may have a value that cannot be read from the source (expansion, glob, brace, group, a replacement string). No
+# list of wrapper names and no word position decides it. Input bound: a command string over 65536 characters or 4096
+# words (past the plain fast path) is refused.
 # Test-only override named here (the smoke names its own in its header): HARNESS_TEST_SWAP_FILE, a path; when it
 # equals the body file being read, the hook rewrites that file between its two stats, which can only force a
 # refusal. It does nothing when unset.
@@ -566,12 +570,17 @@ KEYWORDS = {"if", "elif", "while", "until", "then", "else", "do", "!", "{", "cop
 SAFE_WORD = re.compile(r"[A-Za-z0-9_./+@:%,-]+")
 SAFE_TOKEN = re.compile(r"[A-Za-z0-9_./+@:%,-][A-Za-z0-9_./+@:%,=-]*")
 PROGRAM_OK = {"[", "[[", "{", "}", "!"}   # one-character words that no pattern can turn into a two-letter name
-# Pass-through words: they run another program given later on the same command line. The word that follows them is
-# ALSO a program word, so it gets the same plain-literal test as a first word (T-146).
-WRAPPERS = PREFIXES | {"nice", "ionice", "timeout", "stdbuf", "xargs", "find", "setsid", "caffeinate", "chrt",
-                       "taskset", "flock", "unbuffer", "watch", "parallel", "script", "arch", "chronic", "doas", "su"}
-FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
-DURATION = re.compile(r"[0-9]+(\.[0-9]+)?[smhd]?")
+# Commands that only read, move or print their arguments and never run one of them as a program. A word whose value
+# is unknown until the shell expands it (T-146) is allowed only in a command from this set; in any other command it
+# could be the GitHub CLI by name, wherever it stands. This is default deny: a name missing here costs a refusal, never a leak.
+PLAIN = {"echo", "printf", "wc", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ls", "touch", "head", "tail", "sort", "uniq",
+         "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "stat", "test", "[", "[[", "cd", "pwd", "export",
+         "local", "declare", "readonly", "read", "return", "exit", "shift", "unset", "true", "false", "grep", "egrep",
+         "fgrep", "rg", "tee", "chmod", "ln", "date", "sleep", "du", "df", "file", "make", "cargo", "git", "for", "case",
+         "select"}
+ORDINARY = {"-", "--", "+", ";", ".", "..", "/", "!", "[", "]", "[[", "]]", "{", "}", "=", ":", ","}
+CMD_CAP = 65536       # longest command string read past the fast path; longer is refused
+WORD_CAP = 4096       # most words in one command string; more is refused
 MAX_DEPTH = 8
 API_BAD_LONG = {"--method", "--field", "--raw-field", "--input"}
 
@@ -664,61 +673,44 @@ def program_ok(p):
     return (not p.quoted) and (not p.dyn) and SAFE_WORD.fullmatch(p.raw) is not None
 
 
-def wrapper_name(w):
-    if w.quoted or w.dyn:
-        return None
-    return w.raw.rsplit("/", 1)[-1] if w.raw.startswith("/") else w.raw
+def unknown(w, ws, find):
+    """True when the value of word w cannot be read from the source: it could be the GitHub CLI spelled by an expansion,
+    a glob, a brace, a group or a replacement string. Assignment words are not program words and are skipped."""
+    if is_assign(w):
+        return False
+    t = w.text
+    if "{}" in t and not find:  # G:placeholder
+        return True
+    if w.dyn:
+        core = w.raw.replace("{}", "") if find else w.raw
+        if find and "{}" in w.raw and re.search(r"[$`*?\[(<>{}~\\'\"=]", core) is None:  # G:find_placeholder
+            return False
+        if re.fullmatch(r"~[A-Za-z0-9_./+@:%,-]*", w.raw):  # G:tilde_literal
+            return False
+        return True  # G:dyn_word
+    if (not find) and t not in ORDINARY and (not t.startswith("-")) and (not t.isdigit()) and sum(1 for x in ws if x.text == t) > 1:  # G:repeat_word
+        return True  # a word given twice is a replacement string that takes its value from standard input
+    return False
 
 
-def chase(ws, i, hops=0):
-    """ws[i] is a program word that passed program_ok. When it is a pass-through word, find the program word it runs and
-    hold that word to the same rule, recursively. Words that follow an option may be the option's value or the program, so
-    they must be plain literals too and the next word is then also checked."""
-    if hops > MAX_DEPTH:  # G:wrapper_depth
-        refuse("refused: gh text: pass-through words nested too deeply")
-    if wrapper_name(ws[i]) not in WRAPPERS:
-        return
-    find = wrapper_name(ws[i]) == "find"
-    after_opt = False
-    j = i + 1
+def command_unknown_ok(ws):
+    """One rule, no program position and no wrapper list: when the command's own program word is not a plain everyday
+    command, none of its words may have an unknown value. (Shell keywords and assignments before the program are skipped.)"""
+    i = 0
     n = len(ws)
-    while j < n:
-        w = ws[j]
-        if find:
-            if w.raw in FIND_EXEC and (not w.quoted):  # G:wrapper_find_exec
-                if j + 1 >= n:
-                    return
-                if not program_ok(ws[j + 1]):  # G:wrapper_program
-                    refuse("refused: gh text: a program word that is not a plain literal")
-                chase(ws, j + 1, hops + 1)
-            j += 1
-            continue
-        if is_assign(w):
-            j += 1
-            continue
-        if w.raw.startswith("-") or w.text.startswith("-"):
-            if w.dyn or w.quoted:  # G:wrapper_option
-                refuse("refused: gh text: a program word that is not a plain literal")
-            after_opt = True
-            j += 1
-            continue
-        if (not w.dyn) and (not w.quoted) and DURATION.fullmatch(w.raw):
-            after_opt = False
-            j += 1
-            continue
-        if after_opt and w.raw == "{}":
-            after_opt = False
-            j += 1
-            continue
-        if not program_ok(w):  # G:wrapper_program
-            refuse("refused: gh text: a program word that is not a plain literal")
-        if after_opt:
-            after_opt = False
-            chase(ws, j, hops + 1)
-            j += 1
-            continue
-        chase(ws, j, hops + 1)
+    while i < n and (is_assign(ws[i]) or ((not ws[i].quoted) and ws[i].raw in KEYWORDS)):  # G:plain_lead
+        i += 1
+    if i >= n:
         return
+    p = ws[i]
+    if (not p.quoted) and (p.raw in ("[", "[[") or not p.dyn) and p.raw in PLAIN:  # G:plain_set
+        return
+    if (not p.quoted) and (not p.dyn) and p.raw == "gh":  # G:gh_program
+        return  # parse_gh_call refuses an expansion in every position of a gh call
+    find = (not p.quoted) and (not p.dyn) and p.raw == "find"
+    for w in ws[i + 1:]:
+        if unknown(w, ws, find):
+            refuse("refused: gh text: a word that could spell the CLI in a command that may run it")
 
 
 def check_program_words(st, depth, nest=False):
@@ -734,7 +726,7 @@ def check_program_words(st, depth, nest=False):
                 continue
             if not program_ok(ws[i]):  # G:progword_literal
                 refuse("refused: gh text: a program word that is not a plain literal")
-            chase(ws, i)
+            command_unknown_ok(ws)  # G:unknown_word
     for kind, text in st.subs:  # G:sub_recurse
         check_program_words(tokenize(text), depth + 1, kind == "nest")
 
@@ -1084,12 +1076,16 @@ def main():
     if mention and has_control(cmd):
         refuse("refused: gh text: control characters in the command")
 
+    if len(cmd) > CMD_CAP:  # G:input_len
+        refuse("refused: gh text: the command is too long to read")
     try:
         st = tokenize(cmd)
     except Refuse:
         if True:  # G:cannot_decide
             raise
         return
+    if sum(len(c) for c in st.cmds) > WORD_CAP:  # G:input_words
+        refuse("refused: gh text: the command is too long to read")
     check_program_words(st, 0)
     if not mention:
         return

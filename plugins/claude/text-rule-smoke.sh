@@ -152,8 +152,8 @@ expect_refuse() { # label [required substring]
 mono() { "$PY" -I -c 'import time; print(time.monotonic())'; }
 elapsed() { "$PY" -I -c 'import sys; print(round(float(sys.argv[2]) - float(sys.argv[1]), 1))' "$1" "$2"; }
 under_13() { "$PY" -I -c 'import sys; sys.exit(0 if float(sys.argv[2]) - float(sys.argv[1]) < 13.0 else 1)' "$1" "$2"; }
-ok() { drive "$2"; expect_allow "$1"; }
-no() { drive "$2"; expect_refuse "$1" "$3"; }
+ok() { local f=$FAILN; drive "$2"; expect_allow "$1"; [ "$FAILN" -eq "$f" ] && echo "  case $1"; }
+no() { local f=$FAILN; drive "$2"; expect_refuse "$1" "$3"; [ "$FAILN" -eq "$f" ] && echo "  case $1"; }
 raw_no() { printf '%s' "$2" > "$W/in.json"; SINKN=0; run_hook_file "$W/in.json"; expect_refuse "$1" "$3"; }
 
 # ---------------------------------------------------------------- AC 1
@@ -593,29 +593,84 @@ EOF
   ok twin-heredoc-tab-strip "cat <<-EOF > /dev/null
 	it's fine *
 	EOF" # G:heredoc_skip
-  # T-146: the word after a pass-through word is a program word too (bash brace and glob, zsh group spellings)
-  no pt-nice-brace "nice g{h,x} $M" # G:wrapper_program
-  no pt-nice-nice-brace "nice nice g{h,x} $M" # G:wrapper_program
-  no pt-env-nice-brace "env nice g{h,x} $M" # G:wrapper_program
-  no pt-find-exec-brace "find . -maxdepth 0 -exec g{h,x} $M \;" # G:wrapper_find_exec
-  no pt-cd-nice-glob "cd '$SINK' && nice g? $M" # G:wrapper_program
-  no pt-cd-nice-n-glob "cd '$SINK' && nice -n 1 g? $M" # G:wrapper_program
-  no pt-cd-xargs-glob "cd '$SINK' && echo x | xargs g? $M" # G:wrapper_program
-  no pt-cd-find-exec-glob "cd '$SINK' && find . -maxdepth 0 -exec g? $M \;" # G:wrapper_find_exec
-  no pt-timeout-brace "timeout 5 g{h,x} $M" # G:wrapper_program
-  no pt-timeout-backslash "timeout 5 g\\h $M" # G:wrapper_program
-  no pt-xargs-brace "echo x | xargs g{h,x} $M" # G:wrapper_program
-  no pt-glued-paren "(g)h $M" # G:glued_after_paren
-  no pt-zsh-nice-group "nice g(h|x) $M" # G:wrapper_program
-  no pt-zsh-timeout-group "timeout 5 g(h|x) $M" # G:wrapper_program
-  no pt-nice-option-value "nice -n 1 g{h,x} $M" # G:wrapper_program
+  # T-146: one rule decides pass-through words. A word whose value is unknown until the shell expands it (brace, glob,
+  # group, expansion, substitution, replacement string) is refused in any command that is not a plain everyday one,
+  # wherever the word stands and whatever the command is called. Every case below is a held-out spelling, none a list entry.
+  local R="refused: gh text:" G1='g{h,x}' G2='g(h|x)'
+  both() { # id, text before the disguised word, text after it: one case per shell spelling (bash brace, zsh group)
+    no "$1-bash" "$2$G1 $3" "$R"
+    no "$1-zsh" "$2$G2 $3" "$R"
+  }
+  both pt-nice "nice " "$M"
+  both pt-nice-nice "nice nice " "$M"
+  both pt-env-nice "env nice " "$M"
+  both pt-timeout-dot "timeout .5 " "$M"
+  both pt-timeout-hex "timeout 0x5 " "$M"
+  both pt-timeout-exp "timeout 1e1 " "$M"
+  both pt-timeout-inf "timeout inf " "$M"
+  both pt-timeout-kill-after "timeout --kill-after=1 5 " "$M"
+  both pt-gtimeout "gtimeout 5 " "$M"
+  both pt-relative-dot "cd /usr/bin && ./nice " "$M"
+  both pt-relative-dir "cd /usr && bin/nice " "$M"
+  both pt-find-quoted-exec "find . -maxdepth 0 \"-exec\" " "$M \;"
+  both pt-find-escaped-exec "find . -maxdepth 0 -ex\\ec " "$M \;"
+  both pt-find-exec "find . -maxdepth 0 -exec " "$M \;"
+  both pt-flock-file "flock $SINK/x.lock " "$M"
+  both pt-flock-option "flock -n $SINK/x.lock " "$M"
+  both pt-script-file "script /dev/null " "$M"
+  both pt-script-option "script -q /dev/null " "$M"
+  both pt-sandbox-exec "sandbox-exec -p '(version 1)(allow default)' " "$M"
+  both pt-chroot "chroot / " "$M"
+  both pt-xargs "echo x | xargs " "$M"
+  both pt-nice-option-value "nice -n 1 " "$M"
+  both pt-cd-nice "cd '$SINK' && nice " "$M"
+  both pt-alias-bash "shopt -s expand_aliases
+alias n=nice
+n " "$M"
+  both pt-function "n() { nice \"\$@\"; }; n " "$M"
+  # held-out spellings of my own: a name on no list, a data word before the disguised word, a variable on the same line,
+  # a disguised word inside a substitution that is an argument
+  both pt-held-invented-wrapper "frobnicate --level 3 " "$M"
+  both pt-held-data-positional "lockwrap $SINK/x.lock " "$M"
+  no pt-held-same-line-variable "P=g; Q=h; frobnicate \"\$P\$Q\" $M" "$R"
+  no pt-held-variable-prefix "P=g Q=h frobnicate \"\$P\$Q\" $M" "$R"
+  no pt-held-substitution-argument "frobnicate \"\$(printf g)h\" $M" "$R"
+  no pt-held-substitution-bare "nice \$(printf g)h $M" "$R"
+  # a replacement string that takes the program name from standard input
+  no pt-xargs-J-percent "printf '%sh\\n' g | xargs -J % % $M" "$R"
+  no pt-xargs-I-word "printf '%sh\\n' g | xargs -I XX XX $M" "$R"
+  no pt-xargs-I-quoted-brace "printf '%sh\\n' g | xargs -I'{}' '{}' $M" "$R"
+  no pt-glued-paren "(g)h $M" "$R"
+  # a plain everyday command may carry unknown words
+  ok pt-make-variable "make -j4 test \"\$T\""
+  ok pt-echo-home-pipe "echo \"\$HOME\" | wc -c"
+  ok pt-rsync-plain "rsync -a src/ dest/"
+  ok pt-find-rustfmt "find . -name '*.rs' -exec rustfmt --check {} +"
+  ok pt-find-brace-suffix "find . -name '*.tmp' -exec cp {} {}.bak \;"
+  ok pt-assign-then-plain "FOO=1 echo \"\$HOME\""
+  ok pt-keyword-then-plain "if [ -n \"\$HOME\" ]; then echo \"\$HOME\"; fi"
+  ok pt-tilde-plain "rsync -a ~/src dest/"
+  ok pt-gh-repeated-word "gh pr create --title same --body same"
+  ok pt-xargs-d-quoted "xargs -d '\\n' rm -f < list.txt"
   ok pt-nice-make "nice make"
   ok pt-nice-n-make "nice -n 5 make -j4"
   ok pt-timeout-cargo "timeout 5 cargo test"
+  ok pt-timeout-30s "timeout 30s cargo test --locked"
   ok pt-xargs-wc "echo x | xargs wc -l"
-  ok pt-xargs-I-rm "echo x | xargs -I {} rm {}"
+  ok pt-xargs-n-P "xargs -n 1 -P 4 echo"
   ok pt-find-exec-rm "find . -name '*.nothing' -exec rm {} \;"
+  ok pt-find-exec-bash-n "find src -type f -name '*.sh' -exec bash -n {} \;"
   ok pt-env-assign-nice "env A=1 nice make"
+  # refused as the price of the single rule (recorded in the close note): an unknown value in a command that may run it
+  no cost-xargs-I-brace "xargs -I{} cp {} out/ < list.txt" "$R"
+  no cost-timeout-variable "timeout \"\$T\" make" "$R"
+  no cost-nice-variable "nice -n \"\$N\" make" "$R"
+  # input bound: a command past the cap is refused, not read
+  local longword; longword=$(printf '%*s' 70000 '' | tr ' ' a)
+  no input-too-long "echo \"\$HOME\" $longword" "$R"
+  local manywords; manywords=$(printf ' a%.0s' $(seq 1 4100))
+  no input-too-many-words "echo \"\$HOME\"$manywords" "$R"
+  ok input-under-the-caps "echo \"\$HOME\" a b c"
 }
 
 # ---------------------------------------------------------------- AC 12
