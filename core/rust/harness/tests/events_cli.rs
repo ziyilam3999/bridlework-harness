@@ -272,7 +272,15 @@ fn ac5_each_corruption_type_in_the_middle_is_refused_and_pins_list() {
         gt.replace('}', ",\"extra\":\"x\"}"),
         gt.replace(",\"reason\":\"cap.hit\"", ""),
         gt.replace("\"run_id\":\"run-x\",", ""),
+        gt.replace("\"ticket\":\"t-1\",", ""),
+        gt.replace("\"repo\":\"my-repo\",", ""),
+        gt.replace("\"kind\":\"replan_required\",", ""),
+        gt.replace("\"ts_ms\":1,", ""),
         gt.replace("\"repo\":\"my-repo\",", "\"repo\":\"a\",\"repo\":\"b\","),
+        gt.replace('}', ",\"model\":\"m-9\"}"),
+        gt.replace(",\"role\":\"executor\"", ""),
+        gt.replace(",\"model\":\"m-1\"", ""),
+        gt.replace("\"role\":\"executor\"", "\"role\":\"\""),
         gt.replace("replan_required", "nope"),
         gt.replace("\"ts_ms\":1", "\"ts_ms\":\"1\""),
         gt.replace("\"role\":\"executor\"", "\"role\":\"Executor\""),
@@ -286,6 +294,15 @@ fn ac5_each_corruption_type_in_the_middle_is_refused_and_pins_list() {
         assert_eq!(l.status.code(), Some(1));
         assert_eq!(out(&l), format!("{g}{g}"), "intact events before the bad line, nothing after");
     }
+    // A missing identity key in the LAST line of the log is refused just the same, not only mid-log.
+    fs::write(t.log(), format!("{g}{g}{}\n", gt.replace("\"ticket\":\"t-1\",", ""))).unwrap();
+    let v = verify(&t.log());
+    assert_eq!(v.status.code(), Some(1), "a missing ticket in the last line is corrupt");
+    assert!(err(&v).contains("line 3") && err(&v).contains("ticket missing"), "{}", err(&v));
+    // Twin: three complete v2 lines, all four identity fields present, are read and listed whole.
+    fs::write(t.log(), format!("{g}{g}{g}")).unwrap();
+    assert!(ok(&verify(&t.log())), "complete lines verify clean");
+    assert_eq!(out(&list(&t.log())).lines().count(), 3, "the complete log lists in full");
     fs::write(t.log(), format!("garbage\n{g}")).unwrap();
     let l = list(&t.log());
     assert_eq!((l.status.code(), out(&l).as_str()), (Some(1), ""), "a corrupt first line prints nothing");
@@ -762,11 +779,14 @@ fn option_misuse_is_a_usage_error_with_nothing_on_stdout() {
 // ---------------------------------------------------------------- run identity (PRE-B)
 
 #[test]
-fn a_missing_role_or_model_is_refused_and_nothing_is_written() {
+fn a_missing_required_flag_is_refused_and_nothing_is_written() {
     let t = Tmp::new();
     let lp = t.log().to_str().unwrap().to_string();
-    let full = |role: bool, model: bool| -> Vec<String> {
-        let mut a: Vec<String> = vec!["events".into(), "append".into(), "--log".into(), lp.clone(), "--kind".into(), "escalation".into(), "--ticket".into(), "t-1".into(), "--repo".into(), "r".into(), "--reason".into(), "cap.hit".into()];
+    let full = |role: bool, model: bool, ticket: bool| -> Vec<String> {
+        let mut a: Vec<String> = vec!["events".into(), "append".into(), "--log".into(), lp.clone(), "--kind".into(), "escalation".into(), "--repo".into(), "r".into(), "--reason".into(), "cap.hit".into()];
+        if ticket {
+            a.extend(["--ticket".into(), "t-1".into()]);
+        }
         if role {
             a.extend(["--role".into(), "executor".into()]);
         }
@@ -775,17 +795,43 @@ fn a_missing_role_or_model_is_refused_and_nothing_is_written() {
         }
         a
     };
-    for (name, a) in [("neither", full(false, false)), ("role only", full(true, false)), ("model only", full(false, true))] {
+    let cases = [
+        ("neither role nor model", full(false, false, true)),
+        ("role only", full(true, false, true)),
+        ("model only", full(false, true, true)),
+        ("no ticket", full(true, true, false)),
+    ];
+    for (name, a) in cases {
         let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
         let o = run(&refs, None);
         assert_eq!(o.status.code(), Some(2), "{name}");
         assert!(err(&o).contains("EVENT NOT RECORDED"), "{name}: {}", err(&o));
         assert!(!t.log().exists(), "{name}: no file, no line");
     }
-    // Twin: both given, the append is accepted.
-    let both = full(true, true);
+    // An empty --ticket value is as bad as a missing one: refused, nothing written.
+    let mut empty = full(true, true, true);
+    let i = empty.iter().position(|s| s == "t-1").unwrap();
+    empty[i] = String::new();
+    let refs: Vec<&str> = empty.iter().map(|s| s.as_str()).collect();
+    let o = run(&refs, None);
+    assert_eq!(o.status.code(), Some(2), "empty ticket");
+    assert!(err(&o).contains("EVENT NOT RECORDED"), "empty ticket: {}", err(&o));
+    assert!(!t.log().exists(), "empty ticket: no file, no line");
+    // Every other required flag refuses on its own too: kind, repo, reason.
+    for (name, flag, val) in [("kind", "--kind", "escalation"), ("repo", "--repo", "r"), ("reason", "--reason", "cap.hit")] {
+        let a: Vec<String> = full(true, true, true).into_iter().filter(|s| s != flag && s != val).collect();
+        let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let o = run(&refs, None);
+        assert_eq!(o.status.code(), Some(2), "no {name}");
+        assert!(err(&o).contains("EVENT NOT RECORDED"), "no {name}: {}", err(&o));
+        assert!(!t.log().exists(), "no {name}: no file, no line");
+    }
+    // Twin: ticket, role and model all given — the append is accepted and records exactly one event.
+    let both = full(true, true, true);
     let refs: Vec<&str> = both.iter().map(|s| s.as_str()).collect();
-    assert!(ok(&run(&refs, None)), "twin: role and model together pass");
+    assert!(ok(&run(&refs, None)), "twin: the clean command passes");
+    let text = fs::read_to_string(t.log()).unwrap();
+    assert_eq!(text.lines().count(), 2, "run_issued plus exactly one escalation line");
 }
 
 #[test]
