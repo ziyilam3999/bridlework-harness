@@ -392,13 +392,16 @@ pub fn append(root: &Path, log: &Path, ev: &Event) -> Result<(), AppendError> {
     append_impl(root, log, ev, true)
 }
 
-fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool) -> Result<(), AppendError> {
-    let line = ev.encode()?;
+/// Open the log for appending under the module's exclusive advisory lock: path check, open (creating it only when `create`
+/// — an inherited-id check must never conjure an empty log into existence), lock, then the torn-tail check on the last
+/// byte. The handle is left readable at position 0, so a caller may read the settled file through the SAME lock before
+/// writing — no concurrent writer of this module can be caught mid-append.
+fn open_locked(root: &Path, log: &Path, create: bool) -> Result<File, AppendError> {
     let path = check_log_path(root, log)?;
     let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
     // NOTE for 6b: `check_log_path` resolves the path and `open` resolves it again, so a symlink swapped in between could
     // point the open outside the root. Not closed here (out of scope for 6a); re-check the opened file's identity if needed.
-    let mut f = OpenOptions::new().read(true).append(true).create(true).open(&path).map_err(io)?;
+    let mut f = OpenOptions::new().read(true).append(true).create(create).open(&path).map_err(io)?;
     // Exclusive advisory lock across check + write + sync, so the torn-tail check only ever sees a settled file (another
     // writer of this module is never caught mid-append). Held until `f` drops. It does not bind a writer outside this module.
     f.lock().map_err(|e| AppendError::Io(e.to_string()))?;
@@ -411,14 +414,27 @@ fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool) -> Result<(),
             return Err(AppendError::TornTail);
         }
     }
-    let n = f.write(line.as_bytes()).map_err(io)?;
-    if n != line.len() {
+    f.seek(SeekFrom::Start(0)).map_err(io)?;
+    Ok(f)
+}
+
+/// Write the already-encoded bytes and (optionally) sync. One `write` of the whole payload.
+fn write_locked(f: &mut File, bytes: &[u8], do_sync: bool) -> Result<(), AppendError> {
+    let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
+    let n = f.write(bytes).map_err(io)?;
+    if n != bytes.len() {
         return Err(AppendError::Io("short write".to_string()));
     }
     if do_sync {
-        sync(&f).map_err(io)?;
+        sync(f).map_err(io)?;
     }
     Ok(())
+}
+
+fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool) -> Result<(), AppendError> {
+    let line = ev.encode()?;
+    let mut f = open_locked(root, log, true)?;
+    write_locked(&mut f, line.as_bytes(), do_sync)
 }
 
 // ---------------------------------------------------------------- run identity (v2)
@@ -438,25 +454,63 @@ pub fn new_run_id() -> String {
 
 /// Write one event under one run identity (the v2 writer).
 ///
-/// Without `inherited` (the caller had no `HARNESS_RUN_ID`) a fresh id is self-issued: a `run_issued` line is appended
-/// first, carrying the same `ts_ms`, `ticket`, `repo`, `role` and `model` as the event, then the event itself — two lines.
+/// Without `inherited` (the caller had no `HARNESS_RUN_ID`) a fresh id is self-issued: a `run_issued` line is written
+/// first, carrying the same `ts_ms`, `ticket`, `repo`, `role` and `model` as the event, then the event itself — two lines
+/// in one write, one sync.
 ///
-/// With `inherited` (the value of `HARNESS_RUN_ID`), that exact id is accepted only when this same log is readable, clean,
-/// and already holds a `run_issued` line for it; then exactly ONE line (the event) is appended. An unissued, malformed or
-/// unshowable id is refused and nothing is written — an id from the environment is inherited, never trusted on faith.
+/// With `inherited` (the value of `HARNESS_RUN_ID`), that exact id is accepted only when this same log already holds a
+/// `run_issued` line for it; then exactly ONE line (the event) is appended. The whole operation — open, lock, read the
+/// settled log, check the issue, write — happens under the module's exclusive lock, so a concurrent writer can never make
+/// the issue check read a half-written line as torn or corrupt. An unissued, malformed or unshowable id is refused and
+/// nothing is written — an id from the environment is inherited, never trusted on faith.
 ///
-/// The event's own `run_id` field is ignored (overwritten by the resolved id); every other field is validated as usual.
+/// Both lines are encoded (validated, capped) before any byte is written: a refused event leaves no orphaned `run_issued`
+/// line. The event's own `run_id` field is ignored (overwritten by the resolved id).
 pub fn append_under_run(root: &Path, log: &Path, ev: &Event, inherited: Option<&str>) -> Result<String, AppendError> {
     let bad = |m: String| AppendError::Invalid(m);
-    let run_id = match inherited {
-        None => new_run_id(),
-        Some(id) => {
-            if !token_ok(id) {
-                return Err(bad(format!(
-                    "HARNESS_RUN_ID {id:?} must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"
-                )));
-            }
-            let read = read_log(log).map_err(|m| bad(format!("HARNESS_RUN_ID is set, so the log must be read to show that id was issued: {m}")))?;
+    if let Some(id) = inherited {
+        if !token_ok(id) {
+            return Err(bad(format!(
+                "HARNESS_RUN_ID {id:?} must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"
+            )));
+        }
+    }
+    // Self-issue: the id and BOTH lines are settled before the file is touched, so a refused event never creates the log
+    // and never leaves an orphaned run_issued line behind.
+    let prepared = if inherited.is_none() {
+        let run_id = new_run_id();
+        let under = Event { run_id: run_id.clone(), ..ev.clone() };
+        let under_line = under.encode()?;
+        let issue = Event {
+            kind: Kind::RunIssued,
+            ts_ms: under.ts_ms,
+            run_id: run_id.clone(),
+            ticket: under.ticket.clone(),
+            repo: under.repo.clone(),
+            reason: REASON_RUN_ISSUED.to_string(),
+            role: under.role.clone(),
+            model: under.model.clone(),
+        };
+        Some((run_id, format!("{}{}", issue.encode()?, under_line)))
+    } else {
+        None
+    };
+    // No creation for an inherited id: a log that does not exist cannot show an issue, and the refusal must not
+    // conjure an empty log into being.
+    let mut f = open_locked(root, log, inherited.is_none()).map_err(|e| match (&e, inherited.is_some()) {
+        (AppendError::Io(m), true) => bad(format!("HARNESS_RUN_ID is set, so the log must be readable to show that id was issued: {m}")),
+        _ => e,
+    })?;
+    let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
+    let (run_id, payload) = match prepared {
+        Some(done) => done,
+        None => {
+            let id = inherited.unwrap();
+            // Read through the locked handle: the file is settled (no writer of this module is mid-append), so the issue
+            // check can never see a phantom torn tail or a fused line from an in-flight write.
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes).map_err(io)?;
+            let read = parse_log(&bytes);
             if let Some(c) = &read.corrupt {
                 return Err(bad(format!("HARNESS_RUN_ID is set, but the log is corrupt at line {} ({})", c.line, c.msg)));
             }
@@ -466,28 +520,11 @@ pub fn append_under_run(root: &Path, log: &Path, ev: &Event, inherited: Option<&
             if !read.events.iter().any(|e| e.kind == Kind::RunIssued && e.run_id == id) {
                 return Err(bad(format!("HARNESS_RUN_ID {id:?} was not issued in this log; an unissued id is never written under")));
             }
-            id.to_string()
+            let under = Event { run_id: id.to_string(), ..ev.clone() };
+            (id.to_string(), under.encode()?)
         }
     };
-    let under = Event { run_id: run_id.clone(), ..ev.clone() };
-    // Validate and encode BOTH lines before writing either: a refused event (bad token, over the cap) must leave no
-    // orphaned run_issued line behind. The appends below re-encode; the bytes are already known to be writable.
-    under.encode()?;
-    let issue = Event {
-        kind: Kind::RunIssued,
-        ts_ms: under.ts_ms,
-        run_id: run_id.clone(),
-        ticket: under.ticket.clone(),
-        repo: under.repo.clone(),
-        reason: REASON_RUN_ISSUED.to_string(),
-        role: under.role.clone(),
-        model: under.model.clone(),
-    };
-    issue.encode()?;
-    if inherited.is_none() {
-        append(root, log, &issue)?;
-    }
-    append(root, log, &under)?;
+    write_locked(&mut f, payload.as_bytes(), true)?;
     Ok(run_id)
 }
 
