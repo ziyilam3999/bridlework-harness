@@ -593,6 +593,29 @@ EOF
   ok twin-heredoc-tab-strip "cat <<-EOF > /dev/null
 	it's fine *
 	EOF" # G:heredoc_skip
+  # T-146: the word after a pass-through word is a program word too (bash brace and glob, zsh group spellings)
+  no pt-nice-brace "nice g{h,x} $M" # G:wrapper_program
+  no pt-nice-nice-brace "nice nice g{h,x} $M" # G:wrapper_program
+  no pt-env-nice-brace "env nice g{h,x} $M" # G:wrapper_program
+  no pt-find-exec-brace "find . -maxdepth 0 -exec g{h,x} $M \;" # G:wrapper_find_exec
+  no pt-cd-nice-glob "cd '$SINK' && nice g? $M" # G:wrapper_program
+  no pt-cd-nice-n-glob "cd '$SINK' && nice -n 1 g? $M" # G:wrapper_program
+  no pt-cd-xargs-glob "cd '$SINK' && echo x | xargs g? $M" # G:wrapper_program
+  no pt-cd-find-exec-glob "cd '$SINK' && find . -maxdepth 0 -exec g? $M \;" # G:wrapper_find_exec
+  no pt-timeout-brace "timeout 5 g{h,x} $M" # G:wrapper_program
+  no pt-timeout-backslash "timeout 5 g\\h $M" # G:wrapper_program
+  no pt-xargs-brace "echo x | xargs g{h,x} $M" # G:wrapper_program
+  no pt-glued-paren "(g)h $M" # G:glued_after_paren
+  no pt-zsh-nice-group "nice g(h|x) $M" # G:wrapper_program
+  no pt-zsh-timeout-group "timeout 5 g(h|x) $M" # G:wrapper_program
+  no pt-nice-option-value "nice -n 1 g{h,x} $M" # G:wrapper_program
+  ok pt-nice-make "nice make"
+  ok pt-nice-n-make "nice -n 5 make -j4"
+  ok pt-timeout-cargo "timeout 5 cargo test"
+  ok pt-xargs-wc "echo x | xargs wc -l"
+  ok pt-xargs-I-rm "echo x | xargs -I {} rm {}"
+  ok pt-find-exec-rm "find . -name '*.nothing' -exec rm {} \;"
+  ok pt-env-assign-nice "env A=1 nice make"
 }
 
 # ---------------------------------------------------------------- AC 12

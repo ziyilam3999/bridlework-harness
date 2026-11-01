@@ -325,6 +325,8 @@ def tokenize(s):
                 depth -= 1
                 endcmd()
                 chain.clear()
+                if i + 1 < n and s[i + 1] not in " \t\n;&|<>()":  # G:glued_after_paren
+                    refuse("refused: gh text: a word glued to a closing parenthesis")
             else:  # an unmatched ")" ends a case pattern list: those words are patterns, not program words
                 if endcmd():
                     chain.append(len(st.cmds) - 1)
@@ -564,6 +566,12 @@ KEYWORDS = {"if", "elif", "while", "until", "then", "else", "do", "!", "{", "cop
 SAFE_WORD = re.compile(r"[A-Za-z0-9_./+@:%,-]+")
 SAFE_TOKEN = re.compile(r"[A-Za-z0-9_./+@:%,-][A-Za-z0-9_./+@:%,=-]*")
 PROGRAM_OK = {"[", "[[", "{", "}", "!"}   # one-character words that no pattern can turn into a two-letter name
+# Pass-through words: they run another program given later on the same command line. The word that follows them is
+# ALSO a program word, so it gets the same plain-literal test as a first word (T-146).
+WRAPPERS = PREFIXES | {"nice", "ionice", "timeout", "stdbuf", "xargs", "find", "setsid", "caffeinate", "chrt",
+                       "taskset", "flock", "unbuffer", "watch", "parallel", "script", "arch", "chronic", "doas", "su"}
+FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
+DURATION = re.compile(r"[0-9]+(\.[0-9]+)?[smhd]?")
 MAX_DEPTH = 8
 API_BAD_LONG = {"--method", "--field", "--raw-field", "--input"}
 
@@ -656,6 +664,63 @@ def program_ok(p):
     return (not p.quoted) and (not p.dyn) and SAFE_WORD.fullmatch(p.raw) is not None
 
 
+def wrapper_name(w):
+    if w.quoted or w.dyn:
+        return None
+    return w.raw.rsplit("/", 1)[-1] if w.raw.startswith("/") else w.raw
+
+
+def chase(ws, i, hops=0):
+    """ws[i] is a program word that passed program_ok. When it is a pass-through word, find the program word it runs and
+    hold that word to the same rule, recursively. Words that follow an option may be the option's value or the program, so
+    they must be plain literals too and the next word is then also checked."""
+    if hops > MAX_DEPTH:  # G:wrapper_depth
+        refuse("refused: gh text: pass-through words nested too deeply")
+    if wrapper_name(ws[i]) not in WRAPPERS:
+        return
+    find = wrapper_name(ws[i]) == "find"
+    after_opt = False
+    j = i + 1
+    n = len(ws)
+    while j < n:
+        w = ws[j]
+        if find:
+            if w.raw in FIND_EXEC and (not w.quoted):  # G:wrapper_find_exec
+                if j + 1 >= n:
+                    return
+                if not program_ok(ws[j + 1]):  # G:wrapper_program
+                    refuse("refused: gh text: a program word that is not a plain literal")
+                chase(ws, j + 1, hops + 1)
+            j += 1
+            continue
+        if is_assign(w):
+            j += 1
+            continue
+        if w.raw.startswith("-") or w.text.startswith("-"):
+            if w.dyn or w.quoted:  # G:wrapper_option
+                refuse("refused: gh text: a program word that is not a plain literal")
+            after_opt = True
+            j += 1
+            continue
+        if (not w.dyn) and (not w.quoted) and DURATION.fullmatch(w.raw):
+            after_opt = False
+            j += 1
+            continue
+        if after_opt and w.raw == "{}":
+            after_opt = False
+            j += 1
+            continue
+        if not program_ok(w):  # G:wrapper_program
+            refuse("refused: gh text: a program word that is not a plain literal")
+        if after_opt:
+            after_opt = False
+            chase(ws, j, hops + 1)
+            j += 1
+            continue
+        chase(ws, j, hops + 1)
+        return
+
+
 def check_program_words(st, depth, nest=False):
     """Default deny: every command, including those inside $(..), backticks and <(..), must run a plain literal program."""
     if depth > MAX_DEPTH:  # G:sub_depth
@@ -669,6 +734,7 @@ def check_program_words(st, depth, nest=False):
                 continue
             if not program_ok(ws[i]):  # G:progword_literal
                 refuse("refused: gh text: a program word that is not a plain literal")
+            chase(ws, i)
     for kind, text in st.subs:  # G:sub_recurse
         check_program_words(tokenize(text), depth + 1, kind == "nest")
 
