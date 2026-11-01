@@ -146,7 +146,8 @@ fn process_and_port_entries_survive_restart() {
     let pid_start = if f.len() == 4 { f.pop().unwrap() } else { panic!("process entry must print four fields: {proc_line}") };
     assert_eq!(f, vec!["p-1", "process", &pid.to_string()], "id, class, pid");
     assert!(!pid_start.is_empty() && pid_start.bytes().all(|b| b.is_ascii_digit()), "pid_start_ms is decimal: {pid_start}");
-    assert!(lines.iter().any(|l| l.starts_with("n-1\tport\t8080")), "port entry prints three fields");
+    let port_line = *lines.iter().find(|l| l.starts_with("n-1\t")).expect("port entry listed");
+    assert_eq!(port_line, "n-1\tport\t8080", "the port line is exactly three fields (id, class, port), never a fourth");
 
     assert_eq!(code(&run(&["manifest", "owns", "t-1", "--dir", d.to_str().unwrap(), "--pid", &pid.to_string()], None)), 0, "the listed pid is owned");
     assert_eq!(code(&run(&["manifest", "owns", "t-1", "--dir", d.to_str().unwrap(), "--port", "8080"], None)), 0, "the listed port is owned");
@@ -468,6 +469,8 @@ fn option_hygiene_is_enforced() {
     let (r, _o, d) = seeded(&t, "t-1");
     let dir = d.to_str().unwrap();
     for args in [
+        vec!["manifest"],
+        vec!["manifest", "init", "t-x", "--dir", dir, "--root", r.to_str().unwrap(), "--root"],
         vec!["manifest", "bogus", "t-1", "--dir", dir],
         vec!["manifest", "list", "t-1", "--dir"],
         vec!["manifest", "list", "t-1", "--nope", "x"],
@@ -493,6 +496,14 @@ fn option_hygiene_is_enforced() {
     let l = run(&["manifest", "list", "t-1", "--dir", dir], None);
     assert_eq!(code(&l), 0);
     assert_eq!(out(&l).lines().count(), 1, "none of that ever wrote");
+
+    // a --root with no value is a usage error and creates no manifest file
+    assert!(!t.file(&d, "t-x").exists(), "the refused init with a valueless trailing --root created a manifest anyway");
+
+    // remove with no --id is a usage error and a refused write, never a defaulted removal
+    let rm_no_id = run(&["manifest", "remove", "t-1", "--dir", dir], None);
+    assert_eq!(code(&rm_no_id), 2, "remove with no --id: {}", err(&rm_no_id));
+    refuses_leaving_file_untouched(&["manifest", "remove", "t-1", "--dir", dir], &t.file(&d, "t-1"));
 
     // a missing ticket is refused having created nothing, in a dir that holds no manifest yet
     let d2 = t.0.join("D2");
