@@ -291,7 +291,7 @@ fn a_missing_key_or_section_is_refused_by_name() {
     assert!(err(&o).contains("shadow"), "{}", err(&o));
 }
 
-// ---- AC 9 (v2): the required `lanes` section and its `count` key ----
+// ---- AC 2 (part A): the required `lanes` section and its `count` key ----
 
 #[test]
 fn the_lanes_section_is_required_and_count_is_a_positive_whole_number() {

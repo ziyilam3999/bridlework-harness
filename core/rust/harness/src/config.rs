@@ -460,11 +460,17 @@ mod tests {
         // the key is required: an empty lanes section names the full key
         let e = refused(&valid().replace("lanes:\n  count: 4", "lanes:"));
         assert!(e.contains("missing key `lanes.count`"), "{e}");
-        // 0, a leading zero and a non-number are refused naming the section and the key
-        for bad in ["0", "04", "four"] {
+        // 0, a leading zero, a non-number, a negative, a fraction and an over-cap value are refused naming the section and the key
+        for bad in ["0", "04", "four", "-1", "1.5", "1234567890123456"] {
             let e = refused(&valid().replace("count: 4", &format!("count: {bad}")));
             assert!(e.contains("`lanes`") && e.contains("`count`") && e.contains("positive whole number"), "{bad}: {e}");
         }
+        // a quoted count is refused as a type error, naming the section and the key
+        let e = refused(&valid().replace("count: 4", "count: \"4\""));
+        assert!(e.contains("`lanes`") && e.contains("`count`") && e.contains("quoted"), "{e}");
+        // a second count line under lanes is refused as a duplicate key, naming the section and the key
+        let e = refused(&valid().replace("  count: 4", "  count: 4\n  count: 4"));
+        assert!(e.contains("`lanes`") && e.contains("`count`") && e.contains("duplicate key"), "{e}");
         // the twin loads and the count is read from the text, not compiled in
         let c = Config::parse(&valid().replace("count: 4", "count: 9")).unwrap();
         assert_eq!(c.lane_count(), 9);

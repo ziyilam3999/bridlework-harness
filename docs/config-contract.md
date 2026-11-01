@@ -2,7 +2,7 @@
 
 The harness reads one settings file. This page is the contract in plain words. `config/harness.example.yaml` is the public example of it, with placeholders only.
 
-Status: contract only, with a strict reader and the `harness config check` command already landed (PRE-5b, PRE-5c). v2 adds the required `lanes.count` key; a config written against v1 is refused until it gains the key (intended, fail closed): the lane count is policy the harness refuses to guess.
+Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 adds the required `lanes.count` key; a config written against v1 is refused until it gains the key (intended, fail closed): the lane count is policy the harness refuses to guess.
 
 ## 1. One file, one reader, read-only
 
