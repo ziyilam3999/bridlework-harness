@@ -6,6 +6,8 @@
 //! failed run leaves nothing behind.
 #![cfg(unix)]
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -283,18 +285,24 @@ fn unlisted_pid_is_refused() {
     let own = spawn_own_group("sleep", "60");
     let own_pid = own.id();
     guard.add(own_pid);
+    let file_a = d.join("t-a.jsonl");
+    let before_a = fs::read(&file_a).unwrap();
     let s1 = run(&["process", "stop", "t-a", "--pid", &own_pid.to_string(), "--dir", d.to_str().unwrap()]);
     assert_eq!(code(&s1), 2, "a pid not on the sheet is refused, got {}: stdout {:?} stderr {:?}", code(&s1), out(&s1), err(&s1));
     assert!(alive(own_pid), "the unlisted process was signalled");
+    assert_eq!(fs::read(&file_a).unwrap(), before_a, "the refused stop changed t-a's manifest");
 
     // A live pid listed only on ANOTHER ticket's manifest.
     init_manifest("t-b", &r, &d);
     let (s2, other) = start("t-b", "b-1", &r, None, &d, &["sleep", "60"]);
     assert_eq!(code(&s2), 0, "start on t-b: {}", err(&s2));
     guard.add(other);
+    let file_b = d.join("t-b.jsonl");
+    let before_b = fs::read(&file_b).unwrap();
     let s3 = run(&["process", "stop", "t-a", "--pid", &other.to_string(), "--dir", d.to_str().unwrap()]);
     assert_eq!(code(&s3), 2, "another ticket's pid is refused: stdout {:?} stderr {:?}", out(&s3), err(&s3));
     assert!(alive(other), "the other ticket's process was signalled");
+    assert_eq!(fs::read(&file_b).unwrap(), before_b, "the refused stop changed t-b's manifest");
 
     // Cleanup: stop it through its own ticket.
     let stop = run(&["process", "stop", "t-b", "--id", "b-1", "--dir", d.to_str().unwrap(), "--grace-ms", "3000"]);
@@ -380,7 +388,12 @@ fn dead_and_missing_cases() {
 // ---------------------------------------------------------------- AC 6
 
 /// AC 6: two concurrent stops of one id give exit codes {0, 2}, the group is gone, and the manifest has exactly
-/// one `remove` line for that id.
+/// one `remove` line for that id. The refusal is pinned on the LOCK, not on the manifest's own duplicate-remove
+/// refusal: the per-ticket supervisor lock makes the loser read the sheet only AFTER the winner's remove, so the
+/// loser's stderr is the pre-signal refusal `is not a live entry`. Without the lock both stops read the id live
+/// and both signal; the loser then fails only at its `remove` (`manifest refused: remove of an id that is not
+/// live`) — "exit 2 = nothing signalled" would be false — so the loser's stderr is asserted word for word, over
+/// repeated rounds, to fail on exactly that.
 #[test]
 fn two_stops_at_once() {
     let t = Tmp::new();
@@ -388,30 +401,46 @@ fn two_stops_at_once() {
     init_manifest("t-7", &r, &d);
     let mut guard = Guard::default();
 
-    let (s, pid) = start("t-7", "s-1", &r, None, &d, &["sleep", "30"]);
-    assert_eq!(code(&s), 0, "start: {}", err(&s));
-    guard.add(pid);
+    for round in 1..=5u32 {
+        let id = format!("s-{round}");
+        let (s, pid) = start("t-7", &id, &r, None, &d, &["sleep", "30"]);
+        assert_eq!(code(&s), 0, "start {}: {}", id, err(&s));
+        guard.add(pid);
 
-    let d1 = d.to_string_lossy().into_owned();
-    let h1 = thread::spawn(move || {
-        run(&["process", "stop", "t-7", "--id", "s-1", "--dir", &d1, "--grace-ms", "8000"])
-    });
-    let d2 = d.to_string_lossy().into_owned();
-    let h2 = thread::spawn(move || {
-        run(&["process", "stop", "t-7", "--id", "s-1", "--dir", &d2, "--grace-ms", "8000"])
-    });
-    let (o1, o2) = (h1.join().unwrap(), h2.join().unwrap());
-    let mut codes = [code(&o1), code(&o2)];
-    codes.sort();
-    assert_eq!(codes, [0, 2], "one stop wins, the other is refused: {:?} / {:?}", err(&o1), err(&o2));
-    assert!(poll(5_000, || !group_alive(pid)), "the group is gone");
+        let d1 = d.to_string_lossy().into_owned();
+        let i1 = id.clone();
+        let h1 = thread::spawn(move || {
+            run(&["process", "stop", "t-7", "--id", &i1, "--dir", &d1, "--grace-ms", "8000"])
+        });
+        let d2 = d.to_string_lossy().into_owned();
+        let i2 = id.clone();
+        let h2 = thread::spawn(move || {
+            run(&["process", "stop", "t-7", "--id", &i2, "--dir", &d2, "--grace-ms", "8000"])
+        });
+        let (o1, o2) = (h1.join().unwrap(), h2.join().unwrap());
+        let mut codes = [code(&o1), code(&o2)];
+        codes.sort();
+        assert_eq!(codes, [0, 2], "round {round}: one stop wins, the other is refused: {:?} / {:?}", err(&o1), err(&o2));
+        assert!(poll(5_000, || !group_alive(pid)), "round {round}: the group is gone");
 
-    let text = fs::read_to_string(d.join("t-7.jsonl")).unwrap();
-    let removes = text
-        .lines()
-        .filter(|l| l.contains("\"op\":\"remove\"") && l.contains("\"id\":\"s-1\""))
-        .count();
-    assert_eq!(removes, 1, "exactly one remove line for s-1: {}", text);
+        // The rc-2 loser refused BEFORE signalling: it found the id no longer live (the winner's remove already
+        // on the sheet). If the lock were gone the loser would have signalled too and its stderr would name the
+        // manifest's remove refusal instead.
+        let loser = if code(&o1) == 2 { &o1 } else { &o2 };
+        assert!(
+            err(loser).contains("is not a live entry") && !err(loser).contains("manifest refused"),
+            "round {round}: the losing stop must be the pre-signal refusal `is not a live entry`, got {:?}",
+            err(loser)
+        );
+
+        let text = fs::read_to_string(d.join("t-7.jsonl")).unwrap();
+        let needle = format!("\"id\":\"{id}\"");
+        let removes = text
+            .lines()
+            .filter(|l| l.contains("\"op\":\"remove\"") && l.contains(&needle))
+            .count();
+        assert_eq!(removes, 1, "round {round}: exactly one remove line for {id}: {}", text);
+    }
 }
 
 // ---------------------------------------------------------------- AC 7
@@ -452,4 +481,128 @@ fn refused_start_leaves_nothing_running() {
 
     let stop = run(&["process", "stop", "t-8", "--id", "k-1", "--dir", d.to_str().unwrap(), "--grace-ms", "3000"]);
     assert_eq!(code(&stop), 0, "cleanup stop: {}", err(&stop));
+}
+
+// ---------------------------------------------------------------- fix round 1: the port range is a usage error
+
+/// Fix round 1, finding 1: an out-of-range `--port` (0, 65536, 70000, and a value past u64) is a usage error
+/// checked in the parser BEFORE the lock, the manifest read, the bind check or the spawn: rc 2, the marker file
+/// is absent (the program never ran), and the manifest is byte-identical. The same id then starts cleanly, so a
+/// refused port leaves nothing listed that blocks a retry.
+#[test]
+fn port_out_of_range_refuses_before_spawn() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-9", &r, &d);
+    let mut guard = Guard::default();
+
+    let marker = r.join("marker");
+    let script = format!("echo ran > {}", marker.to_string_lossy());
+    let file = d.join("t-9.jsonl");
+    let before = fs::read(&file).unwrap();
+    for bad in ["0", "65536", "70000", "99999999999999999999"] {
+        let s = run(&[
+            "process", "start", "t-9", "--id", "w-1", "--cwd", r.to_str().unwrap(),
+            "--port", bad, "--dir", d.to_str().unwrap(), "--", "/bin/sh", "-c", &script,
+        ]);
+        assert_eq!(code(&s), 2, "--port {bad} must refuse: stdout {:?} stderr {:?}", out(&s), err(&s));
+        assert!(err(&s).contains("port"), "--port {bad} must name the flag: stderr {:?}", err(&s));
+        assert!(!marker.exists(), "--port {bad}: the refused start ran the program");
+        assert_eq!(fs::read(&file).unwrap(), before, "--port {bad}: the refused start changed the manifest");
+    }
+
+    // The largest accepted port still works end to end, and the child sees PORT.
+    let seen = r.join("port-env");
+    let script = format!("echo \"$PORT\" > {}; sleep 30", seen.to_string_lossy());
+    let (s, pid) = start("t-9", "w-1", &r, Some(65535), &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start with --port 65535: {}", err(&s));
+    guard.add(pid);
+    assert!(poll(10_000, || seen.exists()), "the child never wrote its PORT");
+    assert_eq!(fs::read_to_string(&seen).unwrap().trim(), "65535", "the child saw PORT");
+    let stop = run(&["process", "stop", "t-9", "--id", "w-1", "--dir", d.to_str().unwrap(), "--grace-ms", "3000"]);
+    assert_eq!(code(&stop), 0, "cleanup stop: {}", err(&stop));
+
+    // The other numeric flags are bounded at parse time too: past u64 the flag is a usage error before
+    // anything is read, locked or signalled.
+    let over = u64::MAX.to_string();
+    let over_plus1 = format!("{}", u64::MAX as u128 + 1);
+    for stop_args in [
+        vec!["process", "stop", "t-9", "--pid", over_plus1.as_str(), "--dir", d.to_str().unwrap()],
+        vec!["process", "stop", "t-9", "--id", "x-1", "--grace-ms", over_plus1.as_str(), "--dir", d.to_str().unwrap()],
+    ] {
+        let s = run(&stop_args);
+        assert_eq!(code(&s), 2, "{:?} must refuse: stdout {:?} stderr {:?}", stop_args, out(&s), err(&s));
+        assert!(err(&s).contains("out of range"), "{:?} must name the bound: stderr {:?}", stop_args, err(&s));
+    }
+    // u64::MAX itself is accepted: a stop of an already-gone entry with the largest grace never waits.
+    let (s, short) = start("t-9", "g-1", &r, None, &d, &["/bin/sh", "-c", "sleep 1"]);
+    assert_eq!(code(&s), 0, "short start: {}", err(&s));
+    guard.add(short);
+    assert!(poll(10_000, || !alive(short)), "the short-lived program never exited");
+    let gone = run(&["process", "stop", "t-9", "--id", "g-1", "--dir", d.to_str().unwrap(), "--grace-ms", over.as_str()]);
+    assert_eq!(code(&gone), 3, "grace at u64::MAX is accepted (already-gone): stdout {:?} stderr {:?}", out(&gone), err(&gone));
+}
+
+// ---------------------------------------------------------------- fix round 1: the append-failure rollback
+
+/// Fix round 1, finding 2 (mutation M4): when the PORT append fails AFTER the process line was written, `start`
+/// appends `remove` for that process line and stops the whole group — rc 2, the pid dead, no process line left.
+/// The failure is forced deterministically at a point the parser's range check cannot reach: the test holds the
+/// manifest file's own exclusive lock, so `start` (whose pre-check read takes no lock) blocks INSIDE its first
+/// append; while it is blocked the test appends a live `w-1.port` line by hand, so the SECOND append (the port
+/// line) is refused as a duplicate live id. Deleting the group kill leaves the pid alive; deleting the
+/// compensating remove leaves the process line listed; both fail this test.
+#[test]
+fn append_failure_after_process_line_is_rolled_back() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-c", &r, &d);
+    let mut guard = Guard::default();
+    let port = free_port();
+    let file = d.join("t-c.jsonl");
+
+    // Hold the manifest lock across the whole pre-check window: start's read (a plain fs::read) sees a clean
+    // sheet, but its first `apply` blocks here until the injection below is in place.
+    let mut lock = OpenOptions::new().read(true).append(true).open(&file).unwrap();
+    lock.lock().unwrap();
+
+    let pid_file = r.join("pid");
+    let script = format!("echo $$ > {}; sleep 300", pid_file.to_string_lossy());
+    let r2 = r.to_string_lossy().into_owned();
+    let d2 = d.to_string_lossy().into_owned();
+    let port_s = port.to_string();
+    let h = thread::spawn(move || {
+        run(&[
+            "process", "start", "t-c", "--id", "w-1", "--cwd", &r2, "--port", &port_s,
+            "--dir", &d2, "--", "/bin/sh", "-c", &script,
+        ])
+    });
+
+    // The program runs only after start's pre-checks read the sheet, so once its pid file exists the pre-checks
+    // are past (they can no longer see the injection) and start is blocked on the lock inside the process-line
+    // append.
+    assert!(poll(10_000, || pid_file.exists()), "the program never started");
+    let pid: u32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    guard.add(pid);
+
+    // Inject a live `w-1.port` line through the locked handle, then release: start appends the process line,
+    // then its port append is refused as a duplicate live id.
+    let inject = format!(
+        "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-c\",\"id\":\"w-1.port\",\"class\":\"port\",\"port\":{port},\"ts_ms\":1730000000002}}\n"
+    );
+    lock.write_all(inject.as_bytes()).unwrap();
+    lock.sync_all().unwrap();
+    drop(lock);
+
+    let s = h.join().unwrap();
+    assert_eq!(code(&s), 2, "the refused port append must answer 2: stdout {:?} stderr {:?}", out(&s), err(&s));
+    assert!(err(&s).contains("duplicate live id"), "the port append was refused by the manifest, not by the range check: stderr {:?}", err(&s));
+    assert!(poll(10_000, || !alive(pid)), "the group the refused start made is still alive");
+    assert!(poll(10_000, || !group_alive(pid)), "the group the refused start made is still alive");
+
+    let l = run(&["manifest", "list", "t-c", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    let text = out(&l);
+    assert!(!text.contains("process"), "the refused start left a process line listed: {}", text);
+    assert!(text.contains("w-1.port"), "only the test's own injected port line stays live: {}", text);
 }

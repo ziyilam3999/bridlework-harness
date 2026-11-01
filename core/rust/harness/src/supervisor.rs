@@ -19,9 +19,12 @@
 //! the id not live and exits 2, with exactly one `remove` line; and a stop is safe to repeat after a crash between
 //! the signal and the `remove` (the next stop sees `already-gone`).
 //!
-//! Exit codes: `0` started / stopped; `2` a usage error or any refusal (nothing started, nothing signalled, nothing
-//! written); `3` the recorded process is already gone (`already-gone`) or the pid was re-used (`pid-reused`) — the
-//! entries are removed and nothing was signalled.
+//! Exit codes: `0` started / stopped; `2` a usage error or any refusal (nothing started, nothing signalled, the
+//! MANIFEST not written — a refused operation still creates the per-ticket lock file `<ticket>.proc.lock`); `3` the
+//! recorded process is already gone (`already-gone`) or the pid was re-used (`pid-reused`) — the entries are removed
+//! and nothing was signalled. Every input is validated before the first spawn or write: `--port` must be an integer
+//! in 1..=65535 (checked in the parser, so an out-of-range port is refused with nothing run), and the port-free bind
+//! check covers 127.0.0.1 only.
 
 use crate::manifest::{self, ManifestRead, Target};
 use std::fs::{File, OpenOptions};
@@ -221,8 +224,18 @@ fn parse_start(a: &[String]) -> Result<StartArgs, String> {
     let ticket = ticket.ok_or_else(|| "a ticket is required".to_string())?;
     let id = id.ok_or_else(|| "--id is required".to_string())?;
     let cwd = cwd.ok_or_else(|| "--cwd is required".to_string())?;
+    // The port range is validated HERE, in the parser, before the lock, the manifest read, the bind check or
+    // the spawn: the manifest would refuse an out-of-range port only AFTER the program had run and the process
+    // line had been written (70000 truncates to 4464 as u16, 0 always binds), so the range is a usage error
+    // that leaves nothing started and nothing written.
     let port = match &port {
-        Some(v) => Some(num_flag(v, "port")?),
+        Some(v) => {
+            let p = num_flag(v, "port")?;
+            if p == 0 || p > 65535 {
+                return Err("--port must be an integer in 1..=65535".to_string());
+            }
+            Some(p)
+        }
         None => None,
     };
     Ok(StartArgs { ticket, id, cwd, port, dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()), program, prog_args: after[1..].to_vec() })
@@ -303,7 +316,8 @@ fn start_cmd(a: &[String]) -> i32 {
     };
     let pid = child.id() as u64;
     // Record: the start time first (identity cannot be read -> nothing recorded, nothing left running), then the
-    // process line, then the port line. Any failure stops the whole group this invocation just made.
+    // process line, then the port line. Any failure stops the whole group this invocation just made, and a failure
+    // AFTER the process line also removes that line, so the sheet never lists a start that was refused.
     let start_ms = match manifest::process_start_ms(pid) {
         Ok(ms) => ms,
         Err(e) => {
@@ -318,6 +332,10 @@ fn start_cmd(a: &[String]) -> i32 {
     }
     if let Some(p) = args.port {
         if let Err(e) = manifest::apply(&dir, &args.ticket, &manifest::Op::AddPort { id: &port_id, port: p }, ts_ms) {
+            // The process line is already on the sheet: take it back off (best effort — the refusal below
+            // names the original failure either way), then stop the whole group, so a refused start leaves
+            // nothing running and nothing listed.
+            let _ = manifest::apply(&dir, &args.ticket, &manifest::Op::Remove { id: &args.id }, now_ms());
             kill_own_spawn(&mut child, pid);
             return fail(&e.to_string());
         }
