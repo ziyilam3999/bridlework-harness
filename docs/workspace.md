@@ -67,3 +67,79 @@ Any non-zero exit means "no usable workspace". Before step 6 nothing is written 
 ## Events
 
 None. No P1b event kind names workspace creation, and the manifest file is the durable record.
+
+## Clean-state check (P1B-11)
+
+Before a ticket is marked Done, its workspace must hold only what belongs there, so a stray edit cannot ride
+into Done unnoticed. `harness workspace check` is that look, and it is READ-ONLY: it never writes, deletes,
+moves or locks anything, never touches the manifest (it reads it through the existing reader only), and every
+git call runs under `--no-optional-locks` with fsmonitor forced off, so not even the index's stat cache is
+refreshed. P1B-15 wires it into `harness ticket finalize`; this command only answers the question.
+
+```
+harness workspace check <ticket> --manifest-dir <absolute-dir>
+```
+
+The same explicit-arguments rule as `workspace create`: no default folder, no config file, no current-folder
+lookup. The ticket must be a plain token (refused, never rewritten). The worktree is found ONLY as the live
+manifest entry id `worktree` (class `worktree`) — never by name, never from the current folder.
+
+**Expected** is: (a) everything committed on the branch `ws/<ticket>` (the content of the ticket's own commits
+is the gate's business, not this check's); and (b) a live manifest path entry lying strictly inside the
+worktree that is still what the manifest says it is — today that is the `node_modules` link, so "still what
+the manifest says" means a no-follow stat finds a symlink at that exact stored path. The exemption is for that
+one path itself, never for anything under it, and never anything matched after following a link. The stored
+text is compared to the worktree path directly; the `node_modules` path is never canonicalized (that would
+follow the link out of the worktree).
+
+**Stray** is everything else, one line per path:
+
+- `modified` — a modified, deleted, renamed, type-changed or staged tracked path;
+- `untracked` — an untracked path (every file named individually via `--untracked-files=all`, not just the folder);
+- `ignored` — an ignored path: ignore rules do not hide files here, so a `.gitignore` or `info/exclude` edit cannot
+  sneak a file past the check (a wholly ignored folder is named by the folder itself);
+- `hidden` — a tracked path carrying the assume-unchanged or skip-worktree bit (invisible to `git status`, so it
+  gets its own `git ls-files -v` read; the bit alone is stray, fail closed);
+- `submodule` — a submodule with any change (named by the submodule path, no recursion);
+- `missing` — a live manifest path entry inside the worktree that no longer exists or is no longer the recorded
+  kind (for example the `node_modules` link removed, or replaced by a real directory).
+
+Repo configuration cannot hide anything: the status read forces `--untracked-files=all`, `--ignore-submodules=none`
+and fsmonitor off on the command line (a repo config `status.showUntrackedFiles=no` loses to the flag), and ignored
+paths are listed (`--ignored=matching`). When one path carries two kinds, the stronger wins (order, weakest first:
+`untracked`, `ignored`, `modified`, `hidden`, `submodule`, `missing`).
+
+**Output** (stdout only, fixed fields; paths are worktree-relative — no folder is ever printed in either
+spelling, and no file content is ever printed):
+
+- clean: exactly one line `workspace=clean ticket=<ticket>`;
+- stray: one line `stray <kind> <relative-path>` per path, sorted by raw path bytes, then one line
+  `workspace=stray ticket=<ticket> count=<n>`.
+
+A path is escaped so it is always one line: printable ASCII passes through (backslash doubled), and every other
+byte — control characters, space, DEL, any non-UTF-8 byte — prints as `\xNN`. No byte sequence can panic it.
+
+**Exit codes** (any non-zero means "not proven clean", fail closed):
+
+- `0` — clean;
+- `2` — at least one stray path;
+- `3` — cannot check: usage errors, a missing/torn/corrupt manifest, no live `worktree` entry, a worktree path
+  that is missing, is a symlink (no-follow stat) or is not a directory, a folder that is not that worktree's own
+  top level, a HEAD that is detached or not `refs/heads/ws/<ticket>`, an in-progress merge/rebase/cherry-pick, a
+  failed git call, or a size cap.
+
+**Size caps**: any git output read is capped at 8 MiB and stray entries at 10,000; hitting either is exit 3 with
+`too many paths`, never a truncated PASS and never an unbounded read.
+
+**Symlinks**: a symlink anywhere inside the worktree is judged as a path of its own (by git, by no-follow stat)
+and never followed, so files outside the worktree are never listed or looked at. A symlinked worktree path
+itself is exit 3.
+
+**Git version**: the check uses `git status --porcelain=v2 -z --ignored=matching` and
+`git rev-parse --absolute-git-dir`; it assumes git 2.32 or newer (the same floor `--path-format=absolute`
+implies, plus `--ignored=matching`).
+
+Ignored build output inside the tree (for example `target/`) fails the check on purpose: clean it before
+finalize or list it on the manifest, as described in the P1B-11 plan. Not covered here: unpushed commits
+(P1B-12), moving leftovers to quarantine (P1B-13), and anything in the ticket root outside `tree` (the
+quarantine sweep's ground). No new event kind; P1B-15 records the finalize result.
