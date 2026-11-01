@@ -210,6 +210,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_seen_only_after_the_budget_is_a_timeout() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         use std::os::unix::fs::PermissionsExt;
         let d = std::env::temp_dir().join(format!("hr-late-unit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

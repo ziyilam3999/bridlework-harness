@@ -463,6 +463,21 @@ impl Caps {
     }
 }
 
+/// Test-only gate between tests that start child processes (read side) and tests that lock a ticket and expect the lock to be free again after
+/// the guard drops (write side). A child forked while a lock file is open holds a copy of it until it execs, so a re-lock in that window reads as
+/// busy. Many readers may spawn at once; the write side runs alone, so no child can be mid-fork while it checks.
+#[cfg(test)]
+pub(crate) mod spawn_gate {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+    static GATE: RwLock<()> = RwLock::new(());
+    pub(crate) fn read() -> RwLockReadGuard<'static, ()> {
+        GATE.read().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn write() -> RwLockWriteGuard<'static, ()> {
+        GATE.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +712,7 @@ mod tests {
 
     #[test]
     fn the_streak_file_is_written_read_and_cleared_under_the_lock() {
+        let _spawn_gate = spawn_gate::write();
         let d = scratch();
         let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
         assert_eq!(caps.read_streak("EX-1", "r"), Ok(None));
@@ -718,8 +734,47 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// Load test for the cause of the flake: child processes started by other threads must never make a released lock look busy.
+    /// Four threads start children (each holding the read side of the gate); the main thread locks, drops and re-locks under the write side.
+    /// Without the write side this fails within a few rounds on a normal machine; with it, never.
+    #[cfg(unix)]
+    #[test]
+    fn children_started_by_other_tests_never_make_a_released_lock_look_busy() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::AtomicBool;
+        let d = scratch();
+        let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let loaders: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _spawn_gate = spawn_gate::read();
+                        let _ = Command::new("true").stdin(Stdio::null()).output();
+                    }
+                })
+            })
+            .collect();
+        let mut busy = 0;
+        for _ in 0..50 {
+            let _spawn_gate = spawn_gate::write();
+            drop(caps.lock("EX-1").unwrap());
+            if caps.lock("EX-1").is_err() {
+                busy += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for l in loaders {
+            l.join().unwrap();
+        }
+        assert_eq!(busy, 0, "a re-lock after the guard dropped was refused {busy} times");
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_write_then_a_read_round_trips_and_a_second_lock_is_busy() {
+        let _spawn_gate = spawn_gate::write();
         let d = scratch();
         let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
         assert_eq!(caps.read("EX-1", "r"), Ok(None));

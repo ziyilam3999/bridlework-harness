@@ -411,6 +411,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_valid_gate_file_loads_and_runs_through_the_runner() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
         for (code, want) in [(0, Status::Pass), (3, Status::Fail)] {
             let s = Scratch::new("run");
@@ -434,6 +435,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_gates_budget_and_cap_reach_the_runner() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
         // output past the cap is cut and marked; a check past its budget is a FAIL
         let s = Scratch::new("budget");
@@ -458,6 +460,7 @@ mod tests {
 
     #[test]
     fn a_gate_file_missing_a_required_field_is_refused_naming_file_and_field() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         for f in FIELDS {
             let kept: Vec<&str> = [
                 r#""id":"g1""#,
@@ -483,6 +486,7 @@ mod tests {
 
     #[test]
     fn malformed_gate_values_are_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let arms: Vec<(&str, String, &str)> = vec![
             ("id bad", sw(VALID, r#""id":"g1""#, r#""id":"Bad Id!""#), "malformed"),
             ("id empty", sw(VALID, r#""id":"g1""#, r#""id":"""#), "malformed"),
@@ -562,6 +566,7 @@ mod tests {
 
     #[test]
     fn the_gates_folder_contract_is_enforced() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let junk = b"this is not json";
         // the reserved path-map.json is skipped, junk or not, and the load still succeeds beside a valid gate
         let s = root_with("g1.json", VALID.as_bytes());
@@ -637,6 +642,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_gate_file_or_program_outside_the_repo_is_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let out = Scratch::new("out");
         put(&out.0, "gate.json", sw(VALID, r#""id":"g1""#, r#""id":"out""#).as_bytes());
         put_exec(&out.0, "prog.sh", "#!/bin/sh\nexit 0\n");
@@ -671,6 +677,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_both_ends_flag_selects_the_both_ends_judge() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         use crate::both_ends;
         let _g = EXEC.lock().unwrap_or_else(|e| e.into_inner());
         let gate_text = |both: bool| format!(r#"{{"id":"both-ends","program":"ci/check.sh","args":[],"timeout_ms":20000,"max_output_bytes":4000,"both_ends":{}}}"#, both);
@@ -740,6 +747,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn loading_and_building_a_check_run_nothing() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let s = Scratch::new("norun");
         let marker = s.0.join("ran.txt");
         put(&s.0, "gates/mark.json", sw(VALID, r#""id":"g1""#, r#""id":"mark""#).replace("ci/c.sh", "mark.sh").as_bytes());
@@ -754,6 +762,7 @@ mod tests {
 
     #[test]
     fn map_check_ids_resolve_against_declared_gate_ids() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let s = Scratch::new("ids");
         put(&s.0, "gates/one.json", sw(VALID, r#""id":"g1""#, r#""id":"one""#).as_bytes());
         put(&s.0, "gates/two.json", sw(VALID, r#""id":"g1""#, r#""id":"two""#).as_bytes());
@@ -784,6 +793,7 @@ mod tests {
 
     #[test]
     fn the_committed_seed_gate_and_schema_match_the_loader() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let gates = Gates::load(&repo).expect("the committed gates folder loads");
         assert_eq!(gates.ids(), vec!["cargo-test", "core-layering"], "path-map.json is reserved, the carrier and README are ignored");
