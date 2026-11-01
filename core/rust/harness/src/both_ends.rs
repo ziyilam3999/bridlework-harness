@@ -226,6 +226,7 @@ mod tests {
 
     #[test]
     fn a_neighbour_red_at_base_is_reported_and_never_changes_the_ticket_result() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         for (declared, label) in [(red_green(), "declared fixes it"), (rp(Ended::Exit(0), Ended::Exit(0), ""), "declared passes at base")] {
             let alone = judge_ticket_reports(&declared, &[], HEAD, ID).unwrap();
             for head in [Ended::Exit(0), Ended::Exit(1), Ended::Exit(2)] {
@@ -241,6 +242,7 @@ mod tests {
 
     #[test]
     fn a_neighbour_green_at_base_and_red_at_head_fails_the_ticket() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let nb = rp(Ended::Exit(0), Ended::Exit(3), "line\nNB-MARKER\n[output cut]");
         let r = judge_ticket_reports(&red_green(), &[("nb-suite", &nb)], HEAD, ID).unwrap();
         assert_eq!(r.status, Status::Fail);
@@ -263,6 +265,7 @@ mod tests {
 
     #[test]
     fn an_unverifiable_neighbour_head_after_a_green_base_is_never_green() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         for head in [Ended::Signal(9), Ended::TimedOut, Ended::NotStarted, Ended::Unknown] {
             let nb = rp(Ended::Exit(0), head, "");
             let r = judge_ticket_reports(&red_green(), &[("nb-suite", &nb)], HEAD, ID).unwrap();
@@ -275,6 +278,7 @@ mod tests {
 
     #[test]
     fn a_neighbour_base_that_cannot_be_read_fails_closed_unless_the_head_is_green() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let alone = judge_ticket_reports(&red_green(), &[], HEAD, ID).unwrap();
         for base in [Ended::Exit(126), Ended::Exit(127), Ended::Signal(9), Ended::TimedOut, Ended::NotStarted, Ended::Unknown] {
             let red_head = rp(base, Ended::Exit(1), "");
@@ -297,6 +301,7 @@ mod tests {
 
     #[test]
     fn the_first_neighbour_finding_names_the_class_and_every_finding_is_in_the_message() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let head_error = rp(Ended::Exit(0), Ended::Unknown, "");
         let new_failure = rp(Ended::Exit(0), Ended::Exit(1), "");
         let r = judge_ticket_reports(&red_green(), &[("first", &head_error), ("second", &new_failure)], HEAD, ID).unwrap();
@@ -308,6 +313,7 @@ mod tests {
 
     #[test]
     fn neighbour_disagreement_and_bad_ids_are_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let ok = red_green();
         let nb = |base: &str, head: &str| {
             let mut r = rp(Ended::Exit(0), Ended::Exit(0), "");
@@ -328,6 +334,7 @@ mod tests {
 
     #[test]
     fn an_empty_neighbour_list_reproduces_the_single_check_judgement() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         for declared in [red_green(), rp(Ended::Exit(0), Ended::Exit(0), ""), rp(Ended::Exit(1), Ended::Exit(3), "still red")] {
             assert_eq!(judge_ticket_reports(&declared, &[], HEAD, ID), judge_reports(&declared, HEAD, ID));
         }
@@ -408,6 +415,7 @@ mod tests {
 
     #[test]
     fn end_to_end_with_neighbours_on_a_scratch_repo() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         // the neighbour was broken before the change and still is: reported, and the ticket still passes
         let (a, base, head) = repo("red", "broken", "broken", FIX_CHECK);
         let r = judge_ticket(&a, &base, &head, &head, &spec(ID, "ci/check.sh"), &[spec("nb-suite", "ci/nb.sh")]).unwrap();
@@ -444,6 +452,7 @@ mod tests {
 
     #[test]
     fn two_neighbours_each_get_their_own_outcome() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         // the first was already broken (red at base), the second was fine and the head commit broke it
         let (a, base, head) = repo_with("two", [("broken", "broken"), ("ok", "broken")], FIX_CHECK, NB_SCRIPT);
         let r = judge_ticket(&a, &base, &head, &head, &spec(ID, "ci/check.sh"), &[spec("first-suite", "ci/nb.sh"), spec("second-suite", "ci/nb2.sh")]).unwrap();
@@ -457,6 +466,7 @@ mod tests {
 
     #[test]
     fn a_ref_moved_by_a_check_cannot_send_a_later_suite_to_another_commit() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         // The declared check moves the branch `b`, which the caller used as the base ref. The neighbour must still run on the base the declared run resolved.
         let log = scratch("moved-log").join("log.txt");
         let nb_script = format!("#!/bin/sh\ncat value.txt >> {}\ntest \"$(cat other.txt)\" = ok\n", log.display());

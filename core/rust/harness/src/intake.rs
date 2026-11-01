@@ -180,6 +180,7 @@ mod tests {
     // AC 10 twin: the leak check really does catch an error string that echoes the folder.
     #[test]
     fn the_leak_check_catches_a_message_that_echoes_the_folder() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let d = scratch("leakcheck");
         assert!(leaks(&format!("repo not found at {}", d.display()), &d), "a leaking message must be caught");
         assert!(!leaks("repo not found for repo id `b`", &d), "a clean message passes");
@@ -188,6 +189,7 @@ mod tests {
     // AC 1 (function level): the ticket's repo is used, and the answer carries that repo's head, not another repo's.
     #[test]
     fn intake_reports_the_head_of_the_ticket_repo_not_another_repo() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let a = repo("a", "commit in a");
         let b = repo("b", "commit in b");
         let (sha_a, sha_b) = (git(&a, &["rev-parse", "HEAD"]), git(&b, &["rev-parse", "HEAD"]));
@@ -201,6 +203,7 @@ mod tests {
     // AC 3 (function level): an id missing from the map is refused by name; adding it flips the result; a same-named folder is not a map.
     #[test]
     fn an_unknown_repo_id_is_refused_and_the_same_id_mapped_is_accepted() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let b = repo("b", "in b");
         let c = repo("c", "in c");
         let refused = intake(&ticket("c"), &map_of(&[("b", &b)])).expect_err("c is not mapped");
@@ -219,6 +222,7 @@ mod tests {
     // AC 5 and AC 10 (function level): missing dir, plain dir, subfolder of a repo are refused without leaking the folder; the top level is accepted.
     #[test]
     fn a_folder_that_is_not_the_top_of_a_repo_is_refused_without_naming_it() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let b = repo("b", "in b");
         let sub = b.join("subdir");
         std::fs::create_dir_all(&sub).unwrap();
@@ -240,6 +244,7 @@ mod tests {
     // AC 5: a repo with no commit yet has no head to report, so it is refused rather than given an empty sha.
     #[test]
     fn a_repo_with_no_commit_is_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let d = scratch("empty");
         git(&d, &["init", "-q"]);
         assert_eq!(intake(&ticket("b"), &map_of(&[("b", &d)])), Err(Refusal::RepoNotFound("b".to_string())));
@@ -250,6 +255,7 @@ mod tests {
     // AC 7 (function level) and the map rules: each bad entry is a usage error that does not echo the folder; the valid entry is accepted.
     #[test]
     fn bad_map_entries_are_usage_errors_and_never_echo_the_folder() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let marker = "/marker-dir-xyz";
         let long_id = format!("Bad{marker}");
         let bad: Vec<(&str, String)> = vec![
@@ -272,6 +278,7 @@ mod tests {
     // AC 7 (function level): the same id twice is ambiguous and refused; a different id is fine.
     #[test]
     fn the_same_repo_id_twice_is_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let mut m = RepoMap::new();
         m.add("b=/one-dir").unwrap();
         let err = m.add("b=/two-dir").expect_err("duplicate id");

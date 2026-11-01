@@ -320,6 +320,7 @@ mod tests {
 
     #[test]
     fn a_changed_path_not_in_the_map_fails_naming_it() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let m = map(r#"{"docs":["cargo-test"]}"#);
         let r = judge(&m, &s(&["docs/a.md", "notes/x.md"]), SHA).unwrap();
         assert_eq!(r.status, Status::Fail);
@@ -335,6 +336,7 @@ mod tests {
 
     #[test]
     fn the_same_diff_with_the_path_mapped_passes() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let m = map(r#"{"docs":["cargo-test"],"notes":["cargo-test"]}"#);
         let r = judge(&m, &s(&["docs/a.md", "notes/x.md"]), SHA).unwrap();
         assert_eq!(r.status, Status::Pass);
@@ -349,6 +351,7 @@ mod tests {
 
     #[test]
     fn an_entry_maps_only_whole_components_below_it() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let sub = map(r#"{"core/rus":["c"]}"#);
         let r = judge(&sub, &s(&["core/rust/x.rs"]), SHA).unwrap();
         assert_eq!(r.status, Status::Fail, "a substring is not a prefix");
@@ -367,6 +370,7 @@ mod tests {
 
     #[test]
     fn malformed_map_entries_are_refused_at_parse() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let arms: &[(&str, &str, &str)] = &[
             ("absolute", r#"{"/etc/x":["c"]}"#, "map path"),
             ("dot-dot", r#"{"..":["c"]}"#, "map path"),
@@ -412,6 +416,7 @@ mod tests {
 
     #[test]
     fn a_map_file_outside_or_missing_is_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let good = r#"{"docs":["cargo-test"]}"#;
         let out = Scratch::new("out");
         put(&out.0, "elsewhere.json", good);
@@ -442,6 +447,7 @@ mod tests {
 
     #[test]
     fn changed_paths_git_cannot_emit_are_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let m = map(r#"{"docs":["c"]}"#);
         for bad in ["/abs/x", "a/../b", ".git", ".Git/x", "a\\b", "", "docs/", "docs//a", "docs/a\nb"] {
             assert!(judge(&m, &s(&["docs/a.md", bad]), SHA).is_err(), "changed path refused: {:?}", bad);
@@ -451,6 +457,7 @@ mod tests {
 
     #[test]
     fn a_real_diff_between_two_commits_is_judged() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let sc = Scratch::new("diff");
         let d = &sc.0;
         git(d, &["init", "-q"]);
@@ -514,12 +521,14 @@ mod tests {
     #[test]
     #[ignore]
     fn child_judge_diff() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let (root, base, head) = (std::env::var("HPM_ROOT").unwrap(), std::env::var("HPM_BASE").unwrap(), std::env::var("HPM_HEAD").unwrap());
         println!("HPM-RESULT:{:?}", judge_diff(Path::new(&root), &base, &head));
     }
 
     #[test]
     fn git_env_and_config_cannot_steer_the_diff() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let sc = Scratch::new("env");
         let decoy = Scratch::new("decoy");
         let d = &sc.0;
@@ -572,6 +581,7 @@ mod tests {
 
     #[test]
     fn a_root_that_is_not_a_repository_top_level_is_refused() {
+        let _spawn_gate = crate::caps::spawn_gate::read();
         let sc = Scratch::new("top");
         let d = &sc.0;
         git(d, &["init", "-q"]);
