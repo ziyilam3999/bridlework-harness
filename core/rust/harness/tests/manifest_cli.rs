@@ -419,6 +419,7 @@ fn single_defect_adds_are_refused() {
     let q = r.join("q").to_string_lossy().into_owned();
     let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
     let live_pid = sleeper.id().to_string();
+    let plus_pid = format!("+{live_pid}");
     let base = ["manifest", "add", "t-1", "--dir", dir, "--id", "z"];
     let cases: Vec<Vec<&str>> = vec![
         vec!["--class", "temp_dir", "--path", &q, "--port", "80"],
@@ -427,6 +428,10 @@ fn single_defect_adds_are_refused() {
         vec!["--class", "temp_dir", "--path", &q, "--pid", "abc"],
         vec!["--class", "temp_dir", "--path", &q, "--pid", "99999999999999999999"],
         vec!["--class", "temp_dir", "--path", &q, "--ts-ms", "99999999999999999999"],
+        vec!["--class", "temp_dir", "--path", &q, "--port", "abc"],
+        vec!["--class", "process", "--pid", &live_pid, "--port", "abc"],
+        vec!["--class", "temp_dir", "--path", &q, "--ts-ms", "+5"],
+        vec!["--class", "process", "--pid", &plus_pid],
     ];
     for extra in &cases {
         let mut args: Vec<&str> = base.to_vec();
@@ -440,6 +445,7 @@ fn single_defect_adds_are_refused() {
     assert!(out(&l).contains("ok\ttemp_dir\t"), "the valid entry was written");
     let v = run(&["manifest", "verify", "t-1", "--dir", dir], None);
     assert_eq!(code(&v), 0, "verify with no stray flag on a live manifest: {}", err(&v));
+    assert_eq!(out(&v), "", "verify prints nothing; only list prints entries");
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 }
@@ -466,12 +472,31 @@ fn pid_and_port_bounds_are_refused() {
         vec!["manifest", "add", "t-1", "--dir", dir, "--class", "port", "--id", "z", "--port", "80 80"],
         vec!["manifest", "add", "t-1", "--dir", dir, "--class", "port", "--id", "z", "--port", "0x2000"],
         vec!["manifest", "add", "t-1", "--dir", dir, "--class", "port", "--id", "z", "--port", " 80"],
+        vec!["manifest", "add", "t-1", "--dir", dir, "--class", "port", "--id", "z", "--port", "+80"],
     ] {
         let o = run(&args, None);
         assert_eq!(code(&o), 2, "expected a usage error for {:?}", args);
     }
     let l = run(&["manifest", "list", "t-1", "--dir", dir], None);
     assert_eq!(out(&l).lines().count(), 1);
+}
+
+/// `--id` is required on add even when the id a default would pick is free, and list/verify of a manifest that does not
+/// exist are usage errors, never an empty success.
+#[test]
+fn add_needs_an_id_and_reads_need_a_manifest() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    let dir = d.to_str().unwrap();
+    for sub in ["list", "verify"] {
+        let o = run(&["manifest", sub, "t-9", "--dir", dir], None);
+        assert_eq!(code(&o), 2, "{sub} of a missing manifest: {}", err(&o));
+    }
+    let i = run(&["manifest", "init", "t-9", "--dir", dir, "--root", r.to_str().unwrap(), "--ts-ms", "1000"], None);
+    assert_eq!(code(&i), 0, "init: {}", err(&i));
+    refuses_leaving_file_untouched(&["manifest", "add", "t-9", "--dir", dir, "--class", "temp_dir", "--path", &r.join("x").to_string_lossy()], &t.file(&d, "t-9"));
+    let l = run(&["manifest", "list", "t-9", "--dir", dir], None);
+    assert_eq!(out(&l), "", "nothing was added");
 }
 
 /// A dead pid is refused: its start time cannot be read, so it can never be signed out.
@@ -536,6 +561,8 @@ fn option_hygiene_is_enforced() {
         vec!["manifest", "owns", "t-1", "--dir", dir, "--pid", "123", "--port", "80"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x").to_string_lossy().into_owned(), "--port", "80"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--pid", "abc"],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--port", "abc"],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x/y").to_string_lossy().into_owned(), "--port", "abc"],
         vec!["manifest", "list", "t-1", "--dir", dir, "--pid", "123"],
         vec!["manifest", "verify", "t-1", "--dir", dir, "--port", "80"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--id", "a", "--path", &r.join("x/y").to_string_lossy().into_owned()],
