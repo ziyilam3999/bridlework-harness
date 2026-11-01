@@ -1133,3 +1133,198 @@ fn a_single_writer_add_then_remove_still_round_trips() {
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
     assert!(read.is_clean() && read.live.is_empty());
 }
+
+// ---------------------------------------------------------------- round 3: B6, S3, N-f
+
+/// Every path under `p`, sorted: a before/after picture of what a refused call left behind.
+fn tree(p: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        out.push(d.clone());
+        if d.is_dir() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                stack.push(e.unwrap().path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A path add that must be refused as `Invalid`, leaving the manifest byte-identical and creating nothing anywhere.
+fn assert_path_refused_and_nothing_created(tag: &str, rel_to_root: &str) {
+    let t = Tmp::new(tag);
+    let r = t.sub("roots/r");
+    init(&t, &[r.clone()]).unwrap();
+    let before = t.bytes("t-1");
+    let tree_before = tree(&t.0);
+    let p = r.join(rel_to_root); // `join` keeps the text as given, `.` and `..` included
+    let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &p }, ts(2)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "{rel_to_root}: {err}");
+    assert_eq!(t.bytes("t-1"), before, "{rel_to_root}: the manifest is byte-identical");
+    assert_eq!(tree(&t.0), tree_before, "{rel_to_root}: nothing was created");
+}
+
+/// B6 (a): a `..` after a component that does not exist yet used to be dropped, so `R/ne/../../O/x` was stored as
+/// `R/ne/O/x` while the caller's folder landed outside the root.
+#[test]
+fn b6_a_dot_dot_after_a_missing_component_that_escapes_is_refused_and_nothing_is_created() {
+    assert_path_refused_and_nothing_created("b6a", "ne/../../O/x");
+}
+
+/// B6 (b): pinned as REFUSED (never folded to `R/x`, because folding is wrong across symlinks).
+#[test]
+fn b6_a_dot_dot_after_a_missing_component_that_stays_inside_is_refused_too() {
+    assert_path_refused_and_nothing_created("b6b", "ne/../x");
+}
+
+/// B6 (c) twin: a plain missing tail is still accepted and stored as given.
+#[test]
+fn b6_a_plain_missing_component_is_still_accepted_and_stored_as_given() {
+    let t = Tmp::new("b6c");
+    let r = t.sub("roots/r");
+    init(&t, &[r.clone()]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &r.join("ne").join("x") }, ts(2)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert_eq!(read.live[0].target, Target::Path(r.join("ne").join("x").to_string_lossy().into_owned()));
+}
+
+/// HELD-OUT v1 (must-fire): two missing components, then three `..`.
+#[test]
+fn v1_two_missing_components_then_three_dot_dots_is_refused_and_nothing_is_created() {
+    assert_path_refused_and_nothing_created("v1", "a/b/../../../O/x");
+}
+
+/// HELD-OUT v2 (must-fire): a `.` component inside the missing tail.
+#[test]
+fn v2_a_dot_component_in_the_missing_tail_is_refused_and_nothing_is_created() {
+    assert_path_refused_and_nothing_created("v2", "ne/./x");
+}
+
+/// HELD-OUT v3 (must-fire): the path ends in `..` after a missing component.
+#[test]
+fn v3_a_path_ending_in_dot_dot_after_a_missing_component_is_refused() {
+    assert_path_refused_and_nothing_created("v3", "ne/..");
+}
+
+/// HELD-OUT v5 (must-not-fire): two missing components, plain names, accepted as given.
+#[test]
+fn v5_two_plain_missing_components_are_accepted_as_given() {
+    let t = Tmp::new("v5");
+    let r = t.sub("roots/r");
+    init(&t, &[r.clone()]).unwrap();
+    let p = r.join("ne").join("deep").join("er");
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &p }, ts(2)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert_eq!(read.live[0].target, Target::Path(p.to_string_lossy().into_owned()));
+}
+
+/// HELD-OUT v6 (must-not-fire): `..` through ancestors that all exist still resolves; stored as `R/x`.
+#[test]
+fn v6_a_dot_dot_through_existing_ancestors_still_resolves_and_is_accepted() {
+    let t = Tmp::new("v6");
+    let r = t.sub("roots/r");
+    init(&t, &[r.clone()]).unwrap();
+    let p = r.join("..").join("r").join("x");
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &p }, ts(2)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert_eq!(read.live[0].target, Target::Path(r.join("x").to_string_lossy().into_owned()));
+}
+
+/// S3 (writer): an id that is live in ANY class is refused by every class's add, with a distinct target each time so
+/// only the id check can refuse. `first` is added, then `second` (same id, different target).
+#[test]
+fn s3_a_live_id_is_refused_by_every_class_of_add_and_the_file_is_byte_identical() {
+    #[derive(Clone, Copy)]
+    enum K {
+        Path,
+        Process,
+        Port,
+    }
+    let add = |t: &Tmp, r: &Path, k: K, id: &str, n: u64, at: u64| {
+        let dir = t.manifest_dir();
+        match k {
+            K::Path => apply(&dir, "t-1", &Op::AddPath { id, class: Class::TempDir, path: &r.join(format!("p{n}")) }, ts(at)),
+            K::Process => apply(&dir, "t-1", &Op::AddProcess { id, pid: 4000 + n, pid_start_ms: 7 }, ts(at)),
+            K::Port => apply(&dir, "t-1", &Op::AddPort { id, port: 9000 + n }, ts(at)),
+        }
+    };
+    let names = ["path", "process", "port"];
+    let cases = [
+        (K::Path, K::Port, "a"),
+        (K::Path, K::Process, "a"),
+        (K::Process, K::Path, "p"),
+        (K::Process, K::Port, "p"),
+        (K::Port, K::Path, "q"),
+        (K::Port, K::Process, "q"),
+        (K::Process, K::Port, "x"), // HELD-OUT v4: process x live, then a port x with a distinct port
+    ];
+    for (first, second, id) in cases {
+        let t = Tmp::new("s3");
+        let r = t.sub("roots/r");
+        init(&t, &[r.clone()]).unwrap();
+        add(&t, &r, first, id, 1, 2).unwrap();
+        let before = t.bytes("t-1");
+        let err = add(&t, &r, second, id, 2, 3).unwrap_err();
+        let what = format!("{} {id} then {} {id}", names[first as usize], names[second as usize]);
+        assert!(matches!(&err, ManifestError::Invalid(m) if m.contains("duplicate live id")), "{what}: {err}");
+        assert_eq!(t.bytes("t-1"), before, "{what}: the file is byte-identical");
+        // twin: the same second add under a fresh id is accepted, so the id was the only reason
+        add(&t, &r, second, "fresh", 2, 4).unwrap();
+    }
+    // the same-class repeat for each class (id check on the arm itself)
+    for k in [K::Path, K::Process, K::Port] {
+        let t = Tmp::new("s3-same");
+        let r = t.sub("roots/r");
+        init(&t, &[r.clone()]).unwrap();
+        add(&t, &r, k, "z", 1, 2).unwrap();
+        let before = t.bytes("t-1");
+        let err = add(&t, &r, k, "z", 2, 3).unwrap_err();
+        assert!(matches!(&err, ManifestError::Invalid(m) if m.contains("duplicate live id")), "{err}");
+        assert_eq!(t.bytes("t-1"), before);
+    }
+}
+
+/// S3 (reader): a duplicate live id on hand-written files is corruption for the path arm and the process arm too, with
+/// distinct targets so the same-path / same-pid checks cannot be the reason.
+#[test]
+fn s3_a_duplicate_live_id_on_two_path_lines_or_two_process_lines_is_corruption_on_read() {
+    let t = Tmp::new("s3-read");
+    let r = t.sub("roots/r");
+    let root = r.canonicalize().unwrap().to_string_lossy().into_owned();
+    let root_line = Line::Root { ticket: "t-1".into(), path: root, ts_ms: 1 }.encode().unwrap();
+    let path = |id: &str, name: &str, ts_ms: u64| {
+        let p = r.canonicalize().unwrap().join(name).to_string_lossy().into_owned();
+        Line::AddPath { ticket: "t-1".into(), id: id.into(), class: Class::TempDir, path: p, ts_ms }.encode().unwrap()
+    };
+    let proc = |id: &str, pid: u64, ts_ms: u64| {
+        Line::AddProcess { ticket: "t-1".into(), id: id.into(), pid, pid_start_ms: 7, ts_ms }.encode().unwrap()
+    };
+    for (name, bytes) in [
+        ("two path lines, one id", format!("{root_line}{}{}", path("a", "x", 2), path("a", "y", 3))),
+        ("two process lines, one id", format!("{root_line}{}{}", proc("p", 4242, 2), proc("p", 4243, 3))),
+    ] {
+        let read = parse_manifest(bytes.as_bytes(), "t-1");
+        assert!(!read.is_clean(), "{name} is corruption on read");
+        let c = read.corrupt.as_ref().unwrap();
+        assert!(c.msg.contains("duplicate live id"), "{name}: {}", c.msg);
+        assert!(read.roots.is_empty() && read.live.is_empty(), "{name}: a corrupt read carries no state");
+    }
+    // twin: the same two lines under two ids are clean
+    let ok = format!("{root_line}{}{}", path("a", "x", 2), path("b", "y", 3));
+    assert!(parse_manifest(ok.as_bytes(), "t-1").is_clean());
+}
+
+/// HELD-OUT v7 (must-not-fire): a normal init with three short roots succeeds and every root line is on disk.
+#[test]
+fn v7_a_normal_init_with_three_short_roots_writes_every_root_line() {
+    let t = Tmp::new("v7");
+    let roots = [t.sub("roots/r1"), t.sub("roots/r2"), t.sub("roots/r3")];
+    init(&t, &roots).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(read.is_clean());
+    assert_eq!(read.roots.len(), 3);
+    let text = String::from_utf8(t.bytes("t-1")).unwrap();
+    assert_eq!(text.lines().filter(|l| l.contains("\"op\":\"root\"")).count(), 3);
+}

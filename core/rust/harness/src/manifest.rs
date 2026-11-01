@@ -572,23 +572,49 @@ pub fn read_manifest(dir: &Path, ticket: &str) -> Result<ManifestRead, String> {
 
 /// Resolve `p` the way entries are stored: an existing path canonicalizes; a missing one resolves through its nearest
 /// existing ancestor (symlinks and `..` resolved on the part that exists), keeping the missing tail as-is.
+///
+/// The missing tail may hold plain names only. A `..` or `.` there is REFUSED, never dropped or folded: dropping one
+/// stores a different path from the one the caller will create (so the caller's folder could land outside every root),
+/// and folding it lexically is wrong across symlinks. The raw text is scanned, because `Path` itself hides interior `.`.
 pub fn resolve_for_manifest(p: &Path) -> Result<PathBuf, String> {
     if let Ok(c) = p.canonicalize() {
         return Ok(c);
     }
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = p.to_path_buf();
-    while !cur.exists() {
-        let Some(parent) = cur.parent().map(|x| x.to_path_buf()) else {
-            return Err(format!("path {} does not resolve", p.display()));
-        };
-        if let Some(name) = cur.file_name() {
-            tail.push(name.to_os_string());
+    let text = p.to_str().ok_or_else(|| format!("path {} is not utf-8", p.display()))?;
+    let mut existing = PathBuf::new();
+    let mut tail: Vec<&str> = Vec::new();
+    for (i, seg) in text.split('/').enumerate() {
+        if i == 0 && seg.is_empty() {
+            existing.push("/"); // an absolute path starts at the root
+            continue;
         }
-        cur = parent;
+        if seg.is_empty() {
+            continue; // a doubled or trailing '/' names nothing
+        }
+        if !tail.is_empty() {
+            if seg == "." || seg == ".." {
+                return Err(format!(
+                    "path {text} has a {seg:?} component after a part that does not exist yet; use a plain name (it could not be fenced faithfully)"
+                ));
+            }
+            tail.push(seg);
+            continue;
+        }
+        let next = existing.join(seg);
+        if next.exists() {
+            existing = next;
+        } else if seg == "." || seg == ".." {
+            // the OS could not resolve this prefix (an earlier part is missing or unreadable): fail closed
+            return Err(format!("path {text} does not resolve"));
+        } else {
+            tail.push(seg);
+        }
     }
-    let mut resolved = cur.canonicalize().map_err(|_| format!("path {} does not resolve", p.display()))?;
-    for name in tail.iter().rev() {
+    if existing.as_os_str().is_empty() {
+        return Err(format!("path {text} does not resolve"));
+    }
+    let mut resolved = existing.canonicalize().map_err(|_| format!("path {text} does not resolve"))?;
+    for name in &tail {
         resolved.push(name);
     }
     Ok(resolved)
@@ -750,12 +776,37 @@ fn validate_for_write(bytes: &[u8], ticket: &str) -> Result<ManifestRead, Manife
 /// Success means the line is on disk.
 fn append_locked(f: &mut File, line: &Line) -> Result<(), ManifestError> {
     let text = line.encode()?;
+    write_text_locked(f, &text)
+}
+
+/// Write one already-encoded line and sync it.
+fn write_text_locked(f: &mut File, text: &str) -> Result<(), ManifestError> {
     let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
     let n = f.write(text.as_bytes()).map_err(io)?;
     if n != text.len() {
         return Err(ManifestError::Io("short write".to_string()));
     }
     sync(f).map_err(io)?;
+    Ok(())
+}
+
+/// The write half of init, for roots already validated and resolved. Every root line is encoded BEFORE anything is
+/// created or written (N-f), so an over-long or invalid later root returns its error with nothing on disk.
+fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Result<(), ManifestError> {
+    let lines: Vec<String> = resolved
+        .iter()
+        .map(|r| Line::Root { ticket: ticket.to_string(), path: r.to_string_lossy().into_owned(), ts_ms }.encode())
+        .collect::<Result<_, _>>()?;
+    fs::create_dir_all(dir).map_err(|e| ManifestError::Io(e.kind().to_string()))?;
+    // ONE critical section (B5): the lock is taken first, then the empty-file check runs on bytes read
+    // through the locked handle, so two concurrent inits of one fresh manifest leave exactly one.
+    let mut f = open_locked(&manifest_file(dir, ticket), ticket, true)?;
+    if !read_locked(&mut f)?.is_empty() {
+        return Err(ManifestError::Invalid("second init: the manifest already holds lines".to_string()));
+    }
+    for text in &lines {
+        write_text_locked(&mut f, text)?;
+    }
     Ok(())
 }
 
@@ -796,18 +847,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                     "the manifest dir resolves inside one of the ticket's roots; the record must survive removal of the roots".to_string(),
                 ));
             }
-            fs::create_dir_all(dir).map_err(|e| ManifestError::Io(e.kind().to_string()))?;
-            // ONE critical section (B5): the lock is taken first, then the empty-file check runs on bytes read
-            // through the locked handle, so two concurrent inits of one fresh manifest leave exactly one.
-            let file = manifest_file(dir, ticket);
-            let mut f = open_locked(&file, ticket, true)?;
-            if !read_locked(&mut f)?.is_empty() {
-                return Err(ManifestError::Invalid("second init: the manifest already holds lines".to_string()));
-            }
-            for r in &resolved {
-                append_locked(&mut f, &Line::Root { ticket: ticket.to_string(), path: r.to_string_lossy().into_owned(), ts_ms })?;
-            }
-            Ok(())
+            write_init(dir, ticket, &resolved, ts_ms)
         }
         Op::AddPath { id, class, path } => {
             if !token_ok(id) {
@@ -972,5 +1012,30 @@ pub fn process_start_ms(pid: u64) -> Result<u64, String> {
             _ => return Err(format!("cannot parse ps etime {et:?}")),
         };
         now.checked_sub(secs * 1000).ok_or_else(|| "the clock is before the process start".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N-f: a later root whose line is over the cap makes init refuse with `TooLong` and leaves NOTHING on disk (no
+    /// manifest dir, no file, no earlier root line). The roots here are synthetic: `write_init` takes roots already
+    /// validated, so no real folder 4 KiB deep is needed.
+    #[test]
+    fn an_over_long_later_root_line_refuses_init_with_nothing_written() {
+        let base = std::env::temp_dir().join(format!("manifest-nf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("man");
+        let long = PathBuf::from(format!("/{}", "r".repeat(LINE_CAP)));
+        let roots = [PathBuf::from("/short-a"), long, PathBuf::from("/short-b")];
+        let err = write_init(&dir, "t-1", &roots, 1).unwrap_err();
+        assert!(matches!(err, ManifestError::TooLong(_)), "{err}");
+        assert!(!dir.exists(), "nothing was created");
+        // twin: three short roots write all three lines
+        write_init(&dir, "t-1", &[PathBuf::from("/short-a"), PathBuf::from("/short-b"), PathBuf::from("/short-c")], 1).unwrap();
+        let text = fs::read_to_string(manifest_file(&dir, "t-1")).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        let _ = fs::remove_dir_all(&base);
     }
 }
