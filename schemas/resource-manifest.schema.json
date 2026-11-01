@@ -1,0 +1,132 @@
+{
+  "title": "resource-manifest",
+  "description": "One line of a ticket's resource manifest (<manifest-dir>/<ticket>.jsonl), one branch per shape. A human and tool mirror of the loader's exact key set per shape; the crate does not interpret this file, and a test pins each branch's required set to the loader's. A line is at most 4096 bytes including its newline. Every line's ticket equals the file's ticket; paths are stored resolved and must resolve inside one of the ticket's roots.",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "root",
+      "description": "Written only by init, only before any other line: one of the ticket's roots (the fence every path entry must resolve inside).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "path", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "root" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "path": { "type": "string", "pattern": "^/.+$", "not": { "enum": ["/"] }, "description": "An absolute, existing directory, stored resolved. Never /." }
+      }
+    },
+    {
+      "title": "add_worktree",
+      "description": "A worktree the ticket owns.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "class", "path", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "add" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "Stable entry id; unique among live entries." },
+        "class": { "const": "worktree" },
+        "path": { "type": "string", "pattern": "^/.+$", "description": "Absolute, stored resolved; must resolve inside one of the ticket's roots. May not exist yet; then its parent must resolve inside a root." }
+      }
+    },
+    {
+      "title": "add_temp_dir",
+      "description": "A transient folder the ticket owns (scratch, temp databases, screenshots taken as ephemeral proof).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "class", "path", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "add" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "Stable entry id; unique among live entries." },
+        "class": { "const": "temp_dir" },
+        "path": { "type": "string", "pattern": "^/.+$", "description": "Absolute, stored resolved; must resolve inside one of the ticket's roots. May not exist yet; then its parent must resolve inside a root." }
+      }
+    },
+    {
+      "title": "add_log",
+      "description": "A log file the ticket owns.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "class", "path", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "add" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "Stable entry id; unique among live entries." },
+        "class": { "const": "log" },
+        "path": { "type": "string", "pattern": "^/.+$", "description": "Absolute, stored resolved; must resolve inside one of the ticket's roots. May not exist yet; then its parent must resolve inside a root." }
+      }
+    },
+    {
+      "title": "add_evidence",
+      "description": "A kept-proof artifact the ticket owns; it leaves the manifest when finalize moves it to the retained store.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "class", "path", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "add" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "Stable entry id; unique among live entries." },
+        "class": { "const": "evidence" },
+        "path": { "type": "string", "pattern": "^/.+$", "description": "Absolute, stored resolved; must resolve inside one of the ticket's roots. May not exist yet; then its parent must resolve inside a root." }
+      }
+    },
+    {
+      "title": "add_process",
+      "description": "A process the ticket owns. pid_start_ms is the OS start time: it lets a later reader tell a reused pid from the recorded one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "class", "pid", "pid_start_ms", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "add" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "Stable entry id; unique among live entries." },
+        "class": { "const": "process" },
+        "pid": { "type": "integer", "minimum": 2, "description": "An integer > 1: signalling 0, 1 or a negative would hit a group or init." },
+        "pid_start_ms": { "type": "integer", "minimum": 0, "description": "The process's OS start time in ms since the epoch, read by the writer (on Linux from /proc, otherwise the system ps); a pid whose start time cannot be read is refused." }
+      }
+    },
+    {
+      "title": "add_port",
+      "description": "A network port the ticket owns.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "class", "port", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "add" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "Stable entry id; unique among live entries." },
+        "class": { "const": "port" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    {
+      "title": "remove",
+      "description": "An entry was given back: the id must be live when the line is written.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "remove" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } }
+      }
+    }
+  ]
+}
