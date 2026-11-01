@@ -1,0 +1,9 @@
+{
+  "hook": "gh-text-hook.sh",
+  "event": "PreToolUse",
+  "tools": ["Bash"],
+  "env": ["HARNESS_BIN", "HARNESS_PRIVACY_LIST", "HARNESS_PUBLIC_REPO"],
+  "requires": ["python3"],
+  "exit_allow": 0,
+  "exit_refuse": 2
+}
