@@ -29,7 +29,11 @@ pub const KEYS: [&str; 15] = [
     "lanes.count",
 ];
 
-const SECTIONS: [&str; 4] = ["repos", "budgets", "shadow", "lanes"];
+/// The one string-valued key (config v3): the friction inbox path. Required, exactly like every numeric key; only its
+/// value shape differs. A refusal over it never carries the value (the path names a private folder).
+pub const INBOX_KEY: &str = "friction.inbox";
+
+const SECTIONS: [&str; 5] = ["repos", "budgets", "shadow", "lanes", "friction"];
 const YAML_WORDS: [&str; 11] = ["true", "false", "null", "yes", "no", "on", "off", "y", "n", ".inf", ".nan"];
 
 /// The wall-time and token limit of one ticket size.
@@ -58,6 +62,8 @@ pub struct Config {
     repos: Vec<(RepoId, String)>,
     /// Values in `KEYS` order.
     nums: [u64; 15],
+    /// The `friction.inbox` path (v3). Never printed.
+    inbox: String,
 }
 
 /// A refusal that names the line, and the section and key when known. Never carries a value.
@@ -121,10 +127,11 @@ impl Config {
         if text.is_empty() {
             return Err("config: file is empty".to_string());
         }
-        let mut seen = [false; 4];
+        let mut seen = [false; 5];
         let mut section: Option<usize> = None;
         let mut repos: Vec<(RepoId, String)> = Vec::new();
         let mut nums: [Option<u64>; 15] = [None; 15];
+        let mut inbox: Option<String> = None;
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
             let here = match section {
@@ -190,6 +197,18 @@ impl Config {
                     return Err(refuse(n, &at, "two repo ids on one folder"));
                 }
                 repos.push((id, val.to_string()));
+            } else if sec == "friction" {
+                let at = format!("section `{sec}` key `{}`", shown(key));
+                if key != "inbox" {
+                    return Err(refuse(n, &at, "unknown key"));
+                }
+                if inbox.is_some() {
+                    return Err(refuse(n, &at, "duplicate key"));
+                }
+                if !folder_ok(val) {
+                    return Err(refuse(n, &at, "the inbox path must be absolute, with no `..` component, no control character and no trailing `/`"));
+                }
+                inbox = Some(val.to_string());
             } else {
                 let full = format!("{sec}.{key}");
                 let slot = KEYS.iter().position(|k| *k == full).ok_or_else(|| refuse(n, &at, "unknown key"))?;
@@ -202,14 +221,19 @@ impl Config {
                 nums[slot] = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
             }
         }
+        // v3: a missing `friction` section is named by its key (a v2 file is refused naming `friction.inbox`), but an
+        // earlier missing section is named first, in file order, as before.
         if let Some(i) = seen.iter().position(|s| !s) {
+            if i == 4 {
+                return Err(format!("config: missing key `{INBOX_KEY}`"));
+            }
             return Err(format!("config: missing section `{}`", SECTIONS[i]));
         }
         let mut out = [0u64; 15];
         for (i, slot) in nums.iter().enumerate() {
             out[i] = slot.ok_or_else(|| format!("config: missing key `{}`", KEYS[i]))?;
         }
-        Ok(Config { repos, nums: out })
+        Ok(Config { repos, nums: out, inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))? })
     }
 
     /// Read at most the cap plus one byte, then parse. No search, no default location: the caller names the file. Errors never carry the path.
@@ -254,6 +278,11 @@ impl Config {
         self.nums[14]
     }
 
+    /// The configured friction inbox path (`friction.inbox`, v3). Read by `harness friction`; never printed.
+    pub fn friction_inbox(&self) -> &str {
+        &self.inbox
+    }
+
     pub fn shadow(&self) -> Shadow {
         let n = &self.nums;
         Shadow {
@@ -278,7 +307,7 @@ mod tests {
 
     fn text(repos: &str) -> String {
         format!(
-            "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 111\n  s_tokens: 222\n  m_wall_seconds: 333\n  m_tokens: 444\n  l_wall_seconds: 555\n  l_tokens: 666\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 7\n  p4a_token_budget: 8\n  d2a_token_budget: 9\n  p7_token_budget: 11\n\nlanes:\n  count: 4\n"
+            "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 111\n  s_tokens: 222\n  m_wall_seconds: 333\n  m_tokens: 444\n  l_wall_seconds: 555\n  l_tokens: 666\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 7\n  p4a_token_budget: 8\n  d2a_token_budget: 9\n  p7_token_budget: 11\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n"
         )
     }
 
@@ -488,6 +517,30 @@ mod tests {
         assert!(e.contains("p7_cap") && e.contains("quoted"), "{e}");
         Config::parse(&valid().replacen("  s_tokens: 222", "  s_tokens: 5", 1)).unwrap();
     }
+
+    #[test]
+    fn v3_friction_inbox_is_required_shape_checked_and_read() {
+        // the value is read back, not compiled in
+        assert_eq!(Config::parse(&valid()).unwrap().friction_inbox(), "/synthetic-inbox.jsonl");
+        assert_eq!(
+            Config::parse(&valid().replace("/synthetic-inbox.jsonl", "/other-inbox.jsonl")).unwrap().friction_inbox(),
+            "/other-inbox.jsonl"
+        );
+        // a v2 file (no friction section) is refused naming the full key, and so is an empty section
+        for dropped in ["\nfriction:\n  inbox: /synthetic-inbox.jsonl\n", "friction:\n  inbox: /synthetic-inbox.jsonl"] {
+            let e = refused(&valid().replace(dropped, dropped.lines().next().unwrap()));
+            assert!(e.contains("missing key `friction.inbox`"), "{e}");
+        }
+        // the same shape rules as a repo folder; a refusal never carries the value
+        for bad in ["relative/inbox.jsonl", "/x/../y", "/x/"] {
+            let e = refused(&valid().replace("/synthetic-inbox.jsonl", bad));
+            assert!(e.contains("`friction`") && e.contains("`inbox`") && !e.contains("synthetic-inbox"), "{bad}: {e}");
+        }
+        // only `inbox` lives under friction
+        let e = refused(&valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  extra: 1"));
+        assert!(e.contains("unknown key"), "{e}");
+    }
+
 
     #[test]
     fn a_bad_repo_id_is_refused_naming_repo_id() {

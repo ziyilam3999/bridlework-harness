@@ -13,6 +13,7 @@ pub mod detect;
 pub mod events;
 pub mod explain;
 pub mod fixtures;
+pub mod friction;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;

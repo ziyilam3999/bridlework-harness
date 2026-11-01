@@ -24,3 +24,7 @@ shadow:
 
 lanes:
   count: 4
+
+# The friction inbox (docs/friction-inbox.md) lives only in the private overlay; this path is a placeholder.
+friction:
+  inbox: /placeholder/friction-inbox.jsonl

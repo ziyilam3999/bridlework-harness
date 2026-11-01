@@ -510,8 +510,11 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "fixtures" {
         return fixtures_cmd(&args[1..]);
     }
+    if !args.is_empty() && args[0] == "friction" {
+        return crate::friction::friction_cmd(&args[1..], testmode);
+    }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | status <ticket-file> ... | workspace create <ticket-file> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|close-check | status <ticket-file> ... | workspace create <ticket-file> ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";
