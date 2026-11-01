@@ -1328,3 +1328,18 @@ fn v7_a_normal_init_with_three_short_roots_writes_every_root_line() {
     let text = String::from_utf8(t.bytes("t-1")).unwrap();
     assert_eq!(text.lines().filter(|l| l.contains("\"op\":\"root\"")).count(), 3);
 }
+
+/// Sibling of B6 (found by the sibling search): a manifest dir `S/roots/ne/../r/m` really lands at `S/roots/r/m`, inside
+/// the root, but a walk-up that drops the `..` after the missing `ne` would judge it by `S/roots` and let it through.
+#[test]
+fn a_manifest_dir_with_a_dot_dot_after_a_missing_component_is_refused_and_nothing_is_created() {
+    let t = Tmp::new("f2-dotdot");
+    let r = t.sub("roots/r");
+    let tree_before = tree(&t.0);
+    let dir = t.0.join("roots").join("ne").join("..").join("r").join("m");
+    let err = apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "{err}");
+    assert_eq!(tree(&t.0), tree_before, "nothing was created");
+    // twin: plain missing components outside the roots are fine
+    apply(&t.0.join("man").join("deeper"), "t-1", &Op::Init { roots: &[r] }, ts(1)).unwrap();
+}

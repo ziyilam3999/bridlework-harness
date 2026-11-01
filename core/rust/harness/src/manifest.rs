@@ -639,6 +639,11 @@ fn dir_inside_any_root(dir: &Path, roots: &[PathBuf]) -> bool {
         }
     };
     while !cur.exists() {
+        // A `..` in the missing part cannot be walked past honestly (`parent()` would drop it, so the answer would be
+        // given for a different folder than the one that gets created): refuse, fail closed.
+        if cur.file_name().is_none() {
+            return true;
+        }
         match cur.parent() {
             Some(p) => cur = p.to_path_buf(),
             None => break,
