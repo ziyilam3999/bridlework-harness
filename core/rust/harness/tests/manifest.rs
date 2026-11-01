@@ -5,7 +5,7 @@ use harness::manifest::{
     apply, owns, parse_manifest, process_start_ms, read_manifest, Class, Line, ManifestError, Op, Query, Target, LINE_CAP,
     SCHEMA_VERSION,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn repo() -> PathBuf {
@@ -235,6 +235,13 @@ fn the_doc_names_every_shape_class_and_the_cap() {
     }
     assert!(doc.contains(&LINE_CAP.to_string()));
     assert!(doc.contains("torn tail") && doc.contains("pid_start_ms"));
+    // N4 (ruling): the list line of a process entry has FOUR tab-separated fields, every other class three.
+    assert!(doc.contains("four tab-separated fields"), "the doc states the four-field process list line");
+    assert!(doc.contains("exactly three fields"), "the doc states the three-field non-process list line");
+    // N3: off Linux the start time jitters; the doc must say what tolerance a comparer needs.
+    assert!(doc.contains("2000 ms"), "the doc states the off-Linux pid_start_ms tolerance");
+    // INPUT-BOUND: the doc states the file cap.
+    assert!(doc.contains("1 MiB"), "the doc states the 1 MiB file cap");
 }
 
 // ---------------------------------------------------------------- line codec
@@ -633,4 +640,185 @@ fn process_start_ms_reads_a_live_pid_and_refuses_an_absent_one() {
     assert!(now - start < 3_600_000, "this test process started less than an hour ago");
     assert!(process_start_ms(999_999_999_u64).is_err(), "a pid no OS holds is refused");
     assert!(process_start_ms(0).is_err() && process_start_ms(1).is_err(), "pid 0 and 1 are refused");
+}
+
+// ---------------------------------------------------------------- fix round 1 (review pr49)
+
+/// A relative folder under the crate folder (integration tests run with the crate folder as cwd), removed on drop.
+struct RelDir(String);
+
+impl RelDir {
+    fn new(tag: &str) -> RelDir {
+        RelDir(format!(".tmp-manifest-{tag}-{}", std::process::id()))
+    }
+
+    fn path(&self) -> PathBuf {
+        PathBuf::from(&self.0)
+    }
+}
+
+impl Drop for RelDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// B1: an add or remove on an EXISTING file that holds no init (an init that crashed between create and write
+/// leaves exactly a 0-byte file) is refused, the file stays 0 bytes, and a later init still unblocks the ticket.
+#[test]
+fn an_add_or_remove_on_an_existing_init_less_file_is_refused_run_init_first() {
+    let t = Tmp::new("noinit");
+    let r = t.sub("roots/r");
+    std::fs::create_dir_all(t.manifest_dir()).unwrap();
+    std::fs::write(t.manifest_dir().join("t-1.jsonl"), b"").unwrap();
+    for (name, op) in [
+        ("add port", Op::AddPort { id: "n-1", port: 8080 }),
+        ("add process", Op::AddProcess { id: "p-1", pid: 4242, pid_start_ms: 7 }),
+        ("add path", Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }),
+        ("remove", Op::Remove { id: "n-1" }),
+    ] {
+        let err = apply(&t.manifest_dir(), "t-1", &op, ts(2)).unwrap_err();
+        assert!(err.to_string().contains("run init first"), "{name}: {err}");
+    }
+    assert_eq!(t.bytes("t-1"), Vec::<u8>::new(), "the empty file is untouched");
+    // twin: init on the same empty file works and unblocks the ticket
+    init(&t, &[r]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n-1", port: 8080 }, ts(3)).unwrap();
+    assert_eq!(read_manifest(&t.manifest_dir(), "t-1").unwrap().live.len(), 1);
+}
+
+/// B2: a damaged manifest owns nothing — a torn tail answers "not owned" for a path, a pid and a port that
+/// were live before the damage; the same bytes with a whole final line own all three again.
+#[test]
+fn a_damaged_manifest_owns_nothing_for_path_pid_and_port() {
+    let t = Tmp::new("owns-dmg");
+    let r = t.sub("roots/r");
+    init(&t, &[r.clone()]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }, ts(2)).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddProcess { id: "p", pid: 4242, pid_start_ms: 7 }, ts(3)).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(4)).unwrap();
+    let clean = t.bytes("t-1");
+    let mut torn = clean.clone();
+    torn.extend_from_slice(b"{\"v\":1,\"op\":\"re"); // a final fragment with no newline
+    std::fs::write(t.manifest_dir().join("t-1.jsonl"), &torn).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(!read.is_clean());
+    assert!(!owns(&read, Query::Path(&r.join("x").join("y"))), "a torn tail owns no path");
+    assert!(!owns(&read, Query::Pid(4242)), "a torn tail owns no pid");
+    assert!(!owns(&read, Query::Port(8080)), "a torn tail owns no port");
+    // twin: the same file without the fragment is clean and owns all three
+    std::fs::write(t.manifest_dir().join("t-1.jsonl"), &clean).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(read.is_clean());
+    assert!(owns(&read, Query::Path(&r.join("x").join("y"))));
+    assert!(owns(&read, Query::Pid(4242)));
+    assert!(owns(&read, Query::Port(8080)));
+}
+
+/// B3: a relative root that DOES exist relative to the test's working folder is refused as *not absolute*,
+/// not as missing (an accepting build that deletes the absoluteness check passes a root that exists here).
+#[test]
+fn a_relative_root_that_exists_in_the_cwd_is_refused_as_not_absolute() {
+    let t = Tmp::new("rel-root");
+    // cargo runs integration tests with the crate folder as cwd, so `tests` and `./tests` exist relative to it
+    for name in ["tests", "./tests"] {
+        let err = apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[PathBuf::from(name)] }, ts(1)).unwrap_err();
+        assert!(err.to_string().contains("not absolute"), "{name}: {err}");
+        assert!(!t.manifest_dir().exists(), "{name}: nothing was created");
+    }
+    // a ./-spelled relative root built under the working folder, existing too
+    let rel = RelDir::new("relroot");
+    std::fs::create_dir_all(rel.path().join("r")).unwrap();
+    let root = PathBuf::from(".").join(&rel.0).join("r");
+    let err = apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[root] }, ts(1)).unwrap_err();
+    assert!(err.to_string().contains("not absolute"), "./-spelled: {err}");
+    assert!(!t.manifest_dir().exists(), "the refused init created no folder");
+    assert!(rel.path().join("r").exists(), "the relative root itself is untouched");
+}
+
+/// N1: a relative manifest dir whose parent does not exist yet is answered for the current folder (joined on
+/// before the root check), so it is accepted when it lands outside the roots — and still refused inside one.
+#[test]
+fn a_relative_manifest_dir_with_a_missing_parent_is_answered_for_the_cwd() {
+    let t = Tmp::new("rel-dir");
+    let r = t.sub("roots/r");
+    let rel = RelDir::new("reldir");
+    // no part of the relative dir exists yet, so the walk has to reach the current folder before anything resolves
+    let dir = rel.path().join("fresh").join("manifests");
+    apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+    assert!(dir.join("t-1.jsonl").exists(), "the relative dir was joined onto the cwd and created");
+    // twin: a relative dir that lands INSIDE a root is still refused
+    let root2_rel = rel.path().join("roots").join("r");
+    std::fs::create_dir_all(&root2_rel).unwrap();
+    let root2 = root2_rel.canonicalize().unwrap();
+    let inside = PathBuf::from(".").join(&rel.0).join("roots").join("r").join("man");
+    let err = apply(&inside, "t-1", &Op::Init { roots: &[root2] }, ts(1)).unwrap_err();
+    assert!(err.to_string().contains("inside one of the ticket's roots"), "{err}");
+    assert!(!inside.exists(), "the refused init created no folder");
+}
+
+/// N2: a hand-written path entry that lies outside every declared root is a fence break: corruption on read,
+/// it owns nothing, and a write onto that file is refused unchanged (fail closed).
+#[test]
+fn a_hand_written_path_entry_outside_every_root_is_corruption_on_read() {
+    let t = Tmp::new("fence-read");
+    let r = t.sub("roots/r");
+    let root_line = Line::Root { ticket: "t-1".into(), path: r.canonicalize().unwrap().to_string_lossy().into_owned(), ts_ms: 1 }.encode().unwrap();
+    let outside = Line::AddPath { ticket: "t-1".into(), id: "etc".into(), class: Class::TempDir, path: "/etc".into(), ts_ms: 2 }.encode().unwrap();
+    std::fs::create_dir_all(t.manifest_dir()).unwrap();
+    std::fs::write(t.manifest_dir().join("t-1.jsonl"), format!("{root_line}{outside}")).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(!read.is_clean());
+    let c = read.corrupt.as_ref().unwrap();
+    assert!(c.msg.contains("outside every root"), "{}", c.msg);
+    assert!(!owns(&read, Query::Path(Path::new("/etc/passwd"))), "a fence break owns nothing");
+    let before = t.bytes("t-1");
+    assert!(matches!(apply(&t.manifest_dir(), "t-1", &Op::Remove { id: "etc" }, ts(3)), Err(ManifestError::Damaged { .. })));
+    assert_eq!(t.bytes("t-1"), before, "the refused write changed nothing");
+}
+
+/// N5: a live `R/x` owns `R/x/y` but NOT the sibling `R/xy` (a shared string prefix is not ownership).
+#[test]
+fn a_live_path_owns_children_but_not_a_sibling_sharing_a_string_prefix() {
+    let t = Tmp::new("sib");
+    let r = t.sub("roots/r");
+    init(&t, &[r.clone()]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }, ts(2)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(read.is_clean());
+    assert!(owns(&read, Query::Path(&r.join("x").join("y"))), "R/x owns R/x/y");
+    assert!(!owns(&read, Query::Path(&r.join("xy"))), "R/x does not own the sibling R/xy");
+    assert!(owns(&read, Query::Path(&r.join("x"))), "R/x owns itself (equal counts as inside)");
+}
+
+/// INPUT-BOUND: a manifest file over 1 MiB is refused as corrupt (fail closed, no unbounded read); a write
+/// onto it is refused unchanged; a file AT the cap still gets its normal read (a torn fragment is a torn tail).
+#[test]
+fn a_manifest_file_over_one_mib_is_refused_as_corrupt() {
+    const CAP: usize = 1024 * 1024;
+    let t = Tmp::new("bigfile");
+    let r = t.sub("roots/r");
+    init(&t, &[r]).unwrap();
+    let mut big = t.bytes("t-1");
+    big.extend(std::iter::repeat(b'x').take(CAP + 1));
+    std::fs::write(t.manifest_dir().join("t-1.jsonl"), &big).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    let c = read.corrupt.as_ref().expect("an over-cap file is corruption");
+    assert!(c.msg.contains("1 MiB"), "{}", c.msg);
+    assert!(!owns(&read, Query::Port(8080)), "an over-cap file owns nothing");
+    let before = t.bytes("t-1");
+    assert!(matches!(apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(2)), Err(ManifestError::Damaged { .. })));
+    assert_eq!(t.bytes("t-1"), before, "the refused write changed nothing");
+    // twin: a file of exactly the cap is not corrupt (a missing final newline there is a torn tail, as always)
+    let mut at_cap = t.bytes("t-1");
+    at_cap.truncate(0);
+    at_cap.extend_from_slice(b"{\"v\":1,\"op\":\"root\",\"ticket\":\"t-1\",\"path\":\"/scratch/r\",\"ts_ms\":1}\n");
+    let fill = CAP - at_cap.len();
+    at_cap.extend(std::iter::repeat(b'x').take(fill));
+    assert_eq!(at_cap.len(), CAP);
+    let read = parse_manifest(&at_cap, "t-1");
+    assert!(read.corrupt.is_none(), "a file at the cap is not corrupt");
+    assert!(read.torn_tail.is_some(), "the unterminated tail at the cap is still a torn tail");
+    // and the library-level read of the oversized bytes agrees
+    assert!(parse_manifest(&vec![b'x'; CAP + 1], "t-1").corrupt.unwrap().msg.contains("1 MiB"));
 }

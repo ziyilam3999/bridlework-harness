@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: u64 = 1;
 /// Largest accepted line in bytes, newline included. Keeps each append one small write.
 pub const LINE_CAP: usize = 4096;
+/// Largest accepted manifest file in bytes. A bigger file is refused as corrupt: fail closed, never an unbounded read.
+pub const FILE_CAP: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------- line model
 
@@ -440,6 +442,11 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                 if st.roots.is_empty() {
                     return Err((*n, "add before init".to_string()));
                 }
+                // Stored paths are resolved at write time and fenced; one outside every root is a fence break
+                // by a writer this module did not produce: corruption on read, fail closed.
+                if !inside_any_root(Path::new(path.as_str()), &st.roots) {
+                    return Err((*n, format!("path {path} lies outside every root")));
+                }
                 if st.live.iter().any(|e| e.id == *id) {
                     return Err((*n, format!("duplicate live id {id:?}")));
                 }
@@ -499,6 +506,10 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
 /// a state invariant (an add before init, a duplicate live id, a remove of a dead id, ...) is reported as corruption.
 pub fn parse_manifest(bytes: &[u8], ticket: &str) -> ManifestRead {
     let mut out = ManifestRead { lines: Vec::new(), roots: Vec::new(), live: Vec::new(), torn_tail: None, corrupt: None };
+    if bytes.len() > FILE_CAP {
+        out.corrupt = Some(LineError { line: 1, msg: format!("the file is {} bytes, over the {}-byte (1 MiB) cap", bytes.len(), FILE_CAP) });
+        return out;
+    }
     let mut numbered: Vec<(usize, Line)> = Vec::new();
     let mut start = 0usize;
     let mut line_no = 0usize;
@@ -588,7 +599,15 @@ fn inside_any_root(p: &Path, roots: &[String]) -> bool {
 /// ancestor already sits inside a root (a root always exists, so the nearest existing ancestor is at or below any root that
 /// contains the final path). Unreadable means refuse: fail closed.
 fn dir_inside_any_root(dir: &Path, roots: &[PathBuf]) -> bool {
-    let mut cur = dir.to_path_buf();
+    // A relative dir is answered for the current folder, so join it on before walking up; unreadable means refuse.
+    let mut cur = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(dir),
+            Err(_) => return true,
+        }
+    };
     while !cur.exists() {
         match cur.parent() {
             Some(p) => cur = p.to_path_buf(),
@@ -612,9 +631,12 @@ pub enum Query<'a> {
     Port(u64),
 }
 
-/// Answer an ownership query against a CLEAN read (a damaged manifest owns nothing: the caller fails closed on damage
-/// before asking). Path comparison is component-wise on the stored resolved paths.
+/// Answer an ownership query. Path comparison is component-wise on the stored resolved paths. A read that is not
+/// clean (torn tail or corruption) owns NOTHING: the query itself fails closed, so a caller cannot forget to.
 pub fn owns(read: &ManifestRead, q: Query<'_>) -> bool {
+    if !read.is_clean() {
+        return false;
+    }
     match q {
         Query::Path(p) => read.live.iter().any(|e| match &e.target {
             Target::Path(s) => p.starts_with(Path::new(s.as_str())),
@@ -712,6 +734,11 @@ fn read_for_write(dir: &Path, ticket: &str) -> Result<ManifestRead, ManifestErro
     }
     if let Some(t) = &r.torn_tail {
         return Err(ManifestError::Damaged { line: None, msg: format!("torn tail at line {} ({} bytes)", t.line, t.bytes) });
+    }
+    if r.roots.is_empty() {
+        // A clean read with no roots is a file that exists but holds no init (an init that crashed between
+        // create and write leaves a 0-byte file): appending would corrupt it for good, so refuse.
+        return Err(ManifestError::Invalid(format!("no manifest for ticket {ticket}; run init first")));
     }
     Ok(r)
 }
