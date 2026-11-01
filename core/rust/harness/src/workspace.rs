@@ -49,7 +49,7 @@ struct Args {
     base: String,
     workspace_root: String,
     manifest_dir: String,
-    ts_ms: Option<String>,
+    ts_ms: Option<u64>,
 }
 
 /// A full lowercase hex commit sha (40 or 64 chars), the same shape `harness ticket gate` requires.
@@ -114,18 +114,27 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
             return Err(usage_err(&format!("{} must be an absolute path with no `..` component", flag)));
         }
     }
-    if let Some(t) = ts {
-        if !num_ok(t) {
-            return Err(usage_err("--ts-ms must be a non-negative integer"));
+    // Parsed HERE, still inside parse_args, so an out-of-range --ts-ms is refused BEFORE anything is
+    // written: it is a usage error, and a usage error must leave no ticket folder behind (a folder with
+    // no manifest would block the ticket forever — the manifest is the record, and it was never seeded).
+    // The u64 bound is also the input bound: any digit string that does not fit u64 (over 20 digits, or
+    // over u64::MAX) fails closed right here, before a single filesystem write.
+    let ts_ms = match ts {
+        Some(t) => {
+            if !num_ok(t) {
+                return Err(usage_err("--ts-ms must be a non-negative integer"));
+            }
+            Some(t.parse::<u64>().map_err(|_| usage_err("--ts-ms out of range"))?)
         }
-    }
+        None => None,
+    };
     Ok(Args {
         ticket_file: file.to_string(),
         map,
         base: base.to_string(),
         workspace_root: ws.to_string(),
         manifest_dir: md.to_string(),
-        ts_ms: ts.map(|t| t.to_string()),
+        ts_ms,
     })
 }
 
@@ -286,6 +295,19 @@ fn create(a: &[String]) -> Result<Success, Stop> {
     if ref_exists(&repo.top, &branch) {
         return Err(err2("the workspace branch already exists in the repo and is never reused"));
     }
+    // A token-legal id can still be an illegal branch name (`a..b`, `x.lock`, `.hid`); discovering that
+    // only at `git worktree add` (after the seed) would leave a half-made workspace that blocks the
+    // ticket until teardown. Git's own name rule is asked up front, still before anything is written.
+    if git(&repo.top, &["check-ref-format", "--branch", &branch]).is_none() {
+        return Err(err2("the ticket id is not a legal branch name"));
+    }
+
+    // The manifest timestamp is resolved BEFORE step 6, so no usage or clock error can strike after the
+    // first write: an explicit --ts-ms was already parsed to u64 in parse_args, and the clock is read once.
+    let ts_ms = match args.ts_ms {
+        Some(t) => t,
+        None => SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).map_err(|_| err2("the clock is before the epoch"))?,
+    };
 
     // 6. The ticket root: a new, empty, real, owner-only folder, created exclusively — fails if anything
     //    (including a symlink) already sits at that name. Two racing `create` calls for one ticket: exactly one
@@ -297,11 +319,6 @@ fn create(a: &[String]) -> Result<Success, Stop> {
         .map_err(|_| err2("the ticket folder could not be created (the ticket may already have a workspace)"))?;
     let tree = ticket_root.join("tree");
     let tmp = ticket_root.join("tmp");
-
-    let ts_ms = match args.ts_ms.as_deref() {
-        Some(t) => t.parse::<u64>().map_err(|_| usage_err("--ts-ms out of range"))?,
-        None => SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).map_err(|_| err2("the clock is before the epoch"))?,
-    };
 
     // 7-8. Write-ahead: init the manifest with the ticket root as its ONE root, then list both entries BEFORE the
     // things exist, so a crash between steps can leave only listed things, never an orphan.

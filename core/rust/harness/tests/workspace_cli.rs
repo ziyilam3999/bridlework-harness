@@ -373,12 +373,15 @@ fn ac6_other_refusals_write_nothing() {
     let p = repo(&t, "P", "parent");
     let (lw, _) = t.both("linked");
     git(&p, &["worktree", "add", "--detach", lw.to_str().unwrap(), &head(&p)]);
+    // The base is P's OWN head, so it resolves fine in the linked worktree: with the linked check
+    // present it is refused by that check alone; nothing else can refuse this input first.
     let o = run(
-        &["workspace".into(), "create".into(), t.raw.join("t3.json").to_str().unwrap().into(), "--repo-map".into(), format!("r={}", lw.display()), "--base".into(), s, "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        &["workspace".into(), "create".into(), t.raw.join("t3.json").to_str().unwrap().into(), "--repo-map".into(), format!("r={}", lw.display()), "--base".into(), head(&p), "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
         None,
     );
     assert_eq!(code(&o), 2, "linked worktree: {} {}", out(&o), err(&o));
     assert!(empty(&w) && empty(&m), "linked worktree case wrote something");
+    assert_eq!(worktree_count(&p), 2, "the linked worktree's parent repo gained a worktree");
     assert_no_folder("ac6-linked", &o, &t, &r);
     // A branch that already exists: refused, left at its old commit, nothing written.
     ticket(&t, "t4", "r");
@@ -389,6 +392,152 @@ fn ac6_other_refusals_write_nothing() {
     assert!(empty(&w) && empty(&m), "existing-branch case wrote something");
     assert_eq!(worktree_porcelain(&r).lines().filter(|l| l.starts_with("worktree ")).count(), 1);
     assert_no_folder("ac6-branch", &o, &t, &r);
+}
+
+// --------------------------------------- git failure after the seed: only listed things remain
+
+#[test]
+fn git_failure_after_the_seed_leaves_only_listed_children() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t5", "r");
+    // A branch literally named `ws` makes `git worktree add -b ws/t5 ...` fail AFTER the write-ahead
+    // seed (a git failure the plan allows from step 6 on). The refusal must still leave both entries
+    // on the manifest and no UNLISTED child under the ticket root — never an orphan.
+    git(&r, &["branch", "ws", &s]);
+    let o = run(&create_args(&t, "t5.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "git failure after the seed: {} {}", out(&o), err(&o));
+    assert_no_folder("seed-fail", &o, &t, &r);
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t5".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list t5: {}", err(&l));
+    let listed = out(&l);
+    let entries: Vec<&str> = listed.lines().collect();
+    assert_eq!(entries.len(), 2, "the seed must have written both entries:\n{}", listed);
+    let want_tree = format!("worktree\tworktree\t{}", t.both("W/t5/tree").1.display());
+    let want_tmp = format!("tmp\ttemp_dir\t{}", t.both("W/t5/tmp").1.display());
+    assert!(entries.contains(&want_tree.as_str()), "worktree entry:\n{}", listed);
+    assert!(entries.contains(&want_tmp.as_str()), "tmp entry:\n{}", listed);
+    // Every child of the ticket root is one of the listed paths: no unlisted thing may sit there.
+    let (root, _) = t.both("W/t5");
+    let targets: Vec<PathBuf> = entries.iter().map(|e| PathBuf::from(e.split('\t').nth(2).unwrap_or(""))).collect();
+    for child in fs::read_dir(&root).unwrap().flatten() {
+        let child = child.path().canonicalize().unwrap();
+        assert!(targets.contains(&child), "an unlisted child sits in the ticket root: {:?}", child.file_name());
+    }
+}
+
+// --------------------------- an out-of-range --ts-ms is refused before anything is written
+
+#[test]
+fn out_of_range_ts_ms_is_refused_before_anything_is_written() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "tts", "r");
+    let mut args = create_args(&t, "tts.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push("99999999999999999999999".into()); // 23 digits: over u64
+    let o = run(&args, None);
+    assert_eq!(code(&o), 2, "out-of-range ts-ms: {} {}", out(&o), err(&o));
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    assert!(!w.join("tts").exists(), "a usage error left a ticket folder behind");
+    assert!(empty(&w) && empty(&m), "a usage error wrote something");
+    assert_no_folder("ts-ms-range", &o, &t, &r);
+    // The ticket is not blocked: a re-run without the flag still succeeds.
+    let o2 = run(&create_args(&t, "tts.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o2), 0, "re-run after refused ts-ms: {} {}", out(&o2), err(&o2));
+}
+
+// ----------------- held-out refusal and acceptance variants (executor round 2, none from review)
+
+#[test]
+fn heldout_refusal_and_acceptance_variants() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    // must-fire 1: a base that resolves only via ANOTHER repo's linked worktree. The mapped repo is a
+    // linked worktree L of P and the base is a commit made INSIDE L (so it exists in P's object store
+    // and resolves from L): only the main-work-tree check can refuse it.
+    let p = repo(&t, "P", "parent");
+    let (lw, _) = t.both("linked2");
+    git(&p, &["worktree", "add", "--detach", lw.to_str().unwrap(), &head(&p)]);
+    fs::write(lw.join("g.txt"), "in linked").unwrap();
+    git(&lw, &["add", "g.txt"]);
+    git(&lw, &["commit", "-q", "-m", "in linked"]);
+    ticket(&t, "hl", "r");
+    let o = run(
+        &["workspace".into(), "create".into(), t.raw.join("hl.json").to_str().unwrap().into(), "--repo-map".into(), format!("r={}", lw.display()), "--base".into(), head(&lw), "--workspace-root".into(), t.raw.join("W").to_str().unwrap().into(), "--manifest-dir".into(), t.raw.join("M").to_str().unwrap().into()],
+        None,
+    );
+    assert_eq!(code(&o), 2, "base from a linked worktree: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "linked-base case wrote something");
+    assert_eq!(worktree_count(&p), 2, "P gained a worktree");
+    assert_no_folder("heldout-linked-base", &o, &t, &r);
+    // must-fire 2: a ts-ms with a plus sign (digits-only is refused, before anything is written).
+    ticket(&t, "hplus", "r");
+    let mut args = create_args(&t, "hplus.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push("+1".into());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 2, "signed ts-ms: {} {}", out(&o), err(&o));
+    assert!(!w.join("hplus").exists(), "a signed ts-ms left a ticket folder behind");
+    assert!(empty(&w) && empty(&m), "signed ts-ms wrote something");
+    assert_no_folder("heldout-signed-ts", &o, &t, &r);
+    // must-fire 3: an id that is a legal token but an illegal branch name (`a..b`): refused before
+    // anything is written, not half-made by a git failure after the seed.
+    ticket(&t, "a..b", "r");
+    let o = run(&create_args(&t, "a..b.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "illegal branch name: {} {}", out(&o), err(&o));
+    assert!(!w.join("a..b").exists(), "an illegal branch name left a ticket folder behind");
+    assert!(empty(&w) && empty(&m), "illegal branch name wrote something");
+    assert_eq!(worktree_count(&r), 1, "the refused id registered a worktree");
+    assert_no_folder("heldout-branch-name", &o, &t, &r);
+    // must-not-fire 1: ts-ms exactly u64::MAX is accepted.
+    ticket(&t, "hmax", "r");
+    let mut args = create_args(&t, "hmax.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push(u64::MAX.to_string());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "ts-ms u64::MAX: {} {}", out(&o), err(&o));
+    // must-not-fire 2: ts-ms zero is accepted.
+    ticket(&t, "hzero", "r");
+    let mut args = create_args(&t, "hzero.json", &r_raw, &s, "W", "M");
+    args.push("--ts-ms".into());
+    args.push("0".into());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "ts-ms zero: {} {}", out(&o), err(&o));
+    // must-not-fire 3: an ordinary id on a repo that already has other worktrees is accepted.
+    let q = repo(&t, "Q", "many");
+    let (qw, _) = t.both("qextra");
+    git(&q, &["worktree", "add", "--detach", qw.to_str().unwrap(), &head(&q)]);
+    ticket(&t, "hmany", "q");
+    let (q_raw, _) = t.both("Q");
+    let mut args = create_args(&t, "hmany.json", &q_raw, &head(&q), "W", "M");
+    let i = args.iter().position(|a| a == "--repo-map").unwrap();
+    args[i + 1] = format!("q={}", q_raw.display());
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "repo with existing worktrees: {} {}", out(&o), err(&o));
+    assert_eq!(worktree_count(&q), 3, "Q should hold its main tree, the detached one and the new workspace");
 }
 
 // ---------------------------------------------------------------- AC 7: the repo comes from the ticket
