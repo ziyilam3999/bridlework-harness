@@ -419,6 +419,9 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "ticket" {
         return ticket_cmd(&args[1..]);
     }
+    if !args.is_empty() && args[0] == "manifest" {
+        return manifest_cmd(&args[1..]);
+    }
     if !args.is_empty() && args[0] == "status" {
         return crate::status::status_cmd(&args[1..]);
     }
@@ -463,5 +466,258 @@ pub fn run(mut args: Vec<String>) -> i32 {
                 1
             }
         }
+    }
+}
+
+const MANIFEST_USAGE: &str = "usage: harness manifest init <ticket> --root <dir> [--root <dir> ...] [--dir <manifest-dir>] [--ts-ms <n>] | manifest add <ticket> --class <c> --id <id> (--path <p> | --pid <n> | --port <n>) [--dir <manifest-dir>] [--ts-ms <n>] | manifest remove <ticket> --id <id> [--dir <manifest-dir>] [--ts-ms <n>] | manifest list <ticket> [--dir <manifest-dir>] | manifest owns <ticket> (--path <p> | --pid <n> | --port <n>) [--dir <manifest-dir>] | manifest verify <ticket> [--dir <manifest-dir>]";
+/// Default manifest dir, relative to the working folder (the same pattern as the event log's default). Git-ignored (`.harness/`).
+const MANIFEST_DEFAULT_DIR: &str = ".harness/manifests";
+
+/// One parsed `harness manifest <sub> ...` command line: one positional (the ticket), repeatable `--root`, and the
+/// single-valued flags. Everything is kept as the raw string; each subcommand validates its own values, so a refusal
+/// names the exact flag. An unknown flag, a flag without a value, a single-valued flag given twice, or a second
+/// positional is a usage error.
+struct ManifestArgs {
+    ticket: Option<String>,
+    roots: Vec<String>,
+    o: std::collections::HashMap<String, String>,
+}
+
+fn take_manifest_args(rest: &[String]) -> Result<ManifestArgs, String> {
+    let single = ["dir", "ts-ms", "class", "id", "path", "pid", "port"];
+    let mut out = ManifestArgs { ticket: None, roots: Vec::new(), o: std::collections::HashMap::new() };
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if let Some(name) = arg.strip_prefix("--") {
+            if name == "root" {
+                let Some(v) = it.next() else { return Err("--root needs a value".to_string()) };
+                out.roots.push(v.clone());
+            } else if single.contains(&name) {
+                let Some(v) = it.next() else { return Err(format!("{arg} needs a value")) };
+                if out.o.insert(name.to_string(), v.clone()).is_some() {
+                    return Err(format!("{arg} given twice"));
+                }
+            } else {
+                return Err(format!("unknown option {arg}"));
+            }
+        } else if out.ticket.replace(arg.clone()).is_some() {
+            return Err("more than one ticket given".to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// An unsigned integer flag value: digits only (no sign, no spaces, no empty string), else a usage error naming it.
+fn manifest_num(o: &std::collections::HashMap<String, String>, k: &str) -> Result<Option<u64>, String> {
+    match o.get(k) {
+        None => Ok(None),
+        Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            s.parse::<u64>().map(Some).map_err(|_| format!("--{k} is out of range"))
+        }
+        Some(_) => Err(format!("--{k} must be a non-negative integer")),
+    }
+}
+
+/// The `--ts-ms` flag: a non-negative integer, else the wall clock (the same rule as `harness events`).
+fn manifest_ts_ms(o: &std::collections::HashMap<String, String>) -> Result<u64, String> {
+    match o.get("ts-ms") {
+        Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            s.parse::<u64>().map_err(|_| "--ts-ms out of range".to_string())
+        }
+        Some(_) => Err("--ts-ms must be a non-negative integer".to_string()),
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "clock is before the epoch".to_string())
+            .map(|d| d.as_millis() as u64),
+    }
+}
+
+/// `harness manifest init|add|remove|list|owns|verify` (see `docs/resource-manifest.md`). Exit 0 ok / owned; 1 a torn tail or
+/// corruption on a read, or `owns` answers not owned, or the manifest is missing for `owns` (it owns nothing); 2 a usage error
+/// or any refusal (a refused write leaves the file byte-identical and says on stderr what was refused).
+fn manifest_cmd(a: &[String]) -> i32 {
+    use crate::manifest::{self, Class, Op, Query};
+    use std::path::{Path, PathBuf};
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    let usage = || {
+        eprintln!("{}", MANIFEST_USAGE);
+        2
+    };
+    let Some((sub, rest)) = a.split_first() else { return usage() };
+    let parsed = match take_manifest_args(rest) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let ticket = match &parsed.ticket {
+        Some(t) => t.clone(),
+        None => return fail("a ticket is required"),
+    };
+    // The ticket names the file (`<dir>/<ticket>.jsonl`), so a non-token value is refused before anything is touched.
+    if !crate::events::token_ok(&ticket) {
+        return fail("ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')");
+    }
+    // A malformed numeric flag is a usage error on every subcommand, whatever the subcommand does with the value.
+    let (pid_v, port_v) = match (manifest_num(&parsed.o, "pid"), manifest_num(&parsed.o, "port")) {
+        (Ok(p), Ok(n)) => (p, n),
+        (_, Err(e)) | (Err(e), _) => return fail(&e),
+    };
+    // An empty --dir value is refused, never silently treated as the working folder.
+    if parsed.o.get("dir").map(|v| v.is_empty()).unwrap_or(false) {
+        return fail("the manifest dir is empty");
+    }
+    let dir = PathBuf::from(parsed.o.get("dir").map(|s| s.as_str()).unwrap_or(MANIFEST_DEFAULT_DIR));
+    let need = |k: &str| parsed.o.get(k).cloned().ok_or_else(|| format!("--{k} is required"));
+    let ts_ms = match manifest_ts_ms(&parsed.o) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
+    };
+    match sub.as_str() {
+        "init" => {
+            if parsed.roots.is_empty() {
+                return fail("init needs at least one --root");
+            }
+            let roots: Vec<PathBuf> = parsed.roots.iter().map(PathBuf::from).collect();
+            match manifest::apply(&dir, &ticket, &Op::Init { roots: &roots }, ts_ms) {
+                Ok(()) => 0,
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        "add" => {
+            let class = match need("class").ok().and_then(|c| Class::parse(&c)) {
+                Some(c) => c,
+                None => return fail("unknown --class (worktree, temp_dir, log, evidence, process, port)"),
+            };
+            let id = match need("id") {
+                Ok(v) => v,
+                Err(e) => return fail(&e),
+            };
+            // `--class` must match the target flag: exactly one of --path / --pid / --port, and the one the class takes.
+            let path;
+            let op = if class.is_path() {
+                if pid_v.is_some() || port_v.is_some() {
+                    return fail(&format!("class {} takes --path, not --pid or --port", class.as_str()));
+                }
+                path = match need("path") {
+                    Ok(v) => v,
+                    Err(e) => return fail(&e),
+                };
+                Op::AddPath { id: &id, class, path: Path::new(&path) }
+            } else if class == Class::Process {
+                if parsed.o.contains_key("path") || port_v.is_some() {
+                    return fail("class process takes --pid, not --path or --port");
+                }
+                let Some(pid) = pid_v else { return fail("--pid is required") };
+                // The start time is identity metadata read by the writer (the doc's tolerance note); a pid whose start
+                // time cannot be read is refused, so a dead pid can never be signed out.
+                let pid_start_ms = match manifest::process_start_ms(pid) {
+                    Ok(ms) => ms,
+                    Err(e) => return fail(&format!("cannot read the start time of pid {pid}: {e}")),
+                };
+                Op::AddProcess { id: &id, pid, pid_start_ms }
+            } else {
+                if parsed.o.contains_key("path") || pid_v.is_some() {
+                    return fail("class port takes --port, not --path or --pid");
+                }
+                let Some(port) = port_v else { return fail("--port is required") };
+                Op::AddPort { id: &id, port }
+            };
+            match manifest::apply(&dir, &ticket, &op, ts_ms) {
+                Ok(()) => 0,
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        "remove" => {
+            let id = match need("id") {
+                Ok(v) => v,
+                Err(e) => return fail(&e),
+            };
+            match manifest::apply(&dir, &ticket, &Op::Remove { id: &id }, ts_ms) {
+                Ok(()) => 0,
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        "list" | "verify" => {
+            if parsed.o.contains_key("path") || pid_v.is_some() || port_v.is_some() || parsed.o.contains_key("class") || parsed.o.contains_key("id") {
+                return fail(&format!("manifest {sub} takes only --dir"));
+            }
+            let r = match manifest::read_manifest(&dir, &ticket) {
+                Ok(r) => r,
+                // A file that is not there is not a manifest: `list` and `verify` call it an error, never an empty state.
+                Err(e) => return fail(&e),
+            };
+            if sub == "list" {
+                for e in &r.live {
+                    match &e.target {
+                        manifest::Target::Path(p) => println!("{}\t{}\t{}", e.id, e.class.as_str(), p),
+                        manifest::Target::Port(n) => println!("{}\t{}\t{}", e.id, e.class.as_str(), n),
+                        manifest::Target::Process { pid, pid_start_ms } => {
+                            println!("{}\t{}\t{}\t{}", e.id, e.class.as_str(), pid, pid_start_ms)
+                        }
+                    }
+                }
+            }
+            if let Some(c) = &r.corrupt {
+                eprintln!("harness: manifest is corrupt at line {}: {}", c.line, c.msg);
+                return 1;
+            }
+            if let Some(t) = &r.torn_tail {
+                eprintln!("harness: manifest has a torn tail at line {} ({} bytes, no newline); not read as a line", t.line, t.bytes);
+                return 1;
+            }
+            0
+        }
+        "owns" => {
+            if parsed.o.contains_key("class") || parsed.o.contains_key("id") {
+                return fail("manifest owns takes (--path <p> | --pid <n> | --port <n>) and --dir only");
+            }
+            let resolved_path;
+            let q = if parsed.o.contains_key("path") {
+                if pid_v.is_some() || port_v.is_some() {
+                    return fail("owns takes exactly one of --path, --pid, --port");
+                }
+                let p = PathBuf::from(parsed.o["path"].as_str());
+                if !p.is_absolute() {
+                    return fail("--path must be absolute");
+                }
+                // The query resolves exactly the way entries are stored, so the answer is about the path the caller means;
+                // a path that does not resolve (a dangling link) is NOT owned: the query fails closed.
+                match manifest::resolve_for_manifest(&p) {
+                    Ok(r) => {
+                        resolved_path = r;
+                        Query::Path(&resolved_path)
+                    }
+                    Err(_) => return 1,
+                }
+            } else if let Some(pid) = pid_v {
+                if port_v.is_some() {
+                    return fail("owns takes exactly one of --path, --pid, --port");
+                }
+                Query::Pid(pid)
+            } else if let Some(port) = port_v {
+                Query::Port(port)
+            } else {
+                return fail("owns takes exactly one of --path, --pid, --port");
+            };
+            // A manifest that cannot be read cleanly owns nothing: missing, torn or corrupt all answer not owned.
+            match manifest::read_manifest(&dir, &ticket) {
+                Ok(r) if r.is_clean() && manifest::owns(&r, q) => 0,
+                Ok(r) => {
+                    if let Some(c) = &r.corrupt {
+                        eprintln!("harness: manifest is corrupt at line {}: {}", c.line, c.msg);
+                    } else if let Some(t) = &r.torn_tail {
+                        eprintln!("harness: manifest has a torn tail at line {} ({} bytes, no newline); not read as a line", t.line, t.bytes);
+                    }
+                    1
+                }
+                Err(e) => {
+                    eprintln!("harness: {}", e);
+                    1
+                }
+            }
+        }
+        _ => usage(),
     }
 }
