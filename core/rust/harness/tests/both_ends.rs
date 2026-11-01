@@ -137,6 +137,10 @@ fn put(dir: &Path, rel: &str, body: &str, mode: u32) {
 fn repo(name: &str, check: &str) -> (PathBuf, String, String) {
     let repo = scratch(name);
     git(&repo, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&repo, &["config", k, v]);
+    }
     put(&repo, "value.txt", "bad", 0o644);
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "base"]);

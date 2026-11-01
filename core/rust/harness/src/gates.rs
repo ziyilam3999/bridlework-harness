@@ -689,6 +689,10 @@ mod tests {
         // red at base (value bad), green at head (value good, check committed): judged PASS naming the rev-parse head
         let a = Scratch::new("red");
         git(&a.0, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&a.0, &["config", k, v]);
+        }
         put(&a.0, "value.txt", b"bad");
         git(&a.0, &["add", "-A"]);
         git(&a.0, &["commit", "-q", "-m", "base"]);
@@ -711,6 +715,10 @@ mod tests {
         // green at base too: the judged path fails it with passes-at-base
         let b = Scratch::new("green");
         git(&b.0, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&b.0, &["config", k, v]);
+        }
         put(&b.0, "value.txt", b"good");
         put_exec(&b.0, "ci/check.sh", check);
         git(&b.0, &["add", "-A"]);

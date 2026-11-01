@@ -73,6 +73,10 @@ impl Fx {
             fs::create_dir_all(d).unwrap();
         }
         git(&repo, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&repo, &["config", k, v]);
+        }
         let mut c: Vec<String> = Vec::new();
         for n in 0..3 {
             write_file(&repo.join("f.txt"), &format!("version {n}"), false);
@@ -81,6 +85,10 @@ impl Fx {
             c.push(git(&repo, &["rev-parse", "HEAD"]));
         }
         git(&other, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&other, &["config", k, v]);
+        }
         write_file(&other.join("o.txt"), "other repo", false);
         git(&other, &["add", "-A"]);
         git(&other, &["commit", "-q", "-m", "other"]);
@@ -654,6 +662,10 @@ impl Gw {
             fs::create_dir_all(d).unwrap();
         }
         git(&repo, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&repo, &["config", k, v]);
+        }
         write_file(&repo.join("gates/t.json"), "{\"id\":\"t\",\"program\":\"ci/t.sh\",\"args\":[],\"timeout_ms\":20000,\"max_output_bytes\":4096,\"both_ends\":false}", false);
         write_file(&repo.join("gates/path-map.json"), "{\"src\":[\"t\"]}", false);
         write_file(&repo.join("ci/t.sh"), "#!/bin/sh\n[ \"$(cat src/value.txt)\" = ok ]\n", true);
@@ -666,6 +678,10 @@ impl Gw {
         git(&repo, &["commit", "-q", "-m", "c1"]);
         let c1 = git(&repo, &["rev-parse", "HEAD"]);
         git(&other, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&other, &["config", k, v]);
+        }
         write_file(&other.join("o.txt"), "other", false);
         git(&other, &["add", "-A"]);
         git(&other, &["commit", "-q", "-m", "other"]);
