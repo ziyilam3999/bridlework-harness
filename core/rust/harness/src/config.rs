@@ -11,7 +11,7 @@ use std::path::Path;
 const MAX_BYTES: u64 = 1024 * 1024;
 
 /// Every required `section.key`, in contract order. The loader accepts exactly these (plus repo ids under `repos`).
-pub const KEYS: [&str; 14] = [
+pub const KEYS: [&str; 15] = [
     "budgets.s_wall_seconds",
     "budgets.s_tokens",
     "budgets.m_wall_seconds",
@@ -26,9 +26,10 @@ pub const KEYS: [&str; 14] = [
     "shadow.p4a_token_budget",
     "shadow.d2a_token_budget",
     "shadow.p7_token_budget",
+    "lanes.count",
 ];
 
-const SECTIONS: [&str; 3] = ["repos", "budgets", "shadow"];
+const SECTIONS: [&str; 4] = ["repos", "budgets", "shadow", "lanes"];
 const YAML_WORDS: [&str; 11] = ["true", "false", "null", "yes", "no", "on", "off", "y", "n", ".inf", ".nan"];
 
 /// The wall-time and token limit of one ticket size.
@@ -56,7 +57,7 @@ pub struct Config {
     /// Validated, in file order: (repo id, folder).
     repos: Vec<(RepoId, String)>,
     /// Values in `KEYS` order.
-    nums: [u64; 14],
+    nums: [u64; 15],
 }
 
 /// A refusal that names the line, and the section and key when known. Never carries a value.
@@ -120,10 +121,10 @@ impl Config {
         if text.is_empty() {
             return Err("config: file is empty".to_string());
         }
-        let mut seen = [false; 3];
+        let mut seen = [false; 4];
         let mut section: Option<usize> = None;
         let mut repos: Vec<(RepoId, String)> = Vec::new();
-        let mut nums: [Option<u64>; 14] = [None; 14];
+        let mut nums: [Option<u64>; 15] = [None; 15];
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
             let here = match section {
@@ -204,7 +205,7 @@ impl Config {
         if let Some(i) = seen.iter().position(|s| !s) {
             return Err(format!("config: missing section `{}`", SECTIONS[i]));
         }
-        let mut out = [0u64; 14];
+        let mut out = [0u64; 15];
         for (i, slot) in nums.iter().enumerate() {
             out[i] = slot.ok_or_else(|| format!("config: missing key `{}`", KEYS[i]))?;
         }
@@ -248,6 +249,11 @@ impl Config {
         Some(Budget { wall_seconds: self.nums[i], tokens: self.nums[i + 1] })
     }
 
+    /// The configured lane count (`lanes.count`), the upper bound of a legal lane number.
+    pub fn lane_count(&self) -> u64 {
+        self.nums[14]
+    }
+
     pub fn shadow(&self) -> Shadow {
         let n = &self.nums;
         Shadow {
@@ -272,7 +278,7 @@ mod tests {
 
     fn text(repos: &str) -> String {
         format!(
-            "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 111\n  s_tokens: 222\n  m_wall_seconds: 333\n  m_tokens: 444\n  l_wall_seconds: 555\n  l_tokens: 666\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 7\n  p4a_token_budget: 8\n  d2a_token_budget: 9\n  p7_token_budget: 11\n"
+            "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 111\n  s_tokens: 222\n  m_wall_seconds: 333\n  m_tokens: 444\n  l_wall_seconds: 555\n  l_tokens: 666\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 7\n  p4a_token_budget: 8\n  d2a_token_budget: 9\n  p7_token_budget: 11\n\nlanes:\n  count: 4\n"
         )
     }
 
@@ -310,7 +316,7 @@ mod tests {
         for (i, k) in KEYS.iter().enumerate() {
             assert!(!KEYS[..i].contains(k), "{k} listed twice");
             let (sec, key) = k.split_once('.').unwrap();
-            assert!(sec == "budgets" || sec == "shadow", "{k}");
+            assert!(sec == "budgets" || sec == "shadow" || sec == "lanes", "{k}");
             let line = format!("  {key}: ");
             let mut dropped = valid();
             let start = dropped.find(&line).unwrap();
@@ -444,6 +450,28 @@ mod tests {
         for good in ["1", "9", "10", "123456789012345"] {
             Config::parse(&valid().replacen("  s_tokens: 222", &format!("  s_tokens: {good}"), 1)).unwrap();
         }
+    }
+
+    #[test]
+    fn lanes_count_is_a_required_positive_whole_number() {
+        // the section is required: dropping it names the section
+        let e = refused(&valid().replace("\nlanes:\n  count: 4\n", "\n"));
+        assert!(e.contains("missing section `lanes`"), "{e}");
+        // the key is required: an empty lanes section names the full key
+        let e = refused(&valid().replace("lanes:\n  count: 4", "lanes:"));
+        assert!(e.contains("missing key `lanes.count`"), "{e}");
+        // 0, a leading zero and a non-number are refused naming the section and the key
+        for bad in ["0", "04", "four"] {
+            let e = refused(&valid().replace("count: 4", &format!("count: {bad}")));
+            assert!(e.contains("`lanes`") && e.contains("`count`") && e.contains("positive whole number"), "{bad}: {e}");
+        }
+        // the twin loads and the count is read from the text, not compiled in
+        let c = Config::parse(&valid().replace("count: 4", "count: 9")).unwrap();
+        assert_eq!(c.lane_count(), 9);
+        assert_eq!(Config::parse(&valid()).unwrap().lane_count(), 4);
+        // lanes holds exactly one key
+        let e = refused(&valid().replace("  count: 4", "  count: 4\n  extra: 1"));
+        assert!(e.contains("unknown key"), "{e}");
     }
 
     #[test]

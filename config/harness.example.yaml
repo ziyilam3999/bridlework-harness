@@ -21,3 +21,6 @@ shadow:
   p4a_token_budget: 1
   d2a_token_budget: 1
   p7_token_budget: 1
+
+lanes:
+  count: 4
