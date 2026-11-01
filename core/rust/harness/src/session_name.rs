@@ -122,9 +122,12 @@ fn longest_word(name: &str) -> Option<&'static str> {
     best
 }
 
-/// `name` starts with `w` followed by `-` and has at least one byte after it.
+/// `name` starts with `w` followed by `-` and has at least one byte after it. The comparison is
+/// byte-wise on purpose: a `&str` slice at `w.len()` would panic when that byte offset lands
+/// inside a multi-byte character, and such a name must be refused (exit 1), never crash (101).
 fn starts_word(name: &str, w: &str) -> bool {
-    name.len() > w.len() + 1 && &name[..w.len()] == w && name.as_bytes()[w.len()] == b'-'
+    let (name, w) = (name.as_bytes(), w.as_bytes());
+    name.len() > w.len() + 1 && name.starts_with(w) && name[w.len()] == b'-'
 }
 
 /// Family 1: `<role>-L<n>-t<slug>-<S|M|L>-<model>-<effort>`. Each part is checked in order and the

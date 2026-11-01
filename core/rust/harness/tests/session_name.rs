@@ -357,3 +357,117 @@ fn own_probe_variants() {
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
     assert_eq!(out(&o).trim(), "ok kind=launcher role=gov lane=3 ticket=441");
 }
+
+// ---- F1 (round 1): a multi-byte character at a word-length boundary refuses, never panics ----
+
+#[test]
+fn multi_byte_names_are_refused_without_panicking() {
+    let t = Tmp::new();
+    let c4 = t.config(4);
+    for name in [
+        "exec-L\u{661}-t1-M-son-med",  // Arabic-Indic digit inside the lane digits
+        "exec-L\u{ff11}-t1-M-son-med", // full-width digit inside the lane digits
+        "exec-L1-t\u{f1}-M-son-med",   // multi-byte letter at the `learning`/`knowledge` length
+        "go\u{e9}-L1-t1-M-son-med",    // multi-byte letter at the `gov` word length
+        "pla\u{e9}-L1-t1-M-son-med",   // multi-byte letter at the `plan` word length
+        "\u{e9}xec-L1-t1-M-son-med",   // multi-byte first letter: no word can match
+        "exec-L1-t1-M-son-m\u{e9}",    // multi-byte last letter: no effort word matches
+    ] {
+        let o = run(&check_name(name, &c4, &[]));
+        assert_eq!(code(&o), 1, "{name}: exit (a panic would be 101); stderr: {}", err(&o));
+        assert!(out(&o).is_empty(), "{name}: refusal stdout must be empty");
+        let text = err(&o);
+        let lines: Vec<&str> = text.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 1, "{name}: exactly one stderr line, no panic text: {text}");
+        assert!(lines[0].contains(name), "{name}: the line names the name: {text}");
+    }
+}
+
+// ---- F2 (round 1): one process-level twin per refusal condition, each naming its part ----
+
+#[test]
+fn per_condition_twins_are_refused() {
+    let t = Tmp::new();
+    let c4 = t.config(4);
+    let twins = [
+        // lane digits only: `+1` still parses as 1, only the digit check refuses it
+        ("exec-L+1-t1-M-son-med", "lane"),
+        // size is exactly S, M or L, upper case included
+        ("exec-L1-t1-m-son-med", "size"),
+        // effort and model words are exact, case included
+        ("exec-L1-t1-M-son-MED", "effort"),
+        ("exec-L1-t1-M-SON-med", "model"),
+        // the long-form slug is lowercase letters, digits and `-` only
+        ("execution-l1-X", "task"),
+        // the sign-off phase must start with a digit
+        ("governance-pab-signoff", "task"),
+        // sign-off is a governance / risk-review shape only
+        ("execution-p1-signoff", "lane"),
+        ("planner-p1-signoff", "lane"),
+        // `ahead-` is a planner shape only
+        ("execution-ahead-x", "lane"),
+        // a word with nothing after its `-` is not a word match
+        ("exec-", "role"),
+        // a word run with no `-` terminator at all is not a word match either
+        ("executive-x", "role"),
+        // an empty task slug is not `t<slug>`
+        ("exec-L1-t-M-son-med", "task"),
+        // the long form needs a slug after the lane, and it may not be empty
+        ("planner-l2", "task"),
+        ("planner-l2-", "task"),
+        // the `ahead-` slug is a slug of lowercase letters, digits and `-` only
+        ("planner-ahead-X9", "task"),
+        // the sign-off phase may not be empty, and its charset is lowercase/digit/`-`
+        ("governance-p-signoff", "task"),
+        ("governance-p1A-signoff", "task"),
+        // without the `-signoff` suffix the name is not a sign-off shape
+        ("governance-p1a-x", "lane"),
+    ];
+    for (name, part) in twins {
+        let o = run(&check_name(name, &c4, &[]));
+        assert_eq!(code(&o), 1, "{name}: exit");
+        assert!(out(&o).is_empty(), "{name}: refusal stdout must be empty");
+        assert!(err(&o).contains(part), "{name}: refusal must name `{part}`: {}", err(&o));
+        assert!(err(&o).contains(name), "{name}: refusal must name the name: {}", err(&o));
+    }
+}
+
+// ---- F2 (round 1): one process-level acceptance per word, so a dropped word dies here alone ----
+
+#[test]
+fn every_word_has_a_process_level_acceptance() {
+    let t = Tmp::new();
+    let c4 = t.config(4);
+    // one launcher name per launcher role word, one model word and one effort word per run
+    for name in [
+        "plan-L2-t31-S-son-low",
+        "exec-L1-t32-M-opu-med",
+        "p-rvw-L3-t33-S-glm-hig",
+        "e-rvw-L4-t34-M-fab-med",
+        "rsch-L2-tab-S-fab-xhi",
+        "ship-L1-t9-S-loc-low",
+        "learn-L1-t35-S-hai-max",
+        "know-L3-tz-M-glm-med",
+        "gov-L3-t36-S-opu-low",
+        "push-L2-t117-S-son-low",
+    ] {
+        let o = run(&check_name(name, &c4, &[]));
+        assert_eq!(code(&o), 0, "{name}: stderr: {}", err(&o));
+        assert!(out(&o).starts_with("ok kind=launcher"), "{name}: {}", out(&o));
+    }
+    // one long-form name per long role word, plus each non-lane long shape once
+    for name in [
+        "planner-l2-pre4",
+        "execution-l1-p1a13",
+        "risk-review-l3-q1",
+        "learning-l1-x1",
+        "knowledge-l2-x2",
+        "governance-l4-pusher3",
+        "planner-ahead-pre5",
+        "governance-p1a-signoff",
+    ] {
+        let o = run(&check_name(name, &c4, &[]));
+        assert_eq!(code(&o), 0, "{name}: stderr: {}", err(&o));
+        assert!(out(&o).starts_with("ok kind=long"), "{name}: {}", out(&o));
+    }
+}
