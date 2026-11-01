@@ -1,8 +1,8 @@
-# Config contract (v1)
+# Config contract (v2)
 
 The harness reads one settings file. This page is the contract in plain words. `config/harness.example.yaml` is the public example of it, with placeholders only.
 
-Status: contract only. No reader exists yet; the strict reader, the `harness config check` command and their tests come in later tickets (PRE-5b, PRE-5c), and each rule below gains the name of the test that enforces it when that reader lands.
+Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 adds the required `lanes.count` key; a config written against v1 is refused until it gains the key (intended, fail closed): the lane count is policy the harness refuses to guess.
 
 ## 1. One file, one reader, read-only
 
@@ -17,7 +17,7 @@ The config is one text file. The program only reads it. There is no write, set o
 
 ## 3. Shape
 
-Three sections, in this order of meaning: `repos`, `budgets`, `shadow`. Two levels only: a section line (`name:` with nothing after it), then indented `key: value` lines (two spaces). Whole-line `#` comments and blank lines are allowed. Spaces only.
+Four sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`. Two levels only: a section line (`name:` with nothing after it), then indented `key: value` lines (two spaces). Whole-line `#` comments and blank lines are allowed. Spaces only.
 
 ### Keys
 
@@ -38,12 +38,14 @@ shadow.p1a_token_budget
 shadow.p4a_token_budget
 shadow.d2a_token_budget
 shadow.p7_token_budget
+lanes.count
 ```
 
 `repos` has no fixed keys: each key is a repo id (section 5). It may be empty.
 
 - `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys.
 - `shadow`: per capability, a ticket or dispatch cap (`p1a_cap`, `p4a_cap`, `d2a_cap`, `p7_cap`) and a token budget (`..._token_budget`).
+- `lanes`: `count`, the number of lanes. The session-name check reads it as the upper bound of a legal lane number (P1B-16); the value is policy, not private: the example ships 4.
 
 ### The plain-value grammar (closed)
 
@@ -77,11 +79,11 @@ Anything outside this contract is a refusal. The refusal names the section and k
 
 ## 6. Numbers
 
-Every budget and shadow value is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
+Every budget, shadow and lanes value is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
 
 ## 7. Public file content
 
-The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. The real values live only in the private file.
+The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. The real values live only in the private file.
 
 ## 8. Who reads it
 

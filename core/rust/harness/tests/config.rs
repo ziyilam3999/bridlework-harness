@@ -84,7 +84,7 @@ fn leaks(o: &Output, needle: &str) -> bool {
 /// A full valid config. `repos` is the body of the `repos` section; `s_tokens` is the value planted on one budget key.
 fn make(repos: &str, s_tokens: &str) -> String {
     format!(
-        "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: {s_tokens}\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n"
+        "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: {s_tokens}\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n"
     )
 }
 
@@ -95,7 +95,7 @@ fn valid() -> String {
 /// A config with distinct planted budget pairs per size.
 fn budgets(s: (u64, u64), m: (u64, u64), l: (u64, u64)) -> String {
     format!(
-        "repos:\n\nbudgets:\n  s_wall_seconds: {}\n  s_tokens: {}\n  m_wall_seconds: {}\n  m_tokens: {}\n  l_wall_seconds: {}\n  l_tokens: {}\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n",
+        "repos:\n\nbudgets:\n  s_wall_seconds: {}\n  s_tokens: {}\n  m_wall_seconds: {}\n  m_tokens: {}\n  l_wall_seconds: {}\n  l_tokens: {}\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n",
         s.0, s.1, m.0, m.1, l.0, l.1
     )
 }
@@ -291,6 +291,34 @@ fn a_missing_key_or_section_is_refused_by_name() {
     assert!(err(&o).contains("shadow"), "{}", err(&o));
 }
 
+// ---- AC 2 (part A): the required `lanes` section and its `count` key ----
+
+#[test]
+fn the_lanes_section_is_required_and_count_is_a_positive_whole_number() {
+    let t = Tmp::new();
+    // no lanes section at all: refused naming the section
+    let no_lanes: String = valid().lines().filter(|l| !l.starts_with("lanes") && *l != "  count: 4").map(|l| format!("{l}\n")).collect();
+    let o = check(&t.file("no_lanes.yaml", no_lanes), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("lanes"), "{}", err(&o));
+    // count 0, a leading zero and a non-number: refused naming the section and the key
+    for (label, bad) in [("zero", "0"), ("leading zero", "04"), ("word", "four")] {
+        let o = check(&t.file("bad.yaml", valid().replace("count: 4", &format!("count: {bad}"))), &[]);
+        refused_clean(&o);
+        assert!(err(&o).contains("lanes") && err(&o).contains("count"), "{label}: {}", err(&o));
+    }
+    // the twin loads: another legal count, read from the file
+    let o = check(&t.file("nine.yaml", valid().replace("count: 4", "count: 9")), &[]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let cfg = Config::parse(&valid().replace("count: 4", "count: 9")).unwrap();
+    assert_eq!(cfg.lane_count(), 9);
+    assert_eq!(Config::parse(&valid()).unwrap().lane_count(), 4);
+    // an extra key under lanes is refused
+    let o = check(&t.file("extra.yaml", valid().replace("  count: 4", "  count: 4\n  extra: 1")), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("unknown key"), "{}", err(&o));
+}
+
 #[test]
 fn two_different_absolute_folders_load_as_the_twin_of_the_map_rules() {
     let t = Tmp::new();
@@ -419,6 +447,7 @@ fn pin(text: &str) -> Result<(), String> {
                     return Err(format!("shadow {k} is not {want}"));
                 }
             }
+            "lanes" if v != "4" => return Err(format!("lanes {k} is not 4")),
             _ => {}
         }
         keys.push(format!("{section}.{k}"));
@@ -443,6 +472,7 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
         ("budget 2", text.replace("  s_tokens: 1", "  s_tokens: 2")),
         ("shadow token budget 2", text.replace("  p4a_token_budget: 1", "  p4a_token_budget: 2")),
         ("p1a cap 6", text.replace("  p1a_cap: 5", "  p1a_cap: 6")),
+        ("lanes count 9", text.replace("  count: 4", "  count: 9")),
     ];
     for (label, t) in &twins {
         assert_ne!(t, &text, "{label}: the twin must differ from the example");
