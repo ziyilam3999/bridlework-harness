@@ -189,7 +189,8 @@ fn insert(map: &mut std::collections::BTreeMap<Vec<u8>, Kind>, path: Vec<u8>, ki
 /// Parse `git status --porcelain=v2 -z` output into the stray map. Header lines (leading `#`) are skipped;
 /// every entry type maps to a kind: `1`/`2`/`u` are tracked changes (`modified`, or `submodule` when the sub
 /// field starts `S`), `?` is `untracked`, `!` is `ignored`. Paths are raw bytes (with `-z` git does not quote
-/// them); a rename entry (`2`) carries its origPath in the NEXT NUL-separated token, which is skipped. A
+/// them); a rename entry (`2`) carries its origPath in the NEXT NUL-separated token, which is recorded too
+/// (the removed original is a stray path of its own). A
 /// trailing `/` on an ignored directory entry is dropped so a directory and its spelling as a path compare equal.
 fn parse_status(bytes: &[u8], map: &mut std::collections::BTreeMap<Vec<u8>, Kind>) {
     let tokens: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
@@ -218,11 +219,18 @@ fn parse_status(bytes: &[u8], map: &mut std::collections::BTreeMap<Vec<u8>, Kind
             continue;
         }
         // `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>` then, in -z, the origPath as its own token.
+        // A rename carries TWO paths — the new one and the removed original — and both are recorded, or a
+        // FAIL would name only half of what moved. The origPath token is still consumed either way, so
+        // parsing stays aligned.
         if t.starts_with(b"2 ") {
             if let Some((sub, path)) = field(t, 9, 2) {
-                insert(map, path.to_vec(), sub_kind(sub));
+                let kind = sub_kind(sub);
+                insert(map, path.to_vec(), kind);
+                if i < tokens.len() && !tokens[i].is_empty() {
+                    insert(map, tokens[i].to_vec(), kind);
+                }
             }
-            i += 1; // skip origPath
+            i += 1; // consume the origPath token
             continue;
         }
         // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>` — the 11th field.
@@ -256,15 +264,17 @@ fn sub_kind(sub: &[u8]) -> Kind {
     }
 }
 
-/// Parse `git ls-files -v -z` output: each entry is `<tag> <path>`. A LOWERCASE `h` tag (assume-unchanged) or
-/// an `S` tag (skip-worktree) marks a tracked path hidden from status — stray on its own, fail closed, whether
-/// or not the path was also edited.
+/// Parse `git ls-files -v -z` output: each entry is `<tag> <path>`. The tag is a case-folded set of bits, not
+/// an enumerated kind: `S` is skip-worktree, a LOWERCASE tag is assume-unchanged, and one path carrying BOTH
+/// bits prints `s` — so matching `h` and `S` alone would hide exactly the doubly-hidden file. Anything that is
+/// not a plain `H` (lowercase tags, both-bits tags, unknown and future tags) marks a tracked path hidden from
+/// status: stray on its own, fail closed, whether or not the path was also edited.
 fn parse_hidden(bytes: &[u8], map: &mut std::collections::BTreeMap<Vec<u8>, Kind>) {
     for t in bytes.split(|&b| b == 0) {
         if t.len() < 3 || t[1] != b' ' {
             continue;
         }
-        if matches!(t[0], b'h' | b'S') {
+        if t[0] != b'H' {
             insert(map, t[2..].to_vec(), Kind::Hidden);
         }
     }
@@ -428,6 +438,9 @@ pub fn check_cmd(a: &[String]) -> i32 {
         let rel = rel.as_os_str().as_bytes().to_vec();
         match std::fs::symlink_metadata(p.as_str()) {
             Ok(m) if m.file_type().is_symlink() => {
+                // N1: this erases EVERY kind at this one path; safe today because the link path is never
+                // tracked (nothing stronger than `untracked`/`ignored` can sit here) — a future listed
+                // TRACKED path must instead keep the stronger kind.
                 map.remove(&rel);
             }
             _ => insert(&mut map, rel, Kind::Missing),

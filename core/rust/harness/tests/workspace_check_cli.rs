@@ -525,16 +525,19 @@ fn case11_cannot_check_exit_3() {
     assert_eq!(code(&o), 3, "worktree removed: {}\n{}", out(&o), err(&o));
     assert!(out(&o).is_empty());
 
-    // (e) worktree path replaced by a symlink
+    // (e) worktree path replaced by a symlink POINTING AT A REAL CLEAN WORKTREE: the exit 3 must come
+    //     from the symlink rule itself (the tree behind the link is clean and checkable), never from a
+    //     failing git call or the not-a-directory arm, so the stderr names the symlink rule.
     let t = Tmp::new();
     let (_, tree, _) = mk_ws(&t, false);
+    create_id(&t, "t9", "W9", "M9");
+    let (real_tree, _) = t.both("W9/t9/tree");
     fs::remove_dir_all(&tree).unwrap();
-    let (outside, _) = t.both("outside");
-    fs::create_dir_all(&outside).unwrap();
-    std::os::unix::fs::symlink(&outside, &tree).unwrap();
+    std::os::unix::fs::symlink(&real_tree, &tree).unwrap();
     let o = check(&t);
     assert_eq!(code(&o), 3, "worktree is a symlink: {}\n{}", out(&o), err(&o));
     assert!(out(&o).is_empty());
+    assert!(err(&o).contains("is a symlink"), "the symlink rule itself must speak: {}", err(&o));
 
     // (f) detached HEAD
     let t = Tmp::new();
@@ -718,4 +721,384 @@ fn case16_usage_and_name_refusals_are_exit_3() {
     // The good spelling still works after all those refusals (nothing was consumed or written).
     let o = check(&t);
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+}
+
+// ---------------------------------------------------------------- case 17 (fix F1): both hidden bits, tag `s`
+
+#[test]
+fn case17_both_hidden_bits_tag_s_is_hidden_stray() {
+    // `git ls-files -v` prints one case-folded tag per path: `S` is skip-worktree, a LOWERCASE tag is
+    // assume-unchanged, and one file carrying BOTH bits prints `s`. Anything that is not a plain `H`
+    // must be stray (fail closed: lowercase tags, both-bits tags, unknown and future tags), whatever
+    // the state of the file itself.
+    // (a) both bits, then edited
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        git(&tree, &["update-index", "--skip-worktree", "f.txt"]);
+        git(&tree, &["update-index", "--assume-unchanged", "f.txt"]);
+        fs::write(tree.join("f.txt"), "edited under both bits").unwrap();
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+        assert!(stray_lines(&o).iter().any(|l| l == "stray hidden f.txt"), "lines: {:?}", out(&o));
+        assert!(!out(&o).contains("stray modified f.txt"), "the hidden read names the bit: {}", out(&o));
+    }
+    // (b) both bits, then deleted
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        git(&tree, &["update-index", "--skip-worktree", "f.txt"]);
+        git(&tree, &["update-index", "--assume-unchanged", "f.txt"]);
+        fs::remove_file(tree.join("f.txt")).unwrap();
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+        assert!(stray_lines(&o).iter().any(|l| l == "stray hidden f.txt"), "lines: {:?}", out(&o));
+    }
+    // (c) both bits, file untouched: the bit alone is stray
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        git(&tree, &["update-index", "--skip-worktree", "f.txt"]);
+        git(&tree, &["update-index", "--assume-unchanged", "f.txt"]);
+        let _ = tree;
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+        let binding = out(&o);
+        let lines: Vec<&str> = binding.lines().collect();
+        assert_eq!(lines.len(), 2, "lines: {:?}", lines);
+        assert_eq!(lines[0], "stray hidden f.txt");
+        assert_eq!(lines[1], "workspace=stray ticket=t1 count=1");
+    }
+}
+
+// ---------------------------------------------------------------- case 18 (fix F2): staged rename names both paths
+
+#[test]
+fn case18_staged_rename_names_both_paths() {
+    // A staged rename (`git mv`) carries TWO paths: the new one and the removed original. Both must be
+    // named, or a FAIL would hide half of what moved.
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        git(&tree, &["mv", "f.txt", "renamed.txt"]);
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+        let lines = stray_lines(&o);
+        assert_eq!(lines.join("\n"), "stray modified f.txt\nstray modified renamed.txt", "lines: {:?}", lines);
+        assert!(out(&o).ends_with("workspace=stray ticket=t1 count=2\n"), "summary: {}", out(&o));
+    }
+    // A worktree-only rename (a plain mv, nothing staged) keeps its shape: the old path is a tracked
+    // deletion and the new path is untracked.
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        fs::rename(tree.join("f.txt"), tree.join("moved.txt")).unwrap();
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+        let lines = stray_lines(&o);
+        assert_eq!(lines.join("\n"), "stray modified f.txt\nstray untracked moved.txt", "lines: {:?}", lines);
+    }
+}
+
+// ---------------------------------------------------------------- case 19 (F3a): submodule DIRTY CONTENT
+
+#[test]
+fn case19_submodule_dirty_content_is_stray() {
+    // Advancing a submodule HEAD is only one way a submodule changes; a dirty file INSIDE a committed
+    // submodule must be named too (`--ignore-submodules=dirty` would hide it).
+    let t = Tmp::new();
+    let (s_raw, _) = t.both("S");
+    fs::create_dir_all(&s_raw).unwrap();
+    git(&s_raw, &["init", "-q"]);
+    fs::write(s_raw.join("s.txt"), "s").unwrap();
+    git(&s_raw, &["add", "s.txt"]);
+    git(&s_raw, &["commit", "-q", "-m", "s1"]);
+    let (r, _, _) = mk_ws(&t, false);
+    git(&r, &["-c", "protocol.file.allow=always", "submodule", "add", "--name", "sub", s_raw.to_str().unwrap(), "sub"]);
+    git(&r, &["add", ".gitmodules"]);
+    git(&r, &["commit", "-q", "-m", "add sub"]);
+    let s = head(&r);
+    ticket(&t, "t3", "r");
+    fs::create_dir_all(t.raw.join("W3")).unwrap();
+    fs::create_dir_all(t.raw.join("M3")).unwrap();
+    let (tf, _) = t.both("t3.json");
+    let args: Vec<String> = [
+        "workspace",
+        "create",
+        tf.to_str().unwrap(),
+        "--repo-map",
+        &format!("r={}", t.raw.join("R").display()),
+        "--base",
+        &s,
+        "--workspace-root",
+        t.raw.join("W3").to_str().unwrap(),
+        "--manifest-dir",
+        t.raw.join("M3").to_str().unwrap(),
+    ]
+    .iter()
+    .map(|x| x.to_string())
+    .collect();
+    let o = run(&args, None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    let (tree3, _) = t.both("W3/t3/tree");
+    git(&tree3, &["-c", "protocol.file.allow=always", "submodule", "update", "--init"]);
+    fs::write(tree3.join("sub/s.txt"), "dirty content, not a new commit").unwrap();
+    let o = check_id(&t, "t3", "M3");
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    let binding = out(&o);
+    let lines: Vec<&str> = binding.lines().collect();
+    assert_eq!(lines.len(), 2, "lines: {:?}", lines);
+    assert_eq!(lines[0], "stray submodule sub");
+    assert_eq!(lines[1], "workspace=stray ticket=t3 count=1");
+}
+
+// ---------------------------------------------------------------- case 20 (F3b): non-top-level folder
+
+#[test]
+fn case20_nontoplevel_folder_of_another_repo_is_exit_3() {
+    // A folder that belongs to another repo but is not that repo's top level must be refused, even
+    // when everything else about it looks right (the repo even sits on a branch named ws/t1): judging
+    // it would mean judging the WRONG work tree. The foreign repo sits inside the ticket root so the
+    // manifest fence still holds; only the worktree entry's path text is rewritten to it.
+    let t = Tmp::new();
+    let (_, _, m) = mk_ws(&t, false);
+    let (x, _) = t.both("W/t1/xrepo");
+    fs::create_dir_all(x.join("inner")).unwrap();
+    git(&x, &["init", "-q", "-b", "ws/t1"]);
+    fs::write(x.join("inner/keep.txt"), "x").unwrap();
+    git(&x, &["add", "inner/keep.txt"]);
+    git(&x, &["commit", "-q", "-m", "x"]);
+    let inner = x.join("inner").canonicalize().unwrap();
+    let text = fs::read_to_string(&m).unwrap();
+    let (tree_raw, tree_canon) = t.both("W/t1/tree");
+    let updated = text
+        .replace(&*tree_canon.to_string_lossy(), &*inner.to_string_lossy())
+        .replace(&*tree_raw.to_string_lossy(), &*inner.to_string_lossy());
+    assert!(updated != text, "fixture: the worktree entry path was not found in the manifest");
+    fs::write(&m, updated).unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("top level"), "the top-level rule itself must speak: {}", err(&o));
+}
+
+// ---------------------------------------------------------------- case 21 (F3c): strongest kind wins
+
+#[test]
+fn case21_strongest_kind_wins_at_one_path() {
+    // One path carrying two kinds reports once, with the STRONGER kind (doc order). Here the
+    // node_modules link is replaced by a real directory that a COMMITTED ignore rule covers: status
+    // calls the path `ignored`, the manifest calls it `missing`, and `missing` (the stronger) wins.
+    let t = Tmp::new();
+    let (r, _, _) = mk_ws(&t, true);
+    fs::write(r.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&r, &["add", ".gitignore"]);
+    git(&r, &["commit", "-q", "-m", "ignore node_modules"]);
+    create_id(&t, "t6", "W6", "M6");
+    let (tree6, _) = t.both("W6/t6/tree");
+    fs::remove_file(tree6.join("node_modules")).unwrap();
+    fs::create_dir_all(tree6.join("node_modules")).unwrap();
+    fs::write(tree6.join("node_modules/pkg2.js"), "now real").unwrap();
+    let o = check_id(&t, "t6", "M6");
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray missing node_modules"), "lines: {:?}", out(&o));
+    assert!(!out(&o).contains("stray ignored node_modules"), "the weaker kind must not win: {}", out(&o));
+    assert!(!out(&o).contains("node_modules/"), "one spelling of the path only: {}", out(&o));
+}
+
+// ---------------------------------------------------------------- case 22 (F3e): ignored dir trailing slash
+
+#[test]
+fn case22_ignored_dir_trailing_slash_is_dropped() {
+    // Porcelain spells an ignored DIRECTORY with a trailing `/`; the stray line must name the path,
+    // and the trailing slash must be dropped so a directory and its spelling as a path compare equal.
+    let t = Tmp::new();
+    let (r, _, _) = mk_ws(&t, false);
+    fs::write(r.join(".gitignore"), "build/\n").unwrap();
+    git(&r, &["add", ".gitignore"]);
+    git(&r, &["commit", "-q", "-m", "ignore build"]);
+    create_id(&t, "t7", "W7", "M7");
+    let (tree7, _) = t.both("W7/t7/tree");
+    fs::create_dir_all(tree7.join("build")).unwrap();
+    fs::write(tree7.join("build/x.txt"), "x").unwrap();
+    let o = check_id(&t, "t7", "M7");
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    let binding = out(&o);
+    let lines: Vec<&str> = binding.lines().collect();
+    assert_eq!(lines.len(), 2, "lines: {:?}", lines);
+    assert_eq!(lines[0], "stray ignored build");
+    assert_eq!(lines[1], "workspace=stray ticket=t7 count=1");
+}
+
+// ---------------------------------------------------------------- case 23 (F3f): space prints as \x20
+
+#[test]
+fn case23_space_in_path_prints_as_x20() {
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    fs::write(tree.join("a b.txt"), "stray").unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    let binding = out(&o);
+    let lines: Vec<&str> = binding.lines().collect();
+    assert_eq!(lines.len(), 2, "lines: {:?}", lines);
+    assert_eq!(lines[0], "stray untracked a\\x20b.txt");
+    assert_eq!(lines[1], "workspace=stray ticket=t1 count=1");
+}
+
+// ---------------------------------------------------------------- case 24 (F3d): inherited GIT_* names
+
+#[test]
+fn case24_inherited_git_env_cannot_redirect() {
+    // GIT_DIR / GIT_WORK_TREE inherited from the caller point at the PRIMARY repo (which is clean):
+    // the check must strip every inherited GIT_* name, or its git calls would judge the wrong tree
+    // and report the planted file's workspace clean.
+    let t = Tmp::new();
+    let (r, tree, _) = mk_ws(&t, false);
+    fs::write(tree.join("planted.txt"), "stray").unwrap();
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let args: Vec<String> = [
+        "workspace".to_string(),
+        "check".to_string(),
+        "t1".to_string(),
+        "--manifest-dir".to_string(),
+        t.raw.join("M").to_str().unwrap().to_string(),
+    ]
+    .to_vec();
+    let mut c = Command::new(BIN);
+    c.args(&args)
+        .env("GIT_DIR", r.join(".git"))
+        .env("GIT_WORK_TREE", &r)
+        .current_dir(&unrelated)
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray untracked planted.txt"), "lines: {:?}", out(&o));
+}
+
+// ------------------------------------------------- fix round 1 held-out variants (own inventions, not review rows)
+
+#[test]
+fn ho1_tag_s_and_type_change_to_symlink_is_hidden() {
+    // must-fire: both hidden bits AND the tracked file replaced by a symlink (a type change git
+    // status would report if the bits were not hiding it).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    git(&tree, &["update-index", "--skip-worktree", "f.txt"]);
+    git(&tree, &["update-index", "--assume-unchanged", "f.txt"]);
+    fs::remove_file(tree.join("f.txt")).unwrap();
+    let (outside, _) = t.both("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("x.txt"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, tree.join("f.txt")).unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    let binding = out(&o);
+    let lines: Vec<&str> = binding.lines().collect();
+    assert_eq!(lines.len(), 2, "lines: {:?}", lines);
+    assert_eq!(lines[0], "stray hidden f.txt");
+    assert_eq!(lines[1], "workspace=stray ticket=t1 count=1");
+}
+
+#[test]
+fn ho2_assume_unchanged_in_subfolder_named_with_folder() {
+    // must-fire: the hidden bit on a tracked file inside a subfolder, then edited — the line must
+    // carry the full relative path.
+    let t = Tmp::new();
+    let (r, _, _) = mk_ws(&t, false);
+    fs::create_dir_all(r.join("sub")).unwrap();
+    fs::write(r.join("sub/f.txt"), "sub").unwrap();
+    git(&r, &["add", "sub/f.txt"]);
+    git(&r, &["commit", "-q", "-m", "sub"]);
+    create_id(&t, "t8", "W8", "M8");
+    let (tree8, _) = t.both("W8/t8/tree");
+    git(&tree8, &["update-index", "--assume-unchanged", "sub/f.txt"]);
+    fs::write(tree8.join("sub/f.txt"), "edited").unwrap();
+    let o = check_id(&t, "t8", "M8");
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray hidden sub/f.txt"), "lines: {:?}", out(&o));
+}
+
+#[test]
+fn ho3_staged_rename_into_subfolder_names_both_paths_sorted() {
+    // must-fire: a staged rename that also moves the file into a new subfolder — both paths named,
+    // sorted by raw path bytes.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    git(&tree, &["mv", "f.txt", "sub/f.txt"]);
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    let lines = stray_lines(&o);
+    assert_eq!(lines.join("\n"), "stray modified f.txt\nstray modified sub/f.txt", "lines: {:?}", lines);
+    assert!(out(&o).ends_with("workspace=stray ticket=t1 count=2\n"), "summary: {}", out(&o));
+}
+
+#[test]
+fn ho4_staged_rename_with_space_escapes_old_name() {
+    // must-fire: a staged rename whose OLD name holds a space — the removed original must be named
+    // too, with the space escaped so it stays one line.
+    let t = Tmp::new();
+    let (r, _, _) = mk_ws(&t, false);
+    fs::write(r.join("old name.txt"), "o").unwrap();
+    git(&r, &["add", "old name.txt"]);
+    git(&r, &["commit", "-q", "-m", "space"]);
+    create_id(&t, "t9", "W9", "M9");
+    let (tree9, _) = t.both("W9/t9/tree");
+    git(&tree9, &["mv", "old name.txt", "new.txt"]);
+    let o = check_id(&t, "t9", "M9");
+    assert_eq!(code(&o), 2, "stdout: {}", out(&o));
+    let lines = stray_lines(&o);
+    assert_eq!(lines.join("\n"), "stray modified new.txt\nstray modified old\\x20name.txt", "lines: {:?}", lines);
+}
+
+#[test]
+fn ho5_clean_space_named_tracked_file_stays_clean() {
+    // must-not-fire: a plain `H` tag next to a committed file whose NAME holds a space — nothing to
+    // report, and the clean line is the only output.
+    let t = Tmp::new();
+    let (r, _, _) = mk_ws(&t, false);
+    fs::write(r.join("a b.txt"), "ab").unwrap();
+    git(&r, &["add", "a b.txt"]);
+    git(&r, &["commit", "-q", "-m", "space name"]);
+    create_id(&t, "t10", "W10", "M10");
+    let o = check_id(&t, "t10", "M10");
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), "workspace=clean ticket=t10\n");
+}
+
+#[test]
+fn ho6_committed_rename_on_ticket_branch_stays_clean() {
+    // must-not-fire: a rename that is already committed on the ticket's own branch is expected work.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    git(&tree, &["mv", "f.txt", "renamed.txt"]);
+    git(&tree, &["commit", "-q", "-m", "rename the file"]);
+    let o = check(&t);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), "workspace=clean ticket=t1\n");
+}
+
+#[test]
+fn ho7_node_modules_link_and_clean_submodule_stay_clean() {
+    // must-not-fire: the expected node_modules link present AND an unrelated, cleanly checked-out
+    // submodule — both are expected, the check stays clean.
+    let t = Tmp::new();
+    let (s_raw, _) = t.both("S");
+    fs::create_dir_all(&s_raw).unwrap();
+    git(&s_raw, &["init", "-q"]);
+    fs::write(s_raw.join("s.txt"), "s").unwrap();
+    git(&s_raw, &["add", "s.txt"]);
+    git(&s_raw, &["commit", "-q", "-m", "s1"]);
+    let (r, _, _) = mk_ws(&t, true);
+    git(&r, &["-c", "protocol.file.allow=always", "submodule", "add", "--name", "sub", s_raw.to_str().unwrap(), "sub"]);
+    git(&r, &["add", ".gitmodules"]);
+    git(&r, &["commit", "-q", "-m", "add sub"]);
+    create_id(&t, "t11", "W11", "M11");
+    let (tree11, _) = t.both("W11/t11/tree");
+    git(&tree11, &["-c", "protocol.file.allow=always", "submodule", "update", "--init"]);
+    let o = check_id(&t, "t11", "M11");
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), "workspace=clean ticket=t11\n");
 }

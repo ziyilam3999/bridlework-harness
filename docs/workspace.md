@@ -94,12 +94,15 @@ follow the link out of the worktree).
 
 **Stray** is everything else, one line per path:
 
-- `modified` — a modified, deleted, renamed, type-changed or staged tracked path;
+- `modified` — a modified, deleted, renamed, type-changed or staged tracked path (a rename names BOTH its
+  old and new paths);
 - `untracked` — an untracked path (every file named individually via `--untracked-files=all`, not just the folder);
 - `ignored` — an ignored path: ignore rules do not hide files here, so a `.gitignore` or `info/exclude` edit cannot
   sneak a file past the check (a wholly ignored folder is named by the folder itself);
-- `hidden` — a tracked path carrying the assume-unchanged or skip-worktree bit (invisible to `git status`, so it
-  gets its own `git ls-files -v` read; the bit alone is stray, fail closed);
+- `hidden` — a tracked path whose `git ls-files -v` tag is anything but a plain `H`: the assume-unchanged bit,
+  the skip-worktree bit, both at once (git folds them into one lowercase `s` tag), or any unknown or future
+  tag — fail closed (invisible to `git status`, so it gets its own `git ls-files -v` read; the bit alone is
+  stray, whether or not the file was also edited);
 - `submodule` — a submodule with any change (named by the submodule path, no recursion);
 - `missing` — a live manifest path entry inside the worktree that no longer exists or is no longer the recorded
   kind (for example the `node_modules` link removed, or replaced by a real directory).
