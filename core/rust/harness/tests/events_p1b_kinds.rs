@@ -4,7 +4,7 @@
 //! the one shared declaration) cannot silently pass these tests. The values are synthetic and were never shown to the
 //! loader: the loader's accept/refuse logic reads only its own table, never a vector from this file.
 #![cfg(unix)]
-use harness::events::{append_record, read_log, AppendError, Field, Kind, LINE_CAP, Record};
+use harness::events::{append_record, read_log, AppendError, Event, Field, Kind, LINE_CAP, Record};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -549,4 +549,120 @@ fn v6_check_in_with_steps_as_a_number_is_still_accepted() {
     append_record(&t.0, &t.log(), &rec).unwrap();
     assert_eq!(out(&list(&t.log())), rec.encode().unwrap());
     accepted_at_read(kind, &raw_line(kind, |ps| ps));
+}
+
+// ---------------------------------------------------------------- round-2 fix cycle: a value of any odd shape never panics the loader or the builder
+
+/// `session_started` pairs with `session_id` replaced by `v`.
+fn with_session_id(v: &str) -> Vec<(&'static str, Field)> {
+    pairs_for(Kind::SessionStarted).into_iter().map(|(k, f)| (k, if k == "session_id" { Field::Str(v.to_string()) } else { f })).collect()
+}
+
+/// 36-byte values that are NOT a uuid and hold multibyte characters, each placed so a char straddles a group
+/// boundary the slicing in `uuid_ok` would cut (a non-boundary slice panics) or so the value is only multibyte.
+fn multibyte_36_byte_values() -> Vec<(&'static str, String)> {
+    vec![
+        ("R2-F1: accent straddling the first group end", format!("aaaaaaa\u{e9}{}", "a".repeat(27))),
+        ("accent straddling the second group end", format!("aaaaaaaa-aaa\u{e9}{}", "a".repeat(22))),
+        ("v1: accent in the last group", format!("3f2a9c01-8d4e-4b6f-9a2c-{}\u{e9}", "a".repeat(10))),
+        ("v2: twelve three-byte characters", "\u{3042}".repeat(12)),
+    ]
+}
+
+/// R2-F1 + held-out v1/v2: a 36-BYTE uuid-field value holding a multibyte character is refused, never a panic.
+/// Read: `verify` exits 1 naming line 2 and `session_id`; `list` prints the intact line 1, then exits 1.
+/// Write: `Record::build` returns an `Err` naming `session_id`. (A panic fails the test, so a guard-removed mutant is red.)
+#[test]
+fn r2f1_a_36_byte_uuid_value_with_a_multibyte_character_is_refused_not_a_panic() {
+    let kind = Kind::SessionStarted;
+    let good = good_record(kind).encode().unwrap();
+    for (what, bad) in multibyte_36_byte_values() {
+        assert_eq!(bad.len(), 36, "{what}: the fixture is 36 BYTES");
+        assert!(!bad.is_ascii(), "{what}: the fixture holds a multibyte character");
+        let pairs = with_session_id(&bad);
+        match Record::build(kind, TS, &pairs) {
+            Err(e) => assert!(e.contains("session_id"), "{what}: {e}"),
+            Ok(_) => panic!("{what}: build accepted {bad:?}"),
+        }
+        let line = raw_line(kind, |ps| ps.into_iter().map(|(k, f)| (k, if k == "session_id" { Field::Str(bad.clone()) } else { f })).collect());
+        let t = Tmp::new();
+        fs::write(t.log(), format!("{good}{line}\n")).unwrap();
+        let v = verify(&t.log());
+        assert_eq!(v.status.code(), Some(1), "{what}: verify refuses (not a panic): {}", err(&v));
+        assert!(err(&v).contains("line 2") && err(&v).contains("session_id"), "{what}: names line 2 and session_id: {}", err(&v));
+        let l = list(&t.log());
+        assert_eq!(l.status.code(), Some(1), "{what}: list exits non-zero without a panic: {}", err(&l));
+        assert_eq!(out(&l), good, "{what}: list prints the intact earlier line first");
+    }
+}
+
+/// v3 (must-fire): a 64-byte digest holding a multibyte character is refused naming the key (pinned: already safe).
+#[test]
+fn v3_a_64_byte_digest_with_a_multibyte_character_is_refused_naming_the_key() {
+    let kind = Kind::LaunchRefused;
+    let bad = format!("{}\u{e9}", "a".repeat(62));
+    assert_eq!(bad.len(), 64);
+    let swap = |ps: Vec<(&'static str, Field)>| ps.into_iter().map(|(k, v)| (k, if k == "brief_sha256" { Field::Str(bad.clone()) } else { v })).collect::<Vec<_>>();
+    refused_at_read(kind, &raw_line(kind, |ps| swap(ps.clone())), "brief_sha256");
+    refused_at_write(kind, &swap(pairs_for(kind)), "brief_sha256");
+}
+
+/// v4 (must-fire): a relpath value with a multibyte character in the middle of a segment is REFUSED today (a segment
+/// is a token: ASCII lowercase, digits, `-`, `_`, `.`), on read and on write. A mutant that lets non-ASCII letters
+/// into a token goes red here.
+#[test]
+fn v4_a_relpath_with_a_multibyte_character_mid_segment_is_refused_naming_the_key() {
+    let kind = Kind::TimedOut;
+    let bad = "handover/t-\u{e9}7.md".to_string();
+    let swap = |ps: Vec<(&'static str, Field)>| ps.into_iter().map(|(k, v)| (k, if k == "handover" { Field::Str(bad.clone()) } else { v })).collect::<Vec<_>>();
+    refused_at_read(kind, &raw_line(kind, |ps| swap(ps.clone())), "handover");
+    refused_at_write(kind, &swap(pairs_for(kind)), "handover");
+}
+
+/// v5 (must-not-fire): canonical lowercase 36-character uuids (made up, none from the loader) are still accepted.
+#[test]
+fn v5_canonical_lowercase_uuids_are_still_accepted() {
+    let kind = Kind::SessionStarted;
+    for id in ["00000000-0000-0000-0000-000000000000", "ffffffff-ffff-ffff-ffff-ffffffffffff", "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"] {
+        let rec = Record::build(kind, TS, &with_session_id(id)).unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(rec.field("session_id"), Some(&Field::Str(id.to_string())));
+        accepted_at_read(kind, &raw_line(kind, |ps| ps.into_iter().map(|(k, f)| (k, if k == "session_id" { Field::Str(id.to_string()) } else { f })).collect()));
+    }
+}
+
+/// v6 (must-not-fire) + N-r2-2: the old base kinds through the old `Event::encode` path write the same bytes as a
+/// base-kind `Record` built from the pairs REVERSED (this pins the identity sort: six envelope keys, reversed).
+#[test]
+fn v6_n_r2_2_base_kinds_from_reversed_pairs_write_the_canonical_old_bytes() {
+    for kind in Kind::ALL.iter().copied().filter(|k| k.is_base()) {
+        let canon = good_record(kind);
+        let old = Event {
+            kind,
+            ts_ms: TS,
+            run_id: canon.run_id.clone(),
+            ticket: canon.ticket.clone(),
+            repo: canon.repo.clone(),
+            reason: canon.reason.clone(),
+            role: canon.role.clone(),
+            model: canon.model.clone(),
+        }
+        .encode()
+        .unwrap();
+        let mut rev = pairs_for(kind);
+        rev.reverse();
+        let rec = Record::build(kind, TS, &rev).unwrap_or_else(|e| panic!("{}: {e}", kind.as_str()));
+        assert_eq!(rec.encode().unwrap(), old, "{}: reversed pairs write the old canonical bytes", kind.as_str());
+        assert_eq!(canon.encode().unwrap(), old, "{}: canonical pairs write the old bytes", kind.as_str());
+    }
+}
+
+/// v7 (must-not-fire): a log of only good lines (all nine kinds) still verifies with exit 0.
+#[test]
+fn v7_a_log_of_only_good_lines_verifies_clean() {
+    let t = Tmp::new();
+    for kind in p1b_kinds() {
+        append_record(&t.0, &t.log(), &good_record(kind)).unwrap();
+    }
+    let v = verify(&t.log());
+    assert_eq!(v.status.code(), Some(0), "{}", err(&v));
 }

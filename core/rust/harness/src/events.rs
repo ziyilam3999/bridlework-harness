@@ -110,7 +110,9 @@ fn lower_hex(s: &str) -> bool {
 
 /// Full lowercase uuid `8-4-4-4-12` hex.
 fn uuid_ok(s: &str) -> bool {
-    if s.len() != 36 {
+    // ASCII only, checked BEFORE any slicing: the length is in bytes, so a multibyte character could make a group
+    // boundary fall inside it and the slice below would panic instead of refusing.
+    if s.len() != 36 || !s.is_ascii() {
         return false;
     }
     let mut at = 0usize;
