@@ -4,7 +4,7 @@
 //! the one shared declaration) cannot silently pass these tests. The values are synthetic and were never shown to the
 //! loader: the loader's accept/refuse logic reads only its own table, never a vector from this file.
 #![cfg(unix)]
-use harness::events::{append_record, Field, Kind, Record};
+use harness::events::{append_record, read_log, AppendError, Field, Kind, LINE_CAP, Record};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -289,12 +289,8 @@ fn ac4_values_outside_their_declared_shape_are_refused_and_their_twins_pass() {
         (Kind::HumanOriginRefused, "path", Field::Str("~cfg/harness.conf".to_string())),
         (Kind::SessionStarted, "source", Field::Str("cli".to_string())),
         (Kind::TimedOut, "cause", Field::Str("vanished".to_string())),
-        (Kind::TimedOut, "steps_like", Field::Str("many".to_string())), // a token where a number shape is declared is not in any list; swapped below
     ];
     for (kind, key, bad) in bads {
-        if !kind.keys().contains(&key) {
-            continue; // the placeholder row whose key is not declared for that kind
-        }
         refused_at_read(kind, &raw_line(kind, |ps| ps.into_iter().map(|(k, v)| (k, if k == key { bad.clone() } else { v })).collect()), key);
         refused_at_write(kind, &pairs_for(kind).into_iter().map(|(k, v)| (k, if k == key { bad.clone() } else { v })).collect::<Vec<_>>(), key);
     }
@@ -384,4 +380,173 @@ fn ac6_the_old_cli_append_refuses_every_p1b_kind_and_writes_nothing() {
         assert!(err(&a).contains(kind.as_str()), "{}: the refusal names the kind: {}", kind.as_str(), err(&a));
         assert!(!t.log().exists(), "{}: absent stays absent", kind.as_str());
     }
+}
+
+// ---------------------------------------------------------------- F1 (round-1 review): the caller's pair order never reaches the bytes
+
+/// The written bytes follow the kind's DECLARED key order whatever order the caller passes pairs in: for each of the
+/// nine kinds the record built from its pairs REVERSED (still derived from `Kind::keys()`, so an envelope change keeps
+/// this file honest) encodes, is written and lists back byte-identically to the canonical-order record.
+#[test]
+fn f1_reversed_pairs_write_the_declared_order_byte_identically_for_every_kind() {
+    // v5 measurement hook: the canonical-order bytes of every kind, printed before any assertion so a round-1
+    // (red) run emits them too; a diff against the fixed run must be empty (correct callers see no change).
+    for kind in p1b_kinds() {
+        eprintln!("v5-canonical {}: {}", kind.as_str(), good_record(kind).encode().unwrap().trim_end());
+    }
+    for kind in p1b_kinds() {
+        let canonical = good_record(kind).encode().unwrap();
+        let mut rev = pairs_for(kind);
+        rev.reverse();
+        let rec = Record::build(kind, TS, &rev).unwrap_or_else(|e| panic!("{}: {e}", kind.as_str()));
+        let line = rec.encode().unwrap();
+        assert_eq!(line, canonical, "{}: reversed pairs write the same bytes", kind.as_str());
+        let t = Tmp::new();
+        append_record(&t.0, &t.log(), &rec).unwrap();
+        assert_eq!(fs::read(t.log()).unwrap(), canonical.as_bytes(), "{}: the file holds the canonical line", kind.as_str());
+        let read = read_log(&t.log()).unwrap();
+        assert!(read.is_clean(), "{}: {:?}", kind.as_str(), read);
+        assert_eq!(read.events.len(), 1);
+        assert_eq!(read.events[0].encode().unwrap(), canonical, "{}: read then encode gives the same bytes", kind.as_str());
+        assert_eq!(out(&list(&t.log())), canonical, "{}: events list prints the canonical line", kind.as_str());
+    }
+}
+
+/// A record mutated out of the declared order after building is refused at the door (the re-check compares against
+/// the kind's declared order, not against the record's own order).
+#[test]
+fn f1_a_record_held_out_of_the_declared_order_is_refused_at_encode() {
+    let kind = Kind::TimedOut;
+    let mut rec = good_record(kind);
+    let last = rec.payload.pop().unwrap();
+    rec.payload.insert(0, last);
+    match rec.encode() {
+        Err(AppendError::Invalid(m)) => assert!(m.contains("canonical order"), "{m}"),
+        other => panic!("out-of-order record encoded to {other:?}"),
+    }
+    let t = Tmp::new();
+    assert!(append_record(&t.0, &t.log(), &rec).is_err(), "an out-of-order record is not written");
+    assert!(!t.log().exists(), "a refused record leaves no file");
+}
+
+// ---------------------------------------------------------------- F2 (round-1 review): the write-side line cap
+
+/// A P1b record whose line exceeds the 4096-byte cap is refused at write with `TooLong` and nothing is written. A
+/// relpath value reaches the cap with no length bound of its own (a token segment may be long), so the line cap is
+/// the only bound left and this test exercises it through the record writer's own door.
+#[test]
+fn f2_an_over_cap_record_is_refused_at_write_with_nothing_written() {
+    let kind = Kind::Quarantined;
+    let long = Field::Str(format!("q/{}", "a".repeat(2100)));
+    let pairs: Vec<(&str, Field)> = pairs_for(kind)
+        .into_iter()
+        .map(|(k, v)| (k, if k == "from" || k == "to" { long.clone() } else { v }))
+        .collect();
+    let rec = Record::build(kind, TS, &pairs).unwrap_or_else(|e| panic!("{e}"));
+    match rec.encode() {
+        Err(AppendError::TooLong(n)) => assert!(n > LINE_CAP, "the fixture is past the cap: {n}"),
+        other => panic!("an over-cap record encoded to {other:?}"),
+    }
+    let t = Tmp::new();
+    match append_record(&t.0, &t.log(), &rec) {
+        Err(AppendError::TooLong(n)) => assert!(n > LINE_CAP, "{n}"),
+        other => panic!("append accepted an over-cap record: {other:?}"),
+    }
+    assert!(!t.log().exists(), "an over-cap record leaves no file");
+}
+
+// ---------------------------------------------------------------- F3 (round-1 review): a number where a string shape is declared
+
+/// A number where a string shape is declared is refused naming the key, at read and at write (here: `session_id`, a
+/// uuid shape, and `source`, an enum shape — the two string shapes of the smallest kind).
+#[test]
+fn f3_a_number_where_a_string_shape_is_declared_is_refused_at_read_and_at_write() {
+    for key in ["session_id", "source"] {
+        let kind = Kind::SessionStarted;
+        let swap = |ps: Vec<(&'static str, Field)>| ps.into_iter().map(|(k, v)| (k, if k == key { Field::Num(7) } else { v })).collect::<Vec<_>>();
+        // Read: the stored line with a bare number for the key is refused naming the key.
+        refused_at_read(kind, &raw_line(kind, |ps| swap(ps)), key);
+        // Write: the pairs with a number for the key are refused naming the key.
+        refused_at_write(kind, &swap(pairs_for(kind)), key);
+    }
+}
+
+// ---------------------------------------------------------------- round-1 fix-cycle held-out variants (invented for this round)
+
+/// v1 (must-fire): `timed_out` built from pairs in a rotated order (last pair first) writes the canonical bytes.
+#[test]
+fn v1_timed_out_from_rotated_pairs_writes_the_canonical_bytes() {
+    let kind = Kind::TimedOut;
+    let canonical = good_record(kind).encode().unwrap();
+    let mut rotated = pairs_for(kind);
+    let last = rotated.pop().unwrap();
+    rotated.insert(0, last);
+    let rec = Record::build(kind, TS, &rotated).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rec.encode().unwrap(), canonical);
+    let t = Tmp::new();
+    append_record(&t.0, &t.log(), &rec).unwrap();
+    assert_eq!(fs::read(t.log()).unwrap(), canonical.as_bytes());
+    assert_eq!(out(&list(&t.log())), canonical);
+}
+
+/// v2 (must-fire): `launch_refused` with a number where `launch_role` (a short name field) is declared is refused
+/// naming the key, on read and on write.
+#[test]
+fn v2_launch_refused_number_for_launch_role_is_refused_at_read_and_write() {
+    let kind = Kind::LaunchRefused;
+    let swap = |ps: Vec<(&'static str, Field)>| ps.into_iter().map(|(k, v)| (k, if k == "launch_role" { Field::Num(9) } else { v })).collect::<Vec<_>>();
+    refused_at_read(kind, &raw_line(kind, |ps| swap(ps.clone())), "launch_role");
+    refused_at_write(kind, &swap(pairs_for(kind)), "launch_role");
+}
+
+/// v3 (must-fire): a `quarantined` record padded with the longest allowed relpath values (both `from` and `to`, as
+/// many maximal segments as needed) until the line is over the cap is refused with `TooLong` and nothing is written.
+#[test]
+fn v3_quarantined_padded_past_the_cap_with_relpath_segments_is_refused_too_long() {
+    let kind = Kind::Quarantined;
+    let pad = Field::Str(format!("{}/{}b", "s".repeat(64), "a/".repeat(1100)));
+    let pairs: Vec<(&str, Field)> = pairs_for(kind)
+        .into_iter()
+        .map(|(k, v)| (k, if k == "from" || k == "to" { pad.clone() } else { v }))
+        .collect();
+    let rec = Record::build(kind, TS, &pairs).unwrap_or_else(|e| panic!("{e}"));
+    let t = Tmp::new();
+    match append_record(&t.0, &t.log(), &rec) {
+        Err(AppendError::TooLong(n)) => assert!(n > LINE_CAP, "{n}"),
+        other => panic!("append accepted an over-cap record: {other:?}"),
+    }
+    assert!(!t.log().exists());
+}
+
+/// v4 (must-fire): a STORED line whose keys are out of the declared order is accepted and re-encoded canonical —
+/// the loader's read side stores fields in the declared order, so `events list` prints the canonical bytes. This pins
+/// that arm; a mutant that lets the stored order through goes red here.
+#[test]
+fn v4_a_stored_line_with_keys_out_of_order_is_re_encoded_canonically() {
+    for kind in p1b_kinds() {
+        let canonical = good_record(kind).encode().unwrap();
+        let line = raw_line(kind, |mut ps| {
+            ps.reverse();
+            ps
+        });
+        assert_ne!(line.trim_end(), canonical.trim_end(), "{}: the fixture is genuinely out of order", kind.as_str());
+        let t = Tmp::new();
+        fs::write(t.log(), format!("{line}\n")).unwrap();
+        let v = verify(&t.log());
+        assert_eq!(v.status.code(), Some(0), "{}: {}", kind.as_str(), err(&v));
+        assert_eq!(out(&list(&t.log())), canonical, "{}: list prints the canonical line", kind.as_str());
+    }
+}
+
+/// v6 (must-not-fire): `check_in` with `steps` as an unsigned integer is still accepted (a number where a number is
+/// declared), on write and at read.
+#[test]
+fn v6_check_in_with_steps_as_a_number_is_still_accepted() {
+    let kind = Kind::CheckIn;
+    let rec = good_record(kind); // `steps` carries Field::Num(120)
+    assert!(matches!(rec.field("steps"), Some(Field::Num(_))));
+    let t = Tmp::new();
+    append_record(&t.0, &t.log(), &rec).unwrap();
+    assert_eq!(out(&list(&t.log())), rec.encode().unwrap());
+    accepted_at_read(kind, &raw_line(kind, |ps| ps));
 }

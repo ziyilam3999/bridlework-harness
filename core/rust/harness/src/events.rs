@@ -493,8 +493,10 @@ impl Record {
 
     /// Sort caller-given key/value pairs into `identity` and `payload` against the kind's table entry: the exact key
     /// set (every declared key beyond the trio present, no key the kind does not declare, none twice), the declared
-    /// value shape of every field, and the cross rules. Every error names the offending key. This is the single
-    /// accept/refuse path: `build` (the writer's door) and `validate` (the re-check before encode) both come here.
+    /// value shape of every field, and the cross rules. Both vectors are stored in the kind's DECLARED key order
+    /// regardless of the order the pairs arrived in, so the written bytes never depend on the caller's order. Every
+    /// error names the offending key. This is the single accept/refuse path: `build` (the writer's door) and
+    /// `validate` (the re-check before encode) both come here.
     fn assemble(kind: Kind, pairs: &[(&str, Field)]) -> Result<(Vec<(&'static str, Field)>, Vec<(&'static str, Field)>), String> {
         let def = kind.def();
         let trio = ["v", "kind", "ts_ms"];
@@ -544,6 +546,12 @@ impl Record {
                 return Err(format!("{k} missing"));
             }
         }
+        // The kind's DECLARED order, whatever order the caller passed pairs in: the stored (and written) bytes
+        // never depend on the caller's order. Keys are unique here (a duplicate was refused above), so each sort
+        // key is unique and the order is total. This also makes `validate`'s order check real: it re-assembles a
+        // record's own pairs and compares against the declared order this produces.
+        identity.sort_by_key(|(k, _)| def.envelope.iter().position(|e| *e == *k).unwrap());
+        payload.sort_by_key(|(k, _)| def.fields.iter().position(|f| f.key == *k).unwrap());
         let get = |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone());
         Self::check_cross(kind, get)?;
         Ok((identity, payload))
@@ -570,7 +578,8 @@ impl Record {
     }
 
     /// Re-check this record against its kind's table entry (the same path `build` enforces), so a hand-mutated record
-    /// is refused at encode, never written.
+    /// is refused at encode, never written. `assemble` returns the kind's DECLARED key order, so a record held out of
+    /// that order (hand-mutated after building) fails the comparison below.
     pub fn validate(&self) -> Result<(), String> {
         let pairs: Vec<(&str, Field)> = self.identity.iter().chain(self.payload.iter()).map(|(k, v)| (*k, v.clone())).collect();
         let (identity, payload) = Self::assemble(self.kind, &pairs)?;

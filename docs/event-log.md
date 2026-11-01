@@ -67,7 +67,7 @@ These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`)
 
 ### The version rule
 
-The loader keeps a table of each kind's exact key set and the only `v` it exists at; the four base kinds are at `v` 2 with the PRE-B run-identity envelope (bytes exactly as when that envelope landed), the nine P1b kinds are at `v` 2 with the plain envelope and no identity fields. Any other `(v, kind)` pair — a kind at a `v` it never had, a `v` this reader does not know at all — is refused naming `v`, and a `v:1` line is never upgraded. A new kind, or a new key, is an additive change that bumps `v`. A reader that sees a `v` it does not know refuses the line and names the line and `v`; it never guesses.
+The loader keeps a table of each kind's exact key set and the only `v` it exists at; the four base kinds are at `v` 2 with the PRE-B run-identity envelope (bytes exactly as when that envelope landed), the nine P1b kinds are at `v` 2 with the plain envelope and no identity fields (v 2 was introduced by PRE-B; these kinds join it before any writer exists). Any other `(v, kind)` pair — a kind at a `v` it never had, a `v` this reader does not know at all — is refused naming `v`, and a `v:1` line is never upgraded. A new kind, or a new key, is an additive change that bumps `v`. A reader that sees a `v` it does not know refuses the line and names the line and `v`; it never guesses.
 
 ## Run identity (`run_id`)
 
