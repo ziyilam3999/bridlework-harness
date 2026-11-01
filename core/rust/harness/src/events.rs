@@ -5,6 +5,9 @@
 //! Reader: every complete line must be a valid event (else CORRUPTION, the read stops there); a final fragment with no
 //! trailing newline is a TORN TAIL, reported and never parsed. Writer: one `write()` of the whole line, then `sync_all`;
 //! refuses to append onto a torn tail (it would fuse a new event onto garbage). Recovery of a torn tail is not here.
+//! Kinds: thirteen today — the four base kinds (the PRE-B v2 shape with the run identity) and the nine P1b kinds
+//! (payload kinds, no identity fields yet). Each kind's exact key set, value shapes and `v` are declared ONCE in the
+//! kind table below; the reader, the writer and the schema test all consult that table and nothing else.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -17,12 +20,260 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const SCHEMA_VERSION: u64 = 2;
 /// Largest accepted line in bytes, newline included. Keeps each append one small write.
 pub const LINE_CAP: usize = 4096;
-
-/// Keys of every v2 kind, in canonical order.
+/// Keys of every v2 base kind, in canonical order (the PRE-B envelope, bytes as on master).
 const KEYS_V2: [&str; 9] = ["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"];
+
+/// The single envelope declaration of the nine P1b kinds: the keys each of them carries before its payload. Today it is
+/// the trio every line shares; the PRE-B run identity (`run_id`, `role`, `model`) joins these nine kinds by editing THIS
+/// one list, once a run issuer exists — nowhere else.
+const P1B_ENVELOPE: [&str; 3] = ["v", "kind", "ts_ms"];
 
 /// The reason token of the `run_issued` line a self-issuing invocation appends before its first event.
 pub const REASON_RUN_ISSUED: &str = "self-issue";
+
+// ---------------------------------------------------------------- the kind table (the one source of every shape)
+
+/// The value shape of one payload key. A value outside its declared shape is refused naming the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// A plain token (`token_ok`).
+    Token,
+    /// A full lowercase uuid, `8-4-4-4-12` hex; a short id is refused (every comparison is uuid to uuid).
+    Uuid,
+    /// 64 lowercase hex digits.
+    Hex64,
+    /// 40 or 64 lowercase hex digits (a git sha, either length a repository may use).
+    Sha,
+    /// Token segments joined by `/`: no leading `/`, no empty, `.` or `..` segment, no `~` — so neither an absolute
+    /// nor a home path can be written.
+    RelPath,
+    /// An unsigned integer.
+    Num,
+    /// Exactly one of the listed tokens.
+    OneOf(&'static [&'static str]),
+}
+
+impl Shape {
+    /// Check a string value against this shape; the error names the key and the shape it broke.
+    fn check_str(&self, key: &str, s: &str) -> Result<(), String> {
+        match self {
+            Shape::Token => {
+                if token_ok(s) {
+                    Ok(())
+                } else {
+                    Err(format!("{key} must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"))
+                }
+            }
+            Shape::Uuid => {
+                if uuid_ok(s) {
+                    Ok(())
+                } else {
+                    Err(format!("{key} must be a full lowercase uuid (8-4-4-4-12 hex; a short id is refused)"))
+                }
+            }
+            Shape::Hex64 => {
+                if s.len() == 64 && lower_hex(s) {
+                    Ok(())
+                } else {
+                    Err(format!("{key} must be 64 lowercase hex digits"))
+                }
+            }
+            Shape::Sha => {
+                if (s.len() == 40 || s.len() == 64) && lower_hex(s) {
+                    Ok(())
+                } else {
+                    Err(format!("{key} must be 40 or 64 lowercase hex digits"))
+                }
+            }
+            Shape::RelPath => {
+                if relpath_ok(s) {
+                    Ok(())
+                } else {
+                    Err(format!("{key} must be a relative path: plain token segments joined by '/', no leading '/', no empty, '.' or '..' segment"))
+                }
+            }
+            Shape::OneOf(vals) => {
+                if vals.contains(&s) {
+                    Ok(())
+                } else {
+                    Err(format!("{key} must be one of {vals:?}"))
+                }
+            }
+            Shape::Num => Err(format!("{key} must be an unsigned integer")),
+        }
+    }
+}
+
+fn lower_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Full lowercase uuid `8-4-4-4-12` hex.
+fn uuid_ok(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let mut at = 0usize;
+    for (i, len) in [8usize, 4, 4, 4, 12].iter().enumerate() {
+        if !lower_hex(&s[at..at + len]) {
+            return false;
+        }
+        at += len;
+        if i < 4 {
+            if s.as_bytes().get(at) != Some(&b'-') {
+                return false;
+            }
+            at += 1;
+        }
+    }
+    true
+}
+
+/// Token segments joined by `/`: refuses a leading or doubled `/`, an empty, `.` or `..` segment, and any character a
+/// token forbids (so no `~`, no uppercase, no escapes).
+fn relpath_ok(s: &str) -> bool {
+    !s.is_empty() && s.split('/').all(|seg| token_ok(seg))
+}
+
+/// One declared payload field of a kind: its key and its value shape.
+#[derive(Debug, Clone, Copy)]
+struct FieldDef {
+    key: &'static str,
+    shape: Shape,
+}
+
+/// A declared cross-field honesty rule. `PassMeansManifestEmpty`: on `cleanup_result`, `result=pass` with
+/// `manifest_left` above zero is refused — a pass that left entries behind is a lie the loader rejects cheaply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cross {
+    None,
+    PassMeansManifestEmpty,
+}
+
+/// The declared shape of one kind: its exact key set (envelope keys, then payload keys, canonical order), the value
+/// shape of every payload key, the only `v` it exists at, and its cross-field rule. THIS TABLE IS THE ONE SOURCE: the
+/// reader's accept/refuse logic, the doc's field tables and the schema test all consult it. No kind is described
+/// anywhere else, and no literal test value is special-cased in the reader.
+struct KindDef {
+    /// Keys before the payload. The four base kinds use `KEYS_V2` (the PRE-B envelope, bytes as on master, v 2); the
+    /// nine P1b kinds share `P1B_ENVELOPE` — the one declaration their envelope lives in.
+    envelope: &'static [&'static str],
+    /// Payload fields after the envelope, canonical order; empty for the base kinds (their whole shape is the envelope:
+    /// the trio plus six plain-token identity keys).
+    fields: &'static [FieldDef],
+    /// The only schema version this kind exists at; a line naming any other `v` is refused naming `v`.
+    v: u64,
+    cross: Cross,
+}
+
+const BASE_DEF: KindDef = KindDef { envelope: &KEYS_V2, fields: &[], v: SCHEMA_VERSION, cross: Cross::None };
+
+const SESSION_STARTED_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[FieldDef { key: "session_id", shape: Shape::Uuid }, FieldDef { key: "source", shape: Shape::OneOf(&["launch", "hook"]) }],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const UNMANAGED_SESSION_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "session_id", shape: Shape::Uuid },
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "reason", shape: Shape::OneOf(&["not_supervisor_launched", "no_launch_record"]) },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const LAUNCH_REFUSED_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "launch_role", shape: Shape::Token },
+        FieldDef { key: "brief_sha256", shape: Shape::Hex64 },
+        FieldDef { key: "matched_entry", shape: Shape::Token },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const TIMED_OUT_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "repo", shape: Shape::Token },
+        FieldDef { key: "cause", shape: Shape::OneOf(&["timeout", "died"]) },
+        FieldDef { key: "checkpoint", shape: Shape::Sha },
+        FieldDef { key: "recipe", shape: Shape::OneOf(&["commit_push_then_resume"]) },
+        FieldDef { key: "handover", shape: Shape::RelPath },
+        FieldDef { key: "session_id", shape: Shape::Uuid },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const CHECK_IN_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "repo", shape: Shape::Token },
+        FieldDef { key: "steps", shape: Shape::Num },
+        FieldDef { key: "soft_limit", shape: Shape::Num },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const STEP_LIMIT_STOP_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "repo", shape: Shape::Token },
+        FieldDef { key: "steps", shape: Shape::Num },
+        FieldDef { key: "hard_limit", shape: Shape::Num },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const CLEANUP_RESULT_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "repo", shape: Shape::Token },
+        FieldDef { key: "result", shape: Shape::OneOf(&["pass", "fail"]) },
+        FieldDef { key: "manifest_left", shape: Shape::Num },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::PassMeansManifestEmpty,
+};
+
+const QUARANTINED_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "repo", shape: Shape::Token },
+        FieldDef { key: "from", shape: Shape::RelPath },
+        FieldDef { key: "to", shape: Shape::RelPath },
+        FieldDef { key: "reason", shape: Shape::OneOf(&["unmanifested", "retention"]) },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+const HUMAN_ORIGIN_REFUSED_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[FieldDef { key: "target", shape: Shape::OneOf(&["config", "permission", "control_registry"]) }, FieldDef { key: "path", shape: Shape::RelPath }],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
+impl KindDef {
+    /// The full key set in canonical order: envelope keys, then payload keys.
+    fn key_list(&self) -> Vec<&'static str> {
+        self.envelope.iter().copied().chain(self.fields.iter().map(|f| f.key)).collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -30,10 +281,33 @@ pub enum Kind {
     ReplanRequired,
     BudgetExceeded,
     RunIssued,
+    SessionStarted,
+    UnmanagedSession,
+    LaunchRefused,
+    TimedOut,
+    CheckIn,
+    StepLimitStop,
+    CleanupResult,
+    Quarantined,
+    HumanOriginRefused,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Escalation, Kind::ReplanRequired, Kind::BudgetExceeded, Kind::RunIssued];
+    pub const ALL: [Kind; 13] = [
+        Kind::Escalation,
+        Kind::ReplanRequired,
+        Kind::BudgetExceeded,
+        Kind::RunIssued,
+        Kind::SessionStarted,
+        Kind::UnmanagedSession,
+        Kind::LaunchRefused,
+        Kind::TimedOut,
+        Kind::CheckIn,
+        Kind::StepLimitStop,
+        Kind::CleanupResult,
+        Kind::Quarantined,
+        Kind::HumanOriginRefused,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -41,6 +315,15 @@ impl Kind {
             Kind::ReplanRequired => "replan_required",
             Kind::BudgetExceeded => "budget_exceeded",
             Kind::RunIssued => "run_issued",
+            Kind::SessionStarted => "session_started",
+            Kind::UnmanagedSession => "unmanaged_session",
+            Kind::LaunchRefused => "launch_refused",
+            Kind::TimedOut => "timed_out",
+            Kind::CheckIn => "check_in",
+            Kind::StepLimitStop => "step_limit_stop",
+            Kind::CleanupResult => "cleanup_result",
+            Kind::Quarantined => "quarantined",
+            Kind::HumanOriginRefused => "human_origin_refused",
         }
     }
 
@@ -48,9 +331,37 @@ impl Kind {
         Kind::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 
-    /// The exact key set of this kind at the current schema version, in canonical order.
-    pub fn keys(&self) -> &'static [&'static str] {
-        &KEYS_V2
+    /// The table entry that declares this kind: its key set, value shapes and `v` (exposed as `keys()`/`version()`).
+    fn def(&self) -> &'static KindDef {
+        match self {
+            Kind::Escalation | Kind::ReplanRequired | Kind::BudgetExceeded | Kind::RunIssued => &BASE_DEF,
+            Kind::SessionStarted => &SESSION_STARTED_DEF,
+            Kind::UnmanagedSession => &UNMANAGED_SESSION_DEF,
+            Kind::LaunchRefused => &LAUNCH_REFUSED_DEF,
+            Kind::TimedOut => &TIMED_OUT_DEF,
+            Kind::CheckIn => &CHECK_IN_DEF,
+            Kind::StepLimitStop => &STEP_LIMIT_STOP_DEF,
+            Kind::CleanupResult => &CLEANUP_RESULT_DEF,
+            Kind::Quarantined => &QUARANTINED_DEF,
+            Kind::HumanOriginRefused => &HUMAN_ORIGIN_REFUSED_DEF,
+        }
+    }
+
+    /// The exact key set of this kind at its declared version, in canonical order. Built from the table, so an
+    /// envelope change is one edit in one declaration, never one per kind.
+    pub fn keys(&self) -> Vec<&'static str> {
+        self.def().key_list()
+    }
+
+    /// The only schema version this kind exists at (the version table's row for this kind).
+    pub fn version(&self) -> u64 {
+        self.def().v
+    }
+
+    /// The four base kinds (the PRE-B v2 shape, bytes as on master): the only kinds writable through the base `Event`
+    /// struct. The nine P1b kinds carry a payload and are written through `Record`.
+    pub fn is_base(&self) -> bool {
+        matches!(self, Kind::Escalation | Kind::ReplanRequired | Kind::BudgetExceeded | Kind::RunIssued)
     }
 }
 
@@ -76,6 +387,11 @@ pub fn token_ok(s: &str) -> bool {
 
 impl Event {
     pub fn validate(&self) -> Result<(), String> {
+        // The base `Event` struct expresses only the four base kinds (the PRE-B v2 shape). A P1b kind is refused here,
+        // before any value is looked at, so the old CLI shape can never write one (its payload has no flags there).
+        if !self.kind.is_base() {
+            return Err(format!("kind {} is a P1b kind: the base event shape cannot express its payload (write it through the record writer)", self.kind.as_str()));
+        }
         for (name, v) in [
             ("run_id", &self.run_id),
             ("ticket", &self.ticket),
@@ -112,10 +428,180 @@ impl Event {
         }
         Ok(line)
     }
+}
 
-    /// Strict decode of one line WITHOUT its newline: every key of the kind exactly once, no other key, right types, a known
-    /// kind, `v` equal to `SCHEMA_VERSION` (checked first so a refusal names `v`), then `validate`.
-    pub fn decode(line: &str) -> Result<Event, String> {
+// ---------------------------------------------------------------- the read record (every kind)
+
+/// One payload value: a shape-validated string, or an unsigned integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Field {
+    Str(String),
+    Num(u64),
+}
+
+/// One read line of ANY kind. The eight base fields keep today's names and types (the four base kinds fill them from
+/// their envelope); a P1b kind leaves them empty and carries its values in `payload`, looked up by key. `identity`
+/// holds the envelope keys beyond `v`/`kind`/`ts_ms` (today: the base kinds' run identity), in canonical order; the
+/// six base string fields are mirrors of it, filled by the reader for the existing callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub kind: Kind,
+    pub ts_ms: u64,
+    pub run_id: String,
+    pub ticket: String,
+    pub repo: String,
+    pub reason: String,
+    pub role: String,
+    pub model: String,
+    pub identity: Vec<(&'static str, Field)>,
+    /// The per-kind payload after the envelope, in the kind's canonical key order.
+    pub payload: Vec<(&'static str, Field)>,
+}
+
+impl Record {
+    /// The payload (or identity) value of one key.
+    pub fn field(&self, key: &str) -> Option<&Field> {
+        self.identity.iter().chain(self.payload.iter()).find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+
+    /// Fill the six base string fields from `identity` (they are its mirror for the existing callers).
+    fn mirror_identity(&mut self) {
+        let set = |name: &'static str, slot: &mut String| {
+            if let Some(Field::Str(s)) = self.identity.iter().find(|(k, _)| *k == name).map(|(_, v)| v) {
+                *slot = s.clone();
+            }
+        };
+        set("run_id", &mut self.run_id);
+        set("ticket", &mut self.ticket);
+        set("repo", &mut self.repo);
+        set("reason", &mut self.reason);
+        set("role", &mut self.role);
+        set("model", &mut self.model);
+    }
+
+    /// Check the cross-field rules this kind's table entry declares.
+    fn check_cross(kind: Kind, get: impl Fn(&str) -> Option<Field>) -> Result<(), String> {
+        if kind.def().cross == Cross::PassMeansManifestEmpty {
+            let pass = matches!(get("result"), Some(Field::Str(s)) if s == "pass");
+            let left = matches!(get("manifest_left"), Some(Field::Num(n)) if n > 0);
+            if pass && left {
+                return Err("manifest_left must be 0 when result is pass (a pass that left manifest entries behind is refused)".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sort caller-given key/value pairs into `identity` and `payload` against the kind's table entry: the exact key
+    /// set (every declared key beyond the trio present, no key the kind does not declare, none twice), the declared
+    /// value shape of every field, and the cross rules. Every error names the offending key. This is the single
+    /// accept/refuse path: `build` (the writer's door) and `validate` (the re-check before encode) both come here.
+    fn assemble(kind: Kind, pairs: &[(&str, Field)]) -> Result<(Vec<(&'static str, Field)>, Vec<(&'static str, Field)>), String> {
+        let def = kind.def();
+        let trio = ["v", "kind", "ts_ms"];
+        let mut identity: Vec<(&'static str, Field)> = Vec::new();
+        let mut payload: Vec<(&'static str, Field)> = Vec::new();
+        for (k, v) in pairs {
+            if trio.contains(k) {
+                return Err(format!("{k} is written by the kind itself, not a caller value"));
+            }
+            let declared = def.fields.iter().find(|f| f.key == *k);
+            let slot = def.envelope.iter().find(|e| **e == *k);
+            if declared.is_none() && slot.is_none() {
+                return Err(format!("unexpected key {k:?}"));
+            }
+            if identity.iter().chain(payload.iter()).any(|(known, _)| known == k) {
+                return Err(format!("duplicate key {k:?}"));
+            }
+            match declared {
+                Some(f) => {
+                    let value = match (&v, f.shape) {
+                        (Field::Str(s), shape) => {
+                            shape.check_str(f.key, s)?;
+                            v.clone()
+                        }
+                        (Field::Num(n), Shape::Num) => Field::Num(*n),
+                        (Field::Num(_), _) => return Err(format!("{} has the wrong type (an unsigned integer where a string shape is declared)", f.key)),
+                    };
+                    payload.push((f.key, value));
+                }
+                None => {
+                    // An envelope key beyond the trio (today: the base kinds' run identity): a plain token.
+                    match v {
+                        Field::Str(t) => {
+                            Shape::Token.check_str(k, t)?;
+                            identity.push((def.envelope.iter().find(|e| **e == *k).copied().unwrap(), Field::Str(t.clone())));
+                        }
+                        Field::Num(_) => return Err(format!("{k} has the wrong type (an unsigned integer where a plain token is declared)")),
+                    }
+                }
+            }
+        }
+        for k in def.key_list() {
+            if trio.contains(&k) {
+                continue;
+            }
+            if !identity.iter().chain(payload.iter()).any(|(known, _)| *known == k) {
+                return Err(format!("{k} missing"));
+            }
+        }
+        let get = |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone());
+        Self::check_cross(kind, get)?;
+        Ok((identity, payload))
+    }
+
+    /// Build a record of `kind` at `ts_ms` from key/value pairs (every declared key beyond `v`/`kind`/`ts_ms`, exact
+    /// set, declared shapes). The library writer's door for the P1b kinds; later P1b tickets build their records here.
+    pub fn build(kind: Kind, ts_ms: u64, pairs: &[(&str, Field)]) -> Result<Record, String> {
+        let (identity, payload) = Self::assemble(kind, pairs)?;
+        let mut rec = Record {
+            kind,
+            ts_ms,
+            run_id: String::new(),
+            ticket: String::new(),
+            repo: String::new(),
+            reason: String::new(),
+            role: String::new(),
+            model: String::new(),
+            identity,
+            payload,
+        };
+        rec.mirror_identity();
+        Ok(rec)
+    }
+
+    /// Re-check this record against its kind's table entry (the same path `build` enforces), so a hand-mutated record
+    /// is refused at encode, never written.
+    pub fn validate(&self) -> Result<(), String> {
+        let pairs: Vec<(&str, Field)> = self.identity.iter().chain(self.payload.iter()).map(|(k, v)| (*k, v.clone())).collect();
+        let (identity, payload) = Self::assemble(self.kind, &pairs)?;
+        if identity != self.identity || payload != self.payload {
+            return Err("the key order does not follow the kind's declared canonical order".to_string());
+        }
+        Ok(())
+    }
+
+    /// Canonical line including the trailing newline: envelope keys then payload keys, in the kind's declared order.
+    /// Refuses an invalid record and a line over the cap.
+    pub fn encode(&self) -> Result<String, AppendError> {
+        self.validate().map_err(AppendError::Invalid)?;
+        let mut line = format!("{{\"v\":{},\"kind\":\"{}\",\"ts_ms\":{}", self.kind.version(), self.kind.as_str(), self.ts_ms);
+        for (k, v) in self.identity.iter().chain(self.payload.iter()) {
+            match v {
+                Field::Str(t) => line.push_str(&format!(",\"{k}\":\"{t}\"")),
+                Field::Num(n) => line.push_str(&format!(",\"{k}\":{n}")),
+            }
+        }
+        line.push_str("}\n");
+        if line.len() > LINE_CAP {
+            return Err(AppendError::TooLong(line.len()));
+        }
+        Ok(line)
+    }
+
+    /// Strict decode of one line WITHOUT its newline: `v` first (any other value is refused naming `v`), then a known
+    /// kind, then the kind's exact declared key set (an extra key, a missing key or a duplicate is refused naming the
+    /// key), the declared value shape of every field, and the cross rules. Never guesses, never repairs.
+    pub fn decode(line: &str) -> Result<Record, String> {
         if line.len() + 1 > LINE_CAP {
             return Err(format!("line exceeds the {LINE_CAP}-byte cap"));
         }
@@ -137,36 +623,75 @@ impl Event {
             Some(Val::Str(s)) => Kind::parse(s).ok_or_else(|| format!("unknown kind {s:?}"))?,
             Some(_) => return Err("kind has the wrong type".to_string()),
         };
+        let def = kind.def();
+        let keys = def.key_list();
         for (k, _) in &pairs {
-            if !kind.keys().contains(&k.as_str()) {
+            if !keys.contains(&k.as_str()) {
                 return Err(format!("unexpected key {k:?}"));
             }
         }
-        for k in kind.keys() {
+        for k in &keys {
             if get(k).is_none() {
                 return Err(format!("{k} missing"));
             }
         }
-        let text = |k: &str| match get(k) {
-            Some(Val::Str(s)) => Ok(s.clone()),
-            _ => Err(format!("{k} has the wrong type")),
-        };
         let ts_ms = match get("ts_ms") {
             Some(Val::Num(n)) => *n,
             _ => return Err("ts_ms has the wrong type".to_string()),
         };
-        let ev = Event {
+        let trio = ["v", "kind", "ts_ms"];
+        let mut identity: Vec<(&'static str, Field)> = Vec::new();
+        let mut payload: Vec<(&'static str, Field)> = Vec::new();
+        for k in &keys {
+            if trio.contains(k) {
+                continue;
+            }
+            let v = get(k).unwrap();
+            match def.fields.iter().find(|f| f.key == *k) {
+                Some(f) => {
+                    let value = match v {
+                        Val::Str(t) => {
+                            f.shape.check_str(f.key, t)?;
+                            Field::Str(t.clone())
+                        }
+                        Val::Num(n) if f.shape == Shape::Num => Field::Num(*n),
+                        _ => return Err(format!("{} has the wrong type", f.key)),
+                    };
+                    payload.push((f.key, value));
+                }
+                None => {
+                    // An envelope key beyond the trio (today: the base kinds' run identity): a plain token.
+                    let t = match v {
+                        Val::Str(t) => t.clone(),
+                        _ => return Err(format!("{k} has the wrong type")),
+                    };
+                    Shape::Token.check_str(*k, &t)?;
+                    identity.push((*k, Field::Str(t)));
+                }
+            }
+        }
+        let getf = |name: &str| {
+            identity
+                .iter()
+                .chain(payload.iter())
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+        };
+        Self::check_cross(kind, getf)?;
+        let mut rec = Record {
             kind,
             ts_ms,
-            run_id: text("run_id")?,
-            ticket: text("ticket")?,
-            repo: text("repo")?,
-            reason: text("reason")?,
-            role: text("role")?,
-            model: text("model")?,
+            run_id: String::new(),
+            ticket: String::new(),
+            repo: String::new(),
+            reason: String::new(),
+            role: String::new(),
+            model: String::new(),
+            identity,
+            payload,
         };
-        ev.validate()?;
-        Ok(ev)
+        rec.mirror_identity();
+        Ok(rec)
     }
 }
 
@@ -279,7 +804,7 @@ pub struct LineError {
 /// returned), so a caller can print `events` and still exit non-zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRead {
-    pub events: Vec<Event>,
+    pub events: Vec<Record>,
     pub torn_tail: Option<TornTail>,
     pub corrupt: Option<LineError>,
 }
@@ -300,7 +825,7 @@ pub fn parse_log(bytes: &[u8]) -> LogRead {
         let raw = &bytes[start..start + off];
         start += off + 1;
         let parsed = match std::str::from_utf8(raw) {
-            Ok(s) => Event::decode(s),
+            Ok(s) => Record::decode(s),
             Err(_) => Err("invalid utf-8".to_string()),
         };
         match parsed {
@@ -390,6 +915,15 @@ pub fn check_log_path(root: &Path, log: &Path) -> Result<PathBuf, AppendError> {
 /// at the last byte; it does not validate the rest of the log.
 pub fn append(root: &Path, log: &Path, ev: &Event) -> Result<(), AppendError> {
     append_impl(root, log, ev, true)
+}
+
+/// Append one record of ANY kind (the writer the P1b kinds are written through; later tickets call it, this ticket's
+/// code does not). Same file protocol as `append`: validate and encode first (a refused record never touches the
+/// file), path check, lock, torn-tail check, ONE write of the whole line, then `sync_all`.
+pub fn append_record(root: &Path, log: &Path, rec: &Record) -> Result<(), AppendError> {
+    let line = rec.encode()?;
+    let mut f = open_locked(root, log, true)?;
+    write_locked(&mut f, line.as_bytes(), true)
 }
 
 /// Open the log for appending under the module's exclusive advisory lock: path check, open (creating it only when `create`
@@ -572,6 +1106,11 @@ mod tests {
         }
     }
 
+    /// The read record of a base-kind event (the reader's view of `ev`).
+    fn rec(e: &Event) -> Record {
+        Record::decode(e.encode().unwrap().trim_end()).unwrap()
+    }
+
     /// The three cap kinds (run_issued has its own tests below); three lines, so a torn tail is always the third.
     fn three(t: &Tmp) -> Vec<u8> {
         for (i, k) in Kind::ALL.iter().take(3).enumerate() {
@@ -602,9 +1141,9 @@ mod tests {
     fn ac1_planted_a_fifth_kind_is_refused_on_read_and_cannot_be_constructed() {
         assert_eq!(Kind::parse("surprise"), None);
         let l = "{\"v\":2,\"kind\":\"surprise\",\"ts_ms\":1,\"run_id\":\"run-1\",\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"m-1\"}";
-        assert!(Event::decode(l).unwrap_err().contains("unknown kind"));
+        assert!(Record::decode(l).unwrap_err().contains("unknown kind"));
         // The twin: the same line with a real kind decodes.
-        assert!(Event::decode(&l.replace("surprise", "escalation")).is_ok());
+        assert!(Record::decode(&l.replace("surprise", "escalation")).is_ok());
     }
 
     // AC2 torn tail
@@ -686,7 +1225,7 @@ mod tests {
     fn ac4_unknown_or_missing_v_is_refused_naming_v_and_yields_no_event() {
         let good = ev(Kind::Escalation, 1).encode().unwrap();
         let good = good.trim_end();
-        assert!(Event::decode(good).is_ok(), "twin: v=2 passes");
+        assert!(Record::decode(good).is_ok(), "twin: v=2 passes");
         for (bad, want) in [
             (good.replace("\"v\":2", "\"v\":3"), "unsupported v 3"),
             (good.replace("\"v\":2", "\"v\":1"), "unsupported v 1"),
@@ -694,7 +1233,7 @@ mod tests {
             (good.replace("\"v\":2,", ""), "v missing"),
             (good.replace("\"v\":2", "\"v\":\"2\""), "v has the wrong type"),
         ] {
-            assert_eq!(Event::decode(&bad).unwrap_err(), want, "{bad}");
+            assert_eq!(Record::decode(&bad).unwrap_err(), want, "{bad}");
             let log = format!("{good}\n{bad}\n{good}\n");
             let r = parse_log(log.as_bytes());
             assert_eq!(r.events.len(), 1, "only the line before the bad one");
@@ -704,9 +1243,9 @@ mod tests {
         }
         // v is checked before the rest, so a v3 line with an unknown kind still names v. A v1 line (no run identity) is
         // refused the same way: it is never upgraded by guess.
-        assert_eq!(Event::decode(&good.replace("\"v\":2", "\"v\":3").replace("escalation", "future")).unwrap_err(), "unsupported v 3");
+        assert_eq!(Record::decode(&good.replace("\"v\":2", "\"v\":3").replace("escalation", "future")).unwrap_err(), "unsupported v 3");
         let v1 = "{\"v\":1,\"kind\":\"escalation\",\"ts_ms\":1,\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\"}";
-        assert_eq!(Event::decode(v1).unwrap_err(), "unsupported v 1");
+        assert_eq!(Record::decode(v1).unwrap_err(), "unsupported v 1");
     }
 
     // AC5 corruption is refused, not skipped
@@ -907,7 +1446,7 @@ mod tests {
         append(&t.0, &t.log(), &ev(Kind::BudgetExceeded, 5)).unwrap();
         // Read through a fresh handle: no in-process state is involved.
         let r = read_log(&t.log()).unwrap();
-        assert_eq!(r.events, vec![ev(Kind::BudgetExceeded, 5)]);
+        assert_eq!(r.events, vec![rec(&ev(Kind::BudgetExceeded, 5))]);
     }
 
     #[test]
@@ -1028,14 +1567,55 @@ mod tests {
     }
 
     #[test]
-    fn every_kind_has_the_exact_v2_key_set_and_encodes_exactly_those_keys() {
+    fn every_kind_declares_the_trio_first_an_exact_unique_key_set_and_only_v2() {
+        let trio = ["v", "kind", "ts_ms"];
         for k in Kind::ALL {
-            assert_eq!(k.keys(), &["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"]);
-            let line = ev(k, 1).encode().unwrap();
+            let keys = k.keys();
+            assert_eq!(&keys[..3], &trio, "{}: the shared trio comes first", k.as_str());
+            assert_eq!(keys.len(), keys.iter().collect::<std::collections::HashSet<_>>().len(), "{}: no key twice", k.as_str());
+            assert_eq!(k.version(), SCHEMA_VERSION, "{}: the table's v row", k.as_str());
+            assert_eq!(Kind::parse(k.as_str()), Some(k));
+            if k.is_base() {
+                assert_eq!(keys, KEYS_V2, "{}: the PRE-B envelope, bytes as on master", k.as_str());
+            } else {
+                assert!(keys.starts_with(&P1B_ENVELOPE), "{}: the shared P1b envelope", k.as_str());
+                assert!(keys.len() > 3, "{}: at least one payload field", k.as_str());
+            }
+        }
+        assert_eq!(Kind::ALL.iter().filter(|k| k.is_base()).count(), 4);
+        assert_eq!(Kind::ALL.iter().filter(|k| !k.is_base()).count(), 9);
+    }
+
+    #[test]
+    fn a_base_kind_line_encodes_exactly_its_declared_keys_in_order() {
+        for k in [Kind::Escalation, Kind::ReplanRequired, Kind::BudgetExceeded, Kind::RunIssued] {
+            let mut e = ev(k, 1);
+            if k == Kind::RunIssued {
+                e.reason = REASON_RUN_ISSUED.to_string();
+            }
+            let line = e.encode().unwrap();
             let mut p = P { b: line.trim_end().as_bytes(), i: 0 };
             let keys: Vec<String> = p.object().unwrap().into_iter().map(|(k, _)| k).collect();
             assert_eq!(keys, k.keys());
-            assert_eq!(Kind::parse(k.as_str()), Some(k));
+            // The reader returns the same line back.
+            let r = Record::decode(line.trim_end()).unwrap();
+            assert_eq!(r.encode().unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn the_base_event_writer_refuses_a_p1b_kind_before_any_value_is_looked_at() {
+        for k in Kind::ALL {
+            let mut e = ev(Kind::Escalation, 1);
+            e.kind = k;
+            let got = e.validate();
+            if k.is_base() {
+                assert!(got.is_ok(), "{}", k.as_str());
+            } else {
+                assert_eq!(got.unwrap_err(), format!("kind {} is a P1b kind: the base event shape cannot express its payload (write it through the record writer)", k.as_str()));
+                // Refused at encode, so `append`/`append_under_run` write nothing.
+                assert!(matches!(e.encode(), Err(AppendError::Invalid(_))));
+            }
         }
     }
 
