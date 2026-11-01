@@ -15,7 +15,7 @@ One event per line, compact, fixed key order, every key present. Each line carri
 | Key | Shape |
 |---|---|
 | `v` | the integer `2`; any other value is refused (a `v:1` line names `v` and is never upgraded) |
-| `kind` | one of the four kinds below |
+| `kind` | one of the thirteen kinds below |
 | `ts_ms` | non-negative integer, milliseconds since the epoch, supplied by the caller |
 | `run_id`, `role`, `model` | the run identity: which run wrote the line, in which role, with which model |
 | `ticket`, `repo`, `reason` | a plain token: lowercase letters, digits, `-`, `_`, `.`; not empty, not `.` or `..` |
@@ -24,6 +24,10 @@ One event per line, compact, fixed key order, every key present. Each line carri
 
 ## Kinds
 
+Thirteen kinds today, in two families. Each kind's key set is declared once, in the kind table in `core/rust/harness/src/events.rs`; this doc and `schemas/event.schema.json` mirror that table (a test pins all three together, so a drifted key fails the build).
+
+### The four base kinds (the run-identity envelope)
+
 | Kind | Meaning |
 |---|---|
 | `escalation` | a fix-round cap was reached and the ticket was escalated |
@@ -31,7 +35,39 @@ One event per line, compact, fixed key order, every key present. Each line carri
 | `budget_exceeded` | the ticket went over its budget and was stopped |
 | `run_issued` | a run identity was self-issued; the first line such an invocation appends |
 
-All four have the same key set. A new kind, or a new key, is an additive change that bumps `v`. A reader that sees a `v` it does not know refuses the line and names the line and `v`; it never guesses.
+All four have the same key set: `v, kind, ts_ms, run_id, ticket, repo, reason, role, model`. Every key is a plain token except `v`, `kind` and `ts_ms`.
+
+### The nine P1b kinds (payload kinds)
+
+These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`) joins them by editing the ONE shared envelope declaration in the loader when a run issuer exists (the PRE-B follow-up). Nothing writes them yet; later P1b tickets do, through the library record writer — the `events append` CLI flags cannot express a payload and refuse these kinds outright.
+
+| Kind | Keys (canonical order) | Field shapes after `v`, `kind`, `ts_ms` | Meaning |
+|---|---|---|---|
+| `session_started` | `v, kind, ts_ms, session_id, source` | `session_id` uuid; `source` `launch` or `hook` | a worker session was launched, or the interactive session started at host hook time |
+| `unmanaged_session` | `v, kind, ts_ms, session_id, ticket, reason` | `session_id` uuid; `ticket` token (the ticket or phase id the claimant reported); `reason` `not_supervisor_launched` or `no_launch_record` | a process reported a worker id but was not launched by the supervisor, or a hand-started session had no launch-record row; the one record that must never be lost, so it names no repo |
+| `launch_refused` | `v, kind, ts_ms, launch_role, brief_sha256, matched_entry` | `launch_role` token (the refused session's role — the envelope `role` is the writer's); `brief_sha256` hex64; `matched_entry` token, the NAME of the config entry that matched, never the matched text (which can be a private path) | a builder-state entry matched, the launch was refused, nothing was started |
+| `timed_out` | `v, kind, ts_ms, ticket, repo, cause, checkpoint, recipe, handover, session_id` | `ticket`, `repo` token; `cause` `timeout` or `died`; `checkpoint` sha (the last pushed checkpoint, or the workspace base sha when none was pushed); `recipe` `commit_push_then_resume`; `handover` relpath; `session_id` uuid (the worker) | the Process Supervisor stopped the run and left a continuation recipe |
+| `check_in` | `v, kind, ts_ms, ticket, repo, steps, soft_limit` | `ticket`, `repo` token; `steps`, `soft_limit` u64 | past the soft step limit a check-in was written and the job continued |
+| `step_limit_stop` | `v, kind, ts_ms, ticket, repo, steps, hard_limit` | `ticket`, `repo` token; `steps`, `hard_limit` u64 | the hard step limit stopped the job |
+| `cleanup_result` | `v, kind, ts_ms, ticket, repo, result, manifest_left` | `ticket`, `repo` token; `result` `pass` or `fail`; `manifest_left` u64 (0 = the manifest's empty state) | the finalize step's cleanup outcome; `result=pass` with `manifest_left` above 0 is refused (a pass that left entries behind is a lie) |
+| `quarantined` | `v, kind, ts_ms, ticket, repo, from, to, reason` | `ticket`, `repo` token; `from`, `to` relpath; `reason` `unmanifested` or `retention` | an item was moved to the quarantine folder, not deleted (the "under the harness root" bound is the writer's rule; the loader checks the relpath shape) |
+| `human_origin_refused` | `v, kind, ts_ms, target, path` | `target` `config`, `permission` or `control_registry`; `path` relpath of the target file, never its content | a config, permission or control-registry write was refused because no human origin was proven; no `ticket`/`repo` (an agent run may be off-ticket) |
+
+### Value shapes
+
+| Shape | Rule |
+|---|---|
+| token | lowercase letters, digits, `-`, `_`, `.`; not empty, not `.` or `..` |
+| uuid | full lowercase uuid, `8-4-4-4-12` hex; a short id is refused |
+| hex64 | exactly 64 lowercase hex digits |
+| sha | 40 or 64 lowercase hex digits (either length a repository may use) |
+| relpath | token segments joined by `/`: no leading `/`, no empty, `.` or `..` segment, no `~` — so neither an absolute nor a home path can be written |
+| u64 | an unsigned integer |
+| enum | exactly one of the listed tokens |
+
+### The version rule
+
+The loader keeps a table of each kind's exact key set and the only `v` it exists at; the four base kinds are at `v` 2 with the PRE-B run-identity envelope (bytes exactly as when that envelope landed), the nine P1b kinds are at `v` 2 with the plain envelope and no identity fields (v 2 was introduced by PRE-B; these kinds join it before any writer exists). Any other `(v, kind)` pair — a kind at a `v` it never had, a `v` this reader does not know at all — is refused naming `v`, and a `v:1` line is never upgraded. A new kind, or a new key, is an additive change that bumps `v`. A reader that sees a `v` it does not know refuses the line and names the line and `v`; it never guesses.
 
 ## Run identity (`run_id`)
 
