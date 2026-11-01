@@ -495,6 +495,15 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "manifest" {
         return manifest_cmd(&args[1..]);
     }
+    if !args.is_empty() && args[0] == "workspace" {
+        #[cfg(unix)]
+        return crate::workspace::workspace_cmd(&args[1..]);
+        #[cfg(not(unix))]
+        {
+            eprintln!("harness: error: workspace create is not available on this platform");
+            return 2;
+        }
+    }
     if !args.is_empty() && args[0] == "status" {
         return crate::status::status_cmd(&args[1..]);
     }
@@ -502,7 +511,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return fixtures_cmd(&args[1..]);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | status <ticket-file> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | status <ticket-file> ... | workspace create <ticket-file> ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";
