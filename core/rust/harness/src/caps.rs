@@ -1035,4 +1035,44 @@ mod tests {
             let _ = fs::remove_dir_all(p);
         }
     }
+
+    fn names_in(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    // A5 / A2: the writer's own range guard, the reader's own 4 KiB cap, and a case twin that would otherwise decode.
+    #[test]
+    fn the_budget_writer_and_reader_guards_are_pinned() {
+        let d = scratch();
+        let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
+        let held = caps.lock("EX-1").unwrap();
+        let before = names_in(&d);
+        for bad in [bud("M", 0), bud("XL", 5), bud("m", 5), bud("", 5)] {
+            assert!(caps.write_budget_once(&bad, &held).is_err(), "{bad:?} must be refused");
+            assert_eq!(names_in(&d), before, "nothing is left behind by {bad:?}");
+        }
+        assert_eq!(caps.write_budget_once(&bud("M", 1), &held), Ok(true), "twin: a legal budget is written");
+        drop(held);
+
+        // canonical for this ticket and repo, but over 4 KiB: the reader's own cap refuses it
+        let d2 = scratch();
+        let caps2 = Caps::open(&d2, Path::new("/nonexistent-root")).unwrap();
+        let long = "r".repeat(4100);
+        let big = Budget { ticket: "EX-1".to_string(), repo_id: long.clone(), size: "M".to_string(), started_ms: 7 };
+        assert!(big.encode().len() > 4097);
+        assert_eq!(Budget::decode(big.encode().as_bytes(), "EX-1", &long), Ok(big.clone()), "the bytes are canonical");
+        fs::write(d2.join("EX-1.budget"), big.encode()).unwrap();
+        assert!(caps2.read_budget("EX-1", &long).is_err(), "over 4 KiB is refused by the reader");
+
+        // a case twin holding the canonical bytes for this ticket is still refused, on any filesystem
+        let d3 = scratch();
+        let caps3 = Caps::open(&d3, Path::new("/nonexistent-root")).unwrap();
+        fs::write(d3.join("ex-1.budget"), bud("M", 7).encode()).unwrap();
+        assert!(caps3.read_budget("EX-1", "r").is_err(), "a canonical case twin is refused");
+        for p in [&d, &d2, &d3] {
+            let _ = fs::remove_dir_all(p);
+        }
+    }
 }
