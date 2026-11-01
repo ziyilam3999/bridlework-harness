@@ -74,6 +74,148 @@
         "role": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The role of the run being issued; never defaulted." },
         "model": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The model of the run being issued; never defaulted." }
       }
+    },
+    {
+      "title": "session_started",
+      "description": "A session was started: a worker launched by the supervisor, or the interactive session at host hook time.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "session_id", "source"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "session_started" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "Full lowercase uuid of the session; a short id is refused." },
+        "source": { "enum": ["launch", "hook"], "description": "Whether the id came from a supervisor launch or the host's hook payload." }
+      }
+    },
+    {
+      "title": "unmanaged_session",
+      "description": "A process reported a ticket's worker id but was not launched by the supervisor, or a session started by hand with no launch-record row.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "session_id", "ticket", "reason"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "unmanaged_session" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "Full lowercase uuid of the session." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The ticket (or phase id) the claimant reported." },
+        "reason": { "enum": ["not_supervisor_launched", "no_launch_record"], "description": "Which of the two sourced triggers refused the claimant." }
+      }
+    },
+    {
+      "title": "launch_refused",
+      "description": "A builder-state list entry matched, so the launch was refused and nothing was started.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "launch_role", "brief_sha256", "matched_entry"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "launch_refused" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "launch_role": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The role of the refused session (the writer's role is the envelope's, not this)." },
+        "brief_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the brief file, by the launch-row analogy." },
+        "matched_entry": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The NAME of the config builder-state entry that matched, never the matched text (which can be a private path)." }
+      }
+    },
+    {
+      "title": "timed_out",
+      "description": "The Process Supervisor (not the worker) stopped a run that timed out or died, leaving a continuation recipe.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "cause", "checkpoint", "recipe", "handover", "session_id"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "timed_out" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The ticket the run belonged to." },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The repository the run worked in." },
+        "cause": { "enum": ["timeout", "died"], "description": "Why the run stopped." },
+        "checkpoint": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$", "description": "The last pushed checkpoint commit (the workspace base sha when none was ever pushed)." },
+        "recipe": { "enum": ["commit_push_then_resume"], "description": "The fixed continuation recipe token; inline recipe text is impossible in this format." },
+        "handover": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Relative path to the handover file the resumed run starts from." },
+        "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "Full lowercase uuid of the worker session that timed out or died." }
+      }
+    },
+    {
+      "title": "check_in",
+      "description": "A worker past its soft step limit checked in and the job continued.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "steps", "soft_limit"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "check_in" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The ticket the job belongs to." },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The repository the job works in." },
+        "steps": { "type": "integer", "minimum": 0, "description": "Steps taken so far." },
+        "soft_limit": { "type": "integer", "minimum": 0, "description": "The soft limit that was crossed." }
+      }
+    },
+    {
+      "title": "step_limit_stop",
+      "description": "A worker hit its hard step limit and stopped.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "steps", "hard_limit"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "step_limit_stop" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The ticket the job belongs to." },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The repository the job works in." },
+        "steps": { "type": "integer", "minimum": 0, "description": "Steps taken." },
+        "hard_limit": { "type": "integer", "minimum": 0, "description": "The hard limit that stopped the job." }
+      }
+    },
+    {
+      "title": "cleanup_result",
+      "description": "The finalize step's cleanup outcome; a ticket is only marked Done after a pass.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "result", "manifest_left"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "cleanup_result" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The ticket being finalized." },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The repository being finalized." },
+        "result": { "enum": ["pass", "fail"], "description": "The cleanup result." },
+        "manifest_left": { "type": "integer", "minimum": 0, "description": "Resource-manifest entries still present; 0 is the empty state. A pass with entries left is refused by the loader." }
+      }
+    },
+    {
+      "title": "quarantined",
+      "description": "An item was moved to the quarantine folder, not deleted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "from", "to", "reason"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "quarantined" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The ticket whose harness root the item was found under." },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The repository." },
+        "from": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Where the item was (the under-harness-root bound is the writer's rule; the loader checks the relpath shape)." },
+        "to": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Where it was moved to, under the quarantine folder (the bound is the writer's rule; the loader checks the relpath shape)." },
+        "reason": { "enum": ["unmanifested", "retention"], "description": "An unmanifested planted item, or evidence moved past its retention." }
+      }
+    },
+    {
+      "title": "human_origin_refused",
+      "description": "A config, permission or control-registry write was refused because no human origin was proven for it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "target", "path"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "human_origin_refused" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "target": { "enum": ["config", "permission", "control_registry"], "description": "The class of write refused." },
+        "path": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Relative path of the target file under the harness root, never its content." }
+      }
     }
   ]
 }

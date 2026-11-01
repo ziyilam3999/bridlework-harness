@@ -1,6 +1,8 @@
 //! `schemas/event.schema.json` mirrors the event loader's exact key set per kind; this pins the two together (same idea as the
-//! gate and ticket schema tests). The crate never interprets the schema file.
-use harness::events::{Kind, LINE_CAP, SCHEMA_VERSION};
+//! gate and ticket schema tests). The crate never interprets the schema file. The per-kind `v` comes from the loader's
+//! own version table (`Kind::version()`), and every branch error is reported (never only the first), so an envelope-key
+//! edit in the loader's one declaration names the key for EACH kind whose branch drifted.
+use harness::events::{Kind, LINE_CAP};
 use std::path::PathBuf;
 
 fn repo() -> PathBuf {
@@ -49,7 +51,8 @@ fn property_keys(section: &str) -> Result<Vec<String>, String> {
     Err("properties object is not closed".to_string())
 }
 
-/// Err names the first way the schema text disagrees with the loader.
+/// Err reports EVERY branch that disagrees with the loader (one line per kind), so a drifted key is named for each
+/// kind whose declaration moved — not only the first kind in the list.
 fn check(schema: &str) -> Result<(), String> {
     let marker = "\"title\": \"";
     let n = schema.matches(marker).count();
@@ -59,40 +62,69 @@ fn check(schema: &str) -> Result<(), String> {
     if !schema.contains(&format!("{LINE_CAP} bytes")) {
         return Err("the schema does not state the line cap".to_string());
     }
+    let mut errs: Vec<String> = Vec::new();
     for k in Kind::ALL {
         let name = k.as_str();
-        let start = schema.find(&format!("{marker}{name}\"")).ok_or(format!("no branch for kind {name}"))?;
+        let start = match schema.find(&format!("{marker}{name}\"")) {
+            Some(at) => at,
+            None => {
+                errs.push(format!("no branch for kind {name}"));
+                continue;
+            }
+        };
         let end = schema[start + 1..].find(marker).map(|i| start + 1 + i).unwrap_or(schema.len());
         let section = &schema[start..end];
-        let mut got = required_in(section).map_err(|e| format!("{name}: {e}"))?;
+        let mut got = match required_in(section) {
+            Ok(r) => r,
+            Err(e) => {
+                errs.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
         let mut want: Vec<String> = k.keys().iter().map(|s| s.to_string()).collect();
         got.sort();
         want.sort();
         if got != want {
-            return Err(format!("{name}: required set {got:?} differs from the loader's {want:?}"));
+            errs.push(format!("{name}: required set {got:?} differs from the loader's {want:?}"));
+            continue;
         }
         // Both directions: a property the loader does not know (an extra optional key the schema would allow) is drift too.
-        let mut props = property_keys(section).map_err(|e| format!("{name}: {e}"))?;
+        let mut props = match property_keys(section) {
+            Ok(p) => p,
+            Err(e) => {
+                errs.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
         props.sort();
         if props != want {
-            return Err(format!("{name}: property set {props:?} differs from the loader's {want:?}"));
+            errs.push(format!("{name}: property set {props:?} differs from the loader's {want:?}"));
+            continue;
         }
+        let mut branch_errs: Vec<String> = Vec::new();
         for key in &want {
             if !section.contains(&format!("\"{key}\":")) {
-                return Err(format!("{name}: required key {key} has no property"));
+                branch_errs.push(format!("required key {key} has no property"));
             }
         }
         if !section.contains(&format!("\"kind\": {{ \"const\": \"{name}\" }}")) {
-            return Err(format!("{name}: the kind const does not match the branch"));
+            branch_errs.push("the kind const does not match the branch".to_string());
         }
-        if !section.contains(&format!("\"v\": {{ \"const\": {SCHEMA_VERSION},")) {
-            return Err(format!("{name}: the v const is not {SCHEMA_VERSION}"));
+        if !section.contains(&format!("\"v\": {{ \"const\": {}," , k.version())) {
+            branch_errs.push(format!("the v const is not {} (the loader's version-table row for this kind)", k.version()));
         }
         if !section.contains("\"additionalProperties\": false") {
-            return Err(format!("{name}: extra keys are not refused"));
+            branch_errs.push("extra keys are not refused".to_string());
+        }
+        for e in branch_errs {
+            errs.push(format!("{name}: {e}"));
         }
     }
-    Ok(())
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
 }
 
 fn schema_text() -> String {
@@ -119,6 +151,10 @@ fn planted_a_schema_that_drifted_from_the_loader_is_caught() {
         ("a kind branch missing", good.replacen("\"title\": \"run_issued\"", "\"title\": \"run\"", 1)),
         ("an extra optional property the loader does not know", good.replacen("\"reason\": {", "\"note\": { \"type\": \"string\" },\n        \"reason\": {", 1)),
         ("a stale line cap", good.replace("4096 bytes", "8192 bytes")),
+        ("a key removed from one p1b kind", good.replacen("\"required\": [\"v\", \"kind\", \"ts_ms\", \"session_id\", \"source\"]", "\"required\": [\"v\", \"kind\", \"ts_ms\", \"source\"]", 1)),
+        ("a p1b kind const that no longer matches", good.replacen("\"kind\": { \"const\": \"session_started\" }", "\"kind\": { \"const\": \"session_start\" }", 1)),
+        ("a p1b payload property the loader does not know", good.replacen("\"session_id\": { \"type\": \"string\"", "\"sid\": { \"type\": \"string\" },\n        \"session_id\": { \"type\": \"string\"", 1)),
+        ("a p1b branch missing", good.replacen("\"title\": \"quarantined\"", "\"title\": \"quarantine\"", 1)),
     ];
     for (name, m) in mutants {
         assert!(m != good, "{name}: the mutation changed nothing");
@@ -127,10 +163,14 @@ fn planted_a_schema_that_drifted_from_the_loader_is_caught() {
 }
 
 #[test]
-fn the_doc_names_every_kind_and_the_cap() {
+fn the_doc_names_every_kind_the_cap_and_each_exact_key_list() {
     let doc = std::fs::read_to_string(repo().join("docs/event-log.md")).expect("the doc is committed and utf-8");
     for k in Kind::ALL {
         assert!(doc.contains(&format!("`{}`", k.as_str())), "doc names {}", k.as_str());
+        // The doc's field table is rendered from the loader's declared key list: the exact canonical list, as one code
+        // span, per kind — so a kind or a key missing from the doc cannot pass vacuously.
+        assert!(doc.contains(&format!("`{}`", k.keys().join(", "))), "doc lists the exact keys of {} in canonical order", k.as_str());
+        assert_eq!(k.version(), 2, "{}: the loader's version-table row", k.as_str());
     }
     assert!(doc.contains(&LINE_CAP.to_string()));
     assert!(doc.contains("torn tail") && doc.contains("EVENT NOT RECORDED"));
