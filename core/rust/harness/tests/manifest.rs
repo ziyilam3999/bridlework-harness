@@ -7,6 +7,7 @@ use harness::manifest::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
@@ -821,4 +822,314 @@ fn a_manifest_file_over_one_mib_is_refused_as_corrupt() {
     assert!(read.torn_tail.is_some(), "the unterminated tail at the cap is still a torn tail");
     // and the library-level read of the oversized bytes agrees
     assert!(parse_manifest(&vec![b'x'; CAP + 1], "t-1").corrupt.unwrap().msg.contains("1 MiB"));
+}
+
+// ---------------------------------------------------------------- fix round 2 (review pr49, round 2)
+
+/// Every `.jsonl` file anywhere under `p` (the ticket IS the file name, so a bad one must not plant a file anywhere).
+fn jsonl_under(p: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            let ep = e.path();
+            if ep.is_dir() {
+                jsonl_under(&ep, out);
+            } else if ep.extension().is_some_and(|x| x == "jsonl") {
+                out.push(ep);
+            }
+        }
+    }
+}
+
+/// A `&'static str` view of an owned string, for `Op`'s borrows inside spawned threads.
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// B4: a non-plain `ticket` is refused for every op, naming the plain-token rule, and creates no file anywhere
+/// under the scratch parent — the ticket becomes the file name, so `../escape` must not write outside the dir.
+#[test]
+fn a_non_plain_ticket_is_refused_for_every_op_and_creates_nothing_anywhere() {
+    let t = Tmp::new("ticket4");
+    let r = t.sub("roots/r");
+    for bad in ["../escape", "a/b", "UPPER", "", ".", ".."] {
+        for (name, op) in [
+            ("init", Op::Init { roots: &[r.clone()] }),
+            ("add", Op::AddPort { id: "n", port: 8080 }),
+            ("remove", Op::Remove { id: "n" }),
+        ] {
+            let err = apply(&t.manifest_dir(), bad, &op, ts(1)).unwrap_err();
+            assert!(matches!(err, ManifestError::Invalid(_)), "{bad:?} {name}: {err}");
+            assert!(err.to_string().contains("plain token"), "{bad:?} {name}: {err}");
+        }
+        assert!(!t.manifest_dir().exists(), "{bad:?}: no manifest dir was created");
+    }
+    let mut found = Vec::new();
+    jsonl_under(&t.0, &mut found);
+    assert!(found.is_empty(), "no manifest file anywhere under the scratch parent: {found:?}");
+    // twin: the plain lowercase ticket inits on the same dir
+    apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[r] }, ts(1)).unwrap();
+    assert!(t.manifest_dir().join("t-1.jsonl").exists());
+}
+
+/// B4 (decode half): a stored line carrying a non-plain ticket is refused by the strict decoder too.
+#[test]
+fn a_stored_line_with_a_non_plain_ticket_is_refused_on_decode() {
+    let raw = "{\"v\":1,\"op\":\"add\",\"ticket\":\"T-1\",\"id\":\"n\",\"class\":\"port\",\"port\":8080,\"ts_ms\":1}";
+    let err = Line::decode(raw).unwrap_err();
+    assert!(err.contains("plain token"), "{err}");
+}
+
+/// B5(a): N threads add the SAME id; the lock must cover read+validate+append, so exactly one wins per round
+/// and the file reads clean with one live id (bounded: 8 threads, 25 rounds).
+#[test]
+fn concurrent_adds_of_one_id_leave_exactly_one_winner_and_a_clean_file() {
+    let t = Tmp::new("race-id");
+    let r = t.sub("roots/r");
+    for round in 0..25 {
+        let dir = t.0.join(format!("man-{round}"));
+        apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let b = barrier.clone();
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                apply(&d, "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(2)).is_ok()
+            }));
+        }
+        let oks: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+        assert_eq!(oks, 1, "round {round}: exactly one add of the same id wins");
+        let read = read_manifest(&dir, "t-1").unwrap();
+        assert!(read.is_clean(), "round {round}: {:?}", read.corrupt.as_ref().map(|c| &c.msg));
+        assert_eq!(read.live.len(), 1, "round {round}: one live id");
+        assert_eq!(read.live[0].id, "n");
+    }
+}
+
+/// B5(a): two concurrent removes of one id — one wins, the loser refuses (a dead-id remove), the file stays readable.
+#[test]
+fn concurrent_removes_of_one_id_leave_the_file_readable() {
+    let t = Tmp::new("race-rm");
+    let r = t.sub("roots/r");
+    for round in 0..25 {
+        let dir = t.0.join(format!("man-{round}"));
+        apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+        apply(&dir, "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(2)).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = barrier.clone();
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                apply(&d, "t-1", &Op::Remove { id: "n" }, ts(3)).is_ok()
+            }));
+        }
+        let oks: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+        assert_eq!(oks, 1, "round {round}: exactly one remove wins");
+        let read = read_manifest(&dir, "t-1").unwrap();
+        assert!(read.is_clean(), "round {round}: {:?}", read.corrupt.as_ref().map(|c| &c.msg));
+        assert!(read.live.is_empty(), "round {round}: the id is gone");
+    }
+}
+
+/// B5(b): a hand-written file the writer would refuse is corruption on READ too — a duplicate live id, the same
+/// path, the same pid and the same port twice live each stop the read (the reader is the fail-closed backstop
+/// for a file written by a buggy or racing writer).
+#[test]
+fn a_duplicate_live_id_or_the_same_path_pid_or_port_twice_live_is_corruption_on_read() {
+    let t = Tmp::new("dup-read");
+    let r = t.sub("roots/r");
+    let root = r.canonicalize().unwrap().to_string_lossy().into_owned();
+    let root_line = Line::Root { ticket: "t-1".into(), path: root.clone(), ts_ms: 1 }.encode().unwrap();
+    let port = |id: &str, port: u64, ts_ms: u64| {
+        Line::AddPort { ticket: "t-1".into(), id: id.into(), port, ts_ms }.encode().unwrap()
+    };
+    let path = |id: &str, p: String, ts_ms: u64| {
+        Line::AddPath { ticket: "t-1".into(), id: id.into(), class: Class::TempDir, path: p, ts_ms }.encode().unwrap()
+    };
+    let proc = |id: &str, pid: u64, ts_ms: u64| {
+        Line::AddProcess { ticket: "t-1".into(), id: id.into(), pid, pid_start_ms: 7, ts_ms }.encode().unwrap()
+    };
+    let x = r.join("x").to_string_lossy().into_owned(); // stored paths need not exist; the reader fences lexically
+    for (name, bytes, needle) in [
+        ("duplicate live id", format!("{root_line}{}{}", port("n", 8080, 2), port("n", 8081, 3)), "duplicate live id"),
+        ("same path twice live", format!("{root_line}{}{}", path("a", x.clone(), 2), path("b", x, 3)), "path is listed twice live"),
+        ("same pid twice live", format!("{root_line}{}{}", proc("p", 4242, 2), proc("q", 4242, 3)), "pid is listed twice live"),
+        ("same port twice live", format!("{root_line}{}{}", port("n1", 8080, 2), port("n2", 8080, 3)), "port is listed twice live"),
+    ] {
+        let read = parse_manifest(bytes.as_bytes(), "t-1");
+        assert!(!read.is_clean(), "{name} is corruption on read");
+        let c = read.corrupt.as_ref().unwrap();
+        assert!(c.msg.contains(needle), "{name}: {}", c.msg);
+        assert!(read.roots.is_empty() && read.live.is_empty(), "{name}: a corrupt read carries no state");
+    }
+}
+
+/// S1: a complete line with trailing bytes after the closing `}` and a number with a leading zero are each
+/// corruption — the parser's strictness is pinned, not incidental.
+#[test]
+fn trailing_bytes_after_the_object_and_a_leading_zero_number_are_corruption() {
+    let good = Line::AddPort { ticket: "t-1".into(), id: "n".into(), port: 8080, ts_ms: 1 }.encode().unwrap();
+    let trailing = format!("{}x", good.trim_end_matches('\n'));
+    let err = Line::decode(&trailing).unwrap_err();
+    assert!(err.contains("trailing bytes"), "{err}");
+    let lz = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"n\",\"class\":\"port\",\"port\":08080,\"ts_ms\":1}";
+    let err = Line::decode(lz).unwrap_err();
+    assert!(err.contains("leading zero"), "{err}");
+    // twin: the same line without the trailing byte and without the leading zero decodes
+    assert!(Line::decode(good.trim_end_matches('\n')).is_ok());
+}
+
+/// S2: `Init { roots: &[] }` is refused and creates no manifest dir.
+#[test]
+fn an_init_with_no_roots_is_refused_and_creates_no_manifest_dir() {
+    let t = Tmp::new("noroots2");
+    let err = apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[] }, ts(1)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "{err}");
+    assert!(err.to_string().contains("--root"), "{err}");
+    assert!(!t.manifest_dir().exists(), "the refused init created no folder");
+    // twin: one root still inits
+    let r = t.sub("roots/r");
+    apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[r] }, ts(1)).unwrap();
+}
+
+/// N-a: a torn-tail read carries NO roots and NO live entries ("filled only when the file is clean" must hold),
+/// so a later `list` cannot print entries from a torn file by mistake.
+#[test]
+fn a_torn_tail_read_carries_no_roots_and_no_live_entries() {
+    let t = Tmp::new("torn-state");
+    let r = t.sub("roots/r");
+    init(&t, &[r]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(2)).unwrap();
+    let mut torn = t.bytes("t-1");
+    torn.extend_from_slice(b"{\"v\":1,\"op\":\"re");
+    std::fs::write(t.manifest_dir().join("t-1.jsonl"), &torn).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(read.torn_tail.is_some() && read.corrupt.is_none());
+    assert!(read.roots.is_empty(), "a torn tail carries no roots");
+    assert!(read.live.is_empty(), "a torn tail carries no live entries");
+    assert_eq!(read.lines.len(), 2, "the complete lines before the fragment are intact");
+}
+
+/// HELD-OUT v1 (must-fire): 8 threads add DISTINCT ids but the SAME port; exactly one may win and the file
+/// must read clean — the duplicate-port refusal is only sound inside the critical section.
+#[test]
+fn concurrent_adds_of_distinct_ids_sharing_one_port_leave_one_winner() {
+    let t = Tmp::new("race-port");
+    let r = t.sub("roots/r");
+    for round in 0..25 {
+        let dir = t.0.join(format!("man-{round}"));
+        apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let b = barrier.clone();
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                let id = leak(format!("n-{i}"));
+                apply(&d, "t-1", &Op::AddPort { id, port: 8080 }, ts(2)).is_ok()
+            }));
+        }
+        let oks: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+        assert_eq!(oks, 1, "round {round}: exactly one same-port add wins");
+        let read = read_manifest(&dir, "t-1").unwrap();
+        assert!(read.is_clean(), "round {round}: {:?}", read.corrupt.as_ref().map(|c| &c.msg));
+        assert_eq!(read.live.len(), 1);
+    }
+}
+
+/// HELD-OUT v2 (must-fire): two concurrent inits of one fresh manifest; exactly one wins, the file holds one init.
+#[test]
+fn concurrent_inits_of_one_fresh_manifest_leave_exactly_one_init() {
+    let t = Tmp::new("race-init");
+    let r = t.sub("roots/r");
+    for round in 0..25 {
+        let dir = t.0.join(format!("man-{round}"));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = barrier.clone();
+            let d = dir.clone();
+            let root = r.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                apply(&d, "t-1", &Op::Init { roots: &[root] }, ts(1)).is_ok()
+            }));
+        }
+        let oks: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+        assert_eq!(oks, 1, "round {round}: exactly one init wins");
+        let read = read_manifest(&dir, "t-1").unwrap();
+        assert!(read.is_clean(), "round {round}: {:?}", read.corrupt.as_ref().map(|c| &c.msg));
+        assert_eq!(read.roots.len(), 1, "round {round}: the file holds one init");
+    }
+}
+
+/// HELD-OUT v3 (must-fire): a ticket over 200 characters follows the existing name rule — there is no separate
+/// length cap, so a plain long token is accepted and its file lands INSIDE the manifest dir, never outside it.
+#[test]
+fn an_over_long_plain_ticket_is_still_fenced_inside_the_manifest_dir() {
+    let t = Tmp::new("longticket");
+    let r = t.sub("roots/r");
+    let long = format!("x{}", "a".repeat(200));
+    apply(&t.manifest_dir(), &long, &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+    assert!(t.manifest_dir().join(format!("{long}.jsonl")).exists(), "the long plain ticket inits inside the dir");
+    let mut found = Vec::new();
+    jsonl_under(&t.0, &mut found);
+    assert_eq!(found.len(), 1, "exactly one manifest file, inside the dir: {found:?}");
+    assert_eq!(found[0], t.manifest_dir().join(format!("{long}.jsonl")));
+    // the non-plain spelling is refused regardless of length
+    let bad = format!("x{}", "A".repeat(200));
+    assert!(matches!(apply(&t.manifest_dir(), &bad, &Op::Init { roots: &[r] }, ts(1)), Err(ManifestError::Invalid(_))));
+}
+
+/// HELD-OUT v5 (must-not-fire): 8 threads add distinct ids with distinct ports; all eight land and the file
+/// reads clean with 8 live entries — the lock serialises without refusing independent work.
+#[test]
+fn concurrent_adds_of_distinct_ids_and_ports_all_land() {
+    let t = Tmp::new("race-distinct");
+    let r = t.sub("roots/r");
+    init(&t, &[r]).unwrap();
+    let dir = t.manifest_dir();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let b = barrier.clone();
+        let d = dir.clone();
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            let id = leak(format!("n-{i}"));
+            apply(&d, "t-1", &Op::AddPort { id, port: 9000 + i }, ts(2)).is_ok()
+        }));
+    }
+    let oks: usize = handles.into_iter().map(|h| h.join().unwrap() as usize).sum();
+    assert_eq!(oks, 8, "every independent add lands");
+    let read = read_manifest(&dir, "t-1").unwrap();
+    assert!(read.is_clean());
+    assert_eq!(read.live.len(), 8);
+}
+
+/// HELD-OUT v6 (must-not-fire): a lower-case ticket with digits and hyphens is still a plain token.
+#[test]
+fn a_lower_case_ticket_with_digits_and_hyphens_is_accepted() {
+    let t = Tmp::new("plain-ticket");
+    let r = t.sub("roots/r");
+    apply(&t.manifest_dir(), "p1b-02", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+    assert!(t.manifest_dir().join("p1b-02.jsonl").exists());
+    let read = read_manifest(&t.manifest_dir(), "p1b-02").unwrap();
+    assert!(read.is_clean() && read.roots.len() == 1);
+}
+
+/// HELD-OUT v7 (must-not-fire): single-thread add then remove of one id still works and reads clean.
+#[test]
+fn a_single_writer_add_then_remove_still_round_trips() {
+    let t = Tmp::new("single");
+    let r = t.sub("roots/r");
+    init(&t, &[r]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(2)).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::Remove { id: "n" }, ts(3)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    assert!(read.is_clean() && read.live.is_empty());
 }

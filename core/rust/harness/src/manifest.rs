@@ -541,8 +541,12 @@ pub fn parse_manifest(bytes: &[u8], ticket: &str) -> ManifestRead {
     out.lines = numbered.iter().map(|(_, l)| l.clone()).collect();
     match build_state(&numbered) {
         Ok(st) => {
-            out.roots = st.roots;
-            out.live = st.live;
+            // N-a: `roots` and `live` are filled only when the file is clean — a torn tail carries no state,
+            // so a later listing cannot print entries from a torn file by mistake.
+            if out.torn_tail.is_none() {
+                out.roots = st.roots;
+                out.live = st.live;
+            }
         }
         Err((line, msg)) => {
             out.corrupt = Some(LineError { line, msg });
@@ -694,41 +698,42 @@ fn sync(f: &File) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// Append one encoded line under the event log's write rules: append mode, exclusive lock, last-byte torn-tail check, ONE
-/// write of the whole line, then `sync_all`. Success means the line is on disk.
-fn append_line(file: &Path, line: &Line) -> Result<(), ManifestError> {
-    let text = line.encode()?;
+/// Open the manifest file with the exclusive lock taken FIRST: read, validate and append are ONE critical
+/// section, so two writers cannot both validate against the same stale read and both append (B5). `creating`
+/// is set only by init, the one operation allowed to make the file; every other op opens an existing file,
+/// so a missing manifest is refused having created nothing.
+fn open_locked(file: &Path, ticket: &str, creating: bool) -> Result<File, ManifestError> {
     let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
-    let mut f = OpenOptions::new().read(true).append(true).create(true).open(file).map_err(io)?;
+    let f = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(creating)
+        .open(file)
+        .map_err(|e| match (!creating, e.kind()) {
+            (true, std::io::ErrorKind::NotFound) => {
+                ManifestError::Invalid(format!("no manifest for ticket {ticket}; run init first"))
+            }
+            _ => io(e),
+        })?;
     f.lock().map_err(|e| ManifestError::Io(e.to_string()))?;
-    let len = f.metadata().map_err(io)?.len();
-    if len > 0 {
-        f.seek(SeekFrom::End(-1)).map_err(io)?;
-        let mut last = [0u8; 1];
-        f.read_exact(&mut last).map_err(io)?;
-        if last[0] != b'\n' {
-            return Err(ManifestError::Damaged {
-                line: None,
-                msg: "the last line has no newline".to_string(),
-            });
-        }
-    }
-    let n = f.write(text.as_bytes()).map_err(io)?;
-    if n != text.len() {
-        return Err(ManifestError::Io("short write".to_string()));
-    }
-    sync(&f).map_err(io)?;
-    Ok(())
+    Ok(f)
 }
 
-/// Read a manifest for a write: the file must exist (init first) and be clean (a damaged file refuses the write).
-fn read_for_write(dir: &Path, ticket: &str) -> Result<ManifestRead, ManifestError> {
-    let file = manifest_file(dir, ticket);
-    if !file.exists() {
-        return Err(ManifestError::Invalid(format!("no manifest for ticket {ticket}; run init first")));
-    }
-    let bytes = fs::read(&file).map_err(|e| ManifestError::Io(e.kind().to_string()))?;
-    let r = parse_manifest(&bytes, ticket);
+/// Read the whole file through the locked handle. `parse_manifest`'s final-fragment rule subsumes the old
+/// last-byte check: bytes that do not end in `\n` are a torn tail and refuse the write.
+fn read_locked(f: &mut File) -> Result<Vec<u8>, ManifestError> {
+    let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
+    let mut bytes = Vec::new();
+    f.seek(SeekFrom::Start(0)).map_err(io)?;
+    f.read_to_end(&mut bytes).map_err(io)?;
+    Ok(bytes)
+}
+
+/// The write-side damage rules, applied to bytes read under the lock: a corrupt line or a torn tail refuses
+/// the write unchanged, and a clean read with no roots is a file that exists but holds no init (an init that
+/// crashed between create and write leaves a 0-byte file): appending would corrupt it for good, so refuse.
+fn validate_for_write(bytes: &[u8], ticket: &str) -> Result<ManifestRead, ManifestError> {
+    let r = parse_manifest(bytes, ticket);
     if let Some(c) = &r.corrupt {
         return Err(ManifestError::Damaged { line: Some(c.line), msg: c.msg.clone() });
     }
@@ -736,11 +741,22 @@ fn read_for_write(dir: &Path, ticket: &str) -> Result<ManifestRead, ManifestErro
         return Err(ManifestError::Damaged { line: None, msg: format!("torn tail at line {} ({} bytes)", t.line, t.bytes) });
     }
     if r.roots.is_empty() {
-        // A clean read with no roots is a file that exists but holds no init (an init that crashed between
-        // create and write leaves a 0-byte file): appending would corrupt it for good, so refuse.
         return Err(ManifestError::Invalid(format!("no manifest for ticket {ticket}; run init first")));
     }
     Ok(r)
+}
+
+/// Append one encoded line through the already-locked handle: ONE write of the whole line, then `sync_all`.
+/// Success means the line is on disk.
+fn append_locked(f: &mut File, line: &Line) -> Result<(), ManifestError> {
+    let text = line.encode()?;
+    let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
+    let n = f.write(text.as_bytes()).map_err(io)?;
+    if n != text.len() {
+        return Err(ManifestError::Io("short write".to_string()));
+    }
+    sync(f).map_err(io)?;
+    Ok(())
 }
 
 /// Validate one root for init: absolute, existing, a directory, not `/`; return it resolved.
@@ -773,13 +789,6 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             if roots.is_empty() {
                 return Err(ManifestError::Invalid("init needs at least one --root".to_string()));
             }
-            let file = manifest_file(dir, ticket);
-            if file.exists() {
-                let len = fs::metadata(&file).map_err(|e| ManifestError::Io(e.kind().to_string()))?.len();
-                if len > 0 {
-                    return Err(ManifestError::Invalid("second init: the manifest already holds lines".to_string()));
-                }
-            }
             let resolved: Vec<PathBuf> = roots.iter().map(|r| resolve_root(r)).collect::<Result<_, _>>()?;
             // The record must survive removal of the roots, so the manifest file may not live inside one of them.
             if dir_inside_any_root(dir, &resolved) {
@@ -788,8 +797,15 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 ));
             }
             fs::create_dir_all(dir).map_err(|e| ManifestError::Io(e.kind().to_string()))?;
+            // ONE critical section (B5): the lock is taken first, then the empty-file check runs on bytes read
+            // through the locked handle, so two concurrent inits of one fresh manifest leave exactly one.
+            let file = manifest_file(dir, ticket);
+            let mut f = open_locked(&file, ticket, true)?;
+            if !read_locked(&mut f)?.is_empty() {
+                return Err(ManifestError::Invalid("second init: the manifest already holds lines".to_string()));
+            }
             for r in &resolved {
-                append_line(&file, &Line::Root { ticket: ticket.to_string(), path: r.to_string_lossy().into_owned(), ts_ms })?;
+                append_locked(&mut f, &Line::Root { ticket: ticket.to_string(), path: r.to_string_lossy().into_owned(), ts_ms })?;
             }
             Ok(())
         }
@@ -807,14 +823,16 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             if !path_ok(orig) {
                 return Err(ManifestError::Invalid("path holds a character that would need escaping, or is not absolute".to_string()));
             }
-            let r = read_for_write(dir, ticket)?;
-            if r.live.iter().any(|e| e.id == *id) {
-                return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
-            }
             let resolved = resolve_for_manifest(path).map_err(ManifestError::Invalid)?;
             let stored = resolved.to_str().ok_or_else(|| ManifestError::Invalid("the resolved path is not utf-8".to_string()))?;
             if !path_ok(stored) {
                 return Err(ManifestError::Invalid("the resolved path holds a character that would need escaping".to_string()));
+            }
+            // every file-state check runs inside the critical section (B5)
+            let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
+            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            if r.live.iter().any(|e| e.id == *id) {
+                return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
             }
             if !inside_any_root(&resolved, &r.roots) {
                 return Err(ManifestError::Invalid(format!("path {} resolves outside every root", stored)));
@@ -822,7 +840,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             if r.live.iter().any(|e| matches!(&e.target, Target::Path(p) if p == stored)) {
                 return Err(ManifestError::Invalid(format!("the same path is listed twice live: {stored}")));
             }
-            append_line(&manifest_file(dir, ticket), &Line::AddPath {
+            append_locked(&mut f, &Line::AddPath {
                 ticket: ticket.to_string(),
                 id: id.to_string(),
                 class: *class,
@@ -837,14 +855,15 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             if *pid <= 1 {
                 return Err(ManifestError::Invalid("pid must be an integer > 1 (signalling 0, 1 or a negative would hit a group or init)".to_string()));
             }
-            let r = read_for_write(dir, ticket)?;
+            let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
+            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
             if r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
             }
             if r.live.iter().any(|e| matches!(&e.target, Target::Process { pid: p, .. } if p == pid)) {
                 return Err(ManifestError::Invalid(format!("the same pid is listed twice live: {pid}")));
             }
-            append_line(&manifest_file(dir, ticket), &Line::AddProcess {
+            append_locked(&mut f, &Line::AddProcess {
                 ticket: ticket.to_string(),
                 id: id.to_string(),
                 pid: *pid,
@@ -859,14 +878,15 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             if *port < 1 || *port > 65535 {
                 return Err(ManifestError::Invalid("port must be an integer in 1..65535".to_string()));
             }
-            let r = read_for_write(dir, ticket)?;
+            let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
+            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
             if r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
             }
             if r.live.iter().any(|e| matches!(&e.target, Target::Port(p) if p == port)) {
                 return Err(ManifestError::Invalid(format!("the same port is listed twice live: {port}")));
             }
-            append_line(&manifest_file(dir, ticket), &Line::AddPort {
+            append_locked(&mut f, &Line::AddPort {
                 ticket: ticket.to_string(),
                 id: id.to_string(),
                 port: *port,
@@ -877,11 +897,12 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             if !token_ok(id) {
                 return Err(ManifestError::Invalid("id must be a plain token (lowercase letters, digits, '-', '_', '.')".to_string()));
             }
-            let r = read_for_write(dir, ticket)?;
+            let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
+            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
             if !r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("remove of an id that is not live: {id}")));
             }
-            append_line(&manifest_file(dir, ticket), &Line::Remove { ticket: ticket.to_string(), id: id.to_string(), ts_ms })
+            append_locked(&mut f, &Line::Remove { ticket: ticket.to_string(), id: id.to_string(), ts_ms })
         }
     }
 }
