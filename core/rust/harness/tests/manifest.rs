@@ -461,6 +461,147 @@ fn the_fence_refuses_outside_paths_traversal_and_symlink_escapes() {
     assert_eq!(read.live.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["ok", "future"]);
 }
 
+// ---------------------------------------------------------------- dangling symlinks (B7)
+
+/// B7, from the round-4 review: a symlink whose target does not exist must be refused wherever a path is fenced.
+/// `exists()` follows links, so a dangling link looked "missing": it was stored as a plain name inside the root,
+/// while the caller's write follows it outside. Something that is THERE but does not resolve is refused
+/// (`events.rs::check_log_path`'s rule), never treated as missing.
+#[test]
+fn b7_a_dangling_symlink_in_a_root_is_refused_not_stored_as_missing() {
+    let t = Tmp::new("b7");
+    let r = t.sub("roots/r");
+    let o = t.sub("outside/o");
+    std::os::unix::fs::symlink(o.join("missing"), r.join("dang")).unwrap();
+    std::os::unix::fs::symlink(o.join("missing-dir"), r.join("dangdir")).unwrap();
+    init(&t, &[r.clone()]).unwrap();
+    let before = t.bytes("t-1");
+
+    // (a) the dangling link is the final component: refused, the file is byte-identical, the target stays missing
+    let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "d", class: Class::TempDir, path: &r.join("dang") }, ts(2)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "(a) {err}");
+    assert!(err.to_string().contains("does not resolve"), "(a) {err}");
+    assert_eq!(t.bytes("t-1"), before, "(a) the file is byte-identical");
+    assert!(!o.join("missing").exists(), "(a) nothing was created through the link");
+    assert!(!Path::new(&r.join("dang")).is_dir(), "(a) nothing was created inside the root either");
+
+    // (b) the dangling link is a parent component: same refusal
+    let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "dd", class: Class::TempDir, path: &r.join("dangdir").join("x") }, ts(3)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "(b) {err}");
+    assert!(err.to_string().contains("does not resolve"), "(b) {err}");
+    assert_eq!(t.bytes("t-1"), before, "(b) the file is byte-identical");
+    assert!(!o.join("missing-dir").exists(), "(b) nothing was created through the link");
+
+    // (c) twin: a link to an EXISTING in-root folder still resolves through and is accepted as its target
+    let sub = t.sub("roots/r/sub");
+    std::os::unix::fs::symlink(&sub, r.join("lin")).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "lin", class: Class::TempDir, path: &r.join("lin").join("ne").join("x") }, ts(4)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    let want = Target::Path(sub.canonicalize().unwrap().join("ne").join("x").to_string_lossy().into_owned());
+    assert!(read.live.iter().any(|e| e.target == want), "(c) stored as the in-root target, not the link name: {:?}", read.live);
+
+    // v6 twin: a plainly missing deep path with no link anywhere is accepted as given
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "deep", class: Class::TempDir, path: &r.join("ne").join("deep").join("er") }, ts(5)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    let want = Target::Path(r.canonicalize().unwrap().join("ne").join("deep").join("er").to_string_lossy().into_owned());
+    assert!(read.live.iter().any(|e| e.target == want), "v6 stored as given: {:?}", read.live);
+}
+
+/// v2 (held-out): a chain of two links whose final target is missing is refused too; no link in the chain is
+/// taken as a plain missing name.
+#[test]
+fn b7_v2_a_chain_of_links_to_a_missing_target_is_refused() {
+    let t = Tmp::new("b7v2");
+    let r = t.sub("roots/r");
+    let o = t.sub("outside/o");
+    std::os::unix::fs::symlink(r.join("b"), r.join("a")).unwrap();
+    std::os::unix::fs::symlink(o.join("missing"), r.join("b")).unwrap();
+    init(&t, &[r.clone()]).unwrap();
+    let before = t.bytes("t-1");
+    for (name, p) in [("the link itself", r.join("a")), ("through the chain", r.join("a").join("x"))] {
+        let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "v2", class: Class::TempDir, path: &p }, ts(2)).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid(_)), "v2 {name}: {err}");
+        assert!(err.to_string().contains("does not resolve"), "v2 {name}: {err}");
+        assert_eq!(t.bytes("t-1"), before, "v2 {name}: the file is byte-identical");
+    }
+    assert!(!o.join("missing").exists(), "v2: nothing was created through the chain");
+}
+
+/// v3 (held-out): a dangling symlink handed to init as a ROOT is refused; no manifest dir or file is created.
+#[test]
+fn b7_v3_a_dangling_symlink_as_a_root_is_refused_with_nothing_written() {
+    let t = Tmp::new("b7v3");
+    let r = t.sub("roots/r");
+    let o = t.sub("outside/o");
+    std::os::unix::fs::symlink(o.join("missing"), r.join("dangroot")).unwrap();
+    let err = apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[r.join("dangroot")] }, ts(1)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "v3 {err}");
+    assert!(err.to_string().contains("does not resolve"), "v3 {err}");
+    assert!(!t.manifest_dir().exists(), "v3: no manifest dir was created");
+    assert!(!o.join("missing").exists(), "v3: the dangling target was not created");
+}
+
+/// v1 (held-out): a dangling symlink in the manifest dir's own prefix is refused, not walked past: walking past it
+/// would answer the fence for a different folder than the one that gets created once the target appears.
+/// Twin: the same dir through a link whose target EXISTS outside the roots still inits fine.
+#[test]
+fn b7_v1_a_dangling_symlink_in_the_manifest_dir_prefix_is_refused() {
+    let t = Tmp::new("b7v1");
+    let r = t.sub("roots/r");
+    let o = t.sub("outside/o");
+    let mdir = t.0.join("manlink");
+    std::os::unix::fs::symlink(o.join("missing-man"), &mdir).unwrap();
+    let err = apply(&mdir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "v1 {err}");
+    assert!(!mdir.join("t-1.jsonl").exists(), "v1: no manifest file was written");
+    assert!(!o.join("missing-man").exists(), "v1: the dangling target was not created");
+    // twin: a resolvable link to an existing folder outside the roots is fine as the manifest dir
+    let real = t.sub("manreal");
+    let mlink = t.0.join("manok");
+    std::os::unix::fs::symlink(&real, &mlink).unwrap();
+    apply(&mlink, "t-1", &Op::Init { roots: &[r] }, ts(1)).unwrap();
+    assert!(real.join("t-1.jsonl").exists(), "twin: the manifest landed at the link's target");
+}
+
+/// v4 (held-out, must-not-fire): a link to an EXISTING in-root file resolves through and is accepted as its
+/// target — the new dangling-link refusals must not refuse links that resolve.
+#[test]
+fn b7_v4_a_link_to_an_existing_in_root_file_is_accepted_as_its_target() {
+    let t = Tmp::new("b7v4");
+    let r = t.sub("roots/r");
+    let f = r.join("target-file");
+    std::fs::write(&f, b"x").unwrap();
+    std::os::unix::fs::symlink(&f, r.join("lin")).unwrap();
+    init(&t, &[r.clone()]).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "lin", class: Class::Log, path: &r.join("lin") }, ts(2)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    let want = Target::Path(f.canonicalize().unwrap().to_string_lossy().into_owned());
+    assert!(read.live.iter().any(|e| e.target == want), "v4 stored as the in-root target: {:?}", read.live);
+}
+
+/// N-i (round-4 note): `R/file/../x` where `file` is a plain FILE is refused by the prefix `.`/`..` arm — the OS
+/// cannot resolve the `..` through a non-directory, and accepting would store a non-canonical path that slips past
+/// the same-path check. Pins that arm (turning it into an accept leaves this test red).
+#[test]
+fn n_i_a_dot_dot_after_a_plain_file_component_is_refused() {
+    let t = Tmp::new("ni");
+    let r = t.sub("roots/r");
+    let file = r.join("file");
+    std::fs::write(&file, b"x").unwrap();
+    init(&t, &[r.clone()]).unwrap();
+    let before = t.bytes("t-1");
+    let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "ni", class: Class::TempDir, path: &r.join("file").join("..").join("x") }, ts(2)).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "n-i {err}");
+    assert!(err.to_string().contains("does not resolve"), "n-i {err}");
+    assert_eq!(t.bytes("t-1"), before, "n-i: the file is byte-identical");
+    // twin: the same shape through an existing DIRECTORY resolves (the OS answers it) and is accepted
+    std::fs::create_dir_all(r.join("dir")).unwrap();
+    apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "ni2", class: Class::TempDir, path: &r.join("dir").join("..").join("x") }, ts(3)).unwrap();
+    let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
+    let want = Target::Path(r.canonicalize().unwrap().join("x").to_string_lossy().into_owned());
+    assert!(read.live.iter().any(|e| e.target == want), "twin stored the OS-resolved path: {:?}", read.live);
+}
+
 #[test]
 fn add_then_remove_round_trips_and_ownership_follows_the_live_state() {
     let t = Tmp::new("cycle");

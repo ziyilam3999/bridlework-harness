@@ -576,7 +576,16 @@ pub fn read_manifest(dir: &Path, ticket: &str) -> Result<ManifestRead, String> {
 /// The missing tail may hold plain names only. A `..` or `.` there is REFUSED, never dropped or folded: dropping one
 /// stores a different path from the one the caller will create (so the caller's folder could land outside every root),
 /// and folding it lexically is wrong across symlinks. The raw text is scanned, because `Path` itself hides interior `.`.
+///
+/// A symlink that does not resolve (its target is missing) is REFUSED, never treated as a missing path: the caller's
+/// write would follow it, so what lands on disk is not the path that was checked against the roots. This is the rule
+/// `events.rs::check_log_path` already uses: something that is THERE must canonicalize (B7).
 pub fn resolve_for_manifest(p: &Path) -> Result<PathBuf, String> {
+    // Something AT `p` must fully resolve: a dangling link at `p` itself (or under it) fails here instead of
+    // passing as "missing" (B7, `events.rs`'s rule).
+    if fs::symlink_metadata(p).is_ok() {
+        return p.canonicalize().map_err(|_| format!("path {} does not resolve", p.display()));
+    }
     if let Ok(c) = p.canonicalize() {
         return Ok(c);
     }
@@ -601,7 +610,12 @@ pub fn resolve_for_manifest(p: &Path) -> Result<PathBuf, String> {
             continue;
         }
         let next = existing.join(seg);
-        if next.exists() {
+        if fs::symlink_metadata(&next).is_ok() {
+            // something is at this component: it must resolve. A dangling link is refused, never taken into the
+            // tail as a plain name — the caller's write would follow it outside every root (B7).
+            if !next.exists() {
+                return Err(format!("path {text} does not resolve"));
+            }
             existing = next;
         } else if seg == "." || seg == ".." {
             // the OS could not resolve this prefix (an earlier part is missing or unreadable): fail closed
@@ -627,7 +641,8 @@ fn inside_any_root(p: &Path, roots: &[String]) -> bool {
 
 /// True when `dir` (which may not exist yet) would, once created, resolve inside one of `roots`: its nearest existing
 /// ancestor already sits inside a root (a root always exists, so the nearest existing ancestor is at or below any root that
-/// contains the final path). Unreadable means refuse: fail closed.
+/// contains the final path). Unreadable means refuse: fail closed. A dangling link in the prefix is refused too (B7):
+/// walking past it would answer for a different folder than the one that gets created once its target appears.
 fn dir_inside_any_root(dir: &Path, roots: &[PathBuf]) -> bool {
     // A relative dir is answered for the current folder, so join it on before walking up; unreadable means refuse.
     let mut cur = if dir.is_absolute() {
@@ -639,6 +654,11 @@ fn dir_inside_any_root(dir: &Path, roots: &[PathBuf]) -> bool {
         }
     };
     while !cur.exists() {
+        // Something there that does not resolve (a dangling link) cannot be walked past either, for the same
+        // reason (B7): refuse, fail closed.
+        if fs::symlink_metadata(&cur).is_ok() {
+            return true;
+        }
         // A `..` in the missing part cannot be walked past honestly (`parent()` would drop it, so the answer would be
         // given for a different folder than the one that gets created): refuse, fail closed.
         if cur.file_name().is_none() {

@@ -32,7 +32,7 @@ One operation per line, compact, fixed key order, every key present. Each line c
 
 ## The fence
 
-Init declares the ticket's roots. Every path entry must resolve inside one of them — a path outside, a `..` that escapes, or a symlink that points out are all refused. The manifest file itself must live outside the roots (`--dir` inside a root is refused), so finalize can remove the roots without removing the record, and the record can still show the empty state afterwards.
+Init declares the ticket's roots. Every path entry must resolve inside one of them — a path outside, a `..` that escapes, a symlink that points out, or a symlink that does not resolve (its target is missing; it is never treated as a missing path, because the caller's write would follow it) are all refused. The manifest file itself must live outside the roots (`--dir` inside a root is refused), so finalize can remove the roots without removing the record, and the record can still show the empty state afterwards.
 
 ## Ownership
 
