@@ -144,6 +144,10 @@ mod tests {
     fn repo(tag: &str, msg: &str) -> PathBuf {
         let d = scratch(tag);
         git(&d, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&d, &["config", k, v]);
+        }
         git(&d, &["commit", "-q", "--allow-empty", "-m", msg]);
         d
     }
@@ -212,6 +216,10 @@ mod tests {
         let named = parent.join("c");
         std::fs::create_dir_all(&named).unwrap();
         git(&named, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&named, &["config", k, v]);
+        }
         git(&named, &["commit", "-q", "--allow-empty", "-m", "x"]);
         assert_eq!(intake(&ticket("c"), &map_of(&[("b", &b)])), Err(Refusal::UnknownRepo("c".to_string())), "a folder name is not a map");
     }
@@ -242,6 +250,10 @@ mod tests {
     fn a_repo_with_no_commit_is_refused() {
         let d = scratch("empty");
         git(&d, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&d, &["config", k, v]);
+        }
         assert_eq!(intake(&ticket("b"), &map_of(&[("b", &d)])), Err(Refusal::RepoNotFound("b".to_string())));
         git(&d, &["commit", "-q", "--allow-empty", "-m", "first"]);
         assert!(intake(&ticket("b"), &map_of(&[("b", &d)])).is_ok(), "twin: after a commit it is accepted");

@@ -48,6 +48,10 @@ fn scratch(name: &str) -> Scratch {
     fs::create_dir_all(&dir).unwrap();
     let s = Scratch { dir, list: Some(synth_list()), extra_env: Vec::new() };
     s.git(&["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        s.git(&["config", k, v]);
+    }
     s
 }
 

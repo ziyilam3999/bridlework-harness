@@ -115,12 +115,20 @@ impl Fx {
         ];
         files.extend(extra);
         git(&repo, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&repo, &["config", k, v]);
+        }
         for (p, b, x) in &files {
             write_file(&repo.join(p), b, *x);
         }
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "c0"]);
         git(&other, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&other, &["config", k, v]);
+        }
         write_file(&other.join("o.txt"), "other repo", false);
         git(&other, &["add", "-A"]);
         git(&other, &["commit", "-q", "-m", "other"]);

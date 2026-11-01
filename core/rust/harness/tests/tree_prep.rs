@@ -102,6 +102,10 @@ fn fixture_mode(name: &str, base_val: &str, head_val: &str, base_mode: Option<u3
         std::fs::create_dir_all(d).unwrap();
     }
     git(&repo, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&repo, &["config", k, v]);
+    }
     put(&repo, "value.txt", base_val, 0o644);
     if let Some(m) = base_mode {
         put(&repo, "ci/check.sh", check, m);
@@ -262,6 +266,10 @@ fn a_symlinked_check_folder_at_base_never_writes_outside_the_tree() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("check.sh"), "victim\n").unwrap();
     git(&repo, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&repo, &["config", k, v]);
+    }
     symlink(&outside, repo.join("ci")).unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "base"]);
@@ -293,6 +301,10 @@ fn a_dot_dot_check_path_never_writes_outside_the_trees() {
     std::fs::write(&decoy, "victim\n").unwrap();
     let rel = decoy.to_str().unwrap().trim_start_matches('/').to_string();
     git(&repo, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&repo, &["config", k, v]);
+    }
     put(&repo, "value.txt", "bad", 0o644);
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "base"]);
@@ -373,6 +385,10 @@ fn the_check_sees_no_git_variables_and_cannot_touch_another_index() {
     let decoy = fx.work.join("decoy");
     std::fs::create_dir_all(&decoy).unwrap();
     git(&decoy, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&decoy, &["config", k, v]);
+    }
     put(&decoy, "f.txt", "x", 0o644);
     git(&decoy, &["add", "-A"]);
     git(&decoy, &["commit", "-q", "-m", "d"]);

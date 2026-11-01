@@ -372,6 +372,10 @@ mod tests {
     fn repo_with(name: &str, nb: [(&str, &str); 2], declared_check: &str, nb_script: &str) -> (PathBuf, String, String) {
         let repo = scratch(name);
         git(&repo, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&repo, &["config", k, v]);
+        }
         put(&repo, "value.txt", "bad", 0o644);
         put(&repo, "other.txt", nb[0].0, 0o644);
         put(&repo, "other2.txt", nb[1].0, 0o644);

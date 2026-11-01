@@ -454,6 +454,10 @@ mod tests {
         let sc = Scratch::new("diff");
         let d = &sc.0;
         git(d, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(d, &["config", k, v]);
+        }
         put(d, "core/rust/lib.rs", "fn main() {}\n");
         put(d, "a.md", "one\ntwo\nthree\nfour\nfive\n");
         git(d, &["add", "core", "a.md"]);
@@ -524,6 +528,10 @@ mod tests {
         let decoy = Scratch::new("decoy");
         let d = &sc.0;
         git(d, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(d, &["config", k, v]);
+        }
         put(d, "core/rust/lib.rs", "fn main() {}\n");
         git(d, &["add", "core"]);
         git(d, &["commit", "-q", "-m", "one"]);
@@ -534,6 +542,10 @@ mod tests {
         let c2 = git(d, &["rev-parse", "HEAD"]);
         put_map(d, r#"{"core/rust":["c"]}"#);
         git(&decoy.0, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(&decoy.0, &["config", k, v]);
+        }
         let clean = format!("{:?}", judge_diff(d, &c1, &c2));
         assert!(clean.contains("unmapped-path"), "the clean run fails the unmapped path: {}", clean);
 
@@ -555,6 +567,10 @@ mod tests {
         let sub = Scratch::new("sub");
         let s = &sub.0;
         git(s, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(s, &["config", k, v]);
+        }
         put(s, "core/rust/lib.rs", "fn main() {}\n");
         git(s, &["add", "core"]);
         git(s, &["update-index", "--add", "--cacheinfo", &format!("160000,{},vend", "1".repeat(40))]);
@@ -575,6 +591,10 @@ mod tests {
         let sc = Scratch::new("top");
         let d = &sc.0;
         git(d, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(d, &["config", k, v]);
+        }
         put(d, "core/rust/lib.rs", "fn main() {}\n");
         git(d, &["add", "core"]);
         git(d, &["commit", "-q", "-m", "one"]);

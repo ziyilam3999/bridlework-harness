@@ -311,6 +311,10 @@ fn scan_in(dir: &PathBuf, args: &[&str]) -> (i32, String, String) {
 fn git_modes() {
     let d = tmp("git");
     git(&d, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&d, &["config", k, v]);
+    }
     std::fs::write(d.join("clean.txt"), "nothing to see\n").unwrap();
     git(&d, &["add", "clean.txt"]);
     // staged clean
@@ -396,6 +400,10 @@ fn commit_as(d: &PathBuf, author: (&str, &str), committer: (&str, &str)) {
 fn range_head(name: &str, author: (&str, &str), committer: (&str, &str)) -> (i32, String) {
     let d = tmp(name);
     git(&d, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&d, &["config", k, v]);
+    }
     commit_as(&d, author, committer);
     let (rc, out, _) = scan_in(&d, &["--range", "HEAD"]);
     let _ = std::fs::remove_dir_all(d);
