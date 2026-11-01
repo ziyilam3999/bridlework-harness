@@ -32,12 +32,17 @@ impl Tmp {
         Tmp(p.canonicalize().unwrap())
     }
 
-    /// A scratch config: the public example with the placeholder inbox path swapped for this scratch inbox.
-    fn config(&self) -> PathBuf {
+    /// A scratch config: the public example with the placeholder inbox path swapped for the given inbox.
+    fn config_for(&self, inbox: &Path) -> PathBuf {
         let text = fs::read_to_string(EXAMPLE).unwrap();
-        let text = text.replace(PLACEHOLDER, self.inbox().to_str().unwrap());
-        assert!(text.contains(self.inbox().to_str().unwrap()), "the example must carry the placeholder inbox path");
+        let text = text.replace(PLACEHOLDER, inbox.to_str().unwrap());
+        assert!(text.contains(inbox.to_str().unwrap()), "the example must carry the placeholder inbox path");
         self.file("config.yaml", text)
+    }
+
+    /// The usual scratch config: this scratch inbox.
+    fn config(&self) -> PathBuf {
+        self.config_for(&self.inbox())
     }
 
     fn inbox(&self) -> PathBuf {
@@ -261,6 +266,36 @@ fn refuses_row_with_privacy_hit() {
     refused_untouched(&t, &o, 1, before);
 }
 
+#[test]
+fn refuses_a_privacy_hit_in_every_field_even_a_valid_token() {
+    let t = Tmp::new();
+    assert_eq!(code(&seed(&t, "l-1", "154", "memory", "")), 0);
+    let before = fs::read(t.inbox()).ok();
+    // The deny word IS a plain token, so only the privacy scan can refuse it (M9: text-only scanning goes RED).
+    // It also names no row, so the breaks leg proves the scan runs BEFORE any cross-check echo (F1).
+    let cfg = t.config().to_str().unwrap().to_string();
+    for (i, flag) in ["--id", "--ticket", "--breaks"].iter().enumerate() {
+        let mut a: Vec<String> = vec![
+            s("friction"), s("add"), s("--config"), cfg.clone(),
+            s("--id"), s("l-2"), s("--date"), s("2026-11-01"), s("--ticket"), s("154"),
+            s("--where-it-lives"), s("memory"), s("--text"), s("clean text, poisoned field"),
+        ];
+        if i == 0 {
+            a[5] = s(DENY); // swap the poisoned value in; --id twice would be a usage error
+        } else if i == 1 {
+            a[9] = s(DENY);
+        } else {
+            a.push(s(flag));
+            a.push(s(DENY));
+        }
+        let field = ["id", "ticket", "breaks"][i];
+        let o = run(&a);
+        refused_untouched(&t, &o, 1, before.clone());
+        assert!(err(&o).contains(&format!("field {field}")), "{field}: {}", err(&o));
+        assert!(!err(&o).contains(DENY), "{field}: the deny word must not be echoed: {}", err(&o));
+    }
+}
+
 // ---------------------------------------------------------------- whole-file lint (AC 7)
 
 #[test]
@@ -333,9 +368,11 @@ fn k1_5_refuses_none_when_ticket_has_rows() {
     let o = close_check(&t, &t.file("b.md", "lesson: l-404\n"), "154");
     assert_eq!(code(&o), 1, "{}", err(&o));
     assert!(err(&o).contains("l-404"), "{}", err(&o));
-    // an id from another ticket
-    let o = close_check(&t, &t.file("c.md", "lesson: l-9\n"), "154");
+    // an id from another ticket, named beside ALL of this ticket's rows, so the OTHER-TICKET rule refuses it
+    let o = close_check(&t, &t.file("c.md", "lesson: l-1, l-2, l-9\n"), "154");
     assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("l-9"), "the foreign id is named: {}", err(&o));
+    assert!(err(&o).contains("200") && err(&o).contains("not this one"), "the other-ticket rule refused it: {}", err(&o));
     // a captured row missing from the line
     let o = close_check(&t, &t.file("d.md", "lesson: l-1\n"), "154");
     assert_eq!(code(&o), 1, "{}", err(&o));
@@ -381,6 +418,12 @@ fn refuses_row_with_a_missing_or_bad_field() {
     assert_eq!(code(&add(&t, "l-1", "2026-11-01", "154", "", "", "t")), 1);
     assert_eq!(code(&add(&t, "Bad Id", "2026-11-01", "154", "memory", "", "t")), 1);
     assert_eq!(code(&add(&t, "l-1", "2026-11-01", "Ticket/9", "memory", "", "t")), 1);
+    // Empty and whitespace-only text are row refusals too (M32): a lesson row carries its lesson.
+    for empty in ["", "   \t "] {
+        let o = add(&t, "l-1", "2026-11-01", "154", "memory", "", empty);
+        assert_eq!(code(&o), 1, "{empty:?}: {}", err(&o));
+        assert!(err(&o).contains("text"), "{empty:?}: {}", err(&o));
+    }
     assert!(!t.inbox().exists(), "no refused row may create the inbox");
 }
 
@@ -501,4 +544,238 @@ fn usage_errors_exit_two_with_stdout_empty() {
         assert_eq!(code(&o), 2, "{:?}: {}", args, err(&o));
         assert!(out(&o).is_empty(), "{:?}: {}", args, out(&o));
     }
+}
+
+// ---------------------------------------------------------------- fix round 1: no unscanned byte ever echoed (F1)
+
+/// Three private-shaped values, each assembled at run time so this file never spells one out.
+fn shapes() -> [String; 3] {
+    [
+        DENY.to_string(),
+        ["/Us", "ers/", "zztester", "/proj"].concat(),
+        ["zz", "@", "example", ".", "invalid"].concat(),
+    ]
+}
+
+/// One hand-written row line (no trailing newline) with the six contract fields and clean values.
+fn hand_written(id: &str, ticket: &str, tag: &str, breaks: &str, text: &str) -> String {
+    format!("{{\"id\":\"{id}\",\"date\":\"2026-11-01\",\"ticket\":\"{ticket}\",\"where-it-lives\":\"{tag}\",\"breaks\":\"{breaks}\",\"text\":\"{text}\"}}")
+}
+
+/// The same row with one extra `key: value` pair bolted on before the closing brace.
+fn with_extra_key(line: &str, key: &str, value: &str) -> String {
+    format!("{},\"{}\":\"{}\"}}", &line[..line.len() - 1], key, value)
+}
+
+#[test]
+fn refusals_never_echo_unscanned_bytes() {
+    let t = Tmp::new();
+    assert_eq!(code(&seed(&t, "l-1", "154", "memory", "")), 0);
+    for shape in shapes() {
+        let before = fs::read(t.inbox()).ok();
+        // (a) as the tag of `add`: the field and the reason only, never the value.
+        let o = add(&t, "l-2", "2026-11-01", "154", &shape, "", "clean text, poisoned tag");
+        refused_untouched(&t, &o, 1, before.clone());
+        assert!(err(&o).contains("where-it-lives"), "{}", err(&o));
+        assert!(!err(&o).contains(&shape), "the tag value must not be echoed: {}", err(&o));
+        // (b) as an unknown key of a hand-written row, read by lint.
+        let row = with_extra_key(&hand_written("l-2", "154", "memory", "", "a clean lesson"), &shape, "y");
+        fs::write(t.inbox(), format!("{row}\n")).unwrap();
+        let o = lint(&t);
+        assert_eq!(code(&o), 1, "{}", err(&o));
+        assert!(err(&o).contains("line 1") && err(&o).contains("unknown field"), "{}", err(&o));
+        assert!(!err(&o).contains(&shape), "the key must not be echoed: {}", err(&o));
+        // (c) as a duplicate key of a hand-written row, read by lint.
+        let row = format!("{{\"{}\":\"a\",\"{}\":\"b\",{}", &shape, &shape, &hand_written("l-2", "154", "memory", "", "a clean lesson")[1..]);
+        fs::write(t.inbox(), format!("{row}\n")).unwrap();
+        let o = lint(&t);
+        assert_eq!(code(&o), 1, "{}", err(&o));
+        assert!(err(&o).contains("line 1") && err(&o).contains("duplicate"), "{}", err(&o));
+        assert!(!err(&o).contains(&shape), "the duplicate key must not be echoed: {}", err(&o));
+        // (d) as the `lesson:` value of a close note.
+        fs::write(t.inbox(), format!("{}\n", hand_written("l-2", "154", "memory", "", "a clean lesson"))).unwrap();
+        let note = t.file("note.md", format!("lesson: {shape}\n"));
+        let o = close_check(&t, &note, "154");
+        assert_eq!(code(&o), 1, "{}", err(&o));
+        assert!(out(&o).is_empty());
+        assert!(err(&o).contains("lesson"), "{}", err(&o));
+        assert!(!err(&o).contains(&shape), "the close-line value must not be echoed: {}", err(&o));
+        // (d') an unknown key whose name is private-shaped, read by close-check: refused, no key bytes.
+        let row = with_extra_key(&hand_written("l-2", "154", "memory", "", "a clean lesson"), &shape, "y");
+        fs::write(t.inbox(), format!("{row}\n")).unwrap();
+        let note = t.file("note.md", "lesson: none\n");
+        let o = close_check(&t, &note, "999");
+        assert_eq!(code(&o), 2, "{}", err(&o));
+        assert!(out(&o).is_empty());
+        assert!(err(&o).contains("line 1"), "{}", err(&o));
+        assert!(!err(&o).contains(&shape), "the key must not be echoed: {}", err(&o));
+    }
+}
+
+// ---------------------------------------------------------------- fix round 1: lint scans (F2)
+
+#[test]
+fn lint_scans_every_field_of_every_row_and_add_refuses_after_it() {
+    let t = Tmp::new();
+    // A home-path shape in `text` of a hand-written row: lint refuses naming the line and the field, no bytes.
+    let row = hand_written("l-1", "154", "memory", "", &["see ", "/Us", "ers/", "zztester", "/proj"].concat());
+    fs::write(t.inbox(), format!("{row}\n")).unwrap();
+    let o = lint(&t);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert!(err(&o).contains("line 1") && err(&o).contains("field text") && err(&o).contains("privacy"), "{}", err(&o));
+    assert!(!err(&o).contains("zztester"), "{}", err(&o));
+    // `add` uses the same scanning path: it refuses to append after the hit.
+    let before = fs::read(t.inbox()).ok();
+    let o = add(&t, "l-2", "2026-11-01", "154", "memory", "", "a clean lesson after a poisoned row");
+    refused_untouched(&t, &o, 1, before);
+    assert!(err(&o).contains("line 1") && err(&o).contains("field text"), "{}", err(&o));
+    // The deny word (a valid token) in `id` and in `ticket` of hand-written rows: same refusal.
+    for field in ["id", "ticket"] {
+        let id = if field == "id" { DENY } else { "l-3" };
+        let ticket = if field == "ticket" { DENY } else { "154" };
+        fs::write(t.inbox(), format!("{}\n", hand_written(id, ticket, "memory", "", "a clean lesson"))).unwrap();
+        let o = lint(&t);
+        assert_eq!(code(&o), 1, "{field}: {}", err(&o));
+        assert!(err(&o).contains("line 1") && err(&o).contains(&format!("field {field}")), "{field}: {}", err(&o));
+        assert!(!err(&o).contains(DENY), "{field}: {}", err(&o));
+    }
+    // No privacy list configured: lint fails closed (2), never clean.
+    let mut c = base();
+    c.args(["friction", "lint", "--config", t.config().to_str().unwrap()]).stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    // close-check scans the same rows: a poisoned row fails the check closed (2), naming the line and field.
+    fs::write(t.inbox(), format!("{}\n", hand_written("l-4", "154", "memory", "", &format!("saw {DENY} in the log")))).unwrap();
+    let note = t.file("n.md", "lesson: none\n");
+    let o = close_check(&t, &note, "154");
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert!(err(&o).contains("line 1") && err(&o).contains("field text") && err(&o).contains("privacy"), "{}", err(&o));
+    assert!(!err(&o).contains(DENY), "{}", err(&o));
+}
+
+// ---------------------------------------------------------------- fix round 1: one writer at a time (F3)
+
+/// Run N child adds in parallel and collect their outputs.
+fn run_parallel(args: Vec<Vec<String>>) -> Vec<Output> {
+    let handles: Vec<_> = args.into_iter().map(|a| std::thread::spawn(move || run(&a))).collect();
+    handles.into_iter().map(|h| h.join().unwrap()).collect()
+}
+
+/// The `add` argv for this config, with the id spelled by the caller (built once, run N times).
+fn add_args(cfg: &str, id: &str, text: &str) -> Vec<String> {
+    vec![
+        s("friction"), s("add"), s("--config"), s(cfg), s("--id"), s(id),
+        s("--date"), s("2026-11-01"), s("--ticket"), s("154"),
+        s("--where-it-lives"), s("memory"), s("--text"), s(text),
+    ]
+}
+
+/// A seeded inbox big enough to widen the read-check-append window: many whole rows, all clean.
+fn big_inbox(rows: usize) -> String {
+    let text = "write the row before the code that reads it and lint the whole inbox before the first append ".repeat(24);
+    let mut out = String::new();
+    for i in 0..rows {
+        out.push_str(&hand_written(&format!("l-b-{i}"), "154", "memory", "", &text));
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn concurrent_same_id_adds_store_exactly_one_row() {
+    const N: usize = 12;
+    const SEED: usize = 1600;
+    let t = Tmp::new();
+    let cfg = t.config().to_str().unwrap().to_string();
+    // Round 0: a fresh inbox (nothing to read at all).
+    // Rounds 1-3: a big seeded inbox, so the read-check window is wide enough to race.
+    for round in 0..4 {
+        let seed_rows = if round == 0 { 0 } else { SEED };
+        if seed_rows > 0 {
+            fs::write(t.inbox(), big_inbox(seed_rows)).unwrap();
+        } else {
+            let _ = fs::remove_file(t.inbox());
+        }
+        let id = format!("same-{round}");
+        let args: Vec<Vec<String>> = (0..N).map(|_| add_args(&cfg, &id, "one row per id, no matter how many writers")).collect();
+        let outs = run_parallel(args);
+        let stored: Vec<&Output> = outs.iter().filter(|o| code(o) == 0).collect();
+        assert_eq!(stored.len(), 1, "round {round}: exactly one writer may store the id");
+        for o in outs.iter().filter(|o| code(o) != 0) {
+            assert_eq!(code(o), 1, "round {round}: {}", err(o));
+            assert!(out(o).is_empty(), "round {round}: {}", out(o));
+            assert!(err(o).contains("duplicate"), "round {round}: {}", err(o));
+        }
+        let lines = fs::read_to_string(t.inbox()).unwrap().lines().count();
+        assert_eq!(lines, seed_rows + 1, "round {round}: one row stored, no more");
+        let o = lint(&t);
+        assert_eq!(code(&o), 0, "round {round}: {}", err(&o));
+        assert_eq!(out(&o), format!("inbox ok rows={}\n", seed_rows + 1));
+    }
+}
+
+#[test]
+fn concurrent_distinct_id_adds_all_store() {
+    let t = Tmp::new();
+    let cfg = t.config().to_str().unwrap().to_string();
+    let args: Vec<Vec<String>> = (0..40).map(|i| add_args(&cfg, &format!("l-{i}"), "one whole row per writer")).collect();
+    let outs = run_parallel(args);
+    for o in &outs {
+        assert_eq!(code(o), 0, "{}", err(o));
+    }
+    let body = fs::read_to_string(t.inbox()).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 40);
+    for l in &lines {
+        assert!(friction::parse_row(l).is_ok(), "every stored row is whole and valid");
+    }
+    let o = lint(&t);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "inbox ok rows=40\n");
+}
+
+// ---------------------------------------------------------------- fix round 1: folder and text edges (F6)
+
+#[test]
+fn add_does_not_create_the_inbox_folder() {
+    let t = Tmp::new();
+    let missing_dir = t.0.join("no-such-dir");
+    let cfg = t.config_for(&missing_dir.join("inbox.jsonl")).to_str().unwrap().to_string();
+    let o = run(&add_args(&cfg, "l-1", "a lesson with nowhere to live"));
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert!(!missing_dir.exists(), "the inbox folder is never created by the verb");
+    assert!(!missing_dir.join("inbox.jsonl").exists());
+}
+
+#[test]
+fn a_clean_hand_written_row_lints_and_add_appends() {
+    let t = Tmp::new();
+    fs::write(t.inbox(), format!("{}\n", hand_written("l-1", "154", "memory", "", "a clean hand written lesson"))).unwrap();
+    let o = lint(&t);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "inbox ok rows=1\n");
+    let o = add(&t, "l-2", "2026-11-01", "154", "gate", "", "a clean lesson after a clean row");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let o = lint(&t);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "inbox ok rows=2\n");
+}
+
+#[test]
+fn a_dash_id_and_escaped_text_store_and_lint_clean() {
+    let t = Tmp::new();
+    let text = "quote \" backslash \\ newline\nand tab\tand unicode \u{f1} end";
+    let o = add(&t, "-", "2026-11-01", "154", "memory", "", text);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let line = fs::read_to_string(t.inbox()).unwrap();
+    assert_eq!(line.lines().count(), 1, "the stored row is one line");
+    let row = friction::parse_row(line.trim_end_matches('\n')).unwrap();
+    assert_eq!((row.id.as_str(), row.text.as_str()), ("-", text));
+    let o = lint(&t);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "inbox ok rows=1\n");
 }

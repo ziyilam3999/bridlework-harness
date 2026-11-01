@@ -12,7 +12,7 @@
 use crate::events::token_ok;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The four capture-time routes (K-1 rule 2). The tag is the route chosen at capture, nothing more.
 pub const TAGS: [&str; 4] = ["skill", "gate", "memory", "wiki"];
@@ -80,7 +80,7 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
         return Err("ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')".to_string());
     }
     if !TAGS.contains(&row.tag.as_str()) {
-        return Err(format!("where-it-lives must be one of skill, gate, memory, wiki (K-1.1); got tag {:?}", row.tag));
+        return Err("where-it-lives must be one of skill, gate, memory, wiki (K-1.1)".to_string());
     }
     if !row.breaks.is_empty() && !token_ok(&row.breaks) {
         return Err("breaks must be empty or a plain lesson id (lowercase letters, digits, '-', '_', '.')".to_string());
@@ -161,7 +161,8 @@ impl<'a> P<'a> {
         }
     }
 
-    /// One JSON object of string values. A duplicate key is refused naming the key.
+    /// One JSON object of string values. A duplicate key is refused (the key itself is never echoed: it is
+    /// input that has passed no scan).
     fn object(&mut self) -> Result<Vec<(String, String)>, String> {
         self.ws();
         if self.i >= self.b.len() || self.b[self.i] != b'{' {
@@ -178,7 +179,7 @@ impl<'a> P<'a> {
             self.ws();
             let k = self.string()?;
             if out.iter().any(|(n, _)| *n == k) {
-                return Err(format!("duplicate key {k:?}"));
+                return Err("a duplicate key".to_string());
             }
             self.ws();
             if self.i >= self.b.len() || self.b[self.i] != b':' {
@@ -241,7 +242,7 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
     let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     for (k, _) in &pairs {
         if !FIELDS.contains(&k.as_str()) {
-            return Err(format!("unknown field {k:?}"));
+            return Err("an unknown field: a row has exactly the six contract fields".to_string());
         }
     }
     let mut row = Row { id: String::new(), date: String::new(), ticket: String::new(), tag: String::new(), breaks: String::new(), text: String::new() };
@@ -322,20 +323,50 @@ pub fn lint_text(text: &str) -> Inbox {
     out
 }
 
+/// The six fields of a row as (name, value) pairs in `FIELDS` order: the one list every privacy scan walks.
+fn row_fields(row: &Row) -> [(&'static str, &str); 6] {
+    [
+        ("id", row.id.as_str()),
+        ("date", row.date.as_str()),
+        ("ticket", row.ticket.as_str()),
+        ("where-it-lives", row.tag.as_str()),
+        ("breaks", row.breaks.as_str()),
+        ("text", row.text.as_str()),
+    ]
+}
+
+/// The privacy engine over every field of every stored row — the same rules `add` applies to a new row. Every
+/// reader of the inbox runs this pass (add, lint, close-check); a reason names the line, the field and the
+/// pattern class, never the bytes.
+pub fn privacy_problems(ctx: &crate::scan::Ctx, rows: &[(usize, Row)]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (n, row) in rows {
+        for (name, value) in row_fields(row) {
+            let hits = crate::scan::scan_text(ctx, "friction", value);
+            if !hits.is_empty() {
+                let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
+                out.push((*n, format!("field {name} has a privacy hit ({})", classes.join(", "))));
+            }
+        }
+    }
+    out
+}
+
 /// The cross-row pass a whole-file lint runs after every line parsed: duplicate ids across the file and `breaks`
 /// references (forward and back, and a row naming itself). `add` runs the same rules against the inbox plus its one
-/// new row, so the verb and the lint can never disagree about what a good inbox is.
+/// new row, so the verb and the lint can never disagree about what a good inbox is. The reasons name the field
+/// only: a row value that has not passed the privacy scan is never echoed.
 pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
     let mut problems = Vec::new();
     for (i, (line, row)) in rows.iter().enumerate() {
         if rows[..i].iter().any(|(_, r)| r.id == row.id) {
-            problems.push((*line, format!("id: a duplicate of an earlier row ({:?})", row.id)));
+            problems.push((*line, "id: a duplicate of an earlier row".to_string()));
         }
         if !row.breaks.is_empty() {
             if row.breaks == row.id {
                 problems.push((*line, "breaks names its own row: a lesson cannot break itself".to_string()));
             } else if !rows.iter().any(|(_, r)| r.id == row.breaks) {
-                problems.push((*line, format!("breaks names no lesson in the inbox ({:?})", row.breaks)));
+                problems.push((*line, "breaks names no lesson in the inbox".to_string()));
             }
         }
     }
@@ -353,6 +384,70 @@ pub fn append_row(path: &Path, row: &Row) -> Result<(), String> {
     f.write_all(line.as_bytes()).map_err(|_| "the inbox write failed".to_string())?;
     f.sync_all().map_err(|_| "the inbox sync failed".to_string())?;
     Ok(())
+}
+
+/// A lock older than this is a holder that died without releasing: it is stolen (an atomic rename decides the
+/// one stealer), far above any real critical section (read, scan, check, append, sync of a capped inbox).
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a writer waits for the lock before giving up (exit 2): far above LOCK_STOLEN rounds of appends.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The exclusive writer lock, released on every exit path (Drop). Nothing here prints the lock path.
+struct LockGuard(PathBuf);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// The sidecar lock file path: the inbox path plus `.lock`, so it sits in the same private folder (one lock per
+/// inbox, whatever config pointed at it). The path itself is never printed.
+fn lock_path(inbox: &Path) -> PathBuf {
+    let mut s = inbox.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// Acquire the exclusive writer lock with one atomic `create_new` (O_EXCL), so two concurrent adds can never
+/// both pass the duplicate-id check. A holder that died leaves the file behind; a lock older than LOCK_STALE is
+/// stolen by an atomic rename (exactly one stealer can win the rename) and the next `create_new` decides the new
+/// holder. `Err` is a setup failure (the folder is missing, or the lock stayed busy past LOCK_WAIT).
+fn acquire_lock(lock: &Path) -> Result<LockGuard, String> {
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let mut steals = 0usize;
+    loop {
+        let created = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock)
+            .and_then(|mut f| f.write_all(std::process::id().to_string().as_bytes()));
+        match created {
+            Ok(()) => return Ok(LockGuard(lock.to_path_buf())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(lock)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d >= LOCK_STALE)
+                    .unwrap_or(true);
+                if stale && steals < 4 {
+                    steals += 1;
+                    let mut tmp = lock.as_os_str().to_os_string();
+                    tmp.push(format!(".stale-{}-{}", std::process::id(), steals));
+                    if fs::rename(lock, &tmp).is_ok() {
+                        let _ = fs::remove_file(&tmp);
+                    }
+                    continue;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("the inbox is busy (another writer holds it); try again".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return Err("the inbox cannot be written".to_string()),
+        }
+    }
 }
 
 fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
@@ -395,10 +490,10 @@ pub fn close_check(note: &str, ticket: &str, rows: &[(usize, Row)]) -> Result<us
             return Err("an empty lesson id in the close line".to_string());
         }
         if !token_ok(id) {
-            return Err(format!("the lesson id {:?} is not a plain token", id));
+            return Err("a lesson id in the close line is not a plain token".to_string());
         }
         if named.contains(&id) {
-            return Err(format!("the lesson id {:?} is named twice", id));
+            return Err("a lesson id in the close line is named twice".to_string());
         }
         named.push(id);
     }
@@ -458,8 +553,9 @@ fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, String> {
 /// `harness friction add | lint | close-check` (K-1 slice 1; the contract is `docs/friction-inbox.md`).
 /// Exit 0 ok; 1 a refusal (a refused write leaves the inbox byte-identical, stdout empty, stderr naming the field
 /// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error. Nothing is written
-/// before every check over the new row has passed: flags, then row rules, then the inbox cross rules, then the
-/// privacy engine, and only then one append.
+/// before every check has passed: flags, then row rules, then the privacy engine over the new row, then — under
+/// the exclusive writer lock — the same privacy engine over every stored row and the inbox cross rules, and only
+/// then one append.
 pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     let Some((sub, rest)) = a.split_first() else {
         eprintln!("{}", FRICTION_USAGE);
@@ -467,8 +563,8 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     };
     match sub.as_str() {
         "add" => add_cmd(rest, testmode),
-        "lint" => lint_cmd(rest),
-        "close-check" => close_check_cmd(rest),
+        "lint" => lint_cmd(rest, testmode),
+        "close-check" => close_check_cmd(rest, testmode),
         _ => {
             eprintln!("{}", FRICTION_USAGE);
             2
@@ -476,8 +572,9 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     }
 }
 
-/// The inbox rows, refusing a damaged inbox (fail closed): a torn tail or any bad row blocks the append.
-fn rows_for_add(path: &Path) -> Result<Vec<(usize, Row)>, (i32, String)> {
+/// The inbox rows, refusing a damaged inbox (fail closed): a torn tail, any bad row or any privacy hit in a
+/// stored row blocks the append. Runs under the writer lock, so the rows are the ones the append will follow.
+fn rows_for_add(path: &Path, ctx: &crate::scan::Ctx) -> Result<Vec<(usize, Row)>, (i32, String)> {
     if !path.exists() {
         // A first row creates the inbox; there is nothing to lint yet.
         return Ok(Vec::new());
@@ -487,6 +584,9 @@ fn rows_for_add(path: &Path) -> Result<Vec<(usize, Row)>, (i32, String)> {
         return Err((1, format!("the inbox has a torn tail at line {n}; nothing was appended (run harness friction lint)")));
     }
     if let Some((n, m)) = inbox.problems.first() {
+        return Err((1, format!("the inbox already has a problem at line {n}: {m}; nothing was appended (run harness friction lint)")));
+    }
+    if let Some((n, m)) = privacy_problems(ctx, &inbox.rows).first() {
         return Err((1, format!("the inbox already has a problem at line {n}: {m}; nothing was appended (run harness friction lint)")));
     }
     Ok(inbox.rows)
@@ -507,16 +607,16 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         let Some(name) = arg.strip_prefix("--") else {
-            return fail(&format!("unexpected argument {arg:?}"));
+            return fail("an unexpected argument (only the seven flags of the usage line are allowed)");
         };
         if !single.contains(&name) {
-            return fail(&format!("unknown option {arg}"));
+            return fail("an unknown option (the usage line lists the seven flags)");
         }
         let Some(v) = it.next() else {
-            return fail(&format!("{arg} needs a value"));
+            return fail("a flag is missing its value");
         };
         if o.insert(name.to_string(), v.clone()).is_some() {
-            return fail(&format!("{arg} given twice"));
+            return fail("a flag was given twice");
         }
     }
     // A missing required field is a row refusal naming the field (K-1.1: "no tag" is refused, not a usage error).
@@ -547,7 +647,29 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     if let Err(e) = validate_row(&row) {
         return refuse(&e);
     }
-    let mut rows = match rows_for_add(&inbox_path) {
+    // The privacy list loads before anything else is read: with no list configured the verb fails closed (2),
+    // and the new row is scanned before any cross rule runs, so no unscanned byte of it is ever echoed.
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => {
+            return fail("no privacy list configured: an unscanned row is never stored");
+        }
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    for (name, value) in row_fields(&row) {
+        let hits = crate::scan::scan_text(&ctx, "friction.add", value);
+        if !hits.is_empty() {
+            let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
+            return refuse(&format!("field {name} has a privacy hit ({}); the row is not stored", classes.join(", ")));
+        }
+    }
+    // One writer at a time: the exclusive lock is held across read, check and append, and released on every
+    // exit path, so the duplicate-id check can never race a concurrent add of the same id.
+    let _lock = match acquire_lock(&lock_path(&inbox_path)) {
+        Ok(g) => g,
+        Err(m) => return fail(&m),
+    };
+    let mut rows = match rows_for_add(&inbox_path, &ctx) {
         Ok(r) => r,
         Err((code, m)) => {
             eprintln!("harness: friction refused: {}", m);
@@ -559,30 +681,6 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     rows.push((new_line, row.clone()));
     if let Some((_, m)) = cross_check(&rows).into_iter().find(|(n, _)| *n == new_line) {
         return refuse(&m);
-    }
-    // Every field goes through the same privacy engine as the rest of the harness; with no list configured the
-    // verb fails closed (2), never storing unscanned text. A hit names the field and class, never the bytes.
-    let list = match crate::overlay::load() {
-        Ok(l) => l,
-        Err(_) => {
-            return fail("no privacy list configured: an unscanned row is never stored");
-        }
-    };
-    let ctx = crate::scan::Ctx { list: &list, testmode };
-    let named: [(&str, &str); 6] = [
-        ("id", row.id.as_str()),
-        ("date", row.date.as_str()),
-        ("ticket", row.ticket.as_str()),
-        ("where-it-lives", row.tag.as_str()),
-        ("breaks", row.breaks.as_str()),
-        ("text", row.text.as_str()),
-    ];
-    for (name, value) in named {
-        let hits = crate::scan::scan_text(&ctx, "friction.add", value);
-        if !hits.is_empty() {
-            let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
-            return refuse(&format!("field {name} has a privacy hit ({}); the row is not stored", classes.join(", ")));
-        }
     }
     if let Err(e) = encode_row(&row) {
         return refuse(&e);
@@ -596,7 +694,7 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     }
 }
 
-fn lint_cmd(rest: &[String]) -> i32 {
+fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", m);
         2
@@ -624,6 +722,13 @@ fn lint_cmd(rest: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    // The same privacy engine as `add` over every field of every stored row; with no list configured lint
+    // fails closed (2) — an inbox is never linted clean unscanned.
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => return fail("no privacy list configured: an unscanned inbox is never linted clean"),
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
     let inbox = match read_inbox(std::path::Path::new(cfg.friction_inbox())) {
         Ok(i) => i,
         Err(e) => return fail(&e),
@@ -632,8 +737,10 @@ fn lint_cmd(rest: &[String]) -> i32 {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
         return 1;
     }
-    if !inbox.problems.is_empty() {
-        for (n, m) in &inbox.problems {
+    let mut problems = inbox.problems;
+    problems.extend(privacy_problems(&ctx, &inbox.rows));
+    if !problems.is_empty() {
+        for (n, m) in &problems {
             eprintln!("harness: inbox line {n}: {m}");
         }
         return 1;
@@ -642,7 +749,7 @@ fn lint_cmd(rest: &[String]) -> i32 {
     0
 }
 
-fn close_check_cmd(rest: &[String]) -> i32 {
+fn close_check_cmd(rest: &[String], testmode: bool) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", m);
         2
@@ -700,9 +807,27 @@ fn close_check_cmd(rest: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    // The close check reads the inbox, so it runs the same privacy scan; with no list configured it fails
+    // closed (2), exactly like `add` and `lint`.
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => return fail("no privacy list configured: an unscanned inbox is never checked"),
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    // The close lines are scanned before any of their ids can be echoed by a refusal (a hit names the class
+    // only, never the bytes; the ids the check names on later refusals have all passed this scan).
+    for l in lesson_lines(&note) {
+        let hits = crate::scan::scan_text(&ctx, "friction.close-check", l);
+        if !hits.is_empty() {
+            let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
+            eprintln!("harness: close-check refused: the `lesson:` line has a privacy hit ({}); the note is not checked", classes.join(", "));
+            return 1;
+        }
+    }
     let inbox_path = std::path::Path::new(cfg.friction_inbox());
     // A missing inbox is a fresh install (no lessons captured yet): it holds no row, so only `lesson: none` can pass.
-    // A DAMAGED inbox (unreadable, oversized, torn, bad rows) fails the check closed: it cannot be compared against.
+    // A DAMAGED inbox (unreadable, oversized, torn, bad rows, a privacy hit in a stored row) fails the check
+    // closed: it cannot be compared against.
     let rows = if !inbox_path.exists() {
         Vec::new()
     } else {
@@ -712,6 +837,9 @@ fn close_check_cmd(rest: &[String]) -> i32 {
                     return fail(&format!("the inbox has a torn tail at line {n}; the close line cannot be checked"));
                 }
                 if let Some((n, m)) = i.problems.first() {
+                    return fail(&format!("the inbox has a problem at line {n}: {m}; the close line cannot be checked"));
+                }
+                if let Some((n, m)) = privacy_problems(&ctx, &i.rows).first() {
                     return fail(&format!("the inbox has a problem at line {n}: {m}; the close line cannot be checked"));
                 }
                 i.rows

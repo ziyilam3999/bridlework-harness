@@ -54,14 +54,17 @@ harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> \
 ```
 
 Appends one row. Everything is checked before anything is written, in this order: the flags, the row rules
-(section 1), the inbox cross rules (a duplicate `id`; a `breaks` naming no lesson or naming itself; the existing
-inbox must itself be clean and untorn), then every field goes through the same privacy engine as the rest of the
-harness. Only then is one whole line (plus newline) appended and synced; the file is created when absent, its
-folder is not. On success stdout is `stored id=<id>`.
+(section 1), every field of the new row through the same privacy engine as the rest of the harness, then — under
+one exclusive writer lock (section 4) — the same privacy engine over every stored row and the inbox cross rules
+(a duplicate `id`; a `breaks` naming no lesson or naming itself; the existing inbox must itself be clean, untorn
+and privacy-clean). Only then is one whole line (plus newline) appended and synced; the file is created when
+absent, its folder is not. On success stdout is `stored id=<id>`. The new row is scanned before any cross rule
+runs, so a refusal can never echo an unscanned byte of it.
 
 A missing required field flag (`--where-it-lives` absent) is a row refusal (1) naming the field, not a usage
 error: K-1.1 counts "no tag" as refused. With no privacy list configured the verb fails closed (exit 2) — an
-unscanned row is never stored.
+unscanned row is never stored, and a usage error never echoes the raw flag or argument bytes either: it names
+the problem, not the value.
 
 ### `harness friction lint`
 
@@ -70,10 +73,13 @@ harness friction lint [--config <file>]
 ```
 
 Lints the whole inbox with the same rules: per-row rules with 1-based line numbers, then the cross-row rules
-(duplicate `id`, a `breaks` naming no lesson, a `breaks` naming its own row). Exit 0 clean (stdout
-`inbox ok rows=<n>`); 1 any bad row or a torn tail, each named with its line on stderr. Hand-written rows from
-before this contract and the 154b weekly script share this one checker. A missing inbox is a setup error (2):
-`lint` is how a real inbox is audited, so it must exist.
+(duplicate `id`, a `breaks` naming no lesson, a `breaks` naming its own row), then the same privacy engine over
+every field of every row — a hand-written row holding private text is refused exactly like a new row would be
+(line, field and class on stderr, never the bytes). Exit 0 clean (stdout `inbox ok rows=<n>`); 1 any bad row, a
+privacy hit or a torn tail, each named with its line on stderr. With no privacy list configured lint fails
+closed (exit 2): an inbox is never linted clean unscanned. Hand-written rows from before this contract and the
+154b weekly script share this one checker. A missing inbox is a setup error (2): `lint` is how a real inbox is
+audited, so it must exist.
 
 ### `harness friction close-check`
 
@@ -84,7 +90,10 @@ harness friction close-check <close-note> --ticket <t> [--config <file>]
 K-1.5: at ticket end, the close note names each lesson the ticket captured, or says none. Exit 0 the note matches
 the inbox (stdout `close-check ok ticket=<t> lessons=<n>`); 1 refused (stdout empty); 2 a usage or setup error. A
 missing inbox reads as no rows (a fresh install), so only `lesson: none` can pass; a damaged inbox (torn, bad
-rows, unreadable) fails the check closed (2), because it cannot be compared against.
+rows, unreadable, a privacy hit in a stored row) fails the check closed (2), because it cannot be compared
+against. The `lesson:` lines themselves go through the same privacy engine before the check, so an id the check
+names back on a refusal has always passed the scan; with no privacy list configured the verb fails closed
+(exit 2), exactly like `add` and `lint`.
 
 Orchestration runs this by hand at the S-1.6 session-removal step until P1b automates removal (154c); a non-zero
 exit blocks removal.
@@ -103,7 +112,13 @@ exit blocks removal.
 ## 4. Privacy, caps, torn tails
 
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
-  the row naming the field and the class, never the bytes.
+  the row naming the field and the class, never the bytes. Every reader of the inbox runs the same scan over
+  every stored row (`add`, `lint`, `close-check`), and `close-check` scans its `lesson:` lines too.
+- One writer at a time: `add` holds an exclusive advisory lock — a sidecar `<inbox>.lock` file in the same
+  private folder — across read, scan, check and append, released on every exit path, so two concurrent adds can
+  never both store the same id (the check and the append are one critical section). A lock left behind by a
+  killed writer is stolen after 60 seconds; a lock held longer than 10 seconds by a live writer fails the verb
+  closed (exit 2). The lock path is never printed.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
   than 4 MiB; a close note no further than 1 MiB. Over the bound the verb refuses (1 for a row, 2 for a file).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
