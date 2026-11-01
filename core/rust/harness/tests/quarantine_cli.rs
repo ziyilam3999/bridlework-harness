@@ -8,6 +8,7 @@
 #![cfg(unix)]
 use harness::quarantine::{self, SweepArgs};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -150,6 +151,35 @@ fn sweep(f: &Fix, extra: &[(&str, &str)]) -> Output {
     }
     let refs: Vec<&str> = v.iter().map(|x| x.as_str()).collect();
     run(&refs)
+}
+
+/// One `quarantine sweep` command line for the fixture with ONE base flag's value REPLACED — a single
+/// occurrence of the flag, never a second appended one: a duplicate is refused as "an option was given twice"
+/// by the parser before any placement rule fires, which is exactly the hollow-test bug of review r1 (F4).
+fn sweep_replacing(f: &Fix, flag: &str, value: &str) -> Output {
+    let pairs: Vec<(&str, String)> = vec![
+        ("--manifest-dir", s(&f.md)),
+        ("--workspace-root", s(&f.ws)),
+        ("--quarantine-dir", s(&f.q)),
+        ("--log", s(&f.log)),
+        ("--repo", "r-1".into()),
+        ("--role", "executor".into()),
+        ("--model", "m-1".into()),
+    ];
+    let mut v: Vec<String> = vec!["quarantine".into(), "sweep".into(), "t-1".into()];
+    for (k, val) in &pairs {
+        v.push(k.to_string());
+        v.push(if *k == flag { value.to_string() } else { val.clone() });
+    }
+    let refs: Vec<&str> = v.iter().map(|x| x.as_str()).collect();
+    run(&refs)
+}
+
+/// Hand-append ONE raw line to the ticket's manifest — a line this module's writer would refuse (the escape
+/// fixtures of the delete fence: the reader accepts the shape, so the delete verb must fence it itself).
+fn append_manifest_line(f: &Fix, line: &str) {
+    let mut file = fs::OpenOptions::new().append(true).open(f.md.join("t-1.jsonl")).unwrap();
+    file.write_all(format!("{line}\n").as_bytes()).unwrap();
 }
 
 /// The batch directories of the fixture's quarantine shelf, sorted by name.
@@ -305,14 +335,21 @@ fn earlier_quarantine_never_overwritten() {
 /// AC 7: a manifest whose root is a symlink, or resolves outside `--workspace-root`, exits 2 and nothing moves.
 #[test]
 fn root_symlink_or_outside_base_refused() {
-    // (a) the ticket root itself is a symlink
+    // (a) the ticket root itself is a symlink. The link points at a REAL dir INSIDE the workspace root, so the
+    // outside-base rule cannot catch it: only the root-is-symlink rule refuses this (review r1, F5 — a link
+    // pointing outside was refused twice over, so the symlink rule itself was never pinned).
     let f = fixture();
     plant(&f, "stray-1", "one");
+    let inside = f.ws.join("inside-target");
+    fs::create_dir_all(&inside).unwrap();
+    fs::write(inside.join("inner.txt"), b"inside-payload").unwrap();
     fs::remove_dir_all(&f.root).unwrap();
-    std::os::unix::fs::symlink(&f.outside, &f.root).unwrap();
+    std::os::unix::fs::symlink(&inside, &f.root).unwrap();
     let o = sweep(&f, &[]);
     assert_eq!(code(&o), 2, "a root that IS a symlink is refused: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("symlink"), "the refusal names the root-is-symlink rule itself: {}", err(&o));
     assert!(!f.q.join("t-1").exists(), "no shelf was made, nothing moved");
+    assert!(inside.join("inner.txt").exists(), "the link target inside the workspace is untouched");
     // (b) the manifest's root resolves outside the workspace root
     let f2 = fixture();
     let (elsewhere, _) = f2.t.both("elsewhere");
@@ -345,7 +382,11 @@ fn root_symlink_or_outside_base_refused() {
     assert!(!f2.q.join("t-1").exists(), "nothing moved");
 }
 
-/// AC 8: a quarantine dir inside a root, equal to the manifest dir, or relative exits 2 and nothing moves.
+/// AC 8: a quarantine dir inside a root, equal to the manifest dir, or relative exits 2, the stderr line names
+/// the placement problem, and nothing moves. Each case runs the base argv with the ONE `--quarantine-dir`
+/// occurrence's value REPLACED (review r1, F4: the first draft appended a second flag, so every case was
+/// refused as "an option was given twice" before the placement rule fired — a hollow test that survived the
+/// M11 mutation).
 #[test]
 fn misplaced_quarantine_dir_refused() {
     let f = fixture();
@@ -353,17 +394,20 @@ fn misplaced_quarantine_dir_refused() {
     // (a) inside a root: the ticket root itself
     let inner = f.root.join("q-inner");
     fs::create_dir_all(&inner).unwrap();
-    let o = sweep(&f, &[("--quarantine-dir", &s(&inner))]);
+    let o = sweep_replacing(&f, "--quarantine-dir", &s(&inner));
     assert_eq!(code(&o), 2, "a quarantine dir inside a root is refused: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("outside every root"), "the refusal names the placement problem: {}", err(&o));
     assert!(f.root.join("stray-1/one.txt").exists(), "nothing moved");
     assert!(!f.q.join("t-1").exists(), "no shelf");
     // (b) equal to the manifest dir
-    let o = sweep(&f, &[("--quarantine-dir", &s(&f.md))]);
+    let o = sweep_replacing(&f, "--quarantine-dir", &s(&f.md));
     assert_eq!(code(&o), 2, "a quarantine dir equal to the manifest dir is refused: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("outside each other"), "the refusal names the placement problem: {}", err(&o));
     assert!(f.root.join("stray-1/one.txt").exists(), "nothing moved");
     // (c) relative
-    let o = sweep(&f, &[("--quarantine-dir", "just-a-name")]);
+    let o = sweep_replacing(&f, "--quarantine-dir", "just-a-name");
     assert_eq!(code(&o), 2, "a relative quarantine dir is refused: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("absolute path"), "the refusal names the placement problem: {}", err(&o));
     assert!(f.root.join("stray-1/one.txt").exists(), "nothing moved");
     assert!(!f.q.join("t-1").exists(), "no shelf");
 }
@@ -466,12 +510,22 @@ fn delete_listed_temp_dir() {
     let f = fixture();
     std::os::unix::fs::symlink(&f.outside, f.root.join("tmp/out-link")).unwrap();
     fs::write(f.root.join("tmp/inside.txt"), b"temp-payload").unwrap();
+    // a nested subtree, three levels deep with files at every level and a link to an outside folder at the
+    // middle level: the removal is POST-ORDER (a dir only after its children), so the whole tree goes in ONE
+    // run (review r1, F1: the first draft removed a parent while its children were still queued — ENOTEMPTY,
+    // exit 3, no manifest remove, wedged on every re-run)
+    fs::write(f.root.join("tmp/l0.txt"), b"l0").unwrap();
+    fs::create_dir_all(f.root.join("tmp/mid/lower")).unwrap();
+    fs::write(f.root.join("tmp/mid/l1.txt"), b"l1").unwrap();
+    fs::write(f.root.join("tmp/mid/lower/l2.txt"), b"l2").unwrap();
+    std::os::unix::fs::symlink(&f.outside, f.root.join("tmp/mid/out-link")).unwrap();
     let o = run(&["quarantine", "delete-listed", "t-1", "--id", "tmp", "--manifest-dir", &s(&f.md)]);
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
     assert_eq!(out(&o), "delete=done ticket=t-1 id=tmp\n");
-    assert!(!f.root.join("tmp").exists(), "the listed temp dir is gone");
+    assert!(!f.root.join("tmp").exists(), "the listed temp dir is gone, subtree and all");
     assert!(f.outside.join("keep.txt").exists(), "the link's TARGET survives the unlink");
     assert_eq!(fs::read(f.outside.join("keep.txt")).unwrap(), b"outside-payload");
+    assert_eq!(fs::read_dir(&f.outside).unwrap().count(), 1, "nothing was added to or removed from the target");
     // the manifest remove line was written: tmp is no longer live, the others still are
     let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f.md)]));
     assert!(!listed.lines().any(|l| l.starts_with("tmp\t")), "tmp is no longer live: {listed}");
@@ -494,6 +548,21 @@ fn delete_listed_temp_dir() {
     let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f2.md)]));
     assert!(listed.lines().any(|l| l.starts_with("tmp\t")), "the remove line was NOT written before the deletion: {listed}");
     fs::set_permissions(f2.root.join("tmp"), fs::Permissions::from_mode(0o755)).unwrap();
+    // an EMPTY listed temp dir deletes cleanly (exit 0, the remove line written)
+    let f3 = fixture();
+    fs::create_dir_all(f3.root.join("empty-tmp")).unwrap();
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "empty", "--path", &s(&f3.root.join("empty-tmp")), "--dir", &s(&f3.md)]);
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "empty", "--manifest-dir", &s(&f3.md)]);
+    assert_eq!(code(&o), 0, "an empty listed dir deletes cleanly: {}{}", out(&o), err(&o));
+    assert!(!f3.root.join("empty-tmp").exists());
+    let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f3.md)]));
+    assert!(!listed.lines().any(|l| l.starts_with("empty\t")), "the remove line was written: {listed}");
+    // a re-run on an ALREADY-ABSENT path (listed again) writes the remove and exits 0: the clean no-op
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "gone", "--path", &s(&f3.root.join("gone-tmp")), "--dir", &s(&f3.md)]);
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "gone", "--manifest-dir", &s(&f3.md)]);
+    assert_eq!(code(&o), 0, "an absent listed path is a clean no-op: {}{}", out(&o), err(&o));
+    let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f3.md)]));
+    assert!(!listed.lines().any(|l| l.starts_with("gone\t")), "the remove line was written: {listed}");
 }
 
 /// AC 13: the device check refuses with exit 3 and moves nothing, exercised through a test seam that reports
@@ -565,7 +634,9 @@ fn no_path_on_stdout_or_stderr() {
     let f = fixture();
     plant(&f, "stray-1", "one");
     let mut outputs = vec![sweep(&f, &[])];
-    outputs.push(sweep(&f, &[("--quarantine-dir", "relative-q")]));
+    // one occurrence of the flag, its value REPLACED: a second `--quarantine-dir` would be refused as "an
+    // option was given twice" before the placement rule ever fires (the hollow-test bug of review r1, F4)
+    outputs.push(sweep_replacing(&f, "--quarantine-dir", "relative-q"));
     // a root symlink refusal
     {
         let g = fixture();
@@ -609,4 +680,141 @@ fn no_path_on_stdout_or_stderr() {
     }
     // the success line is fixed fields only
     assert_eq!(out(&outputs[0]), "quarantine=done ticket=t-1 moved=1\n");
+}
+
+/// Review r1, F2: the delete fence is made on the RESOLVED path, never on its spelling. A `..` or `.` component
+/// (raw text, because `Path` hides interior `.`), a symlinked intermediate component, and a root that is itself
+/// a symlink are each refused with exit 2 and NOTHING outside the roots is touched. (Measured before the fix:
+/// every case here escaped the lexical `starts_with` fence and deleted outside data with exit 0.)
+#[test]
+fn delete_listed_escaped_paths_refused() {
+    // (R2) a hand-appended `<root>/../victim` line: a `..` component is refused before anything is examined.
+    // The appended path uses the manifest's CANONICAL root spelling, exactly what the writer stores, so the
+    // reader accepts the line and the delete verb faces the escape itself.
+    let f = fixture();
+    let canon_root = f.root.canonicalize().unwrap();
+    let victim = f.ws.join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("v.txt"), b"victim-payload").unwrap();
+    append_manifest_line(
+        &f,
+        &format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"esc\",\"class\":\"temp_dir\",\"path\":\"{}/../victim\",\"ts_ms\":1731000000123}}",
+            s(&canon_root)
+        ),
+    );
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "esc", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 2, "a `..` component in a listed path is refused: {}{}", out(&o), err(&o));
+    assert!(victim.join("v.txt").exists(), "nothing outside the roots was touched");
+    assert!(f.root.join("tmp/scratch.txt").exists(), "nothing inside the roots was deleted either");
+    // (must-fire) a trailing `/.`: `Path` normalizes it away, so the fence scans the RAW TEXT
+    append_manifest_line(
+        &f,
+        &format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"dot\",\"class\":\"temp_dir\",\"path\":\"{}/tmp/.\",\"ts_ms\":1731000000124}}",
+            s(&canon_root)
+        ),
+    );
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "dot", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 2, "a `.` component in a listed path is refused: {}{}", out(&o), err(&o));
+    assert!(f.root.join("tmp/scratch.txt").exists(), "the spelled-inside tree is not deleted on a dotted spelling");
+    // (R3) listed `tmp/deep` through a normal `manifest add`; `tmp` then swapped for a symlink to an outside dir
+    let f2 = fixture();
+    fs::create_dir_all(f2.root.join("tmp/deep")).unwrap();
+    fs::write(f2.root.join("tmp/deep/p.txt"), b"deep").unwrap();
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "deep", "--path", &s(&f2.root.join("tmp/deep")), "--dir", &s(&f2.md)]);
+    fs::remove_dir_all(f2.root.join("tmp")).unwrap();
+    fs::create_dir_all(f2.outside.join("deep")).unwrap();
+    fs::write(f2.outside.join("deep/p.txt"), b"outside-deep").unwrap();
+    std::os::unix::fs::symlink(&f2.outside, f2.root.join("tmp")).unwrap();
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "deep", "--manifest-dir", &s(&f2.md)]);
+    assert_eq!(code(&o), 2, "a listed path through a symlinked parent is refused: {}{}", out(&o), err(&o));
+    assert!(f2.outside.join("deep/p.txt").exists(), "the outside data behind the swapped parent is intact");
+    // (R4) the ticket root itself swapped for a symlink to an outside dir
+    let f3 = fixture();
+    fs::remove_dir_all(&f3.root).unwrap();
+    fs::create_dir_all(f3.outside.join("tmp")).unwrap();
+    fs::write(f3.outside.join("tmp/p.txt"), b"outside-root").unwrap();
+    std::os::unix::fs::symlink(&f3.outside, &f3.root).unwrap();
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "tmp", "--manifest-dir", &s(&f3.md)]);
+    assert_eq!(code(&o), 2, "a root that is a symlink is refused before any delete: {}{}", out(&o), err(&o));
+    assert!(f3.outside.join("tmp/p.txt").exists(), "the outside data behind the swapped root is intact");
+    // (must-fire, variant 3) a listed path that IS a symlink with a REAL parent is unlinked as the link only
+    // (the entry is written BEFORE the link exists, the write-ahead order every P1b fixture uses — the add
+    // itself would refuse a link that already resolves outside)
+    let f4 = fixture();
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "lnk", "--path", &s(&f4.root.join("lnk")), "--dir", &s(&f4.md)]);
+    std::os::unix::fs::symlink(&f4.outside, f4.root.join("lnk")).unwrap();
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "lnk", "--manifest-dir", &s(&f4.md)]);
+    assert_eq!(code(&o), 0, "a listed link with a real parent is unlinked: {}{}", out(&o), err(&o));
+    assert!(!f4.root.join("lnk").exists(), "the link is gone");
+    assert!(f4.outside.join("keep.txt").exists(), "the link's target survives");
+    // ... and the same shape reached through a parent swapped for a symlink is refused
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "lnk2", "--path", &s(&f4.root.join("tmp/lnk2")), "--dir", &s(&f4.md)]);
+    fs::remove_dir_all(f4.root.join("tmp")).unwrap();
+    std::os::unix::fs::symlink(&f4.outside, f4.root.join("tmp")).unwrap();
+    fs::create_dir_all(f4.outside.join("lnk2")).unwrap();
+    fs::write(f4.outside.join("lnk2/x.txt"), b"payload").unwrap();
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "lnk2", "--manifest-dir", &s(&f4.md)]);
+    assert_eq!(code(&o), 2, "a listed link through a swapped parent is refused: {}{}", out(&o), err(&o));
+    assert!(f4.outside.join("lnk2/x.txt").exists(), "nothing behind the swapped parent was touched");
+}
+
+/// Review r1, F3: the shelf `<quarantine-dir>/<ticket>` is examined with a no-follow stat BEFORE it is read
+/// (reconcile) or made (make_batch). A symlink there would carry every batch, journal and item OUTSIDE the
+/// quarantine dir; a regular file is refused the same way. Exit 2, nothing moved, nothing created outside.
+#[test]
+fn shelf_symlink_or_file_refused() {
+    // (R5) the shelf is a symlink to a folder outside the quarantine dir
+    let f = fixture();
+    plant(&f, "stray-1", "one");
+    let (elsewhere, _) = f.t.both("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(&f.q).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, f.q.join("t-1")).unwrap();
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 2, "a symlinked shelf is refused: {}{}", out(&o), err(&o));
+    assert!(f.root.join("stray-1/one.txt").exists(), "nothing moved");
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing was created outside the quarantine dir");
+    assert!(!fs::symlink_metadata(&f.q.join("t-1/b-1-1-0")).is_ok(), "no batch was made through the link");
+    // (must-fire, variant 4) the shelf is a regular file, not a directory
+    let f2 = fixture();
+    plant(&f2, "stray-1", "one");
+    fs::write(f2.q.join("t-1"), b"not-a-dir").unwrap();
+    let o = sweep(&f2, &[]);
+    assert_eq!(code(&o), 2, "a shelf that is a regular file is refused: {}{}", out(&o), err(&o));
+    assert!(f2.root.join("stray-1/one.txt").exists(), "nothing moved");
+    assert_eq!(fs::read(f2.q.join("t-1")).unwrap(), b"not-a-dir", "the file was not replaced by a shelf");
+}
+
+/// Review r1, F6: an event log inside a root is refused exactly like a misplaced quarantine dir — a log written
+/// inside a root is itself an unmanifested leftover the NEXT sweep would carry off.
+#[test]
+fn log_inside_root_refused() {
+    let f = fixture();
+    plant(&f, "stray-1", "one");
+    let o = sweep_replacing(&f, "--log", &s(&f.root.join("events.jsonl")));
+    assert_eq!(code(&o), 2, "a log inside a root is refused: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("outside every root"), "the refusal names the placement problem: {}", err(&o));
+    assert!(f.root.join("stray-1/one.txt").exists(), "nothing moved");
+    assert!(!f.root.join("events.jsonl").exists(), "no log was created inside the root");
+    assert!(!f.q.join("t-1").exists(), "no shelf was made");
+    // the parent folder need not exist yet either: a would-be log dir inside a root is refused the same way
+    let o = sweep_replacing(&f, "--log", &s(&f.root.join("logdir-yet-to-be/events.jsonl")));
+    assert_eq!(code(&o), 2, "a log dir to be created inside a root is refused: {}{}", out(&o), err(&o));
+    assert!(!f.root.join("logdir-yet-to-be").exists(), "the log dir was not created inside the root");
+}
+
+/// Must-not-fire: a REAL, pre-existing shelf directory is ordinary — the sweep still moves a leftover into it
+/// (exit 0, moved=1). The F3 refusal is about links and files, never about the shelf already existing.
+#[test]
+fn sweep_into_preexisting_shelf_dir() {
+    let f = fixture();
+    plant(&f, "stray-1", "one");
+    fs::create_dir_all(f.q.join("t-1")).unwrap();
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 0, "a pre-existing real shelf is fine: {}{}", out(&o), err(&o));
+    assert!(out(&o).contains("moved=1"));
+    assert_eq!(batches(&f).len(), 1, "one batch in the pre-existing shelf");
+    assert!(batches(&f)[0].join("i-1/one.txt").exists(), "the payload is on the shelf");
 }

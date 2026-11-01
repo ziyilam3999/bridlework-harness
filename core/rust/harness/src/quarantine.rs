@@ -484,6 +484,17 @@ pub fn sweep_with_device_probe(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Optio
         }
         roots.push(canon);
     }
+    // The event log is fenced like the quarantine dir (review r1, F6): a log written inside a root is itself an
+    // unmanifested leftover the NEXT sweep would carry off. The log path is resolved through its nearest
+    // existing ancestor (the manifest's resolver), so a not-yet-created log dir inside a root is refused too.
+    match manifest::resolve_for_manifest(&a.log) {
+        Ok(lp) => {
+            if roots.iter().any(|r| lp.starts_with(r)) {
+                return Err(err2("the event log must lie outside every root; nothing was moved"));
+            }
+        }
+        Err(_) => return Err(err2("the event log path does not resolve; nothing was moved")),
+    }
     // Cross-device, before any move: there is NO copy fallback — copy-then-delete would be a delete.
     let q_dev = device_of(&qd).ok_or_else(|| err3("the quarantine dir cannot be examined"))?;
     for r in &roots {
@@ -494,6 +505,16 @@ pub fn sweep_with_device_probe(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Optio
     }
     // Crash recovery first, then the walk, then the moves.
     let shelf = qd.join(&a.ticket);
+    // The shelf is examined with a no-follow stat BEFORE it is read (reconcile) or made (make_batch): a symlink
+    // there would carry every batch, journal and item OUTSIDE the quarantine dir with exit 0 (review r1, F3,
+    // Decision 5: placement is checked, never trusted); a regular file is refused the same way.
+    match fs::symlink_metadata(&shelf) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(err2("the quarantine shelf cannot be examined; nothing was moved")),
+        Ok(m) if m.file_type().is_symlink() => return Err(err2("the quarantine shelf is a symlink; nothing was moved")),
+        Ok(m) if !m.is_dir() => return Err(err2("the quarantine shelf is not a directory; nothing was moved")),
+        Ok(_) => {}
+    }
     reconcile(a, &shelf, &ws)?;
     let live: Vec<PathBuf> = read
         .live
@@ -586,30 +607,45 @@ fn parse_delete(a: &[String]) -> Result<DeleteArgs, Stop> {
 }
 
 /// Remove a real directory recursively WITHOUT following any symlink inside it (a link inside is unlinked, its
-/// target untouched). Iterative, so no recursion depth; bounded by the tree it is given, which is one listed entry.
+/// target untouched). POST-ORDER, two-phase: a directory is pushed back with an `Unlink` frame BEHIND its
+/// children, so it is removed only once every child is gone — the first draft removed the parent while its
+/// children were still queued, so any listed dir with a subdirectory failed ENOTEMPTY, exit 3, wedged on every
+/// re-run (review r1, F1). Iterative, so no recursion depth; bounded by the tree it is given, one listed entry.
 fn remove_tree_no_follow(root: &Path) -> Result<(), Stop> {
     let io = || err3("a listed folder could not be deleted");
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let rd = fs::read_dir(&p).map_err(|_| io())?;
-        for ent in rd.flatten() {
-            let c = p.join(ent.file_name());
-            let m = fs::symlink_metadata(&c).map_err(|_| io())?;
-            if m.is_dir() {
-                stack.push(c);
-            } else {
-                fs::remove_file(&c).map_err(|_| io())?; // a file OR a symlink: the link only, never its target
+    enum Frame {
+        Descend(PathBuf),
+        Unlink(PathBuf),
+    }
+    let mut stack = vec![Frame::Descend(root.to_path_buf())];
+    while let Some(f) = stack.pop() {
+        match f {
+            Frame::Descend(p) => {
+                let rd = fs::read_dir(&p).map_err(|_| io())?;
+                stack.push(Frame::Unlink(p.clone())); // removed only AFTER the children below it
+                for ent in rd.flatten() {
+                    let c = p.join(ent.file_name());
+                    let m = fs::symlink_metadata(&c).map_err(|_| io())?;
+                    if m.is_dir() {
+                        stack.push(Frame::Descend(c));
+                    } else {
+                        fs::remove_file(&c).map_err(|_| io())?; // a file OR a symlink: the link only, never its target
+                    }
+                }
             }
+            Frame::Unlink(p) => fs::remove_dir(&p).map_err(|_| io())?,
         }
-        fs::remove_dir(&p).map_err(|_| io())?;
     }
     Ok(())
 }
 
 /// The ONE delete path for listed `temp_dir` entries (P1B-14 teardown calls THIS function, never a rebuild):
-/// delete exactly one live manifest entry of class `temp_dir`, named by id. The stored path is re-fenced against the
-/// roots; the final component is examined with a no-follow stat (a symlink entry is removed as the link only — the
-/// `node_modules` rule); a real directory is removed recursively without following any link inside. Only after the
+/// delete exactly one live manifest entry of class `temp_dir`, named by id. The stored path is re-fenced on its
+/// RESOLVED spelling, never its stored one: any `..`/`.` component is refused, every root is re-validated as the
+/// sweep validates it, and the canonicalized PARENT of the path must equal or lie inside a canonical root (the
+/// final component is never followed); the final component itself is examined with a no-follow stat (a symlink
+/// entry is removed as the link only — the `node_modules` rule); a real directory is removed recursively,
+/// post-order, without following any link inside. Only after the
 /// path is gone is the manifest `remove` line written (a crash between leaves a listed half-deleted thing, never an
 /// orphan; a re-run on an already-absent path just writes the remove).
 pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
@@ -628,8 +664,53 @@ pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
         return Err(err2("only temp_dir entries may be deleted through this verb"));
     };
     let path = PathBuf::from(p);
-    if !read.roots.iter().any(|r| path.starts_with(Path::new(r.as_str()))) {
-        return Err(err2("the entry's path lies outside every root"));
+    // The delete fence is made on the RESOLVED path, never on its spelling (review r1, F2: a lexical
+    // `starts_with` accepted `..` spellings and symlinked components, deleting outside data with exit 0).
+    // First: any `..` or `.` component is refused outright — the RAW TEXT is scanned because `Path` itself
+    // hides interior and trailing `.` (the same discipline `manifest.rs::resolve_for_manifest` uses); no
+    // folding, no dropping: what would be deleted is not what was fenced. A non-UTF-8 spelling fails closed.
+    match path.to_str() {
+        Some(t) if t.split('/').any(|seg| seg == "." || seg == "..") => {
+            return Err(err2("the listed path holds a `..` or `.` component; nothing was deleted"));
+        }
+        None => return Err(err2("the listed path is not utf-8; nothing was deleted")),
+        Some(_) => {}
+    }
+    // Second: every root is re-validated exactly as the sweep validates it (a no-follow stat, a real directory,
+    // canonicalizable, never `/`): a root swapped for a symlink or gone missing since the manifest was written
+    // is a different world, and deleting into it is refused before anything is examined.
+    let mut canon_roots: Vec<PathBuf> = Vec::new();
+    for r in &read.roots {
+        let rp = Path::new(r.as_str());
+        let meta = fs::symlink_metadata(rp).map_err(|_| err2("a manifest root is missing; nothing was deleted"))?;
+        if meta.file_type().is_symlink() {
+            return Err(err2("a manifest root is a symlink; nothing was deleted"));
+        }
+        if !meta.is_dir() {
+            return Err(err2("a manifest root is not a directory; nothing was deleted"));
+        }
+        let canon = rp.canonicalize().map_err(|_| err2("a manifest root cannot be resolved; nothing was deleted"))?;
+        if canon == Path::new("/") {
+            return Err(err2("a manifest root may not be the filesystem root; nothing was deleted"));
+        }
+        canon_roots.push(canon);
+    }
+    // Third: containment on resolved paths only, and only when something is THERE to delete — an absent path
+    // deletes nothing, so the re-run stays the documented clean no-op (the remove line is written below). The
+    // PARENT of the listed path is canonicalized, so the final component is never followed (a listed link is
+    // unlinked as the link below); the resolved parent must EQUAL or LIE INSIDE a canonical root.
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(err3("the listed path cannot be examined")),
+        Ok(_) => {
+            let parent = path.parent().ok_or_else(|| err2("the listed path has no parent; nothing was deleted"))?;
+            let canon_parent = parent
+                .canonicalize()
+                .map_err(|_| err2("the listed path does not resolve inside a root; nothing was deleted"))?;
+            if !canon_roots.iter().any(|r| canon_parent == *r || canon_parent.starts_with(r)) {
+                return Err(err2("the listed path does not resolve inside a root; nothing was deleted"));
+            }
+        }
     }
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
