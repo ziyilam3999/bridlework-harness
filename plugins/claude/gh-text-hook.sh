@@ -10,6 +10,10 @@
 # safe characters. Every other command is parsed, and the program word of every command (also inside $(..),
 # backticks and <(..)) must be a plain literal from a small safe set; an allowed prefix (env, command, ...) followed
 # by any option is refused. Unparseable text is refused. No pattern matcher is ever asked "could this be gh?".
+# Unknown-word rule (T-146): in a command whose own program is not a plain everyday one (a small default-deny set), no
+# word may have a value that cannot be read from the source (expansion, glob, brace, group, a replacement string). No
+# list of wrapper names and no word position decides it. Input bound: a command string over 65536 characters or 4096
+# words (past the plain fast path) is refused.
 # Test-only override named here (the smoke names its own in its header): HARNESS_TEST_SWAP_FILE, a path; when it
 # equals the body file being read, the hook rewrites that file between its two stats, which can only force a
 # refusal. It does nothing when unset.
@@ -74,6 +78,8 @@ class Parsed(object):
         self.paren = False
         self.subs = []        # (kind, text): "cmd" = the inside of $(..), backticks, <(..); "nest" = a group whose commands are not run
         self.pats = set()     # indexes into cmds of case-pattern words (the words before an unmatched ")")
+        self.wredirs = []     # target words of output redirects (> >> &>), which are not command words
+        self.kids = []        # (kind, Parsed) of each entry of subs, filled by line_scan
 
 
 def heredoc_start(s, i):
@@ -200,6 +206,7 @@ def tokenize(s):
     w = None
     wstart = 0
     redir = False
+    redir_out = False
     depth = 0
     pending = []
     i = 0
@@ -210,6 +217,8 @@ def tokenize(s):
         if w is not None:
             w.raw = s[wstart:end]
             if redir:
+                if redir_out:
+                    st.wredirs.append(w)
                 redir = False
             elif w.raw.isdigit() and end < n and s[end] in "<>":
                 pass  # a file descriptor prefix such as the 2 of 2>&1
@@ -272,6 +281,7 @@ def tokenize(s):
             if i + 1 < n and s[i + 1] == ">":
                 endword(i)
                 redir = True
+                redir_out = True
                 i += 2
                 while i < n and s[i] in ">&|":
                     i += 1
@@ -300,6 +310,7 @@ def tokenize(s):
                     if hs is not None:
                         pending.append((hs[0], hs[1]))
             redir = True
+            redir_out = s[i] == ">"
             i += 1
             while i < n and s[i] in "<>&|-":
                 if s[i] == "-" and not (i > 0 and s[i - 1] == "<"):
@@ -325,6 +336,8 @@ def tokenize(s):
                 depth -= 1
                 endcmd()
                 chain.clear()
+                if i + 1 < n and s[i + 1] not in " \t\n;&|<>()":  # G:glued_after_paren
+                    refuse("refused: gh text: a word glued to a closing parenthesis")
             else:  # an unmatched ")" ends a case pattern list: those words are patterns, not program words
                 if endcmd():
                     chain.append(len(st.cmds) - 1)
@@ -564,6 +577,43 @@ KEYWORDS = {"if", "elif", "while", "until", "then", "else", "do", "!", "{", "cop
 SAFE_WORD = re.compile(r"[A-Za-z0-9_./+@:%,-]+")
 SAFE_TOKEN = re.compile(r"[A-Za-z0-9_./+@:%,-][A-Za-z0-9_./+@:%,=-]*")
 PROGRAM_OK = {"[", "[[", "{", "}", "!"}   # one-character words that no pattern can turn into a two-letter name
+# Commands that only read, move or print their arguments. A word whose value is unknown until the shell expands it
+# (T-146) is allowed only in a command from this set, and only while (a) the line cannot rebind a name or build an
+# executable (line_scan) and (b) every long option of the command is on LONG_OK (plain_args_ok). In any other command it
+# could be the GitHub CLI by name, wherever it stands. Default deny: a name or option missing here costs a refusal, never a leak.
+# git, make, cargo and rg are NOT here: each can run an argument as a program (ARG_RUNNERS), so each is an ordinary
+# command with per-command argument rules (runner_refuse).
+PLAIN = {"echo", "printf", "wc", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ls", "touch", "head", "tail", "sort", "uniq",
+         "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "stat", "test", "[", "[[", "cd", "pwd", "export",
+         "local", "declare", "readonly", "read", "return", "exit", "shift", "unset", "true", "false", "grep", "egrep",
+         "fgrep", "tee", "chmod", "ln", "date", "sleep", "du", "df", "file", "for", "case", "select"}
+# Long options that run nothing (exact names, before any "="). A PLAIN command with any other long option is not trusted.
+LONG_OK = {"--help", "--version", "--recursive", "--force", "--verbose", "--parents", "--color", "--colour", "--all",
+           "--human-readable", "--reverse", "--numeric-sort", "--unique", "--ignore-case", "--key", "--field-separator",
+           "--line-number", "--count", "--include", "--exclude", "--exclude-dir", "--files-with-matches",
+           "--files-without-match", "--fixed-strings", "--extended-regexp", "--invert-match", "--no-messages",
+           "--max-count", "--regexp", "--word-regexp", "--null", "--binary-files", "--after-context", "--before-context",
+           "--context", "--quiet", "--silent", "--only-matching", "--with-filename", "--no-filename", "--lines", "--bytes",
+           "--interactive", "--no-clobber", "--update", "--preserve", "--archive", "--symbolic", "--relative",
+           "--target-directory", "--no-target-directory", "--almost-all", "--directory", "--inode", "--size",
+           "--numeric-uid-gid", "--time-style", "--full-time", "--classify", "--group-directories-first"}
+ARG_RUNNERS = {"git", "make", "cargo", "rg"}        # ordinary commands that can run one of their own arguments
+REBIND = {"alias", "unalias", "hash", "unhash", "enable", "autoload", "compdef", "functions"}   # change what a name runs
+WRITERS = {"ln", "cp", "mv", "install", "tee", "uniq", "dd"}                                      # write a path from words
+ASSIGNERS = {"export", "declare", "typeset", "local", "readonly", "unset", "read", "getopts", "let", "printf"}
+NAMEBIND = re.compile(r"(^|=)(PATH|path|fpath|FPATH|cdpath|CDPATH)(\+?=|$)")
+HOOKVAR = re.compile(r"^(GIT_|CARGO_|RUSTC|RUSTDOC|RUSTFLAGS|MAKE|MFLAGS|SHELL$|CC$|CXX$|EDITOR$|VISUAL$|PAGER$|MANPAGER$|"
+                     r"BROWSER$|LD_|DYLD_|BASH_ENV$|ENV$|PROMPT_COMMAND$|RIPGREP_|ZDOTDIR$)")
+HOOKVAR_OK = re.compile(r"^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL|DATE)$|^GIT_(DIR|WORK_TREE|TERMINAL_PROMPT)$")
+RUNNER_ENV_OK = {"LC_ALL", "LANG", "TZ", "NO_COLOR", "RUST_BACKTRACE", "RUST_LOG", "CARGO_TERM_COLOR", "GIT_AUTHOR_NAME",
+                 "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"}
+GIT_WORD_BAD = {"-c", "--config-env", "--exec", "-x", "--upload-pack", "--receive-pack", "--exec-path", "config", "alias",
+                "bisect", "filter-branch", "submodule", "for-each-repo", "difftool", "mergetool", "instaweb", "web--browse",
+                "help", "send-email", "credential", "daemon"}
+GIT_PREFIX_BAD = ("--config-env=", "--exec=", "--upload-pack=", "--receive-pack=", "--exec-path=", "ext::", "-c")
+ORDINARY = {"-", "--", "+", ";", ".", "..", "/", "!", "[", "]", "[[", "]]", "{", "}", "=", ":", ","}
+CMD_CAP = 65536       # longest command string read past the fast path; longer is refused
+WORD_CAP = 4096       # most words in one command string; more is refused
 MAX_DEPTH = 8
 API_BAD_LONG = {"--method", "--field", "--raw-field", "--input"}
 
@@ -656,7 +706,185 @@ def program_ok(p):
     return (not p.quoted) and (not p.dyn) and SAFE_WORD.fullmatch(p.raw) is not None
 
 
-def check_program_words(st, depth, nest=False):
+def unknown(w, ws, find):
+    """True when the value of word w cannot be read from the source: it could be the GitHub CLI spelled by an expansion,
+    a glob, a brace, a group or a replacement string. Assignment words are not program words and are skipped."""
+    if is_assign(w):
+        return False
+    t = w.text
+    if "{}" in t and not find:  # G:placeholder
+        return True
+    if w.dyn:
+        core = w.raw.replace("{}", "") if find else w.raw
+        if find and "{}" in w.raw and re.search(r"[$`*?\[(<>{}~\\'\"=]", core) is None:  # G:find_placeholder
+            return False
+        if re.fullmatch(r"~[A-Za-z0-9_./+@:%,-]*", w.raw):  # G:tilde_literal
+            return False
+        return True  # G:dyn_word
+    if (not find) and t not in ORDINARY and (not t.startswith("-")) and (not t.isdigit()) and sum(1 for x in ws if x.text == t) > 1:  # G:repeat_word
+        return True  # a word given twice is a replacement string that takes its value from standard input
+    return False
+
+
+def base_name(w):
+    return w.raw.rsplit("/", 1)[-1] if (not w.quoted) and (not w.dyn) else ""
+
+
+class Line(object):
+    """What the whole command line can do to names and files (all commands, also inside substitutions)."""
+    def __init__(self):
+        self.taint = False      # the line can rebind a name or build an executable: no command is trusted by its name
+        self.written = set()    # basenames of paths a command or redirect on the line writes
+
+
+def line_scan(st, depth, ln, nest=False):
+    """Fill ln: does the line rebind a name (alias, hash, PATH, a function) or write an executable from an unknown word?"""
+    if depth > MAX_DEPTH:  # G:sub_depth
+        refuse("refused: gh text: command substitution nested too deeply")
+    if st.paren and not nest:  # G:func_def
+        ln.taint = True   # a function definition NAME() { .. } or a subshell group: a name may now run something else
+    for idx, ws in enumerate(st.cmds):
+        if nest or idx in st.pats:  # G:case_pattern
+            continue
+        for w in ws:
+            if is_assign(w):
+                nm = w.raw.split("=", 1)[0].rstrip("+")
+                if w.dyn and HOOKVAR.match(nm) and not HOOKVAR_OK.match(nm):  # G:hook_var
+                    refuse("refused: gh text: an expansion assigned to a variable that can name a program")
+            if NAMEBIND.search(w.text):  # G:path_bind
+                ln.taint = True
+        i = lead_index(ws, True)
+        if i is None:
+            continue
+        p = ws[i]
+        name = base_name(p)
+        args = ws[i + 1:]
+        if name in REBIND:  # G:rebind_cmd
+            ln.taint = True
+        if name in ASSIGNERS and any(w.dyn for w in args) and (name != "printf" or any(w.text.startswith("-v") for w in args)):  # G:assigner_dyn
+            ln.taint = True
+        writer = name in WRITERS or (name == "sort" and any(re.match(r"^-[A-Za-z]*o", w.text) for w in args))
+        if writer:  # G:writer_unknown
+            if any(unknown(w, args, False) for w in args):
+                ln.taint = True
+        if writer or any(w.text.startswith("of=") for w in args):
+            for w in args:
+                if not w.text.startswith("-"):
+                    ln.written.add(w.text.rsplit("/", 1)[-1].replace("of=", "", 1))
+    for w in ([] if nest else st.wredirs):
+        if unknown(w, [], False):  # G:redirect_unknown
+            ln.taint = True
+        else:
+            ln.written.add(w.text.rsplit("/", 1)[-1])
+    st.kids = []
+    for kind, text in st.subs:
+        kid = tokenize(text)
+        st.kids.append((kind, kid))
+        line_scan(kid, depth + 1, ln, kind == "nest")
+
+
+def plain_args_ok(args):
+    """A trusted plain command carries no long option outside LONG_OK (a long option can name a program to run)."""
+    for w in args:
+        t = w.text
+        if t.startswith("--") and len(t) > 2 and t.split("=", 1)[0] not in LONG_OK:  # G:long_option
+            return False
+    return True
+
+
+def repl_hit(args):
+    """xargs replacement strings in every spelling (-I XX, -IXX, -J XX, -J%, --replace=XX, -iXX): the string may not
+    appear in any other word, whole or glued, because it takes its value from standard input."""
+    reps = []
+    for k, w in enumerate(args):
+        t = w.text
+        m = re.match(r"^-[IJi](.+)$", t) or re.match(r"^--replace=(.+)$", t)
+        if m:
+            reps.append((m.group(1), {k}))
+        elif t in ("-I", "-J") and k + 1 < len(args):
+            reps.append((args[k + 1].text, {k, k + 1}))
+    for r, defs in reps:
+        if r == "" or r in ORDINARY:
+            continue
+        for k, w in enumerate(args):
+            if k not in defs and r in w.text:
+                return True
+    return False
+
+
+def runner_refuse(name, ws, i):
+    """Per-command rule for a command that can run one of its own arguments. One sentence each:
+    git: no -c/--config-env/config/alias or any option or subcommand that names a program to run (hooks, pagers, bisect run, rebase -x...);
+    make: no NAME=value command variable, no -f from a pipe or device, no --eval;
+    cargo: no --config or -Z; rg: no --pre or --hostname-bin; and for all four no assignment in front except a short harmless list."""
+    for w in ws[:i]:
+        if is_assign(w) and w.raw.split("=", 1)[0].rstrip("+") not in RUNNER_ENV_OK:  # G:runner_env
+            refuse("refused: gh text: an environment assignment in front of a command that can run a program")
+    args = ws[i + 1:]
+    texts = [w.text for w in args]
+    bad = False
+    if name == "git":  # G:git_args
+        for k, t in enumerate(texts):
+            if t in GIT_WORD_BAD or t.startswith(GIT_PREFIX_BAD):
+                bad = True
+            if t.startswith("-u") and not t.startswith("--") and "clone" in texts:
+                bad = True
+    elif name.endswith("make"):  # G:make_args
+        for k, t in enumerate(texts):
+            if re.match(r"^[A-Za-z_.][A-Za-z0-9_.]*[+:?!]?=", t) or t in ("-E",) or t.startswith("--eval"):
+                bad = True
+            v = None
+            if t in ("-f", "--file", "--makefile") and k + 1 < len(texts):
+                v = texts[k + 1]
+            elif t.startswith("-f") and not t.startswith("--"):
+                v = t[2:]
+            elif t.startswith(("--file=", "--makefile=")):
+                v = t.split("=", 1)[1]
+            if v is not None and (v == "-" or v.startswith(("/dev/", "/proc/"))):
+                bad = True
+    elif name == "cargo":  # G:cargo_args
+        for t in texts:
+            if t == "--config" or t.startswith("--config=") or t.startswith("-Z"):
+                bad = True
+    elif name == "rg":  # G:rg_args
+        for t in texts:
+            if t.startswith("--pre") or t.startswith("--hostname-bin"):
+                bad = True
+    if bad:
+        refuse("refused: gh text: an option that makes this command run a program")
+
+
+def command_unknown_ok(ws, plain_ok):
+    """One rule, no program position and no wrapper list: when the command's own program word is not a trusted plain
+    everyday command, none of its words may have an unknown value. Plain is trusted only when plain_ok (the line cannot
+    rebind a name or build an executable) and its long options are all on LONG_OK. (Keywords and assignments before the
+    program are skipped.)"""
+    i = 0
+    n = len(ws)
+    while i < n and (is_assign(ws[i]) or ((not ws[i].quoted) and ws[i].raw in KEYWORDS)):  # G:plain_lead
+        i += 1
+    if i >= n:
+        return
+    p = ws[i]
+    if plain_ok and (not p.quoted) and (p.raw in ("[", "[[") or not p.dyn) and p.raw in PLAIN and plain_args_ok(ws[i + 1:]):  # G:plain_set
+        return
+    if (not p.quoted) and (not p.dyn) and p.raw == "gh":  # G:gh_program
+        return  # parse_gh_call refuses an expansion in every position of a gh call
+    name = base_name(p)
+    find = name == "find"
+    args = ws[i + 1:]
+    if name in ARG_RUNNERS or name.endswith("make"):
+        runner_refuse(name, ws, i)
+    if name == "xargs" and repl_hit(args):  # G:repl_glued
+        refuse("refused: gh text: a replacement string that takes its value from standard input")
+    for k, w in enumerate(args):
+        if find and k > 0 and args[k - 1].text in ("-exec", "-execdir", "-ok", "-okdir") and "{}" in w.raw:  # G:find_program_slot
+            refuse("refused: gh text: a placeholder in the program word of a find command")
+        if unknown(w, ws, find):
+            refuse("refused: gh text: a word that could spell the CLI in a command that may run it")
+
+
+def check_program_words(st, depth, ln, nest=False):
     """Default deny: every command, including those inside $(..), backticks and <(..), must run a plain literal program."""
     if depth > MAX_DEPTH:  # G:sub_depth
         refuse("refused: gh text: command substitution nested too deeply")
@@ -669,8 +897,15 @@ def check_program_words(st, depth, nest=False):
                 continue
             if not program_ok(ws[i]):  # G:progword_literal
                 refuse("refused: gh text: a program word that is not a plain literal")
-    for kind, text in st.subs:  # G:sub_recurse
-        check_program_words(tokenize(text), depth + 1, kind == "nest")
+            command_unknown_ok(ws, not ln.taint)  # G:unknown_word
+            name = base_name(ws[i])
+            if ws[i].raw in PLAIN and ws[i].raw not in WRITERS:
+                continue
+            for w in ws[i:]:
+                if (not w.text.startswith("-")) and w.text.rsplit("/", 1)[-1] in ln.written and name not in WRITERS:  # G:written_run
+                    refuse("refused: gh text: a command runs or reads a path another command on the line writes")
+    for kind, kid in st.kids:  # G:sub_recurse
+        check_program_words(kid, depth + 1, ln, kind == "nest")
 
 
 def plain_command(cmd):
@@ -1018,13 +1253,19 @@ def main():
     if mention and has_control(cmd):
         refuse("refused: gh text: control characters in the command")
 
+    if len(cmd) > CMD_CAP:  # G:input_len
+        refuse("refused: gh text: the command is too long to read")
     try:
         st = tokenize(cmd)
     except Refuse:
         if True:  # G:cannot_decide
             raise
         return
-    check_program_words(st, 0)
+    if sum(len(c) for c in st.cmds) > WORD_CAP:  # G:input_words
+        refuse("refused: gh text: the command is too long to read")
+    ln = Line()
+    line_scan(st, 0, ln)
+    check_program_words(st, 0, ln)
     if not mention:
         return
     if st.heredoc:  # G:heredoc

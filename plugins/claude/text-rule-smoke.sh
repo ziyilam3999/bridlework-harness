@@ -11,6 +11,9 @@
 #   SMOKE_ENGINE_EXTRA  an extra stand-in engine executable; the hook must refuse a clean call through it.
 #   SMOKE_LEAK_GH       1: put a second recording gh on the smoke PATH (the sink guard must go red).
 #   SMOKE_REPORT        a file that receives the scratch folder name (used by the hygiene self-test).
+#   SMOKE_RUN_PATH      extra PATH folders (e.g. /usr/bin:/bin) for the shell that runs an ALLOWED command, and
+#   SMOKE_RUN_SHELL     the shell to run it in (e.g. zsh). Measurement only, used with case ac24_pass_through_r2 so a
+#                       leak becomes a recorded stand-in call; the default run uses neither.
 # The hook has one more test-only seam, HARNESS_TEST_SWAP_FILE (see the hook header).
 # Markers come only from `harness fixtures`; no real regulated string appears in this file or its runs.
 # Everything lives under one mktemp folder; a trap removes it even when a case fails.
@@ -116,7 +119,7 @@ sink_guard() {
 }
 
 run_sink() {
-  (cd "$W/home" && "$ENVBIN" -i "PATH=$SINKPATH" "HOME=$W/home" "SINKLOG=$SINKLOG" "$BASHBIN" -c "$1") > /dev/null 2>&1
+  (cd "$W/home" && "$ENVBIN" -i "PATH=$SINKPATH${SMOKE_RUN_PATH:+:$SMOKE_RUN_PATH}" "HOME=$W/home" "SINKLOG=$SINKLOG" "${SMOKE_RUN_SHELL:-$BASHBIN}" -c "$1") > /dev/null 2>&1
   SINKN=$(command grep -c '^CALL' "$SINKLOG" 2>/dev/null); SINKN=${SINKN:-0}
 }
 
@@ -135,7 +138,7 @@ expect_allow() {
 }
 expect_refuse() { # label [required substring]
   local n m bad
-  if [ "$RC" -ne 2 ]; then fail "$1: expected exit 2, got rc=$RC"; return; fi
+  if [ "$RC" -ne 2 ]; then fail "$1: expected exit 2, got rc=$RC (stand-in calls: $SINKN)"; return; fi
   [ -s "$W/out" ] && fail "$1: stdout not empty"
   [ -s "$W/err" ] || { fail "$1: no reason line"; return; }
   n=$(wc -l < "$W/err" | tr -d ' ')
@@ -152,8 +155,8 @@ expect_refuse() { # label [required substring]
 mono() { "$PY" -I -c 'import time; print(time.monotonic())'; }
 elapsed() { "$PY" -I -c 'import sys; print(round(float(sys.argv[2]) - float(sys.argv[1]), 1))' "$1" "$2"; }
 under_13() { "$PY" -I -c 'import sys; sys.exit(0 if float(sys.argv[2]) - float(sys.argv[1]) < 13.0 else 1)' "$1" "$2"; }
-ok() { drive "$2"; expect_allow "$1"; }
-no() { drive "$2"; expect_refuse "$1" "$3"; }
+ok() { local f=$FAILN; drive "$2"; expect_allow "$1"; [ "$FAILN" -eq "$f" ] && echo "  case $1"; }
+no() { local f=$FAILN; drive "$2"; expect_refuse "$1" "$3"; [ "$FAILN" -eq "$f" ] && echo "  case $1"; }
 raw_no() { printf '%s' "$2" > "$W/in.json"; SINKN=0; run_hook_file "$W/in.json"; expect_refuse "$1" "$3"; }
 
 # ---------------------------------------------------------------- AC 1
@@ -593,6 +596,84 @@ EOF
   ok twin-heredoc-tab-strip "cat <<-EOF > /dev/null
 	it's fine *
 	EOF" # G:heredoc_skip
+  # T-146: one rule decides pass-through words. A word whose value is unknown until the shell expands it (brace, glob,
+  # group, expansion, substitution, replacement string) is refused in any command that is not a plain everyday one,
+  # wherever the word stands and whatever the command is called. Every case below is a held-out spelling, none a list entry.
+  local R="refused: gh text:" G1='g{h,x}' G2='g(h|x)'
+  both() { # id, text before the disguised word, text after it: one case per shell spelling (bash brace, zsh group)
+    no "$1-bash" "$2$G1 $3" "$R"
+    no "$1-zsh" "$2$G2 $3" "$R"
+  }
+  both pt-nice "nice " "$M"
+  both pt-nice-nice "nice nice " "$M"
+  both pt-env-nice "env nice " "$M"
+  both pt-timeout-dot "timeout .5 " "$M"
+  both pt-timeout-hex "timeout 0x5 " "$M"
+  both pt-timeout-exp "timeout 1e1 " "$M"
+  both pt-timeout-inf "timeout inf " "$M"
+  both pt-timeout-kill-after "timeout --kill-after=1 5 " "$M"
+  both pt-gtimeout "gtimeout 5 " "$M"
+  both pt-relative-dot "cd /usr/bin && ./nice " "$M"
+  both pt-relative-dir "cd /usr && bin/nice " "$M"
+  both pt-find-quoted-exec "find . -maxdepth 0 \"-exec\" " "$M \;"
+  both pt-find-escaped-exec "find . -maxdepth 0 -ex\\ec " "$M \;"
+  both pt-find-exec "find . -maxdepth 0 -exec " "$M \;"
+  both pt-flock-file "flock $SINK/x.lock " "$M"
+  both pt-flock-option "flock -n $SINK/x.lock " "$M"
+  both pt-script-file "script /dev/null " "$M"
+  both pt-script-option "script -q /dev/null " "$M"
+  both pt-sandbox-exec "sandbox-exec -p '(version 1)(allow default)' " "$M"
+  both pt-chroot "chroot / " "$M"
+  both pt-xargs "echo x | xargs " "$M"
+  both pt-nice-option-value "nice -n 1 " "$M"
+  both pt-cd-nice "cd '$SINK' && nice " "$M"
+  both pt-alias-bash "shopt -s expand_aliases
+alias n=nice
+n " "$M"
+  both pt-function "n() { nice \"\$@\"; }; n " "$M"
+  # held-out spellings of my own: a name on no list, a data word before the disguised word, a variable on the same line,
+  # a disguised word inside a substitution that is an argument
+  both pt-held-invented-wrapper "frobnicate --level 3 " "$M"
+  both pt-held-data-positional "lockwrap $SINK/x.lock " "$M"
+  no pt-held-same-line-variable "P=g; Q=h; frobnicate \"\$P\$Q\" $M" "$R"
+  no pt-held-variable-prefix "P=g Q=h frobnicate \"\$P\$Q\" $M" "$R"
+  no pt-held-substitution-argument "frobnicate \"\$(printf g)h\" $M" "$R"
+  no pt-held-substitution-bare "nice \$(printf g)h $M" "$R"
+  # a replacement string that takes the program name from standard input
+  no pt-xargs-J-percent "printf '%sh\\n' g | xargs -J % % $M" "$R"
+  no pt-xargs-I-word "printf '%sh\\n' g | xargs -I XX XX $M" "$R"
+  no pt-xargs-I-quoted-brace "printf '%sh\\n' g | xargs -I'{}' '{}' $M" "$R"
+  no pt-glued-paren "(g)h $M" "$R"
+  # a plain everyday command may carry unknown words
+  ok pt-echo-home-pipe "echo \"\$HOME\" | wc -c"
+  ok pt-rsync-plain "rsync -a src/ dest/"
+  ok pt-find-rustfmt "find . -name '*.rs' -exec rustfmt --check {} +"
+  ok pt-find-brace-suffix "find . -name '*.tmp' -exec cp {} {}.bak \;"
+  ok pt-assign-then-plain "FOO=1 echo \"\$HOME\""
+  ok pt-keyword-then-plain "if [ -n \"\$HOME\" ]; then echo \"\$HOME\"; fi"
+  ok pt-tilde-plain "rsync -a ~/src dest/"
+  ok pt-gh-repeated-word "gh pr create --title same --body same"
+  ok pt-xargs-d-quoted "xargs -d '\\n' rm -f < list.txt"
+  ok pt-nice-make "nice make"
+  ok pt-nice-n-make "nice -n 5 make -j4"
+  ok pt-timeout-cargo "timeout 5 cargo test"
+  ok pt-timeout-30s "timeout 30s cargo test --locked"
+  ok pt-xargs-wc "echo x | xargs wc -l"
+  ok pt-xargs-n-P "xargs -n 1 -P 4 echo"
+  ok pt-find-exec-rm "find . -name '*.nothing' -exec rm {} \;"
+  ok pt-find-exec-bash-n "find src -type f -name '*.sh' -exec bash -n {} \;"
+  ok pt-env-assign-nice "env A=1 nice make"
+  # refused as the price of the single rule (recorded in the close note): an unknown value in a command that may run it
+  no cost-make-variable "make -j4 test \"\$T\"" "$R"
+  no cost-xargs-I-brace "xargs -I{} cp {} out/ < list.txt" "$R"
+  no cost-timeout-variable "timeout \"\$T\" make" "$R"
+  no cost-nice-variable "nice -n \"\$N\" make" "$R"
+  # input bound: a command past the cap is refused, not read
+  local longword; longword=$(printf '%*s' 70000 '' | tr ' ' a)
+  no input-too-long "echo \"\$HOME\" $longword" "$R"
+  local manywords; manywords=$(printf ' a%.0s' $(seq 1 4100))
+  no input-too-many-words "echo \"\$HOME\"$manywords" "$R"
+  ok input-under-the-caps "echo \"\$HOME\" a b c"
 }
 
 # ---------------------------------------------------------------- AC 12
@@ -904,7 +985,95 @@ ac23_anchors() {
   ok twin-after "$c"
 }
 
-CASES="ac01_clean_and_marker ac02_session_link ac03_engine_inputs ac04_crash_is_refusal ac05_heredoc ac06_expansion ac07_body_file ac08_stat_swap ac09_flags ac10_api ac11_program_word ac12_target ac13_read_only ac14_no_echo ac15_testmode ac16_manifest ac18_hygiene ac19_public_repo_env ac20_fields ac20_deadline ac21_deny_list ac22_content_shapes ac23_anchors"
+# ---------------------------------------------------------------- AC 24 (T-146 fix round 2)
+# The plain-command trust is not an answer key: git, make, cargo and rg run arguments, a line can rebind a PLAIN name,
+# and a PLAIN command can build the program a later word runs. Every case is a held-out spelling.
+ac24_pass_through_r2() {
+  new_world
+  local R="refused: gh text:" M="pr comment 1 --body '$M_PROFILE'" M2="pr comment 1 -b '$M_PROFILE'" NL=$'\n' G1='g{h,x}' G2='g(h|x)'
+  # M2 has no long option: a long option such as --body already makes a plain command untrusted (G:long_option), so the
+  # cases that pin the name-rebinding and file-building guards use the short flag to leave that guard out of the way.
+  both() { no "$1-bash" "$2$G1 $3" "$R"; no "$1-zsh" "$2$G2 $3" "$R"; }
+  # group 1: a command that runs an argument as a program (reviewer shapes N01-N03, N13, N14, N25, N34, N35)
+  no r2-N01-git-alias-var "X=h; git -c \"alias.y=!g\$X $M\" y" "$R"
+  no r2-N02-git-alias-subst "git -c \"alias.y=!\$(printf g)h $M\" y" "$R"
+  both r2-N03-git-alias-loop "for p in " "; do git -c \"alias.y=!\$p $M\" y; done"
+  no r2-N14-git-alias-printf-v "printf -v P 'g%s' h; git -c \"alias.y=!\$P $M\" y" "$R"
+  no r2-N34-git-alias-export "export P=g; git -c \"alias.y=!\${P}h $M\" y" "$R"
+  no r2-N35-git-alias-read "read P <<< gh2; git -c \"alias.y=!\${P%2} $M\" y" "$R"
+  no r2-N13-make-cc "touch a.c && X=h && make CC=g\$X \"CFLAGS=$M\" a" "$R"
+  no r2-N25-rg-pre "printf x > f && X=h && rg --pre g\$X x f" "$R"
+  # per-command argument rules with literal values (no unknown word, so only the argument rule can refuse them)
+  no r2-git-c-literal "git -c alias.y='!true' y" "$R"
+  no r2-git-config-alias "git config alias.y \"true\"" "$R"
+  no r2-git-bisect-run "git bisect run \"true\"" "$R"
+  no r2-git-rebase-exec "git rebase --exec \"true\" HEAD" "$R"
+  no r2-git-upload-pack "git ls-remote --upload-pack=\"true\" origin" "$R"
+  no r2-make-command-variable "make CC=\"true\" a" "$R"
+  no r2-make-script-from-pipe "printf 'a:\\n\\ttrue\\n' | make -f - a" "$R"
+  no r2-cargo-config-runner "cargo --config 'target.x.runner=\"true\"' test" "$R"
+  no r2-rg-pre-literal "rg --pre \"true\" x f" "$R"
+  no r2-runner-env-literal "GIT_PAGER=\"true\" git log" "$R"
+  no r2-env-hook-var-dynamic "X=h; export GIT_PAGER=g\$X; git log" "$R"
+  # group 2: a line that rebinds a PLAIN name (N07-N10, and held-out spellings of my own)
+  no r2-N07-alias-plain-name "shopt -s expand_aliases${NL}alias cat=nice${NL}cat $G1 $M2" "$R"
+  no r2-N08-hash-p "hash -p /usr/bin/nice cat; cat $G1 $M2" "$R"
+  no r2-N09-hash-assign "hash cat=/usr/bin/nice; cat $G2 $M2" "$R"
+  no r2-N10-path-symlink "ln -s /usr/bin/nice cat && PATH=.:\$PATH cat $G1 $M2" "$R"
+  both r2-held-builtin-alias "shopt -s expand_aliases${NL}builtin alias cat=nice${NL}cat " "$M2"
+  both r2-held-command-alias "shopt -s expand_aliases${NL}command alias cat=nice${NL}cat " "$M2"
+  no r2-held-export-path-by-name "ln -s /usr/bin/nice cat; P=PA; Q=TH; export \"\$P\$Q=.:\$PATH\"; cat $G1 $M2" "$R"
+  no r2-held-function-name-plain "cat() { true; }; cat \"\$f\"" "$R"
+  no r2-held-function-keyword "function cat { true; }; cat \"\$f\"" "$R"
+  # group 3: a PLAIN command builds a program from an unknown word, or a path a command wrote is run (N11, N12)
+  no r2-N11-ln-glob "ln -s $SINK/g? x && ./x $M2" "$R"
+  no r2-N12-cp-glob "cp $SINK/g? x2 && ./x2 $M2" "$R"
+  no r2-held-cat-redirect-build "cat $SINK/g? > x3 && chmod +x x3 && ./x3 $M2" "$R"
+  no r2-held-tee-build "cat $SINK/g? | tee x4 > /dev/null; chmod +x x4; ./x4 $M2" "$R"
+  no r2-held-install-build "install $SINK/g? x5 && ./x5 $M2" "$R"
+  no r2-held-run-path-in-other-dir "mkdir d; cat $SINK/g? > d/x; chmod +x d/x; cd d; ./x $M2" "$R"
+  no r2-held-written-then-sh "printf 'true' > x.sh; sh x.sh" "$R"
+  no r2-cost-cp-glob "cp *.md out/" "$R"
+  no r2-cost-redirect-unknown "echo \"\$HOME\" > \"\$out\"" "$R"
+  # group 4: a placeholder glued into the program word of find (N04, N05) and of other tools
+  no r2-N04-find-glued-after "mkdir h && find h -prune -exec g{} $M \\;" "$R"
+  no r2-N05-find-glued-before "mkdir g && find g -prune -exec {}h $M \\;" "$R"
+  no r2-held-find-ok "mkdir h && find h -prune -ok g{} $M \\;" "$R"
+  no r2-held-find-execdir-bare "find . -maxdepth 0 -execdir {} $M \\;" "$R"
+  no r2-held-parallel-glued "printf 'h\\n' | parallel g{} $M" "$R"
+  no r2-held-fd-glued "fd -x g{} $M" "$R"
+  no r2-held-parallel-bare-placeholder "printf '%sh\\n' g | parallel {} $M" "$R"
+  no r2-held-parallel-quoted-placeholder "printf '%sh\\n' g | parallel '{}' $M" "$R"
+  no r2-held-parallel-I-word "printf '%sh\\n' g | parallel -I XX XX $M" "$R"
+  no r2-held-find-placeholder-class "find . -type f -exec cp {} {}\$X \\;" "$R"
+  # group 5: the replacement string glued into an option (N06)
+  no r2-N06-xargs-J-glued "printf '%sh\\n' g | xargs -J% % $M" "$R"
+  no r2-held-xargs-I-glued "printf '%sh\\n' g | xargs -I% g% $M" "$R"
+  no r2-held-xargs-I-word-glued "printf '%sh\\n' g | xargs -IXX XX $M" "$R"
+  no r2-held-xargs-J-spaced-glued "printf 'h\\n' | xargs -J XX gXX $M" "$R"
+  no r2-held-xargs-replace-long "printf 'h\\n' | xargs --replace=XX gXX $M" "$R"
+  # a PLAIN command with an option that names a program to run (not git, make, cargo or rg)
+  no r2-held-sort-compress-program "seq 1 5 | sort --compress-program=$SINK/g? > /dev/null" "$R"
+  no r2-held-grep-pre "grep --pre=$SINK/g? x f" "$R"
+  # must not fire
+  ok r2-ok-git-status "git status"
+  ok r2-ok-git-log-head "git log --oneline | head -5"
+  ok r2-ok-git-commit "git commit -m \"msg\""
+  ok r2-ok-make-j "make -j4 test"
+  ok r2-ok-cargo-lib "cargo test --lib"
+  ok r2-ok-cat-wc "cat file | wc -l"
+  ok r2-ok-ls-tilde "ls ~/notes"
+  ok r2-ok-grep-glob "grep -rn TODO src/*.rs"
+  ok r2-ok-find-rustfmt "find . -name '*.rs' -exec rustfmt --check {} +"
+  ok r2-ok-find-cp-suffix "find . -name '*.tmp' -exec cp {} {}.bak \\;"
+  ok r2-ok-grep-include "grep -rn --include=*.rs TODO src/"
+  ok r2-ok-env-lang-make "LC_ALL=C make -j4 test"
+  ok r2-ok-xargs-n "printf 'a\\nb\\n' | xargs -n 1 echo"
+  ok r2-ok-cp-literal "cp a.txt b.txt && wc -l b.txt"
+  # input bound is unchanged (cases input-too-long and input-too-many-words in ac11_program_word)
+}
+
+CASES="ac01_clean_and_marker ac02_session_link ac03_engine_inputs ac04_crash_is_refusal ac05_heredoc ac06_expansion ac07_body_file ac08_stat_swap ac09_flags ac10_api ac11_program_word ac12_target ac13_read_only ac14_no_echo ac15_testmode ac16_manifest ac18_hygiene ac19_public_repo_env ac20_fields ac20_deadline ac21_deny_list ac22_content_shapes ac23_anchors ac24_pass_through_r2"
 
 run_case() {
   FAILN=0
