@@ -600,3 +600,272 @@ fn ac8_no_folder_on_stdout_or_stderr() {
         assert_no_folder(label, &o, &t, &r);
     }
 }
+
+// ================================================================ P1B-04: the node_modules link
+
+/// A primary whose top level holds a REAL `node_modules` directory (untracked; one package inside).
+fn repo_with_node_modules(t: &Tmp) -> PathBuf {
+    let r = repo(t, "R", "one");
+    fs::create_dir_all(r.join("node_modules").join("pkg")).unwrap();
+    fs::write(r.join("node_modules").join("pkg").join("f.txt"), "pkg").unwrap();
+    r
+}
+
+/// AC 2 (P1B-04): a primary with a real `node_modules` dir gets a link to it, listed as a third entry.
+#[test]
+fn p1b04_link_made_and_listed() {
+    let t = Tmp::new();
+    let r = repo_with_node_modules(&t);
+    let (r_raw, _) = t.both("R");
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // The link: a no-follow stat says symlink, and its target text IS the primary's canonical node_modules.
+    let (_, tree) = t.both("W/t1/tree");
+    let link = tree.join("node_modules");
+    let meta = fs::symlink_metadata(&link).expect("no node_modules link was made");
+    assert!(meta.file_type().is_symlink(), "tree/node_modules is not a link");
+    assert_eq!(fs::read_link(&link).unwrap(), r.join("node_modules"), "the link points elsewhere");
+    // The link is usable: the package is visible THROUGH it.
+    assert!(fs::metadata(link.join("pkg").join("f.txt")).unwrap().is_file(), "the link does not resolve to the primary's folder");
+    // The manifest lists THREE entries, the third naming the link under class temp_dir.
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    let binding = out(&l);
+    let listed: Vec<&str> = binding.lines().collect();
+    assert_eq!(listed.len(), 3, "manifest list:\n{}", out(&l));
+    assert_eq!(listed[0], format!("worktree\tworktree\t{}", tree.display()));
+    assert_eq!(listed[1], format!("tmp\ttemp_dir\t{}", t.both("W/t1/tmp").1.display()));
+    assert_eq!(listed[2], format!("node_modules\ttemp_dir\t{}", link.display()));
+    assert_no_folder("p1b04-link", &o, &t, &r);
+}
+
+/// AC 3 (P1B-04): a primary with NO `node_modules` gets no link and no third entry (behaviour identical to P1B-03).
+#[test]
+fn p1b04_no_node_modules_no_link() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // Nothing at <tree>/node_modules: a NO-FOLLOW stat fails (an exists() would also miss a dangling link).
+    let (_, tree) = t.both("W/t1/tree");
+    assert!(fs::symlink_metadata(tree.join("node_modules")).is_err(), "something sits at tree/node_modules");
+    // The manifest lists exactly the two P1B-03 entries.
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    let binding = out(&l);
+    let listed: Vec<&str> = binding.lines().collect();
+    assert_eq!(listed.len(), 2, "manifest list:\n{}", out(&l));
+    assert_eq!(listed[0], format!("worktree\tworktree\t{}", tree.display()));
+    assert_eq!(listed[1], format!("tmp\ttemp_dir\t{}", t.both("W/t1/tmp").1.display()));
+    assert_no_folder("p1b04-none", &o, &t, &r);
+}
+
+/// AC 4 (P1B-04): a symlinked primary `node_modules` is refused (to a dir inside the repo AND to one outside),
+/// with nothing written and no folder on the terminal.
+#[test]
+fn p1b04_symlinked_primary_node_modules_refused() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    let before_por = worktree_porcelain(&r);
+    // Case A: the symlink points at a directory INSIDE the repo.
+    fs::create_dir_all(r.join("real_nm")).unwrap();
+    std::os::unix::fs::symlink(r.join("real_nm"), r.join("node_modules")).unwrap();
+    ticket(&t, "ta", "r");
+    let oa = run(&create_args(&t, "ta.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&oa), 2, "symlink inside: exit {} stdout {} stderr {}", code(&oa), out(&oa), err(&oa));
+    assert!(empty(&w) && empty(&m), "the inside-symlink refusal wrote something");
+    assert_eq!(worktree_porcelain(&r), before_por, "the inside-symlink refusal touched the repo");
+    assert_no_folder("p1b04-symlink-in", &oa, &t, &r);
+    // Case B: the symlink points at a directory OUTSIDE the repo.
+    fs::remove_file(r.join("node_modules")).unwrap();
+    let (outside, _) = t.both("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, r.join("node_modules")).unwrap();
+    ticket(&t, "tb", "r");
+    let ob = run(&create_args(&t, "tb.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&ob), 2, "symlink outside: exit {} stdout {} stderr {}", code(&ob), out(&ob), err(&ob));
+    assert!(empty(&w) && empty(&m), "the outside-symlink refusal wrote something");
+    assert_eq!(worktree_porcelain(&r), before_por, "the outside-symlink refusal touched the repo");
+    assert!(outside.read_dir().unwrap().count() == 0, "something was written through the symlink");
+    assert_no_folder("p1b04-symlink-out", &ob, &t, &r);
+}
+
+/// AC 5 (P1B-04): a base commit that tracks `node_modules/x` is not shadowed — the tree keeps its own real
+/// directory, and the manifest keeps exactly the two P1B-03 entries.
+#[test]
+fn p1b04_tracked_node_modules_not_shadowed() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    // The primary's node_modules exists too (untracked pkg) — the base tracking one still means NO link.
+    fs::create_dir_all(r.join("node_modules").join("pkg")).unwrap();
+    fs::write(r.join("node_modules").join("x"), "tracked").unwrap();
+    git(&r, &["add", "node_modules/x"]);
+    git(&r, &["commit", "-q", "-m", "add tracked node_modules"]);
+    let s = head(&r);
+    ticket(&t, "t1", "r");
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let o = run(&create_args(&t, "t1.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "create: {}", err(&o));
+    // The tree's node_modules is the base commit's own REAL directory holding x, not a link.
+    let (_, tree) = t.both("W/t1/tree");
+    let nm = tree.join("node_modules");
+    let meta = fs::symlink_metadata(&nm).expect("the tree has no node_modules");
+    assert!(meta.file_type().is_dir(), "the tree's node_modules was replaced or is not a real directory");
+    assert!(fs::metadata(nm.join("x")).unwrap().is_file(), "the tracked x is missing from the tree");
+    // Two entries only: the link was never listed.
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t1".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list: {}", err(&l));
+    assert_eq!(out(&l).lines().count(), 2, "a link entry was listed for a tracked node_modules:\n{}", out(&l));
+    // The primary's own folder was untouched: x and pkg both still there.
+    assert!(fs::metadata(r.join("node_modules").join("x")).unwrap().is_file());
+    assert!(fs::metadata(r.join("node_modules").join("pkg")).unwrap().is_dir());
+    assert_no_folder("p1b04-tracked", &o, &t, &r);
+}
+
+/// AC 6 (P1B-04): the link's manifest entry is written BEFORE the link (or the tree) exists. The `ws` branch
+/// trick makes `git worktree add` fail after the seed; the entry must already be listed, no link may exist, and
+/// every child of the ticket root must be one of the listed paths.
+#[test]
+fn p1b04_entry_listed_before_link_exists() {
+    let t = Tmp::new();
+    let r = repo_with_node_modules(&t);
+    let (r_raw, _) = t.both("R");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    ticket(&t, "t6", "r");
+    git(&r, &["branch", "ws", &s]);
+    let o = run(&create_args(&t, "t6.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "git failure after the seed: {} {}", out(&o), err(&o));
+    assert_no_folder("p1b04-seed-fail", &o, &t, &r);
+    let (m, _) = t.both("M");
+    let l = run(&["manifest".into(), "list".into(), "t6".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list t6: {}", err(&l));
+    let listed = out(&l);
+    let entries: Vec<&str> = listed.lines().collect();
+    assert_eq!(entries.len(), 3, "the seed must have written all three entries:\n{}", listed);
+    let (_, tree) = t.both("W/t6/tree");
+    let want_nm = format!("node_modules\ttemp_dir\t{}", tree.join("node_modules").display());
+    assert!(entries.contains(&want_nm.as_str()), "the node_modules entry is missing:\n{}", listed);
+    // No link exists (the tree itself may not even exist): the entry was written FIRST.
+    assert!(fs::symlink_metadata(tree.join("node_modules")).is_err(), "a link already exists at tree/node_modules");
+    // Every child of the ticket root is one of the listed paths: no unlisted thing may sit there.
+    let (root, _) = t.both("W/t6");
+    let targets: Vec<PathBuf> = entries.iter().map(|e| PathBuf::from(e.split('\t').nth(2).unwrap_or(""))).collect();
+    for child in fs::read_dir(&root).unwrap().flatten() {
+        let child = child.path().canonicalize().unwrap();
+        assert!(targets.contains(&child), "an unlisted child sits in the ticket root: {:?}", child.file_name());
+    }
+}
+
+// --------------------- P1B-04 held-out refusal and acceptance variants (executor round 1, none from review)
+
+#[test]
+fn p1b04_heldout_refusal_and_acceptance_variants() {
+    let t = Tmp::new();
+    let (r_raw, _) = t.both("R");
+    let r = repo(&t, "R", "one");
+    let s = head(&r);
+    for d in ["W", "M"] {
+        let (p, _) = t.both(d);
+        fs::create_dir_all(&p).unwrap();
+    }
+    let (w, _) = t.both("W");
+    let (m, _) = t.both("M");
+    let before_por = worktree_porcelain(&r);
+    // must-fire 1: a FILE at the primary's node_modules is refused, writing nothing.
+    fs::write(r.join("node_modules"), "a file").unwrap();
+    ticket(&t, "hf", "r");
+    let o = run(&create_args(&t, "hf.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "file at node_modules: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the file case wrote something");
+    assert_eq!(worktree_porcelain(&r), before_por, "the file case touched the repo");
+    assert_no_folder("p1b04-file", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-fire 2: a DANGLING symlink at node_modules (target missing) is refused, never chased.
+    std::os::unix::fs::symlink(r.join("gone"), r.join("node_modules")).unwrap();
+    ticket(&t, "hd", "r");
+    let o = run(&create_args(&t, "hd.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "dangling symlink: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the dangling-symlink case wrote something");
+    assert_no_folder("p1b04-dangling", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-fire 3: a symlink pointing at a FILE is refused (the link class is refused whatever the target is).
+    fs::write(r.join("nmfile"), "target file").unwrap();
+    std::os::unix::fs::symlink(r.join("nmfile"), r.join("node_modules")).unwrap();
+    ticket(&t, "ht", "r");
+    let o = run(&create_args(&t, "ht.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 2, "symlink to a file: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the symlink-to-file case wrote something");
+    assert_no_folder("p1b04-link-to-file", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-fire 4: a FILE at the primary's node_modules is refused EVEN when the base tracks node_modules —
+    // the plan's decision order runs the no-follow stat refusal BEFORE the tracked exemption.
+    fs::write(r.join("node_modules"), "tracked file").unwrap();
+    git(&r, &["add", "node_modules"]);
+    git(&r, &["commit", "-q", "-m", "tracked node_modules file"]);
+    let s2 = head(&r);
+    ticket(&t, "h1", "r");
+    let o = run(&create_args(&t, "h1.json", &r_raw, &s2, "W", "M"), None);
+    assert_eq!(code(&o), 2, "file at node_modules with a tracking base: {} {}", out(&o), err(&o));
+    assert!(empty(&w) && empty(&m), "the tracked-file case wrote something");
+    assert_no_folder("p1b04-file-tracked", &o, &t, &r);
+    fs::remove_file(r.join("node_modules")).unwrap();
+    // must-not-fire 1: a base that tracks node_modules while the primary has NONE — the fresh tree brings its
+    // own real directory, no link, no third entry.
+    ticket(&t, "h1b", "r");
+    let o = run(&create_args(&t, "h1b.json", &r_raw, &s2, "W", "M"), None);
+    assert_eq!(code(&o), 0, "tracked node_modules, no primary folder: {} {}", out(&o), err(&o));
+    let (_, tree1) = t.both("W/h1b/tree");
+    let meta = fs::symlink_metadata(tree1.join("node_modules")).expect("the tracked file is missing from the tree");
+    assert!(meta.file_type().is_file(), "the tree's node_modules is not the tracked file");
+    let l = run(&["manifest".into(), "list".into(), "h1b".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(code(&l), 0, "manifest list h1b: {}", err(&l));
+    assert_eq!(out(&l).lines().count(), 2, "a link entry was listed for a tracked file:\n{}", out(&l));
+    // must-not-fire 2: a second ticket on the same repo also gets a link to the SAME primary folder.
+    fs::create_dir_all(r.join("node_modules").join("pkg")).unwrap();
+    ticket(&t, "h2", "r");
+    let o = run(&create_args(&t, "h2.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "second ticket: {} {}", out(&o), err(&o));
+    let (_, tree2) = t.both("W/h2/tree");
+    assert_eq!(fs::read_link(tree2.join("node_modules")).unwrap(), r.join("node_modules"), "the second link points elsewhere");
+    // must-not-fire 3: the base is an OLD commit from before node_modules appeared in the working tree —
+    // trackedness is keyed on the BASE, so the link is still made and listed.
+    ticket(&t, "h3", "r");
+    let o = run(&create_args(&t, "h3.json", &r_raw, &s, "W", "M"), None);
+    assert_eq!(code(&o), 0, "old base with node_modules present: {} {}", out(&o), err(&o));
+    let (_, tree3) = t.both("W/h3/tree");
+    assert!(fs::symlink_metadata(tree3.join("node_modules")).unwrap().file_type().is_symlink(), "no link for the old-base ticket");
+    let l = run(&["manifest".into(), "list".into(), "h3".into(), "--dir".into(), m.to_str().unwrap().into()], None);
+    assert_eq!(out(&l).lines().count(), 3, "the old-base ticket's manifest:\n{}", out(&l));
+}

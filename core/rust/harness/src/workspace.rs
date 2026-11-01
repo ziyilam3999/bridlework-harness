@@ -8,6 +8,11 @@
 //! every manifest write. No error or stdout line ever carries a folder (given or canonicalized): a folder may be
 //! private, and the manifest — which lives in a caller-chosen private folder — is the record, not the terminal.
 //! The command never cleans up after itself and never retries in place: a re-run is refused as a second workspace.
+//! P1B-04: when the repo's primary copy has a real `node_modules` directory, the fresh tree also gets a symlink
+//! `node_modules` pointing at it (so tests run without a slow reinstall), listed on the manifest BEFORE it is made
+//! like everything else. The decision is read-only and made before any write: a repo with no `node_modules` (or a
+//! base commit that tracks one) gets no link; a symlink, a file or anything unreadable there is REFUSED — the link
+//! must never point at something the repo does not own, and something the fresh tree brings must never be shadowed.
 
 use crate::events::token_ok;
 use crate::intake::{intake, RepoMap};
@@ -216,6 +221,46 @@ fn resolve_dir(flag: &str, arg: &str, repo: &Repo) -> Result<PathBuf, Stop> {
     Ok(canon)
 }
 
+/// The P1B-04 `node_modules` link decision, made read-only BEFORE anything is written (with the other step 3-5
+/// checks). `No` means no link and no manifest entry (a repo with none, or a base that brings its own); `Yes`
+/// carries the remembered canonical target the link will point at.
+enum NodeModules {
+    No,
+    Yes(PathBuf),
+}
+
+/// Look at `<repo-top>/node_modules` with a no-follow stat and at the base commit's top-level tree, and decide:
+/// - absent → no link, no entry (the "repo with none" case; behaviour identical to P1B-03);
+/// - a real directory whose canonical path lies inside the repo top → link wanted, remember the canonical target;
+/// - anything else (a symlink, a file, unreadable, a dir that canonicalizes outside the repo top) → refuse NOW,
+///   exit 2, nothing written. A symlinked primary `node_modules` is refused rather than chased: the link would
+///   then point at something the repo does not own;
+/// - a base commit that tracks a top-level `node_modules` (read-only git query) → no link, no entry: the fresh
+///   tree brings its own and it must never be shadowed or overwritten.
+fn node_modules_decision(repo: &Repo, base: &str) -> Result<NodeModules, Stop> {
+    let nm = repo.top.join("node_modules");
+    let meta = match std::fs::symlink_metadata(&nm) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NodeModules::No),
+        Err(_) => return Err(err2("the repo's node_modules is unreadable, so no link can be made safely")),
+    };
+    if !meta.file_type().is_dir() {
+        // A no-follow stat says this is NOT a real directory: a symlink (wherever it points) or a file.
+        return Err(err2("the repo's node_modules is not a real directory (a link or a file is refused)"));
+    }
+    let canon = nm.canonicalize().map_err(|_| err2("the repo's node_modules cannot be resolved"))?;
+    if canon == repo.top || !canon.starts_with(&repo.top) {
+        return Err(err2("the repo's node_modules does not lie inside the repo, so the repo does not own it"));
+    }
+    // The tracked check is a git query bounded to ONE named path of the base tree, never a walk.
+    let tracked = git(&repo.top, &["ls-tree", "--name-only", base, "--", "node_modules"])
+        .ok_or_else(|| err2("the base commit's tree could not be read"))?;
+    if tracked.lines().any(|l| l == "node_modules") {
+        return Ok(NodeModules::No);
+    }
+    Ok(NodeModules::Yes(canon))
+}
+
 /// Any manifest error stops with a FIXED, folder-free line: the manifest library's own messages may repeat a path,
 /// and no folder is ever printed. The manifest file is the record; the terminal line says only what happened.
 fn manifest_stop(e: manifest::ManifestError) -> Stop {
@@ -301,6 +346,9 @@ fn create(a: &[String]) -> Result<Success, Stop> {
     if git(&repo.top, &["check-ref-format", "--branch", &branch]).is_none() {
         return Err(err2("the ticket id is not a legal branch name"));
     }
+    // P1B-04: the node_modules link decision, still read-only, still before anything is written. A refusal here
+    // leaves the folders empty, exactly like every other pre-write check.
+    let nm = node_modules_decision(&repo, &base)?;
 
     // The manifest timestamp is resolved BEFORE step 6, so no usage or clock error can strike after the
     // first write: an explicit --ts-ms was already parsed to u64 in parse_args, and the clock is read once.
@@ -325,6 +373,14 @@ fn create(a: &[String]) -> Result<Success, Stop> {
     manifest::apply(&md, &ticket.id, &Op::Init { roots: &[ticket_root.clone()] }, ts_ms).map_err(manifest_stop)?;
     manifest::apply(&md, &ticket.id, &Op::AddPath { id: "worktree", class: Class::Worktree, path: &tree }, ts_ms).map_err(manifest_stop)?;
     manifest::apply(&md, &ticket.id, &Op::AddPath { id: "tmp", class: Class::TempDir, path: &tmp }, ts_ms).map_err(manifest_stop)?;
+    // P1B-04 write-ahead: the link's entry goes on the manifest in the SAME write-ahead block, BEFORE the tree or
+    // the link exists (a crash below leaves a listed half-made thing, never an orphan). The path resolves through
+    // the existing ticket root with the plain tail `tree/node_modules`, so it is fenced; the fixed id `node_modules`
+    // under class `temp_dir` is the name P1B-14 teardown will unlink BY ID, never recursing through the link.
+    let nm_path = tree.join("node_modules");
+    if matches!(nm, NodeModules::Yes(_)) {
+        manifest::apply(&md, &ticket.id, &Op::AddPath { id: "node_modules", class: Class::TempDir, path: &nm_path }, ts_ms).map_err(manifest_stop)?;
+    }
 
     // 9. Make the scratch folder, then the worktree on its own branch at the base (the git-call rule: no hooks, no
     //    inherited `GIT_*`, git's own stderr never echoed).
@@ -332,23 +388,51 @@ fn create(a: &[String]) -> Result<Success, Stop> {
     let tree_str = tree.to_str().ok_or_else(|| err2("the worktree path is not utf-8"))?;
     git(&repo.top, &["worktree", "add", "-b", &branch, tree_str, &base])
         .ok_or_else(|| err2("the worktree could not be created"))?;
+    // P1B-04: make the link, only after the tree exists. An EXCLUSIVE create (`symlink` fails if anything already
+    // sits at the name): never removes, never replaces — the base-commit pre-check already ruled out a tracked
+    // `node_modules`, so anything here now is unexpected and the create fails closed. If the primary's folder
+    // vanished since the decision, stop the same way: the entry stays listed, the link may be missing — a listed
+    // half-made thing, never an orphan, the same contract as every other step from the seed on.
+    if let NodeModules::Yes(target) = &nm {
+        match std::fs::symlink_metadata(target) {
+            Ok(m) if m.file_type().is_dir() => {}
+            _ => return Err(err2("the repo's node_modules vanished before the link was made")),
+        }
+        std::os::unix::fs::symlink(target, &nm_path)
+            .map_err(|_| err2("the node_modules link could not be created"))?;
+    }
 
     // 10. Read the manifest back and confirm both entries are live and both paths exist; only then is it a workspace.
     let read = manifest::read_manifest(&md, &ticket.id).map_err(|_| err2("the manifest could not be read back"))?;
     if !read.is_clean() {
         return Err(err2("the manifest did not read back cleanly"));
     }
-    let want = [("worktree", Class::Worktree, &tree), ("tmp", Class::TempDir, &tmp)];
-    if read.live.len() != want.len() {
-        return Err(err2("the manifest did not read back both entries"));
+    let mut want: Vec<(&str, Class, &PathBuf)> = vec![("worktree", Class::Worktree, &tree), ("tmp", Class::TempDir, &tmp)];
+    if matches!(nm, NodeModules::Yes(_)) {
+        want.push(("node_modules", Class::TempDir, &nm_path));
     }
-    for (id, class, path) in want {
+    if read.live.len() != want.len() {
+        return Err(err2("the manifest did not read back every entry"));
+    }
+    for (id, class, path) in &want {
         let hit = read.live.iter().any(|e| match &e.target {
-            Target::Path(p) => e.id == id && e.class == class && Path::new(p) == path,
+            Target::Path(p) => e.id == *id && e.class == *class && Path::new(p) == path.as_path(),
             _ => false,
         });
         if !hit || !path.exists() {
-            return Err(err2("the manifest did not read back both entries with their paths in place"));
+            return Err(err2("the manifest did not read back every entry with its path in place"));
+        }
+    }
+    // The link is checked with a no-follow stat and its TARGET TEXT, never a plain `exists()` (that follows the
+    // link and would pass for any directory that happens to sit at the name).
+    if let NodeModules::Yes(target) = &nm {
+        match std::fs::symlink_metadata(&nm_path) {
+            Ok(m) if m.file_type().is_symlink() => {}
+            _ => return Err(err2("the node_modules link did not read back as a link")),
+        }
+        let got = std::fs::read_link(&nm_path).map_err(|_| err2("the node_modules link could not be read back"))?;
+        if got != *target {
+            return Err(err2("the node_modules link does not point at the repo's own folder"));
         }
     }
     Ok(Success { ticket: ticket.id, repo_id: accepted.repo_id.as_str().to_string(), base, branch })
