@@ -32,16 +32,18 @@ const FOLDER_MODE: u32 = 0o700;
 /// Mode of every handover file.
 const FILE_MODE: u32 = 0o600;
 
-/// Open flags for reading a handover at the final name (fix r1, F2): NO-follow, so a symlinked final
-/// name is never a door out of the folder, and NO-blocking, so a FIFO or socket swapped in at the name
-/// cannot hang the verb with the per-ticket lock held. The values are the platform's own `O_NOFOLLOW`
-/// and `O_NONBLOCK` from `fcntl.h`; neither changes how a REGULAR file opens or reads.
+/// Open flag for reading a handover at the final name (fix r1 F2, corrected r2 N5): NON-BLOCKING only,
+/// so a FIFO or socket swapped in at the name between the metadata gate and the open cannot hang the
+/// verb with the per-ticket lock held. NO no-follow is claimed for the FLAGS: the per-platform
+/// `O_NOFOLLOW` values differ (macOS `0x100`, Linux `0o400000` on x86_64 only) and the r1 values were
+/// wrong on macOS, so the door out of the folder is closed a stronger way — the no-follow metadata gate
+/// BEFORE the open, then `opened_is_gate_file` proving the opened HANDLE is that same regular file.
 #[cfg(target_os = "linux")]
-const OPEN_NO_FOLLOW_NO_BLOCK: i32 = 0o4000 | 0o400000;
+const OPEN_NONBLOCK: i32 = 0o4000;
 #[cfg(target_os = "macos")]
-const OPEN_NO_FOLLOW_NO_BLOCK: i32 = 0x0000_0004 | 0x0040_0000;
+const OPEN_NONBLOCK: i32 = 0x0000_0004;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const OPEN_NO_FOLLOW_NO_BLOCK: i32 = 0;
+const OPEN_NONBLOCK: i32 = 0;
 
 /// Why this process ended (decision 1): stopped by a limit (`timeout`), or provably gone before any
 /// supervisor signal (`died` — whether it exited cleanly is P1B-08's claim, not this one).
@@ -457,24 +459,42 @@ pub fn ensure_folder(dir: &Path, ticket: &str) -> Result<PathBuf, String> {
 
 /// The log pre-flight (decision 6a): the log must be missing or clean, and its path inside the root —
 /// read BEFORE anything is signalled, so a torn log means "refuse", never "stop and discover after".
+/// Fix r2 (N2): the read goes through `events::read_log` (the capped, regular-file-proving door of
+/// #211) — a plain `fs::read` BLOCKS on a FIFO at the log path with the per-ticket lock held, and the
+/// log lives inside the root, where the supervised program itself runs.
 fn preflight_log(root: &Path, log: &Path) -> Result<(), String> {
     if let Err(e) = events::check_log_path(root, log) {
         return Err(format!("event log refused: {e}"));
     }
-    match fs::read(log) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("event log refused: cannot read the log: {}", e.kind())),
-        Ok(bytes) => {
-            let lr = events::parse_log(&bytes);
-            if let Some(c) = &lr.corrupt {
-                Err(format!("event log refused: line {} is corrupt: {}", c.line, c.msg))
-            } else if let Some(t) = &lr.torn_tail {
-                Err(format!("event log refused: torn tail at line {} ({} bytes, no newline)", t.line, t.bytes))
-            } else {
-                Ok(())
-            }
-        }
+    read_log_for_death(log).map(|_| ())
+}
+
+/// The one log reader of the death record (fix r2 N2): a missing log is clean (nothing recorded yet);
+/// every other read goes through `events::read_log`, which refuses — without opening — a symlink, a
+/// FIFO, a directory or anything else that is not a regular file, proves the opened handle is that
+/// same file, and caps the read at 64 MiB. Err carries the reason after `event log refused: `.
+fn read_log_for_death(log: &Path) -> Result<events::LogRead, String> {
+    if matches!(fs::symlink_metadata(log), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(events::LogRead { events: Vec::new(), torn_tail: None, corrupt: None });
     }
+    let lr = events::read_log(log).map_err(|e| format!("event log refused: {e}"))?;
+    if let Some(c) = &lr.corrupt {
+        return Err(format!("event log refused: line {} is corrupt: {}", c.line, c.msg));
+    }
+    if let Some(t) = &lr.torn_tail {
+        return Err(format!("event log refused: torn tail at line {} ({} bytes, no newline)", t.line, t.bytes));
+    }
+    Ok(lr)
+}
+
+/// Is the OPENED handle the very regular file the earlier no-follow metadata gate saw? (fix r2, N5 —
+/// the same re-bind as `events::read_log`.) The open itself cannot be told no-follow portably (the
+/// per-platform `O_NOFOLLOW` values differ and the r1 constants were wrong on macOS), so a same-user
+/// swap of the final name between the gate and the open is refused HERE: the handle must itself be a
+/// regular file and carry the gate's own device and inode, so a symlink, a FIFO or a different file
+/// substituted at the name is never read, however briefly it sat there.
+fn opened_is_gate_file(handle: &fs::Metadata, gate: &fs::Metadata) -> bool {
+    handle.is_file() && handle.dev() == gate.dev() && handle.ino() == gate.ino()
 }
 
 /// Read the handover file at `final_path` if it is a plain, in-cap, strictly-parseable record of
@@ -491,7 +511,13 @@ fn read_existing(final_path: &Path, spec: &DeathSpec<'_>, relpath: &str) -> Resu
     if !md.is_file() {
         return Err(mismatch());
     }
-    let mut f: File = OpenOptions::new().read(true).custom_flags(OPEN_NO_FOLLOW_NO_BLOCK).open(final_path).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
+    // The open is non-blocking (a swapped-in FIFO cannot hang the read), and the handle is then proven
+    // to be the very regular file the gate above saw (fix r2 N5): a swap between the two is the same
+    // planted-name refusal, and the thing now sitting at the name is never parsed.
+    let mut f: File = OpenOptions::new().read(true).custom_flags(OPEN_NONBLOCK).open(final_path).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
+    if !opened_is_gate_file(&f.metadata().map_err(|e| format!("cannot write the handover: {}", e.kind()))?, &md) {
+        return Err(mismatch());
+    }
     let mut buf = Vec::new();
     std::io::Read::take(std::io::Read::by_ref(&mut f), HANDOVER_CAP as u64 + 1).read_to_end(&mut buf).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
     if buf.len() > HANDOVER_CAP {
@@ -602,28 +628,18 @@ fn staged_of(h: &Handover, relpath: &str) -> Staged {
 /// `timed_out` line with this ticket and handover (decision 7 — the same death once). The append goes
 /// through the library record writer, the only writer for the P1b kinds.
 pub fn commit(spec: &DeathSpec<'_>, staged: &Staged, log: &Path, root: &Path, now: u64) -> Result<(), String> {
-    match fs::read(log) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("event log refused: cannot read the log: {}", e.kind())),
-        Ok(bytes) => {
-            let lr = events::parse_log(&bytes);
-            if let Some(c) = &lr.corrupt {
-                return Err(format!("event log refused: line {} is corrupt: {}", c.line, c.msg));
-            }
-            if let Some(t) = &lr.torn_tail {
-                return Err(format!("event log refused: torn tail at line {} ({} bytes, no newline)", t.line, t.bytes));
-            }
-            let already = lr.events.iter().any(|rec| {
-                rec.kind == Kind::TimedOut
-                    && matches!(
-                        (rec.field("ticket"), rec.field("handover")),
-                        (Some(Field::Str(t)), Some(Field::Str(h))) if t == spec.ticket && h == &staged.relpath
-                    )
-            });
-            if already {
-                return Ok(());
-            }
-        }
+    // Fix r2 (N2): the idempotence lookup reads through the same capped, regular-file-proving door as
+    // the pre-flight (`read_log_for_death`) — a plain `fs::read` blocks on a FIFO at the log path.
+    let lr = read_log_for_death(log)?;
+    let already = lr.events.iter().any(|rec| {
+        rec.kind == Kind::TimedOut
+            && matches!(
+                (rec.field("ticket"), rec.field("handover")),
+                (Some(Field::Str(t)), Some(Field::Str(h))) if t == spec.ticket && h == &staged.relpath
+            )
+    });
+    if already {
+        return Ok(());
     }
     let rec = Record::build(
         Kind::TimedOut,
@@ -809,6 +825,51 @@ mod tests {
         let refused = stage(&dir, &s2, &log, &dir, 2_000, 900);
         assert!(refused.is_err(), "a pre-planted foreign handover refuses");
         assert_eq!(fs::read(&other).unwrap(), b"planted bytes", "the planted file was replaced");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fix r2 (N3, the AC 9 mutant): `write_atomic` called with the final name ALREADY planted answers
+    /// `Ok(false)` and leaves the planted bytes untouched — the no-replace `hard_link` is the only
+    /// route to the final name, so replacing it with a create+truncate write goes red here (the stage
+    /// path never exercises the race: it only calls `write_atomic` after seeing the name absent).
+    #[test]
+    fn write_atomic_refuses_a_preplanted_final_name() {
+        let dir = tmp();
+        let folder = dir.join("t.deaths");
+        fs::create_dir_all(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        let s = spec("t", "c", 321, 654, Cause::Timeout);
+        let final_path = folder.join(handover_name(s.id, s.pid, s.pid_start_ms));
+        fs::write(&final_path, b"preplanted bytes").unwrap();
+        let linked = write_atomic(&folder, &s, 5_000).unwrap();
+        assert!(!linked, "the no-replace link must answer false for an existing final name");
+        assert_eq!(fs::read(&final_path).unwrap(), b"preplanted bytes", "the planted final name was replaced");
+        let names: Vec<String> = fs::read_dir(&folder).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![final_path.file_name().unwrap().to_string_lossy().into_owned()], "no temp name survives: {names:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fix r2 (N5): the handle-identity rule — the OPENED handle is the very regular file the gate saw.
+    /// The same file read twice passes; a different file, and any non-regular thing at the name, is
+    /// refused. (The gate-then-open SWAP itself cannot be planted deterministically without a seam, so
+    /// the rule is unit-tested at its own table; which is recorded in the close file.)
+    #[test]
+    fn opened_handle_must_be_the_gated_regular_file() {
+        let dir = tmp();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        fs::write(&a, b"one").unwrap();
+        fs::write(&b, b"two").unwrap();
+        let gate = fs::symlink_metadata(&a).unwrap();
+        let same = fs::File::open(&a).unwrap().metadata().unwrap();
+        let other = fs::File::open(&b).unwrap().metadata().unwrap();
+        assert!(opened_is_gate_file(&same, &gate), "the handle of the gated file itself passes");
+        assert!(!opened_is_gate_file(&other, &gate), "a handle of a DIFFERENT file is refused");
+        let fifo = dir.join("fifo");
+        let _ = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        let fifo_gate = fs::symlink_metadata(&fifo).unwrap();
+        let fifo_open = fs::OpenOptions::new().read(true).custom_flags(OPEN_NONBLOCK).open(&fifo).unwrap();
+        assert!(!opened_is_gate_file(&fifo_open.metadata().unwrap(), &fifo_gate), "a FIFO at the name is refused on the handle itself");
         let _ = fs::remove_dir_all(&dir);
     }
 }

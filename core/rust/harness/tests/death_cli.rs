@@ -833,6 +833,61 @@ fn torn_log_refuses_before_signalling() {
     assert!(!deaths_dir(&d, "t-11").exists(), "the deaths folder was created");
 }
 
+// ---------------------------------------------------------------- fix r2 N2: a blocking thing at the log path
+
+/// Fix r2 (N2): a FIFO at the EVENT-LOG path must refuse within the bound — the pre-flight and the
+/// idempotence read go through the capped, regular-file-proving `events::read_log`, so a FIFO (or a
+/// directory) is refused without ever being opened; the r1 plain `fs::read` BLOCKED on it with the
+/// per-ticket lock held. Refusal shape: exit 2, `event log refused`, nothing signalled, entry kept,
+/// no deaths folder.
+#[test]
+fn fifo_at_the_event_log_path_refuses_without_hanging() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-n2a", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid, _ms) = start("t-n2a", "a", &r, &d, Some(1_000), &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+    let mk = Command::new("mkfifo").arg(&log).stdin(Stdio::null()).output().unwrap();
+    assert!(mk.status.success(), "mkfifo: {}", String::from_utf8_lossy(&mk.stderr));
+    let manifest_before = fs::read(d.join("t-n2a.jsonl")).unwrap();
+    let c = check_rec_bounded("t-n2a", &d, &log, &r);
+    assert_eq!(code(&c), 2, "a FIFO at the log path refuses: stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains("event log refused:"), "the refusal names the log: stderr {:?}", err(&c));
+    assert!(err(&c).contains("harness: DEATH NOT RECORDED"), "stderr {:?}", err(&c));
+    assert!(alive(pid), "the process was signalled despite the refusal");
+    assert_eq!(fs::read(d.join("t-n2a.jsonl")).unwrap(), manifest_before, "the manifest changed");
+    assert!(!deaths_dir(&d, "t-n2a").exists(), "the deaths folder was created");
+}
+
+/// Fix r2 (N2, held-out v3): a DIRECTORY at the event-log path is the same refusal class — exit 2,
+/// `event log refused`, no hang, nothing signalled, entry kept. (The directory is caught one door
+/// EARLIER than the FIFO: the path check refuses it before any read is attempted.)
+#[test]
+fn directory_at_the_event_log_path_refuses_without_hanging() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-n2b", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid, _ms) = start("t-n2b", "a", &r, &d, Some(1_000), &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+    fs::create_dir_all(&log).unwrap();
+    let manifest_before = fs::read(d.join("t-n2b.jsonl")).unwrap();
+    let c = check_rec_bounded("t-n2b", &d, &log, &r);
+    assert_eq!(code(&c), 2, "a directory at the log path refuses: stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains("event log refused:"), "the refusal names the log: stderr {:?}", err(&c));
+    assert!(err(&c).contains("log path refused: path is a directory"), "the refusal names the cause: stderr {:?}", err(&c));
+    assert!(alive(pid), "the process was signalled despite the refusal");
+    assert_eq!(fs::read(d.join("t-n2b.jsonl")).unwrap(), manifest_before, "the manifest changed");
+    assert!(!deaths_dir(&d, "t-n2b").exists(), "the deaths folder was created");
+}
+
 // ---------------------------------------------------------------- AC 13: a dirty manifest refuses first
 
 /// AC 13: a torn manifest plus record flags on check, stop and step: exit 2, nothing written, no deaths
