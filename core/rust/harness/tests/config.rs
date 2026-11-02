@@ -2,7 +2,7 @@
 //! and scratch repos under the system temp folder. The config source is set only on the child (`.env`, `.env_remove`); this file never reads one.
 //! Each refusal has a planted failing twin: the same run with one thing changed that a wrong implementation would get wrong.
 #![cfg(unix)]
-use harness::config::{Config, DESIGN_TIER_KEY, INBOX_KEY, KEYS};
+use harness::config::{Config, DESIGN_TIER_KEY, INBOX_KEY, KEYS, PATTERN_THRESHOLD_KEY};
 use harness::repo_id::RepoId;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -448,7 +448,11 @@ fn pin(text: &str) -> Result<(), String> {
                 }
             }
             "lanes" if v != "4" => return Err(format!("lanes {k} is not 4")),
-            "friction" if v != "/placeholder/friction-inbox.jsonl" => return Err(format!("friction {k} is not the placeholder")),
+            "friction" => match (k, v) {
+                ("inbox", "/placeholder/friction-inbox.jsonl") => {}
+                ("pattern_threshold", "3") => {}
+                _ => return Err(format!("friction {k} is not the placeholder or the shipped default 3")),
+            },
             "factory" if v != "T3" => return Err(format!("factory {k} is not T3")),
             _ => {}
         }
@@ -457,6 +461,8 @@ fn pin(text: &str) -> Result<(), String> {
     keys.sort();
     let mut want: Vec<String> = KEYS.iter().map(|k| k.to_string()).collect();
     want.push(INBOX_KEY.to_string());
+    // the contract's one optional key, shipped in the example at its default
+    want.push(PATTERN_THRESHOLD_KEY.to_string());
     want.push(DESIGN_TIER_KEY.to_string());
     want.sort();
     if keys != want {
@@ -479,6 +485,8 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
         ("lanes count 9", text.replace("  count: 4", "  count: 9")),
         ("inbox not the placeholder", text.replace("/placeholder/friction-inbox.jsonl", "/real/inbox.jsonl")),
         ("missing inbox", text.replace("\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl", "")),
+        ("pattern_threshold 2", text.replace("  pattern_threshold: 3", "  pattern_threshold: 2")),
+        ("missing pattern_threshold", text.replace("  pattern_threshold: 3\n", "")),
         ("design tier t1", text.replace("  design_tier: T3", "  design_tier: T1")),
         ("missing design tier", text.replace("\nfactory:\n  design_tier: T3", "")),
     ];
