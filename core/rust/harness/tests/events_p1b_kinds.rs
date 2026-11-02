@@ -468,7 +468,7 @@ fn f3_a_number_where_a_string_shape_is_declared_is_refused_at_read_and_at_write(
         let kind = Kind::SessionStarted;
         let swap = |ps: Vec<(&'static str, Field)>| ps.into_iter().map(|(k, v)| (k, if k == key { Field::Num(7) } else { v })).collect::<Vec<_>>();
         // Read: the stored line with a bare number for the key is refused naming the key.
-        refused_at_read(kind, &raw_line(kind, |ps| swap(ps)), key);
+        refused_at_read(kind, &raw_line(kind, swap), key);
         // Write: the pairs with a number for the key are refused naming the key.
         refused_at_write(kind, &swap(pairs_for(kind)), key);
     }

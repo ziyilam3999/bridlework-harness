@@ -310,7 +310,7 @@ fn nothing_outside_roots_touched() {
         assert_eq!(fs::metadata(p).unwrap().modified().unwrap(), before[i].1, "same mtime (never written)");
     }
     assert_eq!(fs::read_dir(&sibling).unwrap().count(), 1);
-    assert_eq!(fs::read_dir(&beside.join("keep")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(beside.join("keep")).unwrap().count(), 1);
 }
 
 /// AC 6: two sweeps with a leftover of the same name each time: both copies exist in two different batches, the
@@ -814,7 +814,7 @@ fn shelf_symlink_or_file_refused() {
     assert_eq!(code(&o), 2, "a symlinked shelf is refused: {}{}", out(&o), err(&o));
     assert!(f.root.join("stray-1/one.txt").exists(), "nothing moved");
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing was created outside the quarantine dir");
-    assert!(!fs::symlink_metadata(&f.q.join("t-1/b-1-1-0")).is_ok(), "no batch was made through the link");
+    assert!(!fs::symlink_metadata(f.q.join("t-1/b-1-1-0")).is_ok(), "no batch was made through the link");
     // (must-fire, variant 4) the shelf is a regular file, not a directory
     let f2 = fixture();
     plant(&f2, "stray-1", "one");
@@ -1011,11 +1011,10 @@ fn sweep_ancestor_swap_never_moves_from_outside() {
             if let Ok(rd) = fs::read_dir(&b) {
                 for ent in rd.flatten() {
                     let p = ent.path();
-                    if fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(false) {
-                        if fs::read(&p).map(|b| b == b"outside-c").unwrap_or(false) {
+                    if fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(false)
+                        && fs::read(&p).map(|b| b == b"outside-c").unwrap_or(false) {
                             outside_on_shelf += 1;
                         }
-                    }
                 }
             }
         }

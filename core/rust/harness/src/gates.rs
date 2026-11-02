@@ -764,7 +764,7 @@ mod tests {
         assert!(!marker.exists(), "load ran a gate's program");
         let _check = to_check(&s.0, gates.get("mark").unwrap()).expect("the check builds");
         assert!(!marker.exists(), "building a check ran the program");
-        let _ = with_spec(gates.get("mark").unwrap(), |_| ()).unwrap();
+        with_spec(gates.get("mark").unwrap(), |_| ()).unwrap();
         assert!(!marker.exists(), "building a spec ran the program");
     }
 
@@ -810,7 +810,7 @@ mod tests {
         assert!(to_check(&repo, seed).is_ok(), "the seed's program resolves under the repo");
         let map = crate::path_map::PathMap::load(&repo).expect("the committed path map loads beside the gates");
         for path in ["core/rust/harness/src/lib.rs", "gates/cargo-test.json"] {
-            assert!(resolve_map_ids(&gates, &map.checks_for(path).to_vec()).is_ok(), "the map's ids for {} are declared gates", path);
+            assert!(resolve_map_ids(&gates, map.checks_for(path)).is_ok(), "the map's ids for {} are declared gates", path);
         }
         let schema = std::fs::read_to_string(repo.join("schemas/gate.schema.json")).expect("the schema is committed and utf-8");
         let mut got = required_of(&schema);

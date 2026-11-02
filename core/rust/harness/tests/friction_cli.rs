@@ -445,7 +445,7 @@ fn lint_refuses_missing_field_unknown_field_self_break_and_duplicate() {
     assert_eq!(code(&o), 1);
     assert!(err(&o).contains("line 2") && err(&o).contains("text"), "{}", err(&o));
     // an unknown field
-    fs::write(t.inbox(), format!("{{\"id\":\"l-2\",\"date\":\"2026-11-01\",\"ticket\":\"154\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"x\",\"extra\":\"y\"}}\n")).unwrap();
+    fs::write(t.inbox(), "{\"id\":\"l-2\",\"date\":\"2026-11-01\",\"ticket\":\"154\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"x\",\"extra\":\"y\"}\n").unwrap();
     let o = lint(&t);
     assert_eq!(code(&o), 1);
     assert!(err(&o).contains("line 1") && err(&o).contains("unknown field"), "{}", err(&o));
@@ -594,7 +594,7 @@ fn refusals_never_echo_unscanned_bytes() {
         assert!(err(&o).contains("line 1") && err(&o).contains("unknown field"), "{}", err(&o));
         assert!(!err(&o).contains(&shape), "the key must not be echoed: {}", err(&o));
         // (c) as a duplicate key of a hand-written row, read by lint.
-        let row = format!("{{\"{}\":\"a\",\"{}\":\"b\",{}", &shape, &shape, &hand_written("l-2", "154", "memory", "", "a clean lesson")[1..]);
+        let row = format!("{{\"{}\":\"a\",\"{}\":\"b\",{}", shape, shape, &hand_written("l-2", "154", "memory", "", "a clean lesson")[1..]);
         fs::write(t.inbox(), format!("{row}\n")).unwrap();
         let o = lint(&t);
         assert_eq!(code(&o), 1, "{}", err(&o));
@@ -1036,7 +1036,7 @@ fn a_live_holder_times_out_into_busy_exit_two() {
     holder.lock().unwrap(); // this test process is the live holder
     let before = fs::read(t.inbox()).unwrap();
     let started = std::time::Instant::now();
-    let o = run(&add_args(&t.config().to_str().unwrap(), "l-2", "waits, then fails closed"));
+    let o = run(&add_args(t.config().to_str().unwrap(), "l-2", "waits, then fails closed"));
     drop(holder);
     assert_eq!(code(&o), 2, "{}", err(&o));
     assert!(out(&o).is_empty());
@@ -1046,7 +1046,7 @@ fn a_live_holder_times_out_into_busy_exit_two() {
     assert!(started.elapsed().as_secs() >= 9, "the busy wait is the documented 10 s, not a fast bail");
     assert_eq!(fs::read(t.inbox()).unwrap(), before, "a busy refusal leaves the inbox untouched");
     // once the holder is gone the same id stores
-    let o = run(&add_args(&t.config().to_str().unwrap(), "l-2", "stored once the holder is gone"));
+    let o = run(&add_args(t.config().to_str().unwrap(), "l-2", "stored once the holder is gone"));
     assert_eq!(code(&o), 0, "{}", err(&o));
     let o = lint(&t);
     assert_eq!(code(&o), 0, "{}", err(&o));

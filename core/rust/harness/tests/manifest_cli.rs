@@ -206,7 +206,7 @@ fn outside_the_fence_is_refused() {
 fn dangling_link_is_refused() {
     let t = Tmp::new();
     let (r, _o, d) = seeded(&t, "t-1");
-    std::os::unix::fs::symlink(&r.join("missing-target"), r.join("dangling")).unwrap();
+    std::os::unix::fs::symlink(r.join("missing-target"), r.join("dangling")).unwrap();
     refuses_leaving_file_untouched(
         &["manifest", "add", "t-1", "--dir", d.to_str().unwrap(), "--class", "temp_dir", "--id", "z", "--path", &r.join("dangling/f").to_string_lossy()],
         &t.file(&d, "t-1"),
@@ -293,7 +293,7 @@ fn operations_before_init_are_refused() {
     let (r, _o, d) = t.fence();
     let dir = d.to_str().unwrap();
     for args in [
-        vec!["manifest", "add", "t-1", "--dir", dir, "--class", "temp_dir", "--id", "a", "--path", &r.join("x").to_string_lossy().into_owned()],
+        vec!["manifest", "add", "t-1", "--dir", dir, "--class", "temp_dir", "--id", "a", "--path", &r.join("x").to_string_lossy()],
         vec!["manifest", "remove", "t-1", "--dir", dir, "--id", "a"],
     ] {
         let o = run(&args, None);
@@ -360,7 +360,7 @@ fn bad_roots_are_refused() {
     let dir = d.to_str().unwrap();
     let plain_file = t.0.join("plain");
     fs::write(&plain_file, b"x").unwrap();
-    for root in ["/", "relative/dir", &t.0.join("nope").to_string_lossy().into_owned(), &plain_file.to_string_lossy().into_owned()] {
+    for root in ["/", "relative/dir", &t.0.join("nope").to_string_lossy(), &plain_file.to_string_lossy()] {
         let ticket = format!("tk-{}", root.len()); // distinct ticket per case so no earlier file can matter
         let i = run(&["manifest", "init", &ticket, "--dir", dir, "--root", root], None);
         assert_eq!(code(&i), 2, "root {root:?} must be refused: {}", err(&i));
@@ -547,26 +547,26 @@ fn option_hygiene_is_enforced() {
         vec!["manifest", "list", "t-1", "--dir"],
         vec!["manifest", "list", "t-1", "--nope", "x"],
         vec!["manifest", "list", "t-1", "--dir", dir, "--nope"],
-        vec!["manifest", "add", "t-1", "--dir", dir, "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy().into_owned(), "--ts-ms"],
+        vec!["manifest", "add", "t-1", "--dir", dir, "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy(), "--ts-ms"],
         vec!["manifest", "list", "t-1", "--dir", dir, "--class", "temp_dir"],
         vec!["manifest", "list", "t-1", "--dir", dir, "--id", "a"],
-        vec!["manifest", "list", "t-1", "--dir", dir, "--path", &r.join("x").to_string_lossy().into_owned()],
+        vec!["manifest", "list", "t-1", "--dir", dir, "--path", &r.join("x").to_string_lossy()],
         vec!["manifest", "list"],
-        vec!["manifest", "add", "t-1", "--dir", dir, "--ts-ms", "abc", "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy().into_owned()],
-        vec!["manifest", "add", "t-1", "--dir", dir, "--ts-ms", "-1", "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy().into_owned()],
-        vec!["manifest", "add", "t-1", "--dir", dir, "--dir", dir, "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy().into_owned()],
+        vec!["manifest", "add", "t-1", "--dir", dir, "--ts-ms", "abc", "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy()],
+        vec!["manifest", "add", "t-1", "--dir", dir, "--ts-ms", "-1", "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy()],
+        vec!["manifest", "add", "t-1", "--dir", dir, "--dir", dir, "--class", "temp_dir", "--id", "z", "--path", &r.join("q").to_string_lossy()],
         vec!["manifest", "list", "t-1", "--dir", ""],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--class", "port", "--pid", "123"],
         vec!["manifest", "owns", "t-1", "--dir", dir],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--pid", "123", "--port", "80"],
-        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x").to_string_lossy().into_owned(), "--port", "80"],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x").to_string_lossy(), "--port", "80"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--pid", "abc"],
         vec!["manifest", "owns", "t-1", "--dir", dir, "--port", "abc"],
-        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x/y").to_string_lossy().into_owned(), "--port", "abc"],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x/y").to_string_lossy(), "--port", "abc"],
         vec!["manifest", "list", "t-1", "--dir", dir, "--pid", "123"],
         vec!["manifest", "verify", "t-1", "--dir", dir, "--port", "80"],
-        vec!["manifest", "owns", "t-1", "--dir", dir, "--id", "a", "--path", &r.join("x/y").to_string_lossy().into_owned()],
-        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x/y").to_string_lossy().into_owned(), "--pid", "123"],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--id", "a", "--path", &r.join("x/y").to_string_lossy()],
+        vec!["manifest", "owns", "t-1", "--dir", dir, "--path", &r.join("x/y").to_string_lossy(), "--pid", "123"],
     ] {
         let o = run(&args, None);
         assert_eq!(code(&o), 2, "expected a usage error for {:?}", args);

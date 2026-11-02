@@ -80,10 +80,9 @@ pub struct SweepArgs {
 
 fn parse_sweep(a: &[String]) -> Result<SweepArgs, Stop> {
     let mut ticket: Option<String> = None;
-    let (mut md, mut ws, mut qd, mut log, mut repo, mut role, mut model, mut max, mut ts): (
-        Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>,
-        Option<&str>,
-    ) = (None, None, None, None, None, None, None, None, None);
+    type SweepOpt<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+    let (mut md, mut ws, mut qd, mut log, mut repo, mut role, mut model, mut max, mut ts): SweepOpt =
+        (None, None, None, None, None, None, None, None, None);
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -204,7 +203,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Decode lowercase hex of even length, else `None`.
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()).collect()
@@ -214,7 +213,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 /// `untokenable` form (the journal holds the exact bytes either way).
 fn from_rel(ticket: &str, item: &str, rel: &[u8]) -> String {
     match std::str::from_utf8(rel) {
-        Ok(s) if !s.is_empty() && s.split('/').all(|seg| token_ok(seg)) => s.to_string(),
+        Ok(s) if !s.is_empty() && s.split('/').all(token_ok) => s.to_string(),
         _ => format!("{}/untokenable/{}", ticket, item),
     }
 }
@@ -354,7 +353,7 @@ fn reconcile(a: &SweepArgs, shelf: &Path, ws: &Path) -> Result<(), Stop> {
             // recorded, so whatever sits at the source path NOW is simply a later leftover of the same name — the
             // walk's business, in a fresh batch. Only an intent with no event is decided here, from what exists.
             let tos = tos.get_or_insert_with(|| quarantined_tos(&a.log));
-            if tos.iter().any(|t| *t == to) {
+            if tos.contains(&to) {
                 continue;
             }
             let src_there = fs::symlink_metadata(&src).is_ok();
@@ -394,6 +393,8 @@ fn walk(ws: &Path, roots: &[PathBuf], live: &[PathBuf], max_items: u64) -> Resul
 /// One directory of the walk. Recursive (depth is capped at `MAX_DEPTH`, so the stack is bounded); the current
 /// ancestor chain — each directory the walk has descended into, with the dev/ino it had when examined — is
 /// carried down and CLONED into every leftover found below it, so the move phase can re-check it.
+// reason: bundling the eight walk parameters into a context struct is a refactor beyond this cleanup (deferred follow-up)
+#[allow(clippy::too_many_arguments)]
 fn walk_dir(
     ws: &Path,
     dir: &Path,

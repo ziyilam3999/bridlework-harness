@@ -78,8 +78,8 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
         return Err(Stop(2, format!("usage: harness workspace create <ticket-file> ...\n{}", USAGE)));
     }
     let mut map = RepoMap::new();
-    let (mut file, mut base, mut ws, mut md, mut ts): (Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>) =
-        (None, None, None, None, None);
+    type ArgOpt<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+    let (mut file, mut base, mut ws, mut md, mut ts): ArgOpt = (None, None, None, None, None);
     let mut it = a[1..].iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -370,7 +370,7 @@ fn create(a: &[String]) -> Result<Success, Stop> {
 
     // 7-8. Write-ahead: init the manifest with the ticket root as its ONE root, then list both entries BEFORE the
     // things exist, so a crash between steps can leave only listed things, never an orphan.
-    manifest::apply(&md, &ticket.id, &Op::Init { roots: &[ticket_root.clone()] }, ts_ms).map_err(manifest_stop)?;
+    manifest::apply(&md, &ticket.id, &Op::Init { roots: std::slice::from_ref(&ticket_root) }, ts_ms).map_err(manifest_stop)?;
     manifest::apply(&md, &ticket.id, &Op::AddPath { id: "worktree", class: Class::Worktree, path: &tree }, ts_ms).map_err(manifest_stop)?;
     manifest::apply(&md, &ticket.id, &Op::AddPath { id: "tmp", class: Class::TempDir, path: &tmp }, ts_ms).map_err(manifest_stop)?;
     // P1B-04 write-ahead: the link's entry goes on the manifest in the SAME write-ahead block, BEFORE the tree or

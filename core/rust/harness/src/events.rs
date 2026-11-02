@@ -134,7 +134,7 @@ fn uuid_ok(s: &str) -> bool {
 /// Token segments joined by `/`: refuses a leading or doubled `/`, an empty, `.` or `..` segment, and any character a
 /// token forbids (so no `~`, no uppercase, no escapes).
 fn relpath_ok(s: &str) -> bool {
-    !s.is_empty() && s.split('/').all(|seg| token_ok(seg))
+    !s.is_empty() && s.split('/').all(token_ok)
 }
 
 /// One declared payload field of a kind: its key and its value shape.
@@ -475,6 +475,8 @@ pub struct Record {
     pub payload: Vec<(&'static str, Field)>,
 }
 
+type DeclaredPairs = Vec<(&'static str, Field)>;
+
 impl Record {
     /// The payload (or identity) value of one key.
     pub fn field(&self, key: &str) -> Option<&Field> {
@@ -514,7 +516,7 @@ impl Record {
     /// regardless of the order the pairs arrived in, so the written bytes never depend on the caller's order. Every
     /// error names the offending key. This is the single accept/refuse path: `build` (the writer's door) and
     /// `validate` (the re-check before encode) both come here.
-    fn assemble(kind: Kind, pairs: &[(&str, Field)]) -> Result<(Vec<(&'static str, Field)>, Vec<(&'static str, Field)>), String> {
+    fn assemble(kind: Kind, pairs: &[(&str, Field)]) -> Result<(DeclaredPairs, DeclaredPairs), String> {
         let def = kind.def();
         let trio = ["v", "kind", "ts_ms"];
         let mut identity: Vec<(&'static str, Field)> = Vec::new();
@@ -691,7 +693,7 @@ impl Record {
                         Val::Str(t) => t.clone(),
                         _ => return Err(format!("{k} has the wrong type")),
                     };
-                    Shape::Token.check_str(*k, &t)?;
+                    Shape::Token.check_str(k, &t)?;
                     identity.push((*k, Field::Str(t)));
                 }
             }

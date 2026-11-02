@@ -461,7 +461,8 @@ fn bad_inputs_are_refused_before_any_tree_exists() {
     let sub_s = sub.to_str().unwrap().to_string();
     let wrong = fx.base.clone();
     let not_exec = "not a regular executable file";
-    let cases: Vec<(&str, Vec<(&str, &str)>, &str)> = vec![
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
+    let cases: Vec<Case> = vec![
         ("dash ref", vec![("base", "-x")], "ref malformed"),
         ("blob ref", vec![("base", "HEAD:value.txt")], "does not resolve to a commit"),
         ("unknown ref", vec![("base", "no-such-ref")], "does not resolve to a commit"),

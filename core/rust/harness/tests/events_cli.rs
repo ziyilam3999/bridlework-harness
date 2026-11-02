@@ -615,11 +615,9 @@ fn ac10_the_default_log_is_git_ignored_and_works_from_the_working_folder() {
     let l = run(&["events", "list"], Some(&t.0));
     let text = out(&l);
     let id = run_id_of(&text, 0);
-    let want = format!(
-        "{}{}",
-        format!("{{\"v\":2,\"kind\":\"run_issued\",\"ts_ms\":5,\"run_id\":\"{id}\",\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"self-issue\",\"role\":\"executor\",\"model\":\"m-1\"}}\n"),
-        format!("{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":5,\"run_id\":\"{id}\",\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"m-1\"}}\n")
-    );
+    let issued = format!("{{\"v\":2,\"kind\":\"run_issued\",\"ts_ms\":5,\"run_id\":\"{id}\",\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"self-issue\",\"role\":\"executor\",\"model\":\"m-1\"}}\n");
+    let escalated = format!("{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":5,\"run_id\":\"{id}\",\"ticket\":\"t\",\"repo\":\"r\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"m-1\"}}\n");
+    let want = format!("{issued}{escalated}");
     assert_eq!(text, want);
     assert!(ok(&run(&["events", "verify"], Some(&t.0))));
 }
