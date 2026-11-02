@@ -58,7 +58,8 @@ Appends one row. Everything is checked before anything is written, in this order
 one exclusive writer lock (section 4) — the same privacy engine over every stored row and the inbox cross rules
 (a duplicate `id`; a `breaks` naming no lesson or naming itself; the existing inbox must itself be clean, untorn
 and privacy-clean). Only then is one whole line (plus newline) appended and synced; the file is created when
-absent, its folder is not. On success stdout is `stored id=<id>`. The new row is scanned before any cross rule
+absent, its folder is not; a refused row never creates the file (a first row whose only possible refusal is a
+`breaks` with nothing to name is refused before the file is opened). On success stdout is `stored id=<id>`. The new row is scanned before any cross rule
 runs, so a refusal can never echo an unscanned byte of it.
 
 A missing required field flag (`--where-it-lives` absent) is a row refusal (1) naming the field, not a usage
@@ -91,7 +92,10 @@ harness friction close-check <close-note> --ticket <t> [--config <file>]
 ```
 
 K-1.5: at ticket end, the close note names each lesson the ticket captured, or says none. Exit 0 the note matches
-the inbox (stdout `close-check ok ticket=<t> lessons=<n>`); 1 refused (stdout empty); 2 a usage or setup error. A
+the inbox (stdout `close-check ok ticket=<t> lessons=<n>`); 1 refused (stdout empty); 2 a usage or setup error. The
+`--ticket` value is a plain token and is also run through the privacy engine BEFORE anything is printed: a hit exits
+1 with `field ticket has a privacy hit (<class>)` on stderr (the class only, never the bytes) and nothing on stdout,
+so the success line only ever carries a ticket that passed the scan. A
 missing inbox reads as no rows (a fresh install), so only `lesson: none` can pass; a damaged inbox (torn, bad
 rows, unreadable, a privacy hit in a stored row) fails the check closed (2), because it cannot be compared
 against. The `lesson:` lines themselves go through the same privacy engine before the check, so an id the check
@@ -117,17 +121,20 @@ exit blocks removal.
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
   the row naming the field and the class, never the bytes. Every reader of the inbox runs the same scan over
   every stored row (`add`, `lint`, `close-check`), and `close-check` scans its `lesson:` lines too.
-- One writer at a time: `add` holds an exclusive kernel advisory lock (`flock(2)`, the std file lock) on a
-  sidecar `<inbox>.lock` file across read, scan, check and append, so two concurrent adds can never both store
-  the same id (the check and the append are one critical section) — however many writers arrive at once, and
-  however the inbox path is spelled. The lock file's path is built from the CANONICALIZED inbox (before the
-  inbox exists: its canonicalized folder plus its file name), so a symlinked folder, a `.`/`..` detour and the
-  real path all take the ONE lock of that inbox. The kernel releases the lock the moment the holder exits —
-  return, panic, or a kill -9 — so a crashed writer can never leave the inbox locked: there is NO steal rule
-  and no stale-lock age at all. A lock FILE left behind by an earlier scheme (or by a killed writer) is simply
-  opened and locked again — it never blocks; a leftover lock DIRECTORY at that path cannot be locked, so it is
-  deleted once (only a directory is ever deleted there; a live holder's lock is always a regular file). A lock
-  held longer than 10 seconds by a live writer fails the verb closed (exit 2). The lock path is never printed.
+- One writer at a time: `add` takes ONE exclusive kernel advisory lock (`flock(2)`, the std file lock) on the inbox
+  file itself, and does the read, scan, cross check and append through that same open descriptor, so two
+  concurrent adds can never both store the same id (the check and the append are one critical section) — however
+  many writers arrive at once and however the inbox path is spelled. The lock lives on the inbox's inode, so every
+  spelling of the path shares it: a symlinked folder, a symlinked file, a `./` or doubled-slash detour, a hard
+  link, and a not-yet-created file behind a symlink (the first append creates the target and locks it). There is
+  no side lock file, no path built for locking and nothing canonicalized. The kernel releases the lock the moment
+  the holder exits — return, panic, or a kill -9 — so a crashed writer can never leave the inbox locked: there is
+  NO steal rule and no stale-lock age at all. A file or folder named `<inbox>.lock` is not a lock and is simply
+  ignored (never read, locked, renamed or deleted: the harness never deletes anything it did not create). A
+  lock held longer than 10 seconds by a live writer fails the verb closed (exit 2, `the inbox is busy`, no
+  path). The lock call (`File::try_lock`) needs Rust 1.89 or newer; the workspace pins 1.99.1. `lint` and
+  `close-check` only read and take no lock; the lock is advisory, so it protects against other harness writers,
+  not against an editor that ignores it. A refused row never creates the inbox file.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
   than 4 MiB; a close note no further than 1 MiB. Over the bound the verb refuses (1 for a row, 2 for a file).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed

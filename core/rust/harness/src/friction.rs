@@ -12,7 +12,7 @@
 use crate::events::token_ok;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The four capture-time routes (K-1 rule 2). The tag is the route chosen at capture, nothing more.
 pub const TAGS: [&str; 4] = ["skill", "gate", "memory", "wiki"];
@@ -288,6 +288,18 @@ pub fn read_inbox(path: &Path) -> Result<Inbox, String> {
         return Err("the inbox path is a folder".to_string());
     }
     let bytes = read_capped(path, INBOX_CAP).map_err(|_| "the inbox cannot be read".to_string())?;
+    inbox_from_bytes(bytes)
+}
+
+/// The same read over an already-open (and, for `add`, already-locked) inbox descriptor: the rows the append
+/// will follow are read from the very file the lock is held on.
+fn read_inbox_locked(f: &fs::File) -> Result<Inbox, String> {
+    let mut buf = Vec::new();
+    f.take(INBOX_CAP + 1).read_to_end(&mut buf).map_err(|_| "the inbox cannot be read".to_string())?;
+    inbox_from_bytes(buf)
+}
+
+fn inbox_from_bytes(bytes: Vec<u8>) -> Result<Inbox, String> {
     if bytes.len() as u64 > INBOX_CAP {
         return Err(format!("the inbox is over the {}-byte cap", INBOX_CAP));
     }
@@ -386,9 +398,14 @@ pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
 /// Append one row as a single whole line plus newline, after every check has passed. The file is created when absent
 /// (its folder is not). One write, then sync: success means the line is on disk.
 pub fn append_row(path: &Path, row: &Row) -> Result<(), String> {
+    let mut f = fs::OpenOptions::new().append(true).create(true).open(path).map_err(|_| "the inbox cannot be written".to_string())?;
+    append_row_to(&mut f, row)
+}
+
+/// The same append through an open descriptor (the one `add` holds the writer lock on).
+fn append_row_to(f: &mut fs::File, row: &Row) -> Result<(), String> {
     let mut line = encode_row(row)?;
     line.push('\n');
-    let mut f = fs::OpenOptions::new().append(true).create(true).open(path).map_err(|_| "the inbox cannot be written".to_string())?;
     f.write_all(line.as_bytes()).map_err(|_| "the inbox write failed".to_string())?;
     f.sync_all().map_err(|_| "the inbox sync failed".to_string())?;
     Ok(())
@@ -398,75 +415,27 @@ pub fn append_row(path: &Path, row: &Row) -> Result<(), String> {
 /// (read, scan, check, append, sync of a capped inbox).
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The exclusive writer lock: the open lock file, held by a kernel advisory lock (flock(2), std's file lock).
-/// The kernel releases the lock the moment the holder's file description closes — on return, on panic, on a
-/// kill -9 — so a crashed writer can never leave the inbox locked and there is no stale-steal rule to race.
-/// Dropping the guard closes the file, which releases the lock on every exit path.
-struct LockGuard(std::fs::File);
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        // One last read of the lock file's own metadata: the guard OWNS the open file, and closing it
-        // (immediately after this) is what releases the kernel advisory lock.
-        let _ = self.0.metadata();
-    }
-}
-
-/// The sidecar lock file path: the CANONICALIZED inbox (or, before the inbox exists, its canonicalized folder
-/// plus its file name) with `.lock` appended — so every spelling of one inbox (a symlinked folder, a `.`/`..`
-/// detour, the real path) takes the ONE lock of that inbox. The path itself is never printed.
-fn lock_path(inbox: &Path) -> Result<PathBuf, String> {
-    let base = match fs::canonicalize(inbox) {
-        Ok(p) => p,
-        Err(_) => {
-            let parent = inbox.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-            let name = inbox.file_name().ok_or_else(|| "the inbox cannot be written".to_string())?;
-            fs::canonicalize(parent)
-                .map(|p| p.join(name))
-                .map_err(|_| "the inbox cannot be written".to_string())?
-        }
-    };
-    let mut s = base.into_os_string();
-    s.push(".lock");
-    Ok(PathBuf::from(s))
-}
-
-/// Acquire the exclusive writer lock: an OS advisory lock (flock(2), std's file lock) on the one canonical lock
-/// file of this inbox, so two concurrent adds can never both hold it (the check and the append are one critical
-/// section). A leftover lock FILE from an earlier scheme is simply opened and locked — it never blocks; a
-/// leftover lock DIRECTORY cannot be locked, so it is deleted (only a directory is ever deleted; a live
-/// holder's lock is always a regular file, which `remove_dir_all` refuses). `Err` is a setup failure: the
-/// folder is missing, or the lock stayed busy
-/// past LOCK_WAIT. Nothing here prints any path.
-fn acquire_lock(lock: &Path) -> Result<LockGuard, String> {
+/// Open the inbox FILE (creating it when absent, in its existing folder) and take the exclusive writer lock ON IT:
+/// one kernel advisory lock (flock(2), std's file lock, Rust 1.89+) on the inbox's own inode. Every spelling of
+/// the path (a symlinked folder or file, a `.`/`..` detour, a hard link, a not-yet-created file behind a
+/// symlink) opens the same inode, so they all take the ONE lock; there is no side lock file and no path is
+/// built or compared. The kernel releases the lock when the descriptor closes (return, panic, kill -9), so
+/// there is no stale-steal rule. The returned file is the locked descriptor: the caller reads and appends through it,
+/// and dropping it releases the lock. `Err` is a setup failure (cannot open) or the lock stayed busy past
+/// LOCK_WAIT. Nothing here prints any path.
+fn open_locked(inbox: &Path) -> Result<fs::File, String> {
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(inbox)
+        .map_err(|_| "the inbox cannot be written".to_string())?;
     let deadline = std::time::Instant::now() + LOCK_WAIT;
-    let mut last_progress = std::time::Instant::now();
     loop {
-        match fs::OpenOptions::new().write(true).read(true).create(true).open(lock) {
-            Ok(f) => {
-                last_progress = std::time::Instant::now();
-                match f.try_lock() {
-                    Ok(()) => return Ok(LockGuard(f)),
-                    Err(std::fs::TryLockError::WouldBlock) => {}
-                    Err(std::fs::TryLockError::Error(_)) => return Err("the inbox cannot be written".to_string()),
-                }
-            }
-            Err(_) => {
-                // An earlier scheme could leave a lock DIRECTORY at the path. It can never be a live
-                // holder (a holder's lock is always a regular file), and only a directory is ever
-                // removed — `remove_dir_all` refuses a regular file, so a live lock file can never be
-                // deleted or moved out from under its holder (no rename step, no steal window).
-                // A directory seen at open time may already be gone by the check (another writer
-                // removed it), so an open failure alone is never fatal: retry until the path makes no
-                // progress for 2 s (then it is a setup error) or the busy deadline passes.
-                if fs::metadata(lock).map(|m| m.is_dir()).unwrap_or(false) {
-                    last_progress = std::time::Instant::now();
-                    let _ = fs::remove_dir_all(lock);
-                }
-                if std::time::Instant::now().duration_since(last_progress) >= std::time::Duration::from_secs(2) {
-                    return Err("the inbox cannot be written".to_string());
-                }
-            }
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(_)) => return Err("the inbox cannot be written".to_string()),
         }
         if std::time::Instant::now() >= deadline {
             return Err("the inbox is busy (another writer holds it); try again".to_string());
@@ -598,13 +567,9 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
 }
 
 /// The inbox rows, refusing a damaged inbox (fail closed): a torn tail, any bad row or any privacy hit in a
-/// stored row blocks the append. Runs under the writer lock, so the rows are the ones the append will follow.
-fn rows_for_add(path: &Path, ctx: &crate::scan::Ctx) -> Result<Vec<(usize, Row)>, (i32, String)> {
-    if !path.exists() {
-        // A first row creates the inbox; there is nothing to lint yet.
-        return Ok(Vec::new());
-    }
-    let inbox = read_inbox(path).map_err(|m| (2, m))?;
+/// stored row blocks the append. Reads the locked descriptor, so the rows are the ones the append will follow.
+fn rows_for_add(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<(usize, Row)>, (i32, String)> {
+    let inbox = read_inbox_locked(f).map_err(|m| (2, m))?;
     if let Some(n) = inbox.torn_tail {
         return Err((1, format!("the inbox has a torn tail at line {n}; nothing was appended (run harness friction lint)")));
     }
@@ -688,17 +653,23 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
             return refuse(&format!("field {name} has a privacy hit ({}); the row is not stored", classes.join(", ")));
         }
     }
-    // One writer at a time: the exclusive lock is held across read, check and append, and released on every
-    // exit path, so the duplicate-id check can never race a concurrent add of the same id.
-    let lock = match lock_path(&inbox_path) {
-        Ok(p) => p,
+    // A row that cannot be encoded, or that can only be refused against an empty inbox (a `breaks` with no
+    // earlier row to name), is refused BEFORE the inbox is opened, so a refused first row never creates the file.
+    if let Err(e) = encode_row(&row) {
+        return refuse(&e);
+    }
+    if !inbox_path.exists() {
+        if let Some((_, m)) = cross_check(&[(1, row.clone())]).into_iter().next() {
+            return refuse(&m);
+        }
+    }
+    // One writer at a time: the exclusive lock is on the inbox file itself, held across read, check and append,
+    // and released on every exit path, so the duplicate-id check can never race a concurrent add of the same id.
+    let mut file = match open_locked(&inbox_path) {
+        Ok(f) => f,
         Err(m) => return fail(&m),
     };
-    let _lock = match acquire_lock(&lock) {
-        Ok(g) => g,
-        Err(m) => return fail(&m),
-    };
-    let mut rows = match rows_for_add(&inbox_path, &ctx) {
+    let mut rows = match rows_for_add(&file, &ctx) {
         Ok(r) => r,
         Err((code, m)) => {
             eprintln!("harness: friction refused: {}", m);
@@ -711,10 +682,7 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     if let Some((_, m)) = cross_check(&rows).into_iter().find(|(n, _)| *n == new_line) {
         return refuse(&m);
     }
-    if let Err(e) = encode_row(&row) {
-        return refuse(&e);
-    }
-    match append_row(&inbox_path, &row) {
+    match append_row_to(&mut file, &row) {
         Ok(()) => {
             println!("stored id={}", row.id);
             0
@@ -847,6 +815,14 @@ fn close_check_cmd(rest: &[String], testmode: bool) -> i32 {
         Err(_) => return fail("no privacy list configured: an unscanned inbox is never checked"),
     };
     let ctx = crate::scan::Ctx { list: &list, testmode };
+    // The ticket is printed on the success line and named on refusals, so it is scanned first: a hit names the
+    // field and the class only, never the bytes, and nothing reaches stdout.
+    let ticket_hits = crate::scan::scan_text(&ctx, "friction.close-check", ticket);
+    if !ticket_hits.is_empty() {
+        let classes: Vec<&str> = ticket_hits.iter().map(|h| h.class).collect();
+        eprintln!("harness: close-check refused: field ticket has a privacy hit ({}); the note is not checked", classes.join(", "));
+        return 1;
+    }
     // The close lines are scanned before any of their ids can be echoed by a refusal (a hit names the class
     // only, never the bytes; the ids the check names on later refusals have all passed this scan).
     for l in lesson_lines(&note) {

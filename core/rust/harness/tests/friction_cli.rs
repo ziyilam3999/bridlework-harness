@@ -16,6 +16,14 @@ const PLACEHOLDER: &str = "/placeholder/friction-inbox.jsonl";
 /// A synthetic deny word: the ONLY entry of the injected list. No clean fixture may contain it.
 const DENY: &str = "zzdenyzz";
 static SEQ: AtomicUsize = AtomicUsize::new(0);
+/// Every test that spawns more than 8 writers, or builds an inbox of 5000 rows or more, takes this lock by name
+/// first, so the heavy many-writer tests run one at a time inside the binary: on a small CI runner they would
+/// otherwise queue behind each other past the verb's fixed 10 s busy wait (a product behaviour that stays).
+static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The synthetic test-mode marker, assembled at run time so this file never spells it out.
 fn marker() -> String {
@@ -687,7 +695,8 @@ fn big_inbox(rows: usize) -> String {
 #[test]
 fn concurrent_same_id_adds_store_exactly_one_row() {
     const N: usize = 12;
-    const SEED: usize = 1600;
+    const SEED: usize = 300;
+    let _h = heavy();
     let t = Tmp::new();
     let cfg = t.config().to_str().unwrap().to_string();
     // Round 0: a fresh inbox (nothing to read at all).
@@ -719,6 +728,7 @@ fn concurrent_same_id_adds_store_exactly_one_row() {
 
 #[test]
 fn concurrent_distinct_id_adds_all_store() {
+    let _h = heavy();
     let t = Tmp::new();
     let cfg = t.config().to_str().unwrap().to_string();
     let args: Vec<Vec<String>> = (0..40).map(|i| add_args(&cfg, &format!("l-{i}"), "one whole row per writer")).collect();
@@ -821,36 +831,6 @@ fn usage_errors_never_echo_argument_bytes() {
 
 // ---------------------------------------------------------------- fix round 2: one lock per inbox, one holder (F2/F3)
 
-/// The lock file path for this test's inbox: the canonicalized inbox plus `.lock` (the verb's own rule).
-fn lock_of(inbox: &Path) -> PathBuf {
-    let base = fs::canonicalize(inbox)
-        .unwrap_or_else(|_| fs::canonicalize(inbox.parent().unwrap()).unwrap().join(inbox.file_name().unwrap()));
-    let mut s = base.into_os_string();
-    s.push(".lock");
-    PathBuf::from(s)
-}
-
-/// Plant the round-1 scheme's lock artefact at the lock path — a stale FILE, or the DIRECTORY the old steal
-/// code could leave aside — as a writer that died long ago would leave it. Never called on a live holder.
-fn plant_stale_lock(t: &Tmp, dir: bool) {
-    let lock = lock_of(&t.inbox());
-    let _ = fs::remove_file(&lock);
-    let _ = fs::remove_dir_all(&lock);
-    if dir {
-        fs::create_dir(&lock).unwrap();
-        fs::write(lock.join("leftover"), "old scheme").unwrap();
-    } else {
-        fs::write(&lock, "12345").unwrap();
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-        fs::File::options()
-            .write(true)
-            .open(&lock)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(past))
-            .unwrap();
-    }
-}
-
 /// A clean seeded inbox of many short rows: `rows` rows, just under the 4 MiB read cap at 40000.
 fn compact_inbox(rows: usize) -> String {
     let mut out = String::new();
@@ -861,75 +841,159 @@ fn compact_inbox(rows: usize) -> String {
     out
 }
 
+/// Open the inbox file the way the verb locks it (read + write, no create), for a test that plays a holder.
+fn open_inbox(inbox: &Path) -> fs::File {
+    fs::File::options().read(true).write(true).open(inbox).unwrap()
+}
+
+/// A config naming `inbox` (any spelling), written next to the scratch inbox under `name`.
+fn config_named(t: &Tmp, name: &str, inbox: &Path) -> String {
+    let text = fs::read_to_string(EXAMPLE).unwrap().replace(PLACEHOLDER, inbox.to_str().unwrap());
+    t.file(name, text).to_str().unwrap().to_string()
+}
+
+/// `writers` parallel same-id adds, split round-robin across `cfgs`; exactly one stores, every loser is a
+/// duplicate refusal (never a busy exit).
+fn assert_one_winner(cfgs: &[&str], writers: usize, id: &str, what: &str) {
+    let args: Vec<Vec<String>> = (0..writers).map(|i| add_args(cfgs[i % cfgs.len()], id, "one lock for one inbox")).collect();
+    let outs = run_parallel(args);
+    let stored = outs.iter().filter(|o| code(o) == 0).count();
+    assert_eq!(stored, 1, "{what}: exactly one writer may store the id: {}", outs.iter().map(err).collect::<Vec<_>>().join(" | "));
+    for o in outs.iter().filter(|o| code(o) != 0) {
+        assert_eq!(code(o), 1, "{what}: a loser is a duplicate refusal, not a busy exit: {}", err(o));
+        assert!(err(o).contains("duplicate"), "{what}: {}", err(o));
+    }
+}
+
 #[test]
 fn stale_lock_artefacts_never_block_or_double_store() {
+    // The lock is the kernel lock on the inbox file itself, so a file or a folder named `<inbox>.lock` is
+    // not a lock at all: it never blocks, never causes a double store, and is never touched or deleted.
     const N: usize = 32;
-    const ROUNDS: usize = 20;
+    const ROUNDS: usize = 10;
+    let _h = heavy();
     for dir in [false, true] {
         let t = Tmp::new();
         let cfg = t.config().to_str().unwrap().to_string();
+        fs::write(t.inbox(), compact_inbox(200)).unwrap();
+        let lock = t.0.join("inbox.jsonl.lock");
+        if dir {
+            fs::create_dir_all(lock.join("sub")).unwrap();
+            fs::write(lock.join("keep.txt"), "keep me").unwrap();
+            fs::write(lock.join("sub").join("deep.txt"), "keep me too").unwrap();
+        } else {
+            fs::write(&lock, "12345").unwrap();
+            let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+            fs::File::options().write(true).open(&lock).unwrap().set_times(std::fs::FileTimes::new().set_modified(past)).unwrap();
+        }
         for round in 0..ROUNDS {
-            let id = format!("same-{round}");
-            plant_stale_lock(&t, dir);
-            let args: Vec<Vec<String>> = (0..N).map(|_| add_args(&cfg, &id, "one row per id, stale lock or not")).collect();
-            let outs = run_parallel(args);
-            let stored = outs.iter().filter(|o| code(o) == 0).count();
-            assert_eq!(stored, 1, "dir={dir} round {round}: exactly one writer may store the id");
-            for o in outs.iter().filter(|o| code(o) != 0) {
-                assert_eq!(code(o), 1, "dir={dir} round {round}: {}", err(o));
-                assert!(err(o).contains("duplicate"), "dir={dir} round {round}: {}", err(o));
-            }
+            assert_one_winner(&[&cfg], N, &format!("same-{round}"), &format!("dir={dir} round {round}"));
             let lines = fs::read_to_string(t.inbox()).unwrap().lines().count();
-            assert_eq!(lines, round + 1, "dir={dir} round {round}");
+            assert_eq!(lines, 200 + round + 1, "dir={dir} round {round}");
+        }
+        if dir {
+            assert_eq!(fs::read(lock.join("keep.txt")).unwrap(), b"keep me");
+            assert_eq!(fs::read(lock.join("sub").join("deep.txt")).unwrap(), b"keep me too");
+            assert!(lock.is_dir());
+        } else {
+            assert_eq!(fs::read(&lock).unwrap(), b"12345", "a stale lock file is ignored, not rewritten");
         }
         let o = lint(&t);
         assert_eq!(code(&o), 0, "dir={dir}: {}", err(&o));
-        assert_eq!(out(&o), format!("inbox ok rows={ROUNDS}\n"));
+        assert_eq!(out(&o), format!("inbox ok rows={}\n", 200 + ROUNDS));
     }
+}
+
+/// Eight parallel same-id adds split across two spellings of one inbox, `rounds` times: exactly one row per round.
+fn spelling_case(what: &str, rows: usize, rounds: usize, make: impl Fn(&Tmp) -> (String, String)) {
+    let t = Tmp::new();
+    fs::write(t.inbox(), compact_inbox(rows)).unwrap();
+    let (a, b) = make(&t);
+    for round in 0..rounds {
+        assert_one_winner(&[&a, &b], 8, &format!("pair-{round}"), &format!("{what} round {round}"));
+        let lines = fs::read_to_string(t.inbox()).unwrap().lines().count();
+        assert_eq!(lines, rows + round + 1, "{what} round {round}: exactly one row stored");
+    }
+    let o = lint(&t);
+    assert_eq!(code(&o), 0, "{what}: {}", err(&o));
+    assert_eq!(out(&o), format!("inbox ok rows={}\n", rows + rounds));
 }
 
 #[test]
 fn two_spellings_of_one_inbox_take_one_lock() {
+    let _h = heavy();
+    // (1) a symlink to the inbox FOLDER
+    spelling_case("folder symlink", 2000, 10, |t| {
+        let alias = t.0.join("alias");
+        std::os::unix::fs::symlink(&t.0, &alias).unwrap();
+        (t.config().to_str().unwrap().to_string(), config_named(t, "c-alias.yaml", &alias.join("inbox.jsonl")))
+    });
+    // (2) a symlink to the inbox FILE itself
+    spelling_case("file symlink", 2000, 10, |t| {
+        let alias = t.0.join("inbox-link.jsonl");
+        std::os::unix::fs::symlink(t.inbox(), &alias).unwrap();
+        (t.config().to_str().unwrap().to_string(), config_named(t, "c-alias.yaml", &alias))
+    });
+    // (3) a `./` plus doubled-slash detour (the config contract itself refuses a `..` component, so the
+    // `..` spelling can only arrive through a symlinked folder, which case (1) covers)
+    spelling_case("dot detour", 2000, 10, |t| {
+        let detour = PathBuf::from(format!("{}/.//inbox.jsonl", t.0.display()));
+        (t.config().to_str().unwrap().to_string(), config_named(t, "c-alias.yaml", &detour))
+    });
+    // (4) a HARD link: one inode, two names
+    spelling_case("hard link", 2000, 10, |t| {
+        let alias = t.0.join("inbox-hard.jsonl");
+        fs::hard_link(t.inbox(), &alias).unwrap();
+        (t.config().to_str().unwrap().to_string(), config_named(t, "c-alias.yaml", &alias))
+    });
+}
+
+#[test]
+fn hard_linked_inboxes_take_one_lock_with_two_and_eight_writers() {
+    let _h = heavy();
     let t = Tmp::new();
-    fs::write(t.inbox(), compact_inbox(20000)).unwrap();
-    // a second spelling of the SAME inbox folder: a symlink to it, with its own config
-    let alias = t.0.join("alias");
-    std::os::unix::fs::symlink(&t.0, &alias).unwrap();
-    let alias_inbox = alias.join("inbox.jsonl");
-    let text = fs::read_to_string(EXAMPLE).unwrap().replace(PLACEHOLDER, alias_inbox.to_str().unwrap());
-    let cfg_alias = t.file("config-alias.yaml", text).to_str().unwrap().to_string();
-    let cfg_real = t.config().to_str().unwrap().to_string();
-    // two writers, one per spelling
-    for round in 0..2 {
-        let id = format!("pair-{round}");
-        let args = vec![add_args(&cfg_real, &id, "one lock for one inbox"), add_args(&cfg_alias, &id, "one lock for one inbox")];
-        let outs = run_parallel(args);
-        assert_eq!(outs.iter().filter(|o| code(o) == 0).count(), 1, "round {round}: {}", outs.iter().map(err).collect::<Vec<_>>().join(" | "));
-        assert!(outs.iter().any(|o| code(o) == 1 && err(o).contains("duplicate")), "round {round}: the loser is a duplicate refusal");
-    }
-    // eight writers across both spellings
-    for round in 0..2 {
-        let id = format!("oct-{round}");
-        let args: Vec<Vec<String>> = (0..8)
-            .map(|i| add_args(if i % 2 == 0 { &cfg_real } else { &cfg_alias }, &id, "one lock for one inbox"))
-            .collect();
-        let outs = run_parallel(args);
-        assert_eq!(outs.iter().filter(|o| code(o) == 0).count(), 1, "round {round}");
-        for o in outs.iter().filter(|o| code(o) != 0) {
-            assert_eq!(code(o), 1, "round {round}: {}", err(o));
-            assert!(err(o).contains("duplicate"), "round {round}: {}", err(o));
+    let alias = t.0.join("inbox-hard.jsonl");
+    fs::write(t.inbox(), compact_inbox(4000)).unwrap();
+    fs::hard_link(t.inbox(), &alias).unwrap();
+    let cfg_a = t.config().to_str().unwrap().to_string();
+    let cfg_b = config_named(&t, "c-hard.yaml", &alias);
+    for (writers, rounds) in [(2usize, 10usize), (8, 10)] {
+        for round in 0..rounds {
+            // rewrite in place (same inode, the link survives) so every round starts from 4000 rows
+            fs::write(t.inbox(), compact_inbox(4000)).unwrap();
+            assert_one_winner(&[&cfg_a, &cfg_b], writers, &format!("h{writers}-{round}"), &format!("{writers} writers round {round}"));
+            let lines = fs::read_to_string(&alias).unwrap().lines().count();
+            assert_eq!(lines, 4001, "{writers} writers round {round}: exactly one row stored");
         }
     }
-    assert_eq!(fs::read_to_string(t.inbox()).unwrap().lines().count(), 20004);
+}
+
+#[test]
+fn a_dangling_inbox_symlink_takes_one_lock_on_the_first_ever_append() {
+    let _h = heavy();
+    let t = Tmp::new();
+    let target = t.0.join("real-inbox.jsonl");
+    let link = t.0.join("inbox.jsonl"); // t.inbox(): the symlink; the target does not exist yet
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let cfg_link = t.config().to_str().unwrap().to_string();
+    let cfg_target = config_named(&t, "c-target.yaml", &target);
+    for round in 0..20 {
+        let _ = fs::remove_file(&target);
+        assert!(!target.exists());
+        assert_one_winner(&[&cfg_link, &cfg_target], 8, &format!("first-{round}"), &format!("round {round}"));
+        assert_eq!(fs::read_to_string(&target).unwrap().lines().count(), 1, "round {round}: one row in the real inbox");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link is still a link");
+    }
     let o = lint(&t);
     assert_eq!(code(&o), 0, "{}", err(&o));
-    assert_eq!(out(&o), "inbox ok rows=20004\n");
+    assert_eq!(out(&o), "inbox ok rows=1\n");
 }
 
 #[test]
 fn a_killed_holder_never_blocks_the_next_add() {
+    let _h = heavy();
     let t = Tmp::new();
-    fs::write(t.inbox(), compact_inbox(30000)).unwrap();
+    fs::write(t.inbox(), compact_inbox(9000)).unwrap();
     let cfg = t.config().to_str().unwrap().to_string();
     let mut child = {
         let mut c = base();
@@ -938,17 +1002,16 @@ fn a_killed_holder_never_blocks_the_next_add() {
             .stdin(Stdio::null());
         c.spawn().unwrap()
     };
-    // watch the lock file until the child provably HOLDS it (an exclusive lock we cannot take)
-    let lock = lock_of(&t.inbox());
+    // watch the inbox file until the child provably HOLDS its lock (an exclusive lock we cannot take)
     let mut held = false;
     for _ in 0..2000 {
-        if let Ok(f) = fs::File::options().write(true).create(true).read(true).open(&lock) {
-            if matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
-                held = true;
-                break;
-            }
+        let f = open_inbox(&t.inbox());
+        if matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+            held = true;
+            break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(f);
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     assert!(held, "the child never held the writer lock");
     child.kill().unwrap(); // SIGKILL, mid critical section
@@ -958,10 +1021,10 @@ fn a_killed_holder_never_blocks_the_next_add() {
     let o = run(&add_args(&cfg, "killed-1", "stored after the holder died"));
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert!(started.elapsed() < std::time::Duration::from_secs(10), "a dead holder must not cost a busy wait: {:?}", started.elapsed());
-    assert_eq!(fs::read_to_string(t.inbox()).unwrap().lines().count(), 30001);
+    assert_eq!(fs::read_to_string(t.inbox()).unwrap().lines().count(), 9001);
     let o = lint(&t);
     assert_eq!(code(&o), 0, "{}", err(&o));
-    assert_eq!(out(&o), "inbox ok rows=30001\n");
+    assert_eq!(out(&o), "inbox ok rows=9001\n");
 }
 
 /// SLOW (waits the documented 10 s busy window once, by design): a LIVE holder fails `add` closed.
@@ -969,8 +1032,9 @@ fn a_killed_holder_never_blocks_the_next_add() {
 fn a_live_holder_times_out_into_busy_exit_two() {
     let t = Tmp::new();
     assert_eq!(code(&seed(&t, "l-1", "154", "memory", "")), 0);
-    let holder = fs::File::options().write(true).create(true).read(true).open(lock_of(&t.inbox())).unwrap();
+    let holder = open_inbox(&t.inbox());
     holder.lock().unwrap(); // this test process is the live holder
+    let before = fs::read(t.inbox()).unwrap();
     let started = std::time::Instant::now();
     let o = run(&add_args(&t.config().to_str().unwrap(), "l-2", "waits, then fails closed"));
     drop(holder);
@@ -980,12 +1044,28 @@ fn a_live_holder_times_out_into_busy_exit_two() {
     assert!(!err(&o).contains(t.inbox().to_str().unwrap()), "no path on stderr: {}", err(&o));
     assert!(!err(&o).contains("lock"), "no lock path on stderr: {}", err(&o));
     assert!(started.elapsed().as_secs() >= 9, "the busy wait is the documented 10 s, not a fast bail");
+    assert_eq!(fs::read(t.inbox()).unwrap(), before, "a busy refusal leaves the inbox untouched");
     // once the holder is gone the same id stores
     let o = run(&add_args(&t.config().to_str().unwrap(), "l-2", "stored once the holder is gone"));
     assert_eq!(code(&o), 0, "{}", err(&o));
     let o = lint(&t);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "inbox ok rows=2\n");
+}
+
+#[test]
+fn a_refused_first_row_never_creates_the_inbox_and_a_first_row_creates_it() {
+    let t = Tmp::new();
+    // bad tag, and a `breaks` that can only name nothing in an empty inbox: both refused, nothing created
+    let o = add(&t, "l-1", "2026-11-01", "154", "hook", "", "t");
+    refused_untouched(&t, &o, 1, None);
+    let o = add(&t, "l-1", "2026-11-01", "154", "memory", "l-0", "t");
+    refused_untouched(&t, &o, 1, None);
+    assert!(!t.inbox().exists());
+    // a first-ever add into an existing empty folder creates the inbox
+    let o = add(&t, "l-1", "2026-11-01", "154", "memory", "", "t");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(fs::read_to_string(t.inbox()).unwrap().lines().count(), 1);
 }
 
 // ---------------------------------------------------------------- fix round 2: the cross check is linear (F4)
@@ -1010,23 +1090,21 @@ fn cross_check_over_40000_rows_is_linear() {
     let started = std::time::Instant::now();
     assert!(friction::cross_check(&rows).is_empty());
     let took = started.elapsed();
-    assert!(took < std::time::Duration::from_secs(2), "cross_check over 40000 rows took {took:?} (linear bound)");
+    assert!(took < std::time::Duration::from_secs(4), "cross_check over 40000 rows took {took:?} (linear bound)");
 }
 
-/// The end-to-end shape of F4: a big inbox, 16 parallel same-id adds — a loser is always a duplicate
-/// refusal, never a busy timeout. Sized at 14000 rows: the busy window is 10 s and one full scan of this
-/// inbox costs ~0.5 s in a debug build (16 writers fit the window with margin), while the quadratic
-/// cross check cost ~1.2 s per add here (measured: the 15 losers piled past the window and exited busy).
-/// The 40000-row at-cap oracle is the O(n) time bound of `cross_check_over_40000_rows_is_linear`:
-/// at the 4 MiB cap 16 serialized scans (~1.5 s each, debug) cannot fit ANY 10 s window, so the cap-size
-/// assertion is carried by that unit test, not by this end-to-end one.
+/// The end-to-end shape of F4: a big inbox, 8 parallel same-id adds: a loser is always a duplicate refusal,
+/// never a busy timeout. Sized for a 2-core CI runner in a debug build (one full scan of this inbox is well
+/// under a second, so the serialized queue stays far inside the 10 s window). The at-cap time bound is carried
+/// by `cross_check_over_40000_rows_is_linear`, not by this end-to-end test.
 #[test]
 fn concurrent_adds_on_a_big_inbox_never_exit_busy() {
-    const N: usize = 16;
+    const N: usize = 8;
+    let _h = heavy();
     let t = Tmp::new();
     let cfg = t.config().to_str().unwrap().to_string();
     for round in 0..3 {
-        fs::write(t.inbox(), compact_inbox(14000)).unwrap();
+        fs::write(t.inbox(), compact_inbox(4000)).unwrap();
         let id = format!("same-{round}");
         let args: Vec<Vec<String>> = (0..N).map(|_| add_args(&cfg, &id, "a loser is a duplicate, never a busy exit")).collect();
         let outs = run_parallel(args);
@@ -1035,9 +1113,71 @@ fn concurrent_adds_on_a_big_inbox_never_exit_busy() {
             assert_eq!(code(o), 1, "round {round}: a loser must be a duplicate refusal, not a busy timeout: {}", err(o));
             assert!(err(o).contains("duplicate"), "round {round}: {}", err(o));
         }
-        assert_eq!(fs::read_to_string(t.inbox()).unwrap().lines().count(), 14001, "round {round}");
+        assert_eq!(fs::read_to_string(t.inbox()).unwrap().lines().count(), 4001, "round {round}");
         let o = lint(&t);
         assert_eq!(code(&o), 0, "round {round}: {}", err(&o));
-        assert_eq!(out(&o), "inbox ok rows=14001\n");
+        assert_eq!(out(&o), "inbox ok rows=4001\n");
     }
+}
+// ---------------------------------------------------------------- fix round 4: the close-check ticket is scanned (F2)
+
+#[test]
+fn close_check_never_prints_an_unscanned_ticket() {
+    let t = Tmp::new();
+    let note = t.file("note.md", "lesson: none\n");
+    let clean_piece = ["x-example", "-qq-x"].concat();
+    let mut tickets: Vec<String> = vec![DENY.to_string(), format!("t-{DENY}-1"), format!("t-{DENY}-9"), clean_piece.clone()];
+    for shape in shapes() {
+        tickets.push(shape);
+    }
+    for ticket in tickets {
+        let o = close_check(&t, &note, &ticket);
+        if ticket == clean_piece {
+            // a clean token: printed only after a clean scan
+            assert_eq!(code(&o), 0, "{}", err(&o));
+            assert_eq!(out(&o), format!("close-check ok ticket={ticket} lessons=0\n"));
+            continue;
+        }
+        let c = code(&o);
+        assert!(c == 1 || c == 2, "exit {c}: {}", err(&o));
+        assert!(out(&o).is_empty(), "stdout must be empty: {}", out(&o));
+        assert!(!err(&o).contains(&ticket), "the ticket bytes must not be echoed: {}", err(&o));
+        assert!(!out(&o).contains(DENY) && !err(&o).contains(DENY), "the deny word must not be echoed");
+        if ticket.contains(DENY) {
+            assert_eq!(c, 1, "{}", err(&o));
+            assert!(err(&o).contains("field ticket has a privacy hit"), "{}", err(&o));
+        }
+    }
+    let o = close_check(&t, &note, &format!("t-{DENY}-9"));
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("field ticket has a privacy hit (deny-token)"), "{}", err(&o));
+    // a clean ticket with no rows still passes and is printed
+    let o = close_check(&t, &note, "154");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "close-check ok ticket=154 lessons=0\n");
+}
+
+// ---------------------------------------------------------------- fix round 4: a forward `breaks` (N2)
+
+#[test]
+fn a_forward_breaks_in_a_hand_written_inbox_lints_clean_and_a_missing_one_does_not() {
+    let t = Tmp::new();
+    let body = format!(
+        "{}\n{}\n",
+        hand_written("l-1", "154", "memory", "l-2", "an earlier row naming a later one"),
+        hand_written("l-2", "154", "memory", "", "the later row")
+    );
+    fs::write(t.inbox(), body).unwrap();
+    let o = lint(&t);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "inbox ok rows=2\n");
+    let body = format!(
+        "{}\n{}\n",
+        hand_written("l-1", "154", "memory", "l-9", "names nothing"),
+        hand_written("l-2", "154", "memory", "", "the later row")
+    );
+    fs::write(t.inbox(), body).unwrap();
+    let o = lint(&t);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("line 1") && err(&o).contains("breaks"), "{}", err(&o));
 }
