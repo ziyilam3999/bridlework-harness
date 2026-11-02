@@ -14,9 +14,12 @@
 //! pid's start time still equals the recorded `pid_start_ms` (exact on Linux, 2000 ms elsewhere — a
 //! re-used pid is never signalled, its stale entry is removed with exit 3); and the pid is its OWN
 //! process-group leader, so a signal to the group provably ends the family. After TERM to the group and a
-//! bounded wait — with the identity re-checked before any KILL, and no KILL to a group already provably
-//! empty — the recorded pid must be PROVABLY dead before the answer 0 and the `remove` lines; otherwise
-//! the answer is 4 ("signalled, death not confirmed") and the entry is KEPT, so a later stop can retry.
+//! bounded wait — with no KILL to a group already provably empty, an ALIVE leader still passing the
+//! identity re-check, and a PROVABLY-dead leader's non-empty group still getting the KILL (while any
+//! member lives the group id cannot be re-issued as a pid, so that KILL cannot hit a stranger) — the
+//! answer 0 needs the WHOLE GROUP provably empty AND the recorded pid PROVABLY dead, never the leader
+//! alone; otherwise the answer is 4 ("signalled, death not confirmed") and the entry is KEPT, so a later
+//! stop can retry.
 //! Every helper call goes by ABSOLUTE path (`/bin/kill`, `/bin/ps`), never through PATH.
 //!
 //! The other signal path is the start ROLLBACK, and it touches only the group this run just spawned: a
@@ -202,8 +205,18 @@ fn kill_own_spawn(child: &mut Child, pid: u64) -> Result<(), String> {
         Ran::NotRun(e) => reason = Some(e),
         Ran::Yes(signalled) => {
             if signalled && !wait_group_empty(pid, DEFAULT_GRACE_MS) {
-                let _ = kill_helper(pid, "KILL");
-                let _ = wait_group_empty(pid, KILL_SETTLE_MS);
+                match kill_helper(pid, "KILL") {
+                    Ran::NotRun(e) => {
+                        reason.get_or_insert(e);
+                    }
+                    Ran::Yes(_) => {
+                        // The same proof rule as stop's check 7: "left nothing running" is claimed only
+                        // when the group is PROVABLY empty, never on a discarded probe answer.
+                        if !wait_group_empty(pid, KILL_SETTLE_MS) {
+                            reason.get_or_insert(format!("the spawned group {pid} is not provably empty after the KILL"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -436,29 +449,43 @@ fn probe_alive_at(helper: &Path, pid: u64) -> Liveness {
         .stdin(Stdio::null())
         .output()
     {
-        Ok(o) if o.status.success() => Liveness::Alive,
-        Ok(o) => {
-            let say = String::from_utf8_lossy(&o.stderr).trim().to_ascii_lowercase();
-            if say.contains("no such process") {
-                Liveness::NoSuch
-            } else if say.contains("not permitted") || say.contains("permission") {
-                Liveness::Denied
-            } else {
-                Liveness::Unknown(format!("kill -0 of pid {pid} failed: {say}"))
-            }
-        }
+        Ok(o) => liveness_from_ran(pid, o.status.success(), &String::from_utf8_lossy(&o.stderr).trim().to_ascii_lowercase()),
         Err(e) => Liveness::Unknown(format!("cannot run the liveness probe {}: {}", helper.display(), e.kind())),
     }
 }
 
+/// Classify the kill -0 helper's outcome. Success is Alive; a stderr naming "no such process" is the ONLY
+/// "gone"; a stderr naming permission is Denied — a pid of ANOTHER user, read as not ours and never
+/// signalled, never blessed as a live entry of ours either; anything else proves nothing (Unknown).
+fn liveness_from_ran(pid: u64, helper_ok: bool, say: &str) -> Liveness {
+    if helper_ok {
+        Liveness::Alive
+    } else if say.contains("no such process") {
+        Liveness::NoSuch
+    } else if say.contains("not permitted") || say.contains("permission") {
+        Liveness::Denied
+    } else {
+        Liveness::Unknown(format!("kill -0 of pid {pid} failed: {say}"))
+    }
+}
+
 /// The start-time tolerance between the live pid's start time and the recorded one, the manifest doc's
-/// ownership rule: exact on Linux (`/proc` knows ticks), 2000 ms elsewhere (`ps etime` knows whole seconds).
-#[cfg(target_os = "linux")]
-const START_TOLERANCE_MS: u64 = 0;
+/// ownership rule. Linux is EXACT (`/proc` knows clock ticks), so it compares with `==` and needs no
+/// tolerance at all; elsewhere `ps etime` knows whole seconds, so a 2000 ms tolerance applies. The
+/// constant is compiled ONLY on the platforms that use it and is never 0 there, so no target OS the CI
+/// builds compiles a comparison against a zero tolerance (which the lint `clippy::absurd_extreme_comparisons`
+/// denies, and rightly: on Linux `<= 0` on an `abs_diff` is only ever `==`).
 #[cfg(not(target_os = "linux"))]
 const START_TOLERANCE_MS: u64 = 2000;
 
-/// Does the live pid's start time still match the recorded one, within the platform tolerance?
+/// Does the live pid's start time still match the recorded one? Exact on Linux, within the tolerance
+/// elsewhere. Two bodies (not a cfg'd constant inside one) so each target compiles exactly one comparison,
+/// and neither is against a value that is 0 on that target.
+#[cfg(target_os = "linux")]
+fn same_start(read: u64, recorded: u64) -> bool {
+    read == recorded
+}
+#[cfg(not(target_os = "linux"))]
 fn same_start(read: u64, recorded: u64) -> bool {
     read.abs_diff(recorded) <= START_TOLERANCE_MS
 }
@@ -721,23 +748,36 @@ fn stop_cmd(a: &[String]) -> i32 {
         return fail(&e);
     }
     if !wait_group_empty(pid, args.grace_ms) {
-        // Before any KILL: a leader that is still alive must STILL pass the identity check (the grace
-        // window is long enough for a pid to die and its number be re-used), and a group that is already
-        // provably empty gets no KILL. While any member lives, the group id cannot be re-issued as a pid,
-        // so a KILL to a non-empty group cannot hit a stranger.
-        let still_ours = matches!(probe_identity(pid, recorded), Identity::Same);
-        let group_gone = matches!(kill_helper(pid, "0"), Ran::Yes(false));
-        if still_ours && !group_gone {
-            if let Ran::Yes(_) = kill_helper(pid, "KILL") {
-                let _ = wait_group_empty(pid, KILL_SETTLE_MS);
+        // The grace window ran out with the group not yet PROVABLY empty. The KILL gate (below) needs the
+        // group to be provably OURS before so blunt a signal: a group already provably empty gets no KILL;
+        // a leader still ALIVE must still pass the identity check (the window is long enough for a pid to
+        // die and its number be re-used); and a leader that is PROVABLY dead with a non-empty group still
+        // gets the KILL — while any member lives, the group id cannot be re-issued as a pid, so that KILL
+        // cannot hit a stranger either. The head before fix r2 skipped the KILL in exactly that last case
+        // (a dead leader has no identity to re-read) and then answered 0 on the leader alone.
+        let group_empty_now = matches!(kill_helper(pid, "0"), Ran::Yes(false));
+        let leader_now = probe_alive_at(Path::new("/bin/kill"), pid);
+        match kill_decision(leader_now, group_empty_now, || probe_identity(pid, recorded)) {
+            KillDecision::Send => {
+                if let Ran::Yes(_) = kill_helper(pid, "KILL") {
+                    let _ = wait_group_empty(pid, KILL_SETTLE_MS);
+                }
+            }
+            KillDecision::AlreadyEmpty => {}
+            KillDecision::Barred(why) => {
+                eprintln!("harness: {id} signalled, death not confirmed: no KILL was sent: {why}; entry kept so a later stop can retry")
             }
         }
     }
-    // Check 7: the recorded pid must be PROVABLY dead before the answer 0 and the removes. Anything else —
-    // it still answers the probe, or the probe could not run — is 4 with the entry KEPT, so a later stop
-    // can retry.
-    match probe_alive_at(Path::new("/bin/kill"), pid) {
-        Liveness::NoSuch => match remove_stopped(&dir, &args.ticket, &id, port_live) {
+    // Check 7: the answer 0 needs the WHOLE GROUP provably empty — the leader alone dying proves nothing
+    // about a member that ignored TERM — and the recorded pid itself provably dead (a member of its own
+    // group, but pid and group are probed separately so neither proof leans on the other). Anything else —
+    // a survivor, an unreaped zombie, or a probe that could not run — is 4 with the entry KEPT, so a later
+    // stop can retry.
+    let group_gone = matches!(kill_helper(pid, "0"), Ran::Yes(false));
+    let leader_gone = matches!(probe_alive_at(Path::new("/bin/kill"), pid), Liveness::NoSuch);
+    if death_proven(group_gone, leader_gone) {
+        return match remove_stopped(&dir, &args.ticket, &id, port_live) {
             Ok(()) => {
                 println!("{id}\t{pid}\tstopped");
                 0
@@ -746,11 +786,59 @@ fn stop_cmd(a: &[String]) -> i32 {
                 eprintln!("harness: {id} signalled, death not confirmed: the removal failed: {e}; entry kept so a later stop can retry");
                 4
             }
+        };
+    }
+    eprintln!(
+        "harness: {id} signalled, death not confirmed: pid {pid} or its group still answers the liveness probe, or the probe could not run; entry kept so a later stop can retry"
+    );
+    4
+}
+
+/// Check 7's proof: the answer 0 needs BOTH proofs — the whole group provably empty AND the recorded pid
+/// provably dead. Neither alone suffices: a dead leader proves nothing about a TERM-ignoring member, and
+/// an empty group probe leans on the leader being a member of its own group (it is, but the two probes
+/// are kept independent so neither proof stands in for the other).
+fn death_proven(group_gone: bool, leader_gone: bool) -> bool {
+    group_gone && leader_gone
+}
+
+/// The KILL gate of check 6, after the grace window ran out: may the KILL go to the group at all? `Send`
+/// needs TWO proofs — the group is not already provably empty (nothing to signal), and it is provably
+/// still OURS: either the leader is alive and STILL the recorded process (the pre-KILL identity re-check),
+/// or the leader is PROVABLY dead, in which case the group id (the dead leader's pid) cannot have been
+/// re-issued as a new process's pid while any member lives. A leader only "denied" or "unknown", or an
+/// alive leader whose identity no longer matches (its number was re-used inside the grace window), bars
+/// the KILL: check 7 then answers 4 with the entry kept.
+enum KillDecision {
+    /// The group is already provably empty: nothing to signal.
+    AlreadyEmpty,
+    /// The group is provably ours and non-empty: send the KILL.
+    Send,
+    /// The KILL must not go; the string names why (it reaches the stop's stderr).
+    Barred(String),
+}
+
+/// Decide the KILL. `identity` is read LAZILY — only a LIVE leader has a start time worth re-reading, so a
+/// dead leader costs no identity probe at all.
+fn kill_decision(leader: Liveness, group_empty: bool, identity: impl FnOnce() -> Identity) -> KillDecision {
+    if group_empty {
+        return KillDecision::AlreadyEmpty;
+    }
+    match leader {
+        // A provably-dead leader with a live group: the group is still ours (its id cannot be re-issued as
+        // a pid while any member lives), so the KILL cannot hit a stranger. This is the fix-r2 case.
+        Liveness::NoSuch => KillDecision::Send,
+        Liveness::Alive => match identity() {
+            Identity::Same => KillDecision::Send,
+            Identity::Reused => KillDecision::Barred(
+                "the leader's pid was re-used inside the grace window; a KILL to its group could hit a stranger".to_string(),
+            ),
+            Identity::Unknown(e) => KillDecision::Barred(format!("cannot re-check the leader's start time: {e}")),
         },
-        _ => {
-            eprintln!("harness: {id} signalled, death not confirmed: pid {pid} still answers the liveness probe; entry kept so a later stop can retry");
-            4
-        }
+        Liveness::Denied => KillDecision::Barred(
+            "the leader answers the probe but is not ours to signal; a KILL to its group could hit a stranger".to_string(),
+        ),
+        Liveness::Unknown(e) => KillDecision::Barred(e),
     }
 }
 
@@ -782,5 +870,70 @@ mod stop_tests {
             matches!(probe_identity(4_000_000_000, 1730000000000), Identity::Unknown(_)),
             "an unreadable identity must answer Unknown, never Same or Reused"
         );
+    }
+
+    /// #183 fix r2, F3 (review mutant own-4): a kill -0 that answers "operation not permitted" names
+    /// another user's pid — Denied, read as NOT OURS and never signalled. Mapping it to Alive would let a
+    /// foreign pid be probed as a live entry of ours; this test goes red the moment that mapping changes.
+    #[test]
+    fn supervisor_eperm_liveness_is_denied_never_alive() {
+        assert!(
+            matches!(liveness_from_ran(123, false, "kill: (123) - operation not permitted"), Liveness::Denied),
+            "EPERM must classify as Denied (not ours), never Alive"
+        );
+        assert!(
+            matches!(liveness_from_ran(123, false, "kill: (123) - permission denied"), Liveness::Denied),
+            "the other permission spelling must classify as Denied too"
+        );
+        assert!(
+            matches!(liveness_from_ran(123, false, "kill: (123) - no such process"), Liveness::NoSuch),
+            "no-such-process is the only 'gone' there is"
+        );
+        assert!(
+            matches!(liveness_from_ran(123, false, ""), Liveness::Unknown(_)),
+            "an empty failure proves nothing: Unknown"
+        );
+        assert!(
+            matches!(liveness_from_ran(123, true, ""), Liveness::Alive),
+            "a successful probe is Alive"
+        );
+    }
+
+    /// #183 fix r2, F3 (review mutant own-2) + F2: the KILL gate's decision table. The identity re-check
+    /// is load-bearing ONLY for a LIVE leader (its number could have been re-used inside the grace
+    /// window), and a PROVABLY-dead leader with a non-empty group still gets the KILL (the fix-r2 case:
+    /// the head skipped it and answered 0 while a TERM-ignoring member lived).
+    #[test]
+    fn supervisor_kill_gate_decision_table() {
+        use KillDecision::{AlreadyEmpty, Barred, Send};
+
+        // A group already provably empty gets no KILL, whatever the leader says.
+        assert!(matches!(kill_decision(Liveness::NoSuch, true, || panic!("an empty group must not read identity")), AlreadyEmpty));
+        assert!(matches!(kill_decision(Liveness::Alive, true, || panic!("an empty group must not read identity")), AlreadyEmpty));
+
+        // The fix-r2 case: a PROVABLY-dead leader with a non-empty group still gets the KILL — the group
+        // id cannot be re-issued as a pid while any member lives, so the KILL cannot hit a stranger.
+        assert!(matches!(kill_decision(Liveness::NoSuch, false, || panic!("a dead leader must not be identity-read")), Send));
+
+        // A LIVE leader is KILLed only when it is STILL the recorded process (review mutant own-2:
+        // still_ours forced true — red here).
+        assert!(matches!(kill_decision(Liveness::Alive, false, || Identity::Same), Send));
+        assert!(matches!(kill_decision(Liveness::Alive, false, || Identity::Reused), Barred(_)));
+        assert!(matches!(kill_decision(Liveness::Alive, false, || Identity::Unknown("read failed".into())), Barred(_)));
+
+        // A leader that is only denied or unknown bars the KILL: not provably ours.
+        assert!(matches!(kill_decision(Liveness::Denied, false, || panic!("a denied leader must not be identity-read")), Barred(_)));
+        assert!(matches!(kill_decision(Liveness::Unknown("probe failed".into()), false, || panic!("an unknown leader must not be identity-read")), Barred(_)));
+    }
+
+    /// #183 fix r2 (check 7, the second half of F2): "stopped" needs the GROUP provably empty, never the
+    /// leader alone — this is the exact rule the head violated when it answered 0 while a TERM-ignoring
+    /// member lived (the head read only the leader here).
+    #[test]
+    fn supervisor_stopped_proof_needs_group_and_leader() {
+        assert!(death_proven(true, true), "both proofs dead: stopped");
+        assert!(!death_proven(false, true), "a dead leader alone must never prove 'stopped' (the fix-r2 rule)");
+        assert!(!death_proven(true, false), "an empty group alone must never prove 'stopped' (the pid could be a zombie elsewhere)");
+        assert!(!death_proven(false, false), "nothing proven");
     }
 }

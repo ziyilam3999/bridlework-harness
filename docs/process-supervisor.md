@@ -103,15 +103,18 @@ SIGNALS only when every check passes:
    group provably ends the family it heads. A non-leader pid (for example one signed out through the
    public `harness manifest add --class process`) is **exit 2**, nothing signalled, entry kept — the
    message says a group signal could not prove it ends this process.
-6. TERM to the whole group, then a bounded wait (`--grace-ms`, default 5000). Before any KILL the identity
-   is re-checked (a leader still alive must still pass check 4) and a group already provably empty gets no
-   KILL; while any member lives, the group id cannot be re-issued as a pid, so a KILL to a non-empty group
-   cannot hit a stranger.
-7. Post-signal proof: the recorded pid must be PROVABLY dead (`kill -0` failing for the pid itself, not
-   just the group) before the answer 0 and the `remove` lines (the process entry, and `<id>.port` when
-   live). Still answering — an unreaped zombie does — or a probe that could not run: **exit 4**
-   "signalled, death not confirmed", the entry KEPT, so a later stop can retry (and a retry after a reap
-   answers `already-gone`).
+6. TERM to the whole group, then a bounded wait (`--grace-ms`, default 5000). The KILL gate, before any
+   KILL goes: a group already provably empty gets none; a leader still alive must still pass check 4; and
+   a leader that is PROVABLY dead with the group still non-empty still gets the KILL — while any member
+   lives, the group id cannot be re-issued as a pid, so that KILL cannot hit a stranger either. (Before
+   fix r2 this last case got no KILL: the leader's own TERM had killed it, and the gate demanded a live
+   leader's identity — so a member that trapped TERM survived a "stopped" answer.)
+7. Post-signal proof: the answer 0 needs the WHOLE GROUP provably empty (`kill -0 -- -<pid>` failing) AND
+   the recorded pid PROVABLY dead (`kill -0 <pid>` failing) — the leader alone dying proves nothing about
+   a member that ignored TERM — before the `remove` lines (the process entry, and `<id>.port` when live).
+   A survivor, a leader still answering — an unreaped zombie does — or a probe that could not run:
+   **exit 4** "signalled, death not confirmed", the entry KEPT, so a later stop can retry (and a retry
+   after a reap answers `already-gone`).
 
 ### stop exit codes
 
@@ -135,6 +138,8 @@ path (never through `PATH`), so a PATH-shadowed `ps` cannot bless a re-used pid.
   re-used within ~2 s of the original start could pass. Linux is exact.
 - **A non-leader entry can never be stopped by this verb** (always exit 2): an honest refusal over a false
   "stopped"; the message says why. The orphan reaper (P2) owns what a group signal cannot reach.
-- **Children that leave the group** (`setsid`) and a group whose leader already exited (`already-gone`,
-  members not signalled: no live leader to prove identity) are not stopped.
+- **Children that leave the group** (`setsid`) and a group whose leader already exited BEFORE the stop
+  began (`already-gone`: the entry is stale and is removed with nothing signalled; the orphan reaper P2
+  owns leaderless groups) are not stopped. A leader the stop's OWN TERM ended is different — that group
+  is still provably ours and gets the KILL (check 6).
 - **`kill -0` EPERM** names a pid of another user: read as not ours, exit 2, no signal.

@@ -978,16 +978,20 @@ fn dead_and_missing_cases() {
     init_manifest("ts-7t", &r, &d);
     let mut guard = Guard::default();
 
-    // (a) an entry whose process exited on its own (spawned, signed out while alive, then reaped).
+    // (a) an entry whose process exited on its own (spawned, signed out while alive, then reaped). The
+    // fixture's lifetime is one the TEST ends (fix r2, F4): it waits for the `go` file instead of a
+    // wall-clock `sleep 2` a slow CI host could run out of during the `manifest add`.
     let pid_file = r.join("short");
-    let script = format!("echo $$ > {}; sleep 2", pid_file.to_string_lossy());
+    let go_file = r.join("short-go");
+    let script = format!("echo $$ > {}; while [ ! -f {} ]; do sleep 0.1; done", pid_file.to_string_lossy(), go_file.to_string_lossy());
     let mut own = spawn_sh(&script);
     guard.add(own.id());
     assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the short program never wrote its pid");
     let pid = read_pid(&pid_file).unwrap();
     let add = manifest_add_process("ts-7", "p-7", pid, &d);
     assert_eq!(code(&add), 0, "add of the short-lived pid: {}", err(&add));
-    assert!(poll(10_000, || own.try_wait().unwrap().is_some()), "the short program never exited");
+    fs::write(&go_file, b"").unwrap();
+    assert!(poll(10_000, || own.try_wait().unwrap().is_some()), "the short program never exited after go");
     assert!(!alive(pid), "the reaped pid must be gone before the stop");
     let s = stop("ts-7", StopSel::Id("p-7"), None, &d);
     assert_eq!(code(&s), 3, "a dead entry answers 3: stdout {:?} stderr {:?}", out(&s), err(&s));
@@ -1104,4 +1108,163 @@ fn path_ps_liar_cannot_bless_a_reused_pid() {
     assert!(own.try_wait().unwrap().is_none(), "the re-used pid is dead");
     let _ = own.kill();
     let _ = own.wait();
+}
+
+// ---------------------------------------------------------------- #183 fix r2 (F2): members that ignore TERM
+
+/// #183 fix r2, F2 (review repro H1): the started leader obeys TERM, but a group member TRAPS it. The head
+/// code gated the KILL on the LEADER's identity re-check — a leader the stop's own TERM just killed has no
+/// identity to re-read — so no KILL went, and the answer was 0 "stopped" with the entry removed while the
+/// member still ran. The stop must end the member (or answer 4 and KEEP the entry); it may never answer 0
+/// while any member of the group lives.
+#[test]
+fn stop_ends_a_group_member_that_ignores_term() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2a", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("member");
+    let script = format!("sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done' & wait", mfile.to_string_lossy());
+    let (s, leader) = start("ts-f2a", "p-1", &r, None, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(leader > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(leader);
+    assert!(poll(10_000, || read_pid(&mfile).is_some()), "the member never wrote its pid");
+    let member = read_pid(&mfile).unwrap();
+    guard.add(member);
+    assert!(alive(member) && alive(leader), "both must be live before the stop");
+    assert_eq!(pgid_of(member), leader, "precondition: the member is in the started leader's group");
+
+    let st = stop("ts-f2a", StopSel::Id("p-1"), Some(500), &d);
+    assert!(
+        code(&st) == 0 || code(&st) == 4,
+        "a surviving member must mean a KILL or a 4, never a silent leader-only success: stdout {:?} stderr {:?}",
+        out(&st),
+        err(&st)
+    );
+    if code(&st) == 0 {
+        assert!(poll(10_000, || !alive(member) && !alive(leader)), "the stop answered 0 but the group still has a member");
+        let l = run(&["manifest", "list", "ts-f2a", "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+    } else {
+        assert!(err(&st).contains("not confirmed"), "a 4 names the unconfirmed death: stderr {:?}", err(&st));
+        let l = run(&["manifest", "list", "ts-f2a", "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        assert!(out(&l).contains("p-1"), "the unconfirmed entry must stay listed: {}", out(&l));
+    }
+}
+
+/// #183 fix r2, F2 (held-out must-fire): TWO members of the group both ignore TERM — the group KILL must
+/// end both (or the answer is 4 with the entry kept); never 0 with a survivor.
+#[test]
+fn stop_ends_two_members_that_ignore_term() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2b", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("members");
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ >> {}; while :; do sleep 1; done' & sh -c 'trap \"\" TERM; echo $$ >> {}; while :; do sleep 1; done' & wait",
+        mfile.to_string_lossy(),
+        mfile.to_string_lossy()
+    );
+    let (s, leader) = start("ts-f2b", "p-1", &r, None, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(leader);
+    assert!(poll(10_000, || read_pids(&mfile).len() == 2), "the members never wrote both pids");
+    let members = read_pids(&mfile);
+    for m in &members {
+        guard.add(*m);
+        assert!(alive(*m), "member {m} must be live before the stop");
+        assert_eq!(pgid_of(*m), leader, "precondition: both members are in the started leader's group");
+    }
+
+    let st = stop("ts-f2b", StopSel::Id("p-1"), Some(500), &d);
+    assert!(
+        code(&st) == 0 || code(&st) == 4,
+        "two TERM-ignoring members must mean a group KILL or a 4: stdout {:?} stderr {:?}",
+        out(&st),
+        err(&st)
+    );
+    if code(&st) == 0 {
+        assert!(poll(10_000, || members.iter().all(|m| !alive(*m)) && !alive(leader)), "the stop answered 0 but a member still lives");
+        let l = run(&["manifest", "list", "ts-f2b", "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+    } else {
+        assert!(err(&st).contains("not confirmed"), "a 4 names the unconfirmed death: stderr {:?}", err(&st));
+    }
+}
+
+/// #183 fix r2 (F2 wiring, the Alive+Same arm): the LEADER itself ignores TERM. The identity re-check must
+/// still pass (the live leader IS still the recorded process), so the KILL goes and the stop answers 0
+/// with the leader gone. A gate that KILLed only dead leaders (or never re-read identity) leaves this red.
+#[test]
+fn stop_ends_a_leader_that_ignores_term() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2c", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("leader");
+    let script = format!("trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done", mfile.to_string_lossy());
+    let (s, leader) = start("ts-f2c", "p-1", &r, None, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(leader > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(leader);
+    assert!(poll(10_000, || read_pid(&mfile).is_some()), "the leader never wrote its pid");
+    assert_eq!(read_pid(&mfile).unwrap(), leader, "the started pid is the pid the script reports");
+    assert!(alive(leader), "the leader must be live before the stop");
+
+    let st = stop("ts-f2c", StopSel::Id("p-1"), Some(500), &d);
+    assert_eq!(code(&st), 0, "a live, still-ours leader that ignored TERM must be KILLed and confirmed: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert!(poll(10_000, || !alive(leader)), "the leader survived its own stop");
+    let l = run(&["manifest", "list", "ts-f2c", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+}
+
+/// #183 fix r2 (held-out must-fire): the recorded leader is ALREADY dead when the stop begins, while a
+/// group member still lives. The stop must not answer 0 for a non-empty group: the sanctioned answer is
+/// exit 3 `already-gone` (nothing signalled — the doc's "does not cover" line; the orphan reaper P2 owns
+/// leaderless groups), and this pins that it is never 0 while the member lives.
+#[test]
+fn dead_leader_with_live_member_never_answers_stopped() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2d", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("member");
+    let gofile = r.join("go");
+    // The leader forks a TERM-trapping member, then waits until the TEST lets it exit (so the entry can
+    // be recorded with the leader's REAL start time while it still lives): after `go`, the group
+    // outlives its leader.
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done' & while [ ! -f {} ]; do sleep 0.1; done",
+        mfile.to_string_lossy(),
+        gofile.to_string_lossy()
+    );
+    let mut lead = spawn_sh(&script);
+    let lead_pid = lead.id();
+    guard.add(lead_pid);
+    assert!(poll(10_000, || read_pid(&mfile).is_some()), "the member never wrote its pid");
+    let member = read_pid(&mfile).unwrap();
+    guard.add(member);
+    assert!(alive(member) && alive(lead_pid), "both must be live before the recording");
+    assert_eq!(pgid_of(member), lead_pid, "precondition: the member is in the leader's group");
+    // Record the entry with the leader's REAL start time while it lives, then let it die and reap it.
+    let recorded = real_start_ms(lead_pid);
+    plant_process(&d, "ts-f2d", "p-1", lead_pid, recorded);
+    fs::write(&gofile, b"").unwrap();
+    assert!(poll(10_000, || lead.try_wait().unwrap().is_some()), "the leader never exited");
+    assert!(!alive(lead_pid), "the leader must be gone before the stop");
+
+    let st = stop("ts-f2d", StopSel::Id("p-1"), None, &d);
+    assert_ne!(code(&st), 0, "a non-empty group must never take the 0 answer: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert_eq!(code(&st), 3, "a leader already gone answers already-gone: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert!(err(&st).contains("already-gone"), "the answer names already-gone: stderr {:?}", err(&st));
+    assert!(alive(member), "the already-gone path signalled anything (it must not)");
+    let l = run(&["manifest", "list", "ts-f2d", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).contains("p-1"), "the gone entry is still listed: {}", out(&l));
 }
