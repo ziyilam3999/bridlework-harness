@@ -10,6 +10,7 @@
 //! anywhere: order is proved by bounded polls on observable state, never by elapsed time.
 #![cfg(unix)]
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::TcpListener;
@@ -372,101 +373,96 @@ fn port_out_of_range_refuses_before_spawn() {
 // ---------------------------------------------------------------- fix round 1: the append-failure rollback
 
 /// Fix round 1, finding 2 (mutation M4): when the PORT append fails AFTER the process line was written, `start`
-/// appends `remove` for that process line and stops the whole group — rc 2, the pid dead, no process line left.
-/// The failure is forced deterministically at a point the parser's range check cannot reach: the test holds the
-/// manifest file's own exclusive lock, so `start` (whose pre-check read takes no lock) blocks INSIDE its first
-/// append; while it is blocked the test appends a live `w-1.port` line by hand, so the SECOND append (the port
-/// line) is refused as a duplicate live id. Deleting the group kill leaves the pid alive; deleting the
-/// compensating remove leaves the process line listed; both fail this test.
+/// appends `remove` for that process line and stops everything it made — rc 2, the pid dead, no process line left.
+/// #209 changes HOW the failure is forced: a start now appends its three write-ahead evidence entries before the
+/// spawn, so the old hold-the-lock-from-before trick no longer delays the spawn. The test instead waits for the
+/// third entry (`w-1.<ts>.exit`), takes the manifest's own lock (the next appends block on it, after the spawn),
+/// and injects a live `w-1.port` line through it, so the PORT append is refused as a duplicate live id. Retried
+/// outcomes: the pre-spawn `already bound` port race, and losing the lock window (the start committed cleanly; it
+/// is stopped and the attempt repeated on a fresh ticket). Deleting the group kill leaves the pid alive; deleting
+/// the compensating remove leaves the process line listed; both fail this test.
 #[test]
 fn append_failure_after_process_line_is_rolled_back() {
-    let t = Tmp::new();
-    let (r, _o, d) = t.fence();
-    init_manifest("t-c", &r, &d);
-    let mut guard = Guard::default();
-    let pid_file = r.join("pid");
-    // The spawn writes its own pid file; the guard reads that file on drop (polling until it PARSES, because
-    // the shell's redirection creates it empty first), so a panic anywhere after the spawn — before this test
-    // ever parsed the pid — still kills the group. A leaked process after a failed run is itself a defect.
-    guard.watch_pid_file(pid_file.clone());
-
-    // Up to 5 attempts, each with a fresh free port. The only retried outcome is the `already bound` refusal
-    // of the snapshot port BEFORE the spawn (a free-port-then-check race, the same class as finding 2): that
-    // refusal starts nothing and writes nothing, so the attempt repeats cleanly on a new port.
-    let mut done: Option<(Output, u32)> = None;
-    for _attempt in 0..5 {
+    for attempt in 0..5 {
+        let t = Tmp::new();
+        let (r, _o, d) = t.fence();
+        let ticket = format!("t-c{attempt}");
+        init_manifest(&ticket, &r, &d);
+        let mut guard = Guard::default();
+        let pid_file = r.join("pid");
+        // The spawn writes its own pid file; the guard reads that file on drop (polling until it PARSES,
+        // because the shell's redirection creates it empty first), so a panic anywhere after the spawn
+        // still kills the group. A leaked process after a failed run is itself a defect.
+        guard.watch_pid_file(pid_file.clone());
         let port = free_port();
-        let file = d.join("t-c.jsonl");
-
-        // Hold the manifest lock across the whole pre-check window: start's read (a plain fs::read) sees a
-        // clean sheet, but its first `apply` blocks here until the injection below is in place.
-        let mut lock = OpenOptions::new().read(true).append(true).open(&file).unwrap();
-        lock.lock().unwrap();
-
+        let file = d.join(format!("{ticket}.jsonl"));
         let script = format!("echo $$ > {}; sleep 300", pid_file.to_string_lossy());
+        let (tx, rx) = mpsc::channel();
         let r2 = r.to_string_lossy().into_owned();
         let d2 = d.to_string_lossy().into_owned();
         let port_s = port.to_string();
-        let (tx, rx) = mpsc::channel();
+        let script_s = script.clone();
+        let ticket_s = ticket.clone();
         thread::spawn(move || {
             let _ = tx.send(run(&[
-                "process", "start", "t-c", "--id", "w-1", "--cwd", &r2, "--port", &port_s,
-                "--dir", &d2, "--", "/bin/sh", "-c", &script,
+                "process", "start", &ticket_s, "--id", "w-1", "--cwd", &r2, "--port", &port_s,
+                "--dir", &d2, "--", "/bin/sh", "-c", &script_s,
             ]));
         });
-
-        // The program runs only after start's pre-checks read the sheet, so once its pid file PARSES as a pid
-        // the pre-checks are past (they can no longer see the injection) and start is blocked on the lock
-        // inside the process-line append. A run that answers the port race instead (refused `already bound`
-        // before any spawn) moves to the next attempt; existence of the file alone proves nothing (round-2
-        // finding 1: the empty first write panicked the parse 9 runs in 30 under contention).
-        let mut refused: Option<Output> = None;
-        let started = poll(10_000, || {
-            if read_pid(&pid_file).is_some() {
-                return true;
-            }
-            match rx.try_recv() {
-                Ok(o) => {
-                    refused = Some(o);
-                    true
+        let mut lock = match lock_or_early_refusal(&file, "w-1", &rx) {
+            Ok(l) => l,
+            Err(o) => {
+                if code(&o) == 0 {
+                    let _ = run(&["process", "stop", &ticket, "--id", "w-1", "--dir", d.to_str().unwrap()]);
+                    continue;
                 }
-                Err(mpsc::TryRecvError::Empty) => false,
-                Err(mpsc::TryRecvError::Disconnected) => true,
+                assert_eq!(code(&o), 2, "an early refusal must be the port race: stdout {:?} stderr {:?}", out(&o), err(&o));
+                assert!(err(&o).contains("already bound"), "an early refusal must be the port race: stderr {:?}", err(&o));
+                continue;
             }
-        });
-        if let Some(o) = refused {
-            assert_eq!(code(&o), 2, "an early refusal must be the port race: stdout {:?} stderr {:?}", out(&o), err(&o));
-            assert!(err(&o).contains("already bound"), "an early refusal must be the port race: stderr {:?}", err(&o));
-            continue;
-        }
-        assert!(started, "the program never started and the run never answered");
-        let pid = read_pid(&pid_file).expect("polled until the pid file parses");
-
-        // Inject a live `w-1.port` line through the locked handle, then release: start appends the process
-        // line, then its port append is refused as a duplicate live id.
+        };
+        // Inject a live `w-1.port` line through the locked handle, then release: the process append
+        // succeeds, the port append is refused as a duplicate live id, after the spawn.
         let inject = format!(
-            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-c\",\"id\":\"w-1.port\",\"class\":\"port\",\"port\":{port},\"ts_ms\":1730000000002}}\n"
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"{ticket}\",\"id\":\"w-1.port\",\"class\":\"port\",\"port\":{port},\"ts_ms\":1730000000002}}\n"
         );
         lock.write_all(inject.as_bytes()).unwrap();
         lock.sync_all().unwrap();
         drop(lock);
 
         let s = rx.recv().expect("the run answers once unblocked");
-        done = Some((s, pid));
-        break;
-    }
-    let (s, pid) = done.expect("5 attempts in a row hit the already-bound port race");
-    guard.add(pid);
-    assert_eq!(code(&s), 2, "the refused port append must answer 2: stdout {:?} stderr {:?}", out(&s), err(&s));
-    assert!(err(&s).contains("duplicate live id"), "the port append was refused by the manifest, not by the range check: stderr {:?}", err(&s));
-    assert!(poll(10_000, || !alive(pid)), "the group the refused start made is still alive");
-    assert!(poll(10_000, || !group_alive(pid)), "the group the refused start made is still alive");
+        if let Some(pid) = read_pid(&pid_file) {
+            guard.add(pid);
+        }
+        if code(&s) == 0 {
+            let _ = run(&["process", "stop", &ticket, "--id", "w-1", "--dir", d.to_str().unwrap()]);
+            continue;
+        }
+        assert_eq!(code(&s), 2, "the refused port append must answer 2: stdout {:?} stderr {:?}", out(&s), err(&s));
+        assert!(err(&s).contains("duplicate live id"), "the port append was refused by the manifest, not by the range check: stderr {:?}", err(&s));
+        // The refusal follows the SPAWN, not the program's first output, so the shell may not have
+        // written its pid yet: a parsed pid must be dead, and an unparsed one must never parse after
+        // (the group the refusal made is gone before the program could report).
+        if let Some(pid) = read_pid(&pid_file) {
+            assert!(poll(10_000, || !alive(pid)), "the group the refused start made is still alive");
+            assert!(poll(10_000, || !group_alive(pid)), "the group the refused start made is still alive");
+        } else {
+            assert!(!poll(5_000, || read_pid(&pid_file).is_some()), "the refused start's program lived on to write its pid");
+        }
 
-    let l = run(&["manifest", "list", "t-c", "--dir", d.to_str().unwrap()]);
-    assert_eq!(code(&l), 0);
-    let text = out(&l);
-    assert!(!text.contains("process"), "the refused start left a process line listed: {}", text);
-    assert!(text.contains("w-1.port"), "only the test's own injected port line stays live: {}", text);
+        let l = run(&["manifest", "list", &ticket, "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        let text = out(&l);
+        assert!(!text.lines().any(|x| x.starts_with("w-1\t")), "the refused start left a process line listed: {}", text);
+        assert!(text.lines().any(|x| x.starts_with("w-1.port\t")), "only the test's own injected port line stays live: {}", text);
+        // #209 decision 7: the attempt's three evidence entries stay listed (removing them would make
+        // the run dir's files unlisted leftovers).
+        for stream in ["stdout", "stderr", "exit"] {
+            assert!(text.lines().any(|x| x.starts_with("w-1.") && x.ends_with(stream)), "the {stream} evidence entry stays listed: {}", text);
+        }
+        return;
+    }
+    panic!("5 attempts in a row hit the port race or lost the lock window");
 }
 
 // ---------------------------------------------------------------- fix round 2: the bind error kind is named
@@ -501,35 +497,28 @@ fn low_port_names_the_bind_error_kind() {
 // ---------------------------------------------------------------- fix round 3: the rollback is PATH-free and leaves nothing running
 
 /// Fix round 3, item 2: a refused start whose rollback cannot reach its helpers must return FAST, answer 2, and
-/// leave nothing running and nothing listed. Two cases:
+/// leave nothing running and nothing listed (but its write-ahead evidence entries, #209 decision 7). Three cases:
 ///
-/// (A) PATH points at an EMPTY folder after the spawn. Since #183 the start-time read runs `/bin/ps` by
-///     ABSOLUTE path (manifest.rs, one line), so the empty PATH refuses NOTHING any more — the start
-///     SUCCEEDS on every platform and PATH never decides identity (the round-4 H7 hostile: a PATH-shadowed
-///     `ps` could move a recorded start time). The started pid joins the cleanup guard BEFORE any assert,
-///     so a wrong assert can never leave the sleep 30 running. The rollback still ends the child —
-///     `/bin/kill` is called by absolute path and the std `Child::kill()` needs no PATH — and never blocks
-///     in `wait()` on a child it could not signal (r3 H1d: the round-2 code answered only after 8033 ms,
-///     and a server would never).
-/// (A2) the post-spawn refusal is ALSO proved platform-neutrally, the lock-held torn-tail way (B) uses: the
-///     manifest lock is held across the spawn so the start blocks inside its process-line append, a
-///     duplicate live id is injected through the lock, and on release the append is refused AFTER the
-///     spawn — on Linux this is the refusal (A) cannot make there; everywhere it also re-proves the
-///     bounded rollback with nothing appended and nothing left running.
-/// (B) the std fallback is load-bearing on its own: a child that MOVES OUT of the group the rollback
-///     signals (`setpgid` back into the parent's group — a spawned leader cannot `setsid`, but it may join
-///     another group of its session) is out of reach of every group signal — `/bin/kill -TERM -- -pid`
-///     answers "no such process" — so only the std kill of the direct pid ends it. The refusal is engineered
-///     to land only AFTER the escape is provable: the test holds the manifest lock so the start blocks inside
-///     its process-line append, waits until the child provably left the group, then injects a duplicate live
-///     id so the append is refused and the rollback runs against an already-escaped child.
+/// (A) PATH points at an EMPTY folder after the spawn. Every helper the start path uses goes by ABSOLUTE
+///     path (`/bin/ps`, `/bin/kill`, and since #209 the waiter's `/usr/bin/id`), so the empty PATH refuses
+///     NOTHING — the start SUCCEEDS on every platform and PATH never decides identity. The started pid joins
+///     the cleanup guard BEFORE any assert. #209: a successful start now appends THREE write-ahead evidence
+///     lines before the process line (decision 2), so the tail of a successful start is four lines.
+/// (A2) the post-spawn refusal is platform-neutral: the manifest lock is taken the moment the third
+///     write-ahead entry lands (the spawn window), a duplicate live id is injected through it, and on
+///     release the process-line append is refused AFTER the spawn — nothing appended by the start beyond
+///     its write-ahead (which stays, decision 7), nothing left running.
+/// (B) the direct kill is load-bearing on its own: a child that MOVES OUT of the group the rollback
+///     signals (`setpgid` into the waiter's group, #209 — the waiter is the child's parent) is out of
+///     reach of every group signal, so only the WAITER's direct kill of its child pid ends it. The
+///     refusal is engineered to land only AFTER the escape is provable: the lock taken at the write-ahead
+///     is HELD while the child escapes, then the duplicate live id is injected and the process-line
+///     append is refused with the rollback running against an already-escaped child.
 #[test]
 fn refused_start_rollback_leaves_nothing_running() {
-    // (A) empty PATH after the spawn: the start-time read runs `/bin/ps` by ABSOLUTE path (the #183
-    // one-line manifest change), so the empty PATH refuses nothing — the start SUCCEEDS on every
-    // platform and PATH never decides identity. The started pid is registered with the guard BEFORE any
-    // assert (the pid file is watched from before the spawn), so a failing assert can never leave the
-    // sleep 30 running.
+    // (A) empty PATH after the spawn: every helper goes by absolute path, so the start succeeds — PATH
+    // never decides identity. The started pid is registered with the guard BEFORE any assert (the pid
+    // file is watched from before the spawn), so a failing assert can never leave the sleep 30 running.
     {
         let t = Tmp::new();
         let (r, _o, d) = t.fence();
@@ -552,15 +541,15 @@ fn refused_start_rollback_leaves_nothing_running() {
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        // #183: the /bin/ps start-time read needs no PATH on ANY platform, so the start succeeds —
-        // PATH never decides identity. Register the started pid BEFORE any assert.
+        // The absolute-path helpers (and the waiter's own absolute paths) need no PATH on ANY platform,
+        // so the start succeeds. Register the started pid BEFORE any assert.
         let pid_stdout = out(&s).split('\t').nth(1).and_then(|f| f.trim().parse::<u32>().ok());
         if let Some(pid) = pid_stdout {
             guard.add(pid);
         }
         assert_eq!(
             code(&s), 0,
-            "the /bin/ps start-time read needs no PATH, so the start succeeds: stdout {:?} stderr {:?}",
+            "the helpers go by absolute path, so the start succeeds: stdout {:?} stderr {:?}",
             out(&s), err(&s)
         );
         let pid = pid_stdout.expect("start printed the pid it started");
@@ -569,119 +558,178 @@ fn refused_start_rollback_leaves_nothing_running() {
         assert!(after.starts_with(&before), "the successful start rewrote the head of the manifest");
         assert_eq!(
             String::from_utf8_lossy(&after[before.len()..]).matches('\n').count(),
-            1,
-            "the successful start appended exactly one line: {}",
+            4,
+            "#209 decision 2: a successful start appends its three write-ahead evidence lines and the process line: {}",
             String::from_utf8_lossy(&after)
         );
     }
 
-    // (A2) the post-spawn refusal, platform-neutral (on Linux this is the refusal the empty-PATH arm of
-    // (A) cannot make there): hold the manifest lock across the spawn — the pre-check read is a plain
-    // read and passes, the first append blocks — then inject a duplicate live id through the lock and
-    // release, so the append is refused AFTER the spawn and the rollback must answer 2, FAST, append
-    // nothing, and leave nothing running. The same torn-tail shape (B) uses, without the group escape.
+    // (A2) the post-spawn refusal, platform-neutral: take the manifest lock when the third write-ahead
+    // entry lands (the spawn window), inject a duplicate live id for the process line, release — the
+    // process-line append is refused AFTER the spawn and the rollback must answer 2, FAST, append
+    // nothing beyond its (kept) write-ahead, and leave nothing running.
     {
+        let mut done = false;
+        for attempt in 0..5 {
+            let t = Tmp::new();
+            let (r, _o, d) = t.fence();
+            let ticket = format!("t-r4-{attempt}");
+            init_manifest(&ticket, &r, &d);
+            let mut guard = Guard::default();
+            let pid_file = r.join("pid");
+            guard.watch_pid_file(pid_file.clone());
+            let file = d.join(format!("{ticket}.jsonl"));
+            let before = fs::read(&file).unwrap();
+            let script = format!("echo $$ > {}; exec /bin/sleep 30", pid_file.to_string_lossy());
+            let (tx, rx) = mpsc::channel();
+            let r4 = r.to_string_lossy().into_owned();
+            let d4 = d.to_string_lossy().into_owned();
+            let script_s = script.clone();
+            let ticket_s = ticket.clone();
+            thread::spawn(move || {
+                let _ = tx.send(
+                    Command::new(BIN)
+                        .args(["process", "start", &ticket_s, "--id", "a-4", "--cwd", &r4, "--dir", &d4, "--", "/bin/sh", "-c", &script_s])
+                        .stdin(Stdio::null())
+                        .output()
+                        .unwrap(),
+                );
+            });
+            let mut lock = match lock_or_early_refusal(&file, "a-4", &rx) {
+                Ok(l) => l,
+                Err(o) => {
+                    if code(&o) == 0 {
+                        let _ = run(&["process", "stop", &ticket, "--id", "a-4", "--dir", d.to_str().unwrap()]);
+                        continue;
+                    }
+                    panic!("an unexpected early refusal: stdout {:?} stderr {:?}", out(&o), err(&o));
+                }
+            };
+            let inject = format!(
+                "{{\"v\":1,\"op\":\"add\",\"ticket\":\"{ticket}\",\"id\":\"a-4\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}}\n"
+            );
+            lock.write_all(inject.as_bytes()).unwrap();
+            lock.sync_all().unwrap();
+            drop(lock);
+            let s = rx.recv().expect("the run answers once unblocked");
+            if let Some(pid) = read_pid(&pid_file) {
+                guard.add(pid);
+            }
+            if code(&s) == 0 {
+                let _ = run(&["process", "stop", &ticket, "--id", "a-4", "--dir", d.to_str().unwrap()]);
+                continue;
+            }
+            assert_eq!(code(&s), 2, "the duplicate live id refuses the start after the spawn: stdout {:?} stderr {:?}", out(&s), err(&s));
+            assert!(err(&s).contains("duplicate live id"), "the refusal names the append failure: stderr {:?}", err(&s));
+            // The refusal follows the SPAWN, not the first output: a parsed pid must die, an unparsed
+            // one must never parse afterwards.
+            if let Some(pid) = read_pid(&pid_file) {
+                assert!(poll(5_000, || !alive(pid)), "the child of the refused start still lives");
+            } else {
+                assert!(!poll(5_000, || read_pid(&pid_file).is_some()), "the refused start's program lived on to write its pid");
+            }
+            let after = fs::read(&file).unwrap();
+            assert!(after.starts_with(&before), "the injected tail moved the head of the manifest");
+            // #209: the refused start's own appends are exactly its three kept write-ahead entries
+            // (decision 7), written BEFORE the test's injected line; no process line, no remove.
+            let tail = String::from_utf8_lossy(&after[before.len()..]).into_owned();
+            let lines: Vec<&str> = tail.lines().collect();
+            assert_eq!(lines.len(), 4, "the write-ahead plus the injected line: {tail}");
+            assert!(lines.iter().take(3).all(|l| l.contains("\"class\":\"evidence\"") && l.contains("\"id\":\"a-4.")), "the first three are this start's evidence entries: {tail}");
+            assert_eq!(lines[3], inject.trim_end(), "the injected line is the last thing on the sheet");
+            done = true;
+            break;
+        }
+        assert!(done, "5 attempts in a row lost the lock window");
+    }
+
+    // (B) the direct kill: a child that moved out of the signalled group can only be ended by the
+    // direct kill of its pid — since #209 that kill is the WAITER's (its own child, killed the moment
+    // the commit pipe closes uncommitted). The lock taken at the write-ahead is HELD while the child
+    // escapes, so the refusal lands only once the escape is provable. Skipped when the host has no
+    // python3 or refuses the move.
+    if !Path::new("/usr/bin/python3").exists() {
+        println!("SKIP: no /usr/bin/python3 on this host, so the group-escape cannot be spawned");
+        return;
+    }
+    let mut done = false;
+    for attempt in 0..5 {
         let t = Tmp::new();
         let (r, _o, d) = t.fence();
-        init_manifest("t-r4", &r, &d);
+        let ticket = format!("t-r2-{attempt}");
+        init_manifest(&ticket, &r, &d);
         let mut guard = Guard::default();
         let pid_file = r.join("pid");
         guard.watch_pid_file(pid_file.clone());
-        let file = d.join("t-r4.jsonl");
-        let before = fs::read(&file).unwrap();
-        let script = format!("echo $$ > {}; exec /bin/sleep 30", pid_file.to_string_lossy());
-        let mut lock = OpenOptions::new().read(true).append(true).open(&file).unwrap();
-        lock.lock().unwrap();
-        let r4 = r.to_string_lossy().into_owned();
-        let d4 = d.to_string_lossy().into_owned();
+        let moved = r.join("moved");
+        // The child is its own group leader (the waiter spawned it with process_group(0)), so setsid()
+        // would fail; moving back into the WAITER's group (same session; the waiter is its parent)
+        // puts it out of reach of a signal to -<its pid> while the direct kill of its pid still ends
+        // it. The marker names which of the two happened.
+        let script = format!(
+            "echo $$ > {}; exec /usr/bin/python3 -c 'import os, time\ntry:\n    os.setpgid(0, os.getpgid(os.getppid())); open(\"{}\", \"w\").write(\"moved\")\nexcept OSError:\n    open(\"{}\", \"w\").write(\"fail\")\ntime.sleep(30)'",
+            pid_file.to_string_lossy(),
+            moved.to_string_lossy(),
+            moved.to_string_lossy()
+        );
+        let file = d.join(format!("{ticket}.jsonl"));
         let (tx, rx) = mpsc::channel();
+        let r2 = r.to_string_lossy().into_owned();
+        let d2 = d.to_string_lossy().into_owned();
+        let script_s = script.clone();
+        let ticket_s = ticket.clone();
         thread::spawn(move || {
             let _ = tx.send(
                 Command::new(BIN)
-                    .args(["process", "start", "t-r4", "--id", "a-4", "--cwd", &r4, "--dir", &d4, "--", "/bin/sh", "-c", &script])
+                    .args(["process", "start", &ticket_s, "--id", "b-1", "--cwd", &r2, "--dir", &d2, "--", "/bin/sh", "-c", &script_s])
                     .stdin(Stdio::null())
                     .output()
                     .unwrap(),
             );
         });
+        // Hold the manifest lock from the write-ahead onward: the start blocks inside its process-line
+        // append while the child runs, escapes, and provably leaves its group.
+        let lock = match lock_or_early_refusal(&file, "b-1", &rx) {
+            Ok(l) => l,
+            Err(o) => {
+                if code(&o) == 0 {
+                    let _ = run(&["process", "stop", &ticket, "--id", "b-1", "--dir", d.to_str().unwrap()]);
+                    continue;
+                }
+                panic!("an unexpected early refusal: stdout {:?} stderr {:?}", out(&o), err(&o));
+            }
+        };
         assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the program never started");
         let pid = read_pid(&pid_file).unwrap();
         guard.add(pid);
-        let inject = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-r4\",\"id\":\"a-4\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}\n";
+        if !poll(10_000, || fs::read_to_string(&moved).map(|m| m.trim() == "moved").unwrap_or(false)) {
+            assert!(
+                fs::read_to_string(&moved).unwrap().trim() == "fail",
+                "the child never reported the group move"
+            );
+            println!("SKIP: this host refuses setpgid into the waiter group, so the escape cannot be exercised");
+            return;
+        }
+        // Provably out of the signalled group BEFORE the refusal: the group probe (kill -0 -- -pid) says
+        // no such group exists any more.
+        assert!(poll(10_000, || !group_alive(pid)), "the child never left its process group");
+        // Inject a duplicate live id through the locked handle, then release: the process-line append
+        // is refused as a duplicate and the rollback runs with the group already unreachable.
+        let mut lock = lock;
+        let inject = format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"{ticket}\",\"id\":\"b-1\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}}\n"
+        );
         lock.write_all(inject.as_bytes()).unwrap();
         lock.sync_all().unwrap();
         drop(lock);
         let s = rx.recv().expect("the run answers once unblocked");
-        assert_eq!(code(&s), 2, "the duplicate live id refuses the start after the spawn: stdout {:?} stderr {:?}", out(&s), err(&s));
+        assert_eq!(code(&s), 2, "the duplicate live id refuses the start: stdout {:?} stderr {:?}", out(&s), err(&s));
         assert!(err(&s).contains("duplicate live id"), "the refusal names the append failure: stderr {:?}", err(&s));
-        assert!(poll(5_000, || !alive(pid)), "the child of the refused start still lives");
-        let after = fs::read(&file).unwrap();
-        assert!(after.starts_with(&before), "the injected tail moved the head of the manifest");
-        assert_eq!(&after[before.len()..], inject.as_bytes(), "the refused start appended beyond the injected line");
+        assert!(poll(5_000, || !alive(pid)), "the child that left the signalled group still lives: only the direct kill reaches it");
+        done = true;
+        break;
     }
-
-    // (B) the std fallback: a child that moved out of the signalled group can only be ended by the
-    // direct (std) kill. Skipped when the host has no python3 or refuses the move.
-    if !Path::new("/usr/bin/python3").exists() {
-        println!("SKIP: no /usr/bin/python3 on this host, so the group-escape cannot be spawned");
-        return;
-    }
-    let t = Tmp::new();
-    let (r, _o, d) = t.fence();
-    init_manifest("t-r2", &r, &d);
-    let mut guard = Guard::default();
-    let pid_file = r.join("pid");
-    guard.watch_pid_file(pid_file.clone());
-    let moved = r.join("moved");
-    // The child is its own group leader (start spawned it with process_group(0)), so setsid() would fail;
-    // moving back into the PARENT's group (same session) puts it out of reach of a signal to -<its pid>
-    // while the std kill of the direct pid still reaches it. The marker names which of the two happened.
-    let script = format!(
-        "echo $$ > {}; exec /usr/bin/python3 -c 'import os, time\ntry:\n    os.setpgid(0, os.getpgid(os.getppid())); open(\"{}\", \"w\").write(\"moved\")\nexcept OSError:\n    open(\"{}\", \"w\").write(\"fail\")\ntime.sleep(30)'",
-        pid_file.to_string_lossy(),
-        moved.to_string_lossy(),
-        moved.to_string_lossy()
-    );
-
-    // Hold the manifest lock: the start's pre-check read is a plain read, so it passes, and its first append
-    // blocks here until the escape below is provable.
-    let mut lock = OpenOptions::new().read(true).append(true).open(d.join("t-r2.jsonl")).unwrap();
-    lock.lock().unwrap();
-    let r2 = r.to_string_lossy().into_owned();
-    let d2 = d.to_string_lossy().into_owned();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(
-            Command::new(BIN)
-                .args(["process", "start", "t-r2", "--id", "b-1", "--cwd", &r2, "--dir", &d2, "--", "/bin/sh", "-c", &script])
-                .stdin(Stdio::null())
-                .output()
-                .unwrap(),
-        );
-    });
-    assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the program never started");
-    let pid = read_pid(&pid_file).unwrap();
-    assert!(
-        poll(10_000, || fs::read_to_string(&moved).map(|m| m.trim() == "moved").unwrap_or(false)),
-        "the child never reported the group move"
-    );
-    if fs::read_to_string(&moved).unwrap().trim() == "fail" {
-        println!("SKIP: this host refuses setpgid into the parent group, so the escape cannot be exercised");
-        return;
-    }
-    // Provably out of the signalled group BEFORE the refusal: the group probe (kill -0 -- -pid) says
-    // no such group exists any more.
-    assert!(poll(10_000, || !group_alive(pid)), "the child never left its process group");
-    // Inject a duplicate live id through the locked handle, then release: the process-line append is
-    // refused as a duplicate and the rollback runs with the group already unreachable.
-    let inject = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-r2\",\"id\":\"b-1\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}\n";
-    lock.write_all(inject.as_bytes()).unwrap();
-    lock.sync_all().unwrap();
-    drop(lock);
-    let s = rx.recv().expect("the run answers once unblocked");
-    assert_eq!(code(&s), 2, "the duplicate live id refuses the start: stdout {:?} stderr {:?}", out(&s), err(&s));
-    assert!(err(&s).contains("duplicate live id"), "the refusal names the append failure: stderr {:?}", err(&s));
-    assert!(poll(5_000, || !alive(pid)), "the child that left the signalled group still lives: only the std kill reaches it");
+    assert!(done, "5 attempts in a row lost the lock window");
 }
 
 // ---------------------------------------------------------------- #183: process stop helpers
@@ -767,6 +815,60 @@ fn read_pids(f: &Path) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// #209: a start also lists three write-ahead EVIDENCE entries (`<id>.<ts_ms>.<stream>`) that OUTLIVE
+/// the process (decision 2), so "the id is no longer listed" is judged on the id's OWN lines (the
+/// process line and `<id>.port`), never on a substring the evidence ids also carry.
+fn id_gone(text: &str, id: &str) -> bool {
+    !text
+        .lines()
+        .any(|l| l.starts_with(&format!("{id}\t")) || l.starts_with(&format!("{id}.port\t")))
+}
+
+/// #209: a start appends its three write-ahead evidence entries BEFORE the spawn, so the old
+/// hold-the-lock-from-before trick no longer delays the spawn (the evidence appends need the lock
+/// first). The new blocking point: poll until the THIRD evidence entry (`<id>.<ts>.exit`) is on the
+/// sheet — the spawn window opens right after — then take the manifest's own exclusive lock: the
+/// start's NEXT append (always the process line) blocks on it, and whatever is injected through the
+/// locked handle is what that append validates against, a deterministic POST-SPAWN refusal. The poll
+/// also watches the run itself: a pre-spawn refusal (e.g. the free-port snapshot race) writes no
+/// evidence at all, and a start that committed before the lock was taken answers 0 — both come back
+/// as Err(output) for the caller to branch on (retry) rather than wait out the bound.
+fn lock_or_early_refusal(file: &Path, id: &str, rx: &mpsc::Receiver<Output>) -> Result<File, Output> {
+    // The handle is opened BEFORE the wait, so the lock itself is one syscall once the third entry is
+    // seen; the poll runs at 1 ms because the window between the third entry and the process-line
+    // append is itself only a few ms (the waiter spawn + handshake + ps read).
+    let lock = OpenOptions::new().read(true).append(true).open(file).unwrap();
+    let mut early: Option<Output> = None;
+    let deadline = Instant::now() + Duration::from_millis(10_000);
+    let mut saw = false;
+    while Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(o) => {
+                early = Some(o);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        if fs::read_to_string(file)
+            .map(|t| t.lines().any(|l| l.contains(&format!("\"id\":\"{id}.")) && l.contains(".exit\"")))
+            .unwrap_or(false)
+        {
+            saw = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    match (saw, early) {
+        (_, Some(o)) => Err(o),
+        (false, None) => panic!("neither the write-ahead nor an answer arrived within the bound"),
+        (true, None) => {
+            lock.lock().unwrap();
+            Ok(lock)
+        }
+    }
+}
+
 // ---------------------------------------------------------------- #183 AC 1
 
 /// #183 AC 1: a started program that forks a grandchild (both pids written to a file in the root) is stopped
@@ -799,7 +901,7 @@ fn stop_ends_process_and_its_children() {
     let l = run(&["manifest", "list", "ts-1", "--dir", d.to_str().unwrap()]);
     assert_eq!(code(&l), 0);
     let text = out(&l);
-    assert!(!text.contains("p-1"), "the stopped id (or its port line) is still listed: {}", text);
+    assert!(id_gone(&text, "p-1"), "the stopped id (or its port line) is still listed: {}", text);
 }
 
 // ---------------------------------------------------------------- #183 AC 2
@@ -1146,7 +1248,7 @@ fn stop_ends_a_group_member_that_ignores_term() {
         assert!(poll(10_000, || !alive(member) && !alive(leader)), "the stop answered 0 but the group still has a member");
         let l = run(&["manifest", "list", "ts-f2a", "--dir", d.to_str().unwrap()]);
         assert_eq!(code(&l), 0);
-        assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+        assert!(id_gone(&out(&l), "p-1"), "the stopped id is still listed: {}", out(&l));
     } else {
         assert!(err(&st).contains("not confirmed"), "a 4 names the unconfirmed death: stderr {:?}", err(&st));
         let l = run(&["manifest", "list", "ts-f2a", "--dir", d.to_str().unwrap()]);
@@ -1191,7 +1293,7 @@ fn stop_ends_two_members_that_ignore_term() {
         assert!(poll(10_000, || members.iter().all(|m| !alive(*m)) && !alive(leader)), "the stop answered 0 but a member still lives");
         let l = run(&["manifest", "list", "ts-f2b", "--dir", d.to_str().unwrap()]);
         assert_eq!(code(&l), 0);
-        assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+        assert!(id_gone(&out(&l), "p-1"), "the stopped id is still listed: {}", out(&l));
     } else {
         assert!(err(&st).contains("not confirmed"), "a 4 names the unconfirmed death: stderr {:?}", err(&st));
     }
@@ -1221,7 +1323,7 @@ fn stop_ends_a_leader_that_ignores_term() {
     assert!(poll(10_000, || !alive(leader)), "the leader survived its own stop");
     let l = run(&["manifest", "list", "ts-f2c", "--dir", d.to_str().unwrap()]);
     assert_eq!(code(&l), 0);
-    assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+    assert!(id_gone(&out(&l), "p-1"), "the stopped id is still listed: {}", out(&l));
 }
 
 /// #183 fix r2 (held-out must-fire): the recorded leader is ALREADY dead when the stop begins, while a
