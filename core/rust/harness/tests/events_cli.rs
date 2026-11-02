@@ -4,10 +4,14 @@
 //! append of a log self-issues (`run_issued` line first), later appends inherit the id through `HARNESS_RUN_ID`.
 #![cfg(unix)]
 use std::fs;
+use std::io::{Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use harness::events::LOG_READ_CAP;
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -915,4 +919,118 @@ fn read_only_commands_write_nothing_and_create_no_file() {
     assert!(ok(&verify(&t.log())));
     assert_eq!(fs::read(t.log()).unwrap(), before, "byte size unchanged");
     assert_eq!(fs::read_dir(&t.0).unwrap().count(), files_before, "no new file appeared");
+}
+
+// ---------------------------------------------------------------- #211: the read cap (a giant, linked or non-regular log is refused BEFORE it is read)
+
+/// A sparse file of exactly `len` bytes: `head` at the start, `last` as the final byte, zeros in between.
+/// Sparse on APFS/ext4, so a 64 MiB fixture costs a few blocks.
+fn sparse(path: &Path, len: u64, head: &[u8], last: u8) {
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path).unwrap();
+    f.write_all(head).unwrap();
+    f.seek(SeekFrom::Start(len - 1)).unwrap();
+    f.write_all(&[last]).unwrap();
+    f.set_len(len).unwrap();
+}
+
+#[test]
+fn ac3_211_an_over_cap_log_is_refused_before_reading_no_log_bytes_leak() {
+    let t = Tmp::new();
+    let big = t.0.join("big.jsonl");
+    sparse(&big, LOG_READ_CAP + 1, b"MARKER-211-SECRET\n", 0);
+    let o = verify(&big);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(out(&o), "");
+    let e = err(&o);
+    assert_eq!(e.lines().count(), 1, "exactly one stderr line: {e}");
+    assert!(e.contains("read cap"), "{e}");
+    assert!(e.contains(&LOG_READ_CAP.to_string()), "the cap value itself is named: {e}");
+    assert!(!e.contains("MARKER-211-SECRET"), "no log byte is ever echoed: {e}");
+}
+
+#[test]
+fn ac4_211_a_log_exactly_at_the_cap_is_read_not_refused() {
+    let t = Tmp::new();
+    let big = t.0.join("cap.jsonl");
+    sparse(&big, LOG_READ_CAP, b"", 0);
+    let o = verify(&big);
+    assert_eq!(o.status.code(), Some(1), "all-zero bytes with no newline: a torn tail, not a cap refusal: {}", err(&o));
+    assert!(err(&o).contains("torn tail"), "{}", err(&o));
+    assert!(!err(&o).contains("read cap"), "{}", err(&o));
+}
+
+#[test]
+fn ac5_211_a_fifo_is_refused_without_opening_it_the_child_never_hangs() {
+    let t = Tmp::new();
+    let fifo = t.0.join("log.fifo");
+    let mk = Command::new("mkfifo").arg(&fifo).output().unwrap();
+    assert!(mk.status.success(), "mkfifo must exist on unix: {}", String::from_utf8_lossy(&mk.stderr));
+    let mut c = Command::new(BIN);
+    c.args(["events", "verify", "--log", fifo.to_str().unwrap()]).stdin(Stdio::null())
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    for k in ["HARNESS_RUN_ID", "HARNESS_ROLE", "HARNESS_MODEL"] {
+        c.env_remove(k);
+    }
+    let mut child = c.spawn().unwrap();
+    // A hang guard, not a timing assert: nothing here asserts how fast the child is, only that it comes
+    // back at all. Without the pre-open check the open of a FIFO blocks until a writer appears.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut killed = false;
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                killed = true;
+                break child.wait().unwrap();
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert!(!killed, "harness events verify blocked on a FIFO: the log must be refused before it is opened");
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(status.code(), o.status.code());
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("not a regular file"), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn ac6_211_a_symlinked_log_is_refused_on_read_but_the_target_reads() {
+    let t = Tmp::new();
+    let real = t.0.join("events.jsonl");
+    fs::write(&real, line("escalation", 1, "run-x")).unwrap();
+    let link = t.0.join("link.jsonl");
+    symlink(&real, &link).unwrap();
+    let o = list(&link);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(out(&o), "");
+    assert!(err(&o).contains("symbolic link"), "{}", err(&o));
+    // Twin: the very same file given directly reads clean and lists its one event.
+    let d = list(&real);
+    assert_eq!(d.status.code(), Some(0));
+    assert_eq!(out(&d).lines().count(), 1);
+}
+
+#[test]
+fn ac7_211_a_directory_is_refused_as_a_log() {
+    let t = Tmp::new();
+    let o = verify(&t.0);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(out(&o), "");
+    assert!(err(&o).contains("not a regular file"), "{}", err(&o));
+}
+
+#[test]
+fn ac8_211_an_inherited_append_onto_an_over_cap_log_is_refused_and_writes_nothing() {
+    let t = Tmp::new();
+    let big = t.0.join("big.jsonl");
+    // The final byte is a newline so the append path passes its torn-tail check and reaches the inherited read.
+    sparse(&big, LOG_READ_CAP + 1, b"", b'\n');
+    let o = append_as(&big, "escalation", "1", "run-1");
+    assert_eq!(o.status.code(), Some(2));
+    let e = err(&o);
+    assert!(e.contains("read cap"), "{e}");
+    assert!(e.contains("EVENT NOT RECORDED"), "{e}");
+    assert_eq!(fs::metadata(&big).unwrap().len(), LOG_READ_CAP + 1, "the over-cap log is left byte-for-byte unchanged");
 }
