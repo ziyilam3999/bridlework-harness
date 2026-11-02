@@ -434,11 +434,14 @@ fn gate_fail_malformed_refused() {
         // Wherever the bad line sits in a batch: the whole batch is an error with no rows.
         assert!(map_lines(&[&good, line]).is_err(), "{name}: one bad line fails the whole batch");
         assert!(map_lines(&[line, &good]).is_err(), "{name}: also when the bad line comes first");
-        // And the real binary's own reader refuses the same line: `events verify` exits non-zero.
+        // And the real binary's own reader refuses the same line: `events verify --log <path>` exits 1
+        // naming the corrupt log. Pinned exactly (exit code AND message), so a usage error — exit 2,
+        // what a bare-positional path gets — can never pass for a refusal.
         let log = t.0.join("gate-fail-bad.jsonl");
         fs::write(&log, format!("{line}\n")).unwrap();
-        let o = run(&[s("events"), s("verify"), log.to_str().unwrap().to_string()]);
-        assert_ne!(code(&o), 0, "{name}: events verify must refuse the line, stdout: {}", out(&o));
+        let o = run(&[s("events"), s("verify"), s("--log"), log.to_str().unwrap().to_string()]);
+        assert_eq!(code(&o), 1, "{name}: events verify must refuse the line with exit 1, never a usage error; stdout: {} stderr: {}", out(&o), err(&o));
+        assert!(err(&o).contains("log is corrupt"), "{name}: the refusal must name the corrupt log: stderr: {}", err(&o));
     }
 }
 
