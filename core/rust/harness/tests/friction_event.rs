@@ -228,6 +228,7 @@ fn mapped_rows_pass_friction_lint() {
 /// this file's builds.
 fn value_for(kind: Kind, key: &str) -> Field {
     let v = match (kind.as_str(), key) {
+        ("launch_refused", "brief_sha256") => BRIEF_A,
         ("session_started", "session_id") => "3f2a9c01-8d4e-4b6f-9a2c-7e5d1c0b4a83",
         ("session_started", "source") => "launch",
         ("unmanaged_session", "session_id") => "1b7e0d4a-2c9f-4e8a-b3d6-5a0f8e2c9d17",
@@ -274,6 +275,11 @@ fn unmapped_kinds_yield_none() {
     let mut unmapped: Vec<&str> = Vec::new();
     for kind in Kind::ALL {
         if MAPPED.contains(&kind.as_str()) {
+            // The list is exact in BOTH directions: a kind on it must map to Some. A kind moved into
+            // the `None` arm (mutant M2) fails HERE, not only in the per-kind row tests below.
+            let rec = good_record(kind);
+            let got = map_record(&rec).unwrap_or_else(|e| panic!("{}: a valid mapped event must not be refused: {e}", kind.as_str()));
+            assert!(got.is_some(), "{} is on the closed list: it must map to a row", kind.as_str());
             continue;
         }
         unmapped.push(kind.as_str());

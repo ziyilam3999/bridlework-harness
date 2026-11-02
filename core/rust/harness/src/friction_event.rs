@@ -1,7 +1,8 @@
 //! The T-9.3 event-to-row mapper (ticket 193): the pure translator from event-log lines to friction-inbox
 //! rows. A fixed, closed list of deterministic event kinds — `replan_required` (the G3a cap signal),
-//! `launch_refused` (a dispatcher refusal) and `gate_fail` (a gate check's FAIL) — writes ONE inbox row per (event kind, signature) per ISO week
-//! through the friction verbs; every other kind maps to nothing, and no prose is ever read or written. The
+//! `launch_refused` (a dispatcher refusal) and `gate_fail` (a gate check's FAIL) — writes ONE inbox row
+//! per (event kind, signature) per ISO week through the friction verbs; every other kind maps to nothing
+//! and no prose is ever read or written. The
 //! signature names the CAUSE of the event, not its incident: a repeat of the same cause in the same week
 //! files no second row, and next week starts a fresh row.
 //!
