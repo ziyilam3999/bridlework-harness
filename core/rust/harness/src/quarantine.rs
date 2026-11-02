@@ -736,10 +736,15 @@ fn walk_and_delete(anchor: &Path, intermediates: &[std::ffi::OsString], final_na
 /// swapped-in link as the link, and has no path length limit. Only after the
 /// path is gone is the manifest `remove` line written (a crash between leaves a listed half-deleted thing, never an
 /// orphan; a re-run on an already-absent path just writes the remove).
-/// The walk also changes the process working directory while it runs (saved and restored before returning), so this
-/// function is not safe to call while another thread is using the working directory or relative paths — P1B-14
-/// teardown must call it from a single thread only.
+/// The walk also changes the process working directory while it runs (saved and restored before returning), and the
+/// working directory is shared by EVERY thread in the process — so the FIRST thing this function does is prove the
+/// process is single-threaded and REFUSE otherwise (exit 3, one fixed folder-free stderr line naming threads, nothing
+/// deleted, nothing written, before the manifest is even read); a host where the thread count cannot be read is
+/// refused the same way. P1B-14 teardown therefore runs each delete as the `harness quarantine delete-listed` verb in
+/// its own process (single-threaded by construction), one id per call, and treats exit 3 as teardown failure — never
+/// an in-process retry.
 pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
+    refuse_unless_single_thread()?;
     let md = resolve_base_dir("--manifest-dir", &a.manifest_dir)?;
     let read = manifest::read_manifest(&md, &a.ticket).map_err(|_| err2("the manifest could not be read (missing or unreadable); nothing was deleted"))?;
     if !read.is_clean() {
@@ -817,6 +822,49 @@ pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
     manifest::apply(&md, &a.ticket, &Op::Remove { id: &a.id }, a.ts_ms)
         .map_err(|_| err3("the manifest remove line could not be written"))?;
     Ok(format!("delete=done ticket={} id={}", a.ticket, a.id))
+}
+
+/// The single-thread guard (#185): the delete walk changes the process working directory, which every thread in the
+/// process shares, so before `delete_listed` reads anything or takes one step it proves THIS process holds exactly
+/// one thread, and refuses (exit 3, nothing deleted) when it does not or when it cannot tell. The proof is sound for
+/// the whole walk: a process holding exactly one thread cannot gain another while the walk runs, because only the
+/// running thread could spawn one. macOS: the one libSystem call `pthread_is_threaded_np` (no arguments), which is
+/// STICKY — any thread ever started, even one long joined, keeps answering threaded — stricter, still fail-closed.
+/// Every other Unix: the thread count is read from procfs; an unreadable answer (no procfs, an odd container) is a
+/// refusal, never a pass. The child verb `harness quarantine delete-listed` is single-threaded by construction, so
+/// the one delete path (P1B-14) is unaffected.
+fn refuse_unless_single_thread() -> Result<(), Stop> {
+    #[cfg(target_os = "macos")]
+    let alone = {
+        // The crate's first and only `unsafe`: one call into libSystem, no arguments, a boolean query on this
+        // process's own thread list — it touches no resource, returns nothing to free, and cannot fail.
+        extern "C" {
+            fn pthread_is_threaded_np() -> i32;
+        }
+        let threaded = unsafe { pthread_is_threaded_np() };
+        threaded == 0
+    };
+    #[cfg(not(target_os = "macos"))]
+    let alone = {
+        let rd = fs::read_dir("/proc/self/task")
+            .map_err(|_| err3("the thread count cannot be read (procfs); nothing was deleted"))?;
+        let mut n = 0u32;
+        for e in rd {
+            let _ = e.map_err(|_| err3("the thread count cannot be read (procfs); nothing was deleted"))?;
+            n += 1; // procfs task entries are the thread ids themselves (no `.` or `..`); anything at all counts
+            if n > 1 {
+                break;
+            }
+        }
+        n == 1
+    };
+    if alone {
+        Ok(())
+    } else {
+        Err(err3(
+            "delete-listed refuses to run while another thread exists in this process (the walk changes the process working directory); run the delete as the harness quarantine delete-listed verb in its own process; nothing was deleted",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------- the verb
