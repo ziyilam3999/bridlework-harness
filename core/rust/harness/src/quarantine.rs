@@ -13,10 +13,12 @@
 
 use crate::events::{self, token_ok, Field, Kind, Record};
 use crate::manifest::{self, Class, Op, Target};
-use std::fs::{self, OpenOptions};
+use std::ffi::{c_char, c_int, CString};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -188,9 +190,11 @@ fn resolve_base_dir(flag: &str, arg: &Path) -> Result<PathBuf, Stop> {
 /// (raw, because a name need not be UTF-8; the journal stores these bytes hex-encoded), plus the ANCESTOR
 /// CHAIN the walk examined — the root and every real directory between it and the leftover, each with the
 /// dev/ino it had at walk time. The chain is re-checked immediately before the item's rename (review r2, F2 /
-/// RACE-S): an ancestor that is gone, is now a symlink, or is a different directory makes the sweep SKIP the
-/// item (nothing moved for it, no journal line, no event, exit 3 at the end naming the item token) instead of
-/// following a swapped component out of the roots.
+/// RACE-S, closed by #187): every ancestor is opened and its handle's stat matched against the recorded
+/// dev/ino, and the immediate parent's handle is HELD into the rename, which is dirfd-relative — an ancestor
+/// that is gone, is now a symlink, or is a different directory makes the sweep SKIP the item (nothing moved
+/// for it, no journal line, no event, exit 3 at the end naming the item token) instead of following a swapped
+/// component out of the roots, and a swap landing after the check can no longer redirect the move.
 struct Leftover {
     src: PathBuf,
     rel: Vec<u8>,
@@ -461,6 +465,52 @@ fn real_device(p: &Path) -> Option<u64> {
     fs::symlink_metadata(p).ok().map(|m| m.dev())
 }
 
+/// Re-check one leftover's ancestor chain immediately before its move (#187): every ancestor the walk recorded
+/// is OPENED, and the handle's own stat (an fstat — no path is re-resolved after the open) must be the SAME
+/// real directory the walk recorded: a directory, same dev, same ino. An ancestor that was swapped for a
+/// symlink opens to a different identity (or not at all), so `None` is fail-closed — the item is skipped.
+/// The LAST ancestor — the leftover's immediate parent — is returned with its HANDLE HELD: the rename then
+/// names the item relative to this verified directory, so no swap landing after the check can redirect the
+/// move (the rule of this fix round: act on what was checked, never on a path looked up again afterwards).
+/// Opening follows a link, but only the exact recorded directory (dev/ino) passes, and the walk never
+/// descended a link, so a match is by construction the real in-roots ancestor.
+fn verified_parent(chain: &[(PathBuf, u64, u64)]) -> Option<File> {
+    let mut held: Option<File> = None;
+    for (p, dev, ino) in chain {
+        let f = File::open(p).ok()?;
+        let m = f.metadata().ok()?;
+        if !m.is_dir() || m.dev() != *dev || m.ino() != *ino {
+            return None;
+        }
+        held = Some(f);
+    }
+    held
+}
+
+/// Move one leftover onto the shelf with one `renameat(2)` RELATIVE TO TWO HELD DIRECTORY HANDLES (#187): the
+/// source name is resolved inside the parent directory `verified_parent` just checked (its handle, held from
+/// the check to this call), the item name inside the freshly minted batch directory (this process created it
+/// exclusively at mode 0700 and holds its handle from before the first move). No full source path is
+/// re-resolved at rename time, so an ancestor swapped for a symlink between the re-check and this call cannot
+/// redirect the move onto a file outside the roots. This is the crate's second and last `unsafe`: one libc
+/// call taking two borrowed descriptors and two relative names — a filesystem name can never hold a NUL byte,
+/// so the two `CString`s are total, nothing is allocated beyond them, nothing is returned to free.
+fn rename_verified(parent: &File, name: &std::ffi::OsStr, batch: &File, item: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let old = CString::new(name.as_bytes()).map_err(|_| std::io::Error::other("a move name holds a nul byte"))?;
+    let new = CString::new(item).map_err(|_| std::io::Error::other("a move name holds a nul byte"))?;
+    let r = unsafe { renameat(parent.as_raw_fd(), old.as_ptr(), batch.as_raw_fd(), new.as_ptr()) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+extern "C" {
+    fn renameat(olddirfd: c_int, oldpath: *const c_char, newdirfd: c_int, newpath: *const c_char) -> c_int;
+}
+
 // ---------------------------------------------------------------- the sweep
 
 /// `harness quarantine sweep` with the real device probe. Returns the success stdout line or a stop.
@@ -474,6 +524,24 @@ pub fn sweep_cli(a: &[String]) -> Result<String, Stop> {
 /// differing ids (a test seam, named as such in the test; the real two-filesystem rename error is still covered
 /// fail-closed by construction — any rename error stops the sweep with exit 3).
 pub fn sweep_with_device_probe(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Option<u64>) -> Result<String, Stop> {
+    sweep_probed(a, device_of, &|_| {})
+}
+
+/// TEST SEAM (#187, named and documented exactly like `sweep_with_device_probe` above — no product caller may
+/// grow on it): the sweep with a caller-supplied step run between an item's ancestor re-check and its move, so a
+/// test can land an ancestor swap exactly inside that gap — deterministically, with no thread and no timing luck.
+/// The step receives the item's source path and runs only for items whose chain re-check PASSED (a skipped item
+/// never reaches its move, so the step never runs for it); everything else is the production code path, including
+/// the move itself.
+pub fn sweep_with_step_before_each_move(
+    a: &SweepArgs,
+    device_of: &dyn Fn(&Path) -> Option<u64>,
+    step: &dyn Fn(&Path),
+) -> Result<String, Stop> {
+    sweep_probed(a, device_of, step)
+}
+
+fn sweep_probed(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Option<u64>, step: &dyn Fn(&Path)) -> Result<String, Stop> {
     // Refusals first: every folder and placement check runs before anything is written.
     let ws = resolve_base_dir("--workspace-root", &a.workspace_root)?;
     let qd = resolve_base_dir("--quarantine-dir", &a.quarantine_dir)?;
@@ -553,31 +621,38 @@ pub fn sweep_with_device_probe(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Optio
     if leftovers.is_empty() {
         return Ok(format!("quarantine=done ticket={} moved=0", a.ticket));
     }
-    // The moves. Per item, in order: ANCESTOR RE-CHECK, journal intent (write-ahead), absent check, rename,
-    // event. The re-check (review r2, F2 / RACE-S): every ancestor the walk recorded must still be the SAME
-    // real directory — a no-follow stat, same dev, same ino, never a link. An ancestor swapped for a symlink
-    // in the gap between the walk and the move makes the sweep SKIP the item: nothing moved for it, no journal
-    // line, no event, and the run ends exit 3 naming the item token (never a path). A narrow window remains
-    // between this check and the rename itself; it is named under "v1 limits" in docs/quarantine.md.
+    // The moves. Per item, in order: ANCESTOR RE-CHECK (every recorded ancestor opened and the handle's stat
+    // matched against the walk's dev/ino), journal intent (write-ahead), absent check, rename RELATIVE TO THE
+    // VERIFIED PARENT HANDLE, event. The re-check (review r2, F2 / RACE-S, window closed by #187): every
+    // ancestor the walk recorded must still be the SAME real directory — same dev, same ino, a directory — and
+    // the immediate parent's HANDLE is held from the check to the rename, which names the item relative to that
+    // handle, never by a path re-resolved at rename time. An ancestor swapped for a symlink before the re-check
+    // makes the sweep SKIP the item: nothing moved for it, no journal line, no event, and the run ends exit 3
+    // naming the item token (never a path). A swap landing between the re-check and the rename can no longer
+    // redirect the move: the rename acts on the verified directory itself, so the file behind the swapped-in
+    // link — outside the roots — is never touched.
     let (batch_name, batch) = make_batch(&shelf, a.ts_ms)?;
+    let batch_dir = File::open(&batch).map_err(|_| err3("a quarantine batch could not be examined"))?;
     let mut moved = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for (n, lo) in leftovers.iter().enumerate() {
         let item = format!("i-{}", n + 1);
-        let chain_ok = lo.chain.iter().all(|(p, dev, ino)| match fs::symlink_metadata(p) {
-            Ok(m) => !m.file_type().is_symlink() && m.is_dir() && m.dev() == *dev && m.ino() == *ino,
-            Err(_) => false,
-        });
-        if !chain_ok {
+        let Some(parent) = verified_parent(&lo.chain) else {
             skipped.push(item);
             continue; // fail closed for THIS item: nothing moved for it, no journal line, no event
-        }
+        };
+        step(&lo.src); // the #187 TEST SEAM: runs exactly between the re-check and the move (no product effect)
         let dest = batch.join(&item);
         append_intent(&batch, &item, &lo.rel, "unmanifested")?;
         if fs::symlink_metadata(&dest).is_ok() {
             return Err(err3("a quarantine item name is already taken; nothing further was moved"));
         }
-        fs::rename(&lo.src, &dest).map_err(|_| err3("a move failed mid-run; already-moved items stay moved"))?;
+        let name = lo
+            .src
+            .file_name()
+            .ok_or_else(|| err3("a move failed mid-run; already-moved items stay moved"))?;
+        rename_verified(&parent, name, &batch_dir, &item)
+            .map_err(|_| err3("a move failed mid-run; already-moved items stay moved"))?;
         let from = from_rel(&a.ticket, &item, &lo.rel);
         let to = format!("{}/{}/{}", a.ticket, batch_name, item);
         write_quarantined_event(a, &from, &to, "unmanifested")?;
@@ -837,8 +912,9 @@ pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
 fn refuse_unless_single_thread() -> Result<(), Stop> {
     #[cfg(target_os = "macos")]
     let alone = {
-        // The crate's first and only `unsafe`: one call into libSystem, no arguments, a boolean query on this
-        // process's own thread list — it touches no resource, returns nothing to free, and cannot fail.
+        // One of the crate's two `unsafe` blocks (the other is `renameat` in the sweep's move): one call into
+        // libSystem, no arguments, a boolean query on this process's own thread list — it touches no resource,
+        // returns nothing to free, and cannot fail.
         extern "C" {
             fn pthread_is_threaded_np() -> i32;
         }

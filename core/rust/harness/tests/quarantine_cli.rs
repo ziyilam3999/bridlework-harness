@@ -1030,6 +1030,100 @@ fn sweep_ancestor_swap_never_moves_from_outside() {
     }
 }
 
+/// Ticket #187, the deterministic twin of `sweep_ancestor_swap_never_moves_from_outside` above: the sweep's
+/// move acts on the VERIFIED PARENT DIRECTORY (the handle whose dev/ino the re-check just matched), never on a
+/// path re-resolved at rename time. The swap lands EXACTLY between an item's ancestor re-check and its move
+/// because the library test seam `sweep_with_step_before_each_move` (named like `sweep_with_device_probe`)
+/// runs the caller's step there — no thread, no polling, no timing luck. The step swaps the item's parent
+/// (`a00`) for a symlink to an outside folder holding a file NAMED `c` with DIFFERENT bytes. The outside file
+/// must still exist at its outside path with its original bytes, nothing on the shelf may carry the outside
+/// bytes, the item that moves is the INSIDE file (through the handle, from the real directory), the journal
+/// lines match the quarantined events, and the process working directory is unchanged (the sweep must work
+/// from a threaded caller without changing it). RED on a build whose move reverts to a path-based
+/// `fs::rename` of the source path: that rename resolves `a00/c` through the swapped-in link and carries the
+/// OUTSIDE file onto the shelf, deterministically (10 of 10 runs, #187).
+#[test]
+fn sweep_swap_between_recheck_and_move_never_redirects() {
+    let f = fixture();
+    let ext = f.outside.join("ext-gap");
+    fs::create_dir_all(&ext).unwrap();
+    fs::write(ext.join("c"), b"outside-c").unwrap();
+    let a = f.root.join("a00");
+    fs::create_dir_all(&a).unwrap();
+    fs::write(a.join("c"), b"inside-c").unwrap();
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "live00", "--path", &s(&a.join("b")), "--dir", &s(&f.md)]);
+    let args = SweepArgs {
+        ticket: "t-1".to_string(),
+        manifest_dir: f.md.clone(),
+        workspace_root: f.ws.clone(),
+        quarantine_dir: f.q.clone(),
+        log: f.log.clone(),
+        repo: "r-1".to_string(),
+        role: "executor".to_string(),
+        model: "m-1".to_string(),
+        max_items: 1000,
+        ts_ms: 1731000000123,
+    };
+    let cwd_before = std::env::current_dir().unwrap();
+    // the sweep records sources against the CANONICAL root spelling, so the seam's expected parent is canonical too
+    let step_root = f.root.canonicalize().unwrap();
+    let step_ext = ext.clone();
+    let step = |src: &Path| {
+        let parent = src.parent().unwrap().to_path_buf();
+        assert_eq!(parent, step_root.join("a00"), "the seam sees the leftover's source path: {src:?}");
+        let old = step_root.join("a00-swapped");
+        // the swap lands exactly between the re-check and the move: the directory the re-check just verified
+        // is replaced by a symlink to the outside folder
+        fs::rename(&parent, &old).unwrap();
+        std::os::unix::fs::symlink(&step_ext, &parent).unwrap();
+    };
+    match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
+        Ok(line) => assert!(line.contains("moved=1"), "the inside item moved: {line}"),
+        Err(quarantine::Stop(c, line)) => {
+            assert!(c == 3, "exit 0 or 3, got {c}: {line}");
+            assert!(line.contains("parent chain"), "a refusal names the changed parent chain: {line}");
+        }
+    }
+    // the outside file never moved: still at its outside path, original bytes
+    assert!(ext.join("c").exists(), "ext-gap/c is gone from outside the roots");
+    assert_eq!(fs::read(ext.join("c")).unwrap(), b"outside-c", "ext-gap/c is intact");
+    // nothing on the shelf carries the outside bytes
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let mut outside_on_shelf = 0;
+    for b in &bs {
+        if let Ok(rd) = fs::read_dir(b) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(false)
+                    && fs::read(&p).map(|x| x == b"outside-c").unwrap_or(false)
+                {
+                    outside_on_shelf += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(outside_on_shelf, 0, "a file from OUTSIDE the roots landed on the shelf");
+    // the item that moved is the INSIDE file, byte-identical, moved through the verified parent handle
+    let item = bs[0].join("i-1");
+    assert!(fs::symlink_metadata(&item).is_ok(), "the inside item reached the shelf");
+    assert_eq!(fs::read(&item).unwrap(), b"inside-c", "the moved item is the INSIDE file, byte-identical");
+    // the swap really happened, exactly in the gap, and the real directory was moved aside, never followed
+    assert!(fs::symlink_metadata(&a).unwrap().file_type().is_symlink(), "the parent really was swapped for a link");
+    assert!(f.root.join("a00-swapped").exists(), "the real parent directory was moved aside");
+    assert!(!f.root.join("a00-swapped/c").exists(), "the inside leftover left the real directory");
+    // journal lines == quarantined events, always: none for a skipped item, one per moved item
+    let mut journal_lines = 0usize;
+    for b in &bs {
+        if let Ok(t) = fs::read_to_string(b.join("journal.jsonl")) {
+            journal_lines += t.lines().count();
+        }
+    }
+    assert_eq!(journal_lines, quarantined_lines(&f).len(), "one journal line per event");
+    // the sweep never changes the process working directory (it must work from a threaded caller)
+    assert_eq!(std::env::current_dir().unwrap(), cwd_before, "the working directory is unchanged");
+}
+
 /// Review r2, F3 (A8): a listed temp dir DEEPER than the filesystem's path limit (PATH_MAX) is
 /// still deleted — the fence walks the components one at a time from the validated root and the
 /// real-directory removal is `std::fs::remove_dir_all`, which recurses by openat with no path
