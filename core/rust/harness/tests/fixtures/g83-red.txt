@@ -1,0 +1,13 @@
+# G8.3 red fixture (docs/fix-tier.md): one row per bad condition, labelled r1..r7.
+# Decision rows: id|lesson|status|proven|requested|reason|default  ('-' = the slot is absent)
+# Config rows:   id|cfg|design_tier  ('-' = the key is absent from the file)
+# Every row carries its bad condition. Rows r1, r4, r5 are hard refusals; rows r2, r3
+# refuse the lesson's tier claim (the only dispatch allowed is at default_main, never
+# the lesson's); rows r6, r7 are config refusals.
+r1|lesson-r1|validated|T2|T3|-|T2
+r2|lesson-r2|validated|unproven|T1|-|T3
+r3|lesson-r3|unvalidated|T1|-|-|T3
+r4|lesson-r4|validated|T3|T2|cheaper-is-enough|T3
+r5|lesson-r5|validated|T2|synth-model-4x|-|T2
+r6|cfg|T4
+r7|cfg|-

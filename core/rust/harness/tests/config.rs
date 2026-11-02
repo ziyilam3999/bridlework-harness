@@ -2,7 +2,7 @@
 //! and scratch repos under the system temp folder. The config source is set only on the child (`.env`, `.env_remove`); this file never reads one.
 //! Each refusal has a planted failing twin: the same run with one thing changed that a wrong implementation would get wrong.
 #![cfg(unix)]
-use harness::config::{Config, INBOX_KEY, KEYS};
+use harness::config::{Config, DESIGN_TIER_KEY, INBOX_KEY, KEYS};
 use harness::repo_id::RepoId;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,7 +84,7 @@ fn leaks(o: &Output, needle: &str) -> bool {
 /// A full valid config. `repos` is the body of the `repos` section; `s_tokens` is the value planted on one budget key.
 fn make(repos: &str, s_tokens: &str) -> String {
     format!(
-        "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: {s_tokens}\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n"
+        "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: {s_tokens}\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n\nfactory:\n  design_tier: T3\n"
     )
 }
 
@@ -95,7 +95,7 @@ fn valid() -> String {
 /// A config with distinct planted budget pairs per size.
 fn budgets(s: (u64, u64), m: (u64, u64), l: (u64, u64)) -> String {
     format!(
-        "repos:\n\nbudgets:\n  s_wall_seconds: {}\n  s_tokens: {}\n  m_wall_seconds: {}\n  m_tokens: {}\n  l_wall_seconds: {}\n  l_tokens: {}\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n",
+        "repos:\n\nbudgets:\n  s_wall_seconds: {}\n  s_tokens: {}\n  m_wall_seconds: {}\n  m_tokens: {}\n  l_wall_seconds: {}\n  l_tokens: {}\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n\nfactory:\n  design_tier: T3\n",
         s.0, s.1, m.0, m.1, l.0, l.1
     )
 }
@@ -449,6 +449,7 @@ fn pin(text: &str) -> Result<(), String> {
             }
             "lanes" if v != "4" => return Err(format!("lanes {k} is not 4")),
             "friction" if v != "/placeholder/friction-inbox.jsonl" => return Err(format!("friction {k} is not the placeholder")),
+            "factory" if v != "T3" => return Err(format!("factory {k} is not T3")),
             _ => {}
         }
         keys.push(format!("{section}.{k}"));
@@ -456,6 +457,7 @@ fn pin(text: &str) -> Result<(), String> {
     keys.sort();
     let mut want: Vec<String> = KEYS.iter().map(|k| k.to_string()).collect();
     want.push(INBOX_KEY.to_string());
+    want.push(DESIGN_TIER_KEY.to_string());
     want.sort();
     if keys != want {
         return Err("the key set differs from config::KEYS plus INBOX_KEY".to_string());
@@ -477,6 +479,8 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
         ("lanes count 9", text.replace("  count: 4", "  count: 9")),
         ("inbox not the placeholder", text.replace("/placeholder/friction-inbox.jsonl", "/real/inbox.jsonl")),
         ("missing inbox", text.replace("\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl", "")),
+        ("design tier t1", text.replace("  design_tier: T3", "  design_tier: T1")),
+        ("missing design tier", text.replace("\nfactory:\n  design_tier: T3", "")),
     ];
     for (label, t) in &twins {
         assert_ne!(t, &text, "{label}: the twin must differ from the example");
@@ -490,7 +494,7 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
 fn config_v3_requires_friction_inbox() {
     let t = Tmp::new();
     // A v2 file (every v2 key present, no `friction` section) is refused naming `friction.inbox`.
-    let v2: String = valid().replace("\nfriction:\n  inbox: /synthetic-inbox.jsonl\n", "\n");
+    let v2: String = valid().replace("\nfriction:\n  inbox: /synthetic-inbox.jsonl\n\nfactory:\n  design_tier: T3\n", "\n");
     let o = check(&t.file("v2.yaml", v2), &[]);
     refused_clean(&o);
     assert!(err(&o).contains("friction.inbox"), "must name the key: {}", err(&o));
@@ -506,4 +510,68 @@ fn config_v3_requires_friction_inbox() {
     // Twin: the same file with the key present loads, and the public example (placeholder value) loads as-is.
     assert_eq!(code(&check(&t.file("v3.yaml", valid()), &[])), 0);
     assert_eq!(code(&run(&["config", "check", "--config", EXAMPLE], None, None)), 0);
+}
+
+// ---- AC 7 (config v4, ticket 190): `factory.design_tier` is required, a tier, never a brand ----
+
+/// A full valid config text with one planted `factory.design_tier` value; `None` leaves the whole
+/// `factory` section out.
+fn with_design_tier(v: Option<&str>) -> String {
+    let factory = match v {
+        Some(v) => format!("factory:\n  design_tier: {v}\n"),
+        None => String::new(),
+    };
+    format!(
+        "repos:\n\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: 1\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n\n{factory}"
+    )
+}
+
+#[test]
+fn design_tier_t3_loads() {
+    // T3 loads, is read from the text (not compiled in), and so do T1 and T2; the check passes.
+    let cfg = Config::parse(&with_design_tier(Some("T3"))).unwrap();
+    assert_eq!(cfg.design_tier(), harness::fix_tier::Tier::T3);
+    assert_eq!(Config::parse(&with_design_tier(Some("T1"))).unwrap().design_tier(), harness::fix_tier::Tier::T1);
+    assert_eq!(Config::parse(&with_design_tier(Some("T2"))).unwrap().design_tier(), harness::fix_tier::Tier::T2);
+    let t = Tmp::new();
+    let o = check(&t.file("t3.yaml", with_design_tier(Some("T3"))), &[]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+}
+
+#[test]
+fn design_tier_missing_refused() {
+    let t = Tmp::new();
+    // A v3 file (no `factory` section) is refused naming the full key, and so is an empty section.
+    let o = check(&t.file("v3.yaml", with_design_tier(None)), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("factory.design_tier"), "{}", err(&o));
+    let empty_sec = with_design_tier(Some("T3")).replace("factory:\n  design_tier: T3", "factory:");
+    let o = check(&t.file("empty.yaml", empty_sec), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("factory.design_tier"), "{}", err(&o));
+}
+
+#[test]
+fn design_tier_brand_refused_without_echo() {
+    let t = Tmp::new();
+    // A brand-shaped value (a model name, not a tier) is refused naming the section, the key and the
+    // line, and never echoes the planted value.
+    let planted = "synth-model-4x";
+    let o = check(&t.file("brand.yaml", with_design_tier(Some(planted))), &[]);
+    refused_clean(&o);
+    let e = err(&o);
+    assert!(e.contains("factory") && e.contains("design_tier") && e.contains("line "), "{e}");
+    assert!(!e.contains(planted), "the refusal echoed the value: {e}");
+    // T4 and lowercase are refused too, never echoing the value.
+    for bad in ["T4", "t3"] {
+        let o = check(&t.file("bad.yaml", with_design_tier(Some(bad))), &[]);
+        refused_clean(&o);
+        let e = err(&o);
+        assert!(e.contains("factory") && e.contains("design_tier"), "{bad}: {e}");
+        assert!(!e.contains(bad), "{bad}: the refusal echoed the value: {e}");
+    }
+    // Twin: the same file with T3 in the slot loads.
+    let twin = with_design_tier(Some(planted)).replace(planted, "T3");
+    let o = check(&t.file("twin.yaml", twin), &[]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
 }
