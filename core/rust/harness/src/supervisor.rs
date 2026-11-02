@@ -195,7 +195,7 @@ fn kill_own_spawn(child: &mut Child, pid: u64) -> Result<(), String> {
         reason.get_or_insert_with(|| format!("cannot kill the started pid {} (std): {}", pid, e.kind()));
     }
     if let Err(e) = reap_bounded(child, REAP_BOUND_MS) {
-        reason.get_or_insert_with(|| e);
+        reason.get_or_insert(e);
     }
     match reason {
         Some(r) => Err(r),

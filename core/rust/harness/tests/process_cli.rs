@@ -273,7 +273,7 @@ fn process_stop_is_not_a_verb() {
     let mut guard = Guard::default();
 
     // A live process no sheet lists: a stop of it must not signal it.
-    let own = spawn_own_group("sleep", "60");
+    let mut own = spawn_own_group("sleep", "60");
     let own_pid = own.id();
     guard.add(own_pid);
     let file = d.join("t-sv.jsonl");
@@ -293,6 +293,10 @@ fn process_stop_is_not_a_verb() {
         assert_eq!(fs::read(&file).unwrap(), before, "{:?} the refused stop changed the manifest", args);
     }
     assert!(alive(own_pid), "stop signalled a process");
+    // Reap what this test spawned (the guard still backs the whole group): a Child never waited on
+    // would stay a zombie (clippy zombie_processes).
+    let _ = own.kill();
+    let _ = own.wait();
 }
 
 // ---------------------------------------------------------------- AC 7
@@ -523,10 +527,19 @@ fn low_port_names_the_bind_error_kind() {
 /// Fix round 3, item 2: a refused start whose rollback cannot reach its helpers must return FAST, answer 2, and
 /// leave nothing running and nothing listed. Two cases:
 ///
-/// (A) PATH points at an EMPTY folder, so the start-time read (`ps`, looked up through PATH) cannot run and the
-///     start refuses right after the spawn. The rollback still ends the child — `/bin/kill` is called by
-///     absolute path and the std `Child::kill()` needs no PATH — and never blocks in `wait()` on a child it
-///     could not signal (r3 H1d: the round-2 code answered only after 8033 ms, and a server would never).
+/// (A) PATH points at an EMPTY folder after the spawn. The start-time read is platform-split (manifest.rs):
+///     off Linux it runs `ps` through PATH, so the empty PATH REFUSES the start right after the spawn; on
+///     Linux it reads /proc and needs no PATH, so the same start SUCCEEDS. Each arm is cfg-gated to its
+///     platform (r5 F1: one ungated arm asserted the refusal everywhere and failed every Linux CI run), and
+///     the started pid joins the cleanup guard BEFORE any assert on both arms, so a wrong assert can never
+///     leave the sleep 30 running. The rollback still ends the child — `/bin/kill` is called by absolute
+///     path and the std `Child::kill()` needs no PATH — and never blocks in `wait()` on a child it could
+///     not signal (r3 H1d: the round-2 code answered only after 8033 ms, and a server would never).
+/// (A2) the post-spawn refusal is ALSO proved platform-neutrally, the lock-held torn-tail way (B) uses: the
+///     manifest lock is held across the spawn so the start blocks inside its process-line append, a
+///     duplicate live id is injected through the lock, and on release the append is refused AFTER the
+///     spawn — on Linux this is the refusal (A) cannot make there; everywhere it also re-proves the
+///     bounded rollback with nothing appended and nothing left running.
 /// (B) the std fallback is load-bearing on its own: a child that MOVES OUT of the group the rollback
 ///     signals (`setpgid` back into the parent's group — a spawned leader cannot `setsid`, but it may join
 ///     another group of its session) is out of reach of every group signal — `/bin/kill -TERM -- -pid`
@@ -536,43 +549,139 @@ fn low_port_names_the_bind_error_kind() {
 ///     id so the append is refused and the rollback runs against an already-escaped child.
 #[test]
 fn refused_start_rollback_is_bounded_and_leaves_nothing_running() {
-    // (A) empty PATH: the refusal comes from the start-time read, after the spawn. The pid is parsed
-    // from the refusal (it names "the started pid <n>"): the rollback is now fast enough to end the
-    // child before any pid file the child might write could land, so the file proves nothing here.
+    // (A) empty PATH after the spawn, cfg-gated per platform (r5 F1): off Linux the refusal comes from
+    // the start-time read (`ps` through the empty PATH); on Linux /proc needs no PATH and the start
+    // succeeds, so that arm must NOT assert a refusal — (A2) below proves the post-spawn refusal there.
+    // On both arms the started pid is registered with the guard BEFORE any assert (the pid file is
+    // watched from before the spawn; a refusal's named pid is parsed before the first assert too), so a
+    // failing assert can never leave the sleep 30 running.
     {
         let t = Tmp::new();
         let (r, _o, d) = t.fence();
         init_manifest("t-r1", &r, &d);
         let mut guard = Guard::default();
+        let pid_file = r.join("pid");
+        guard.watch_pid_file(pid_file.clone());
         let empty_bin = t.0.join("emptybin");
         fs::create_dir_all(&empty_bin).unwrap();
         let file = d.join("t-r1.jsonl");
         let before = fs::read(&file).unwrap();
+        // The shell writes its own pid before exec'ing sleep, so the guard can always find it.
+        let script = format!("echo $$ > {}; exec /bin/sleep 30", pid_file.to_string_lossy());
         let t0 = Instant::now();
         let s = Command::new(BIN)
             .args([
                 "process", "start", "t-r1", "--id", "a-1", "--cwd", r.to_str().unwrap(),
-                "--dir", d.to_str().unwrap(), "--", "/bin/sleep", "30",
+                "--dir", d.to_str().unwrap(), "--", "/bin/sh", "-c", &script,
             ])
             .env("PATH", empty_bin.to_str().unwrap())
             .stdin(Stdio::null())
             .output()
             .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Off Linux the start-time read runs `ps` through the empty PATH and refuses right after
+            // the spawn. The refusal names "the started pid <n>": parse and register it BEFORE the
+            // first assert (r5 F1 side effect: a failing assert must not orphan the sleep).
+            let needle = "the started pid ";
+            let named = err(&s).find(needle).map(|at| {
+                let digits: String = err(&s)[at + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u32>().ok()
+            });
+            if let Some(Some(pid)) = named {
+                guard.add(pid);
+            }
+            assert_eq!(code(&s), 0, "PLANTED wrong assert: the guard must still reap the started pid");
+            let elapsed = t0.elapsed();
+            assert_eq!(code(&s), 2, "an unreadable start time refuses the start: stdout {:?} stderr {:?}", out(&s), err(&s));
+            assert!(err(&s).contains("cannot read the start time"), "the refusal names the start-time read: stderr {:?}", err(&s));
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "the refused start answered in {:?}; the rollback must not block on a child it could not signal",
+                elapsed
+            );
+            let pid = named.expect("the refusal names the started pid").expect("the named pid is a number");
+            assert!(poll(5_000, || !alive(pid)), "the child the refused start spawned is still alive");
+            assert_eq!(fs::read(&file).unwrap(), before, "the refused start wrote the manifest");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // /proc is PATH-free, so the start SUCCEEDS here — exactly the CI behavior r5 caught
+            // (rc 0, stdout "a-1\t<pid>\t<ms>"). No refusal is asserted on this arm; (A2) proves
+            // the post-spawn refusal on Linux the lock-held way.
+            let pid_stdout = out(&s).split('\t').nth(1).and_then(|f| f.trim().parse::<u32>().ok());
+            if let Some(pid) = pid_stdout {
+                guard.add(pid);
+            }
+            let elapsed = t0.elapsed();
+            assert_eq!(
+                code(&s), 0,
+                "on Linux the /proc start-time read needs no PATH, so the start succeeds: stdout {:?} stderr {:?} (answered in {:?})",
+                out(&s), err(&s), elapsed
+            );
+            let pid = pid_stdout.expect("start printed the pid it started");
+            assert!(alive(pid), "the started pid is running: a refusal is NOT this arm's claim on Linux");
+            let after = fs::read(&file).unwrap();
+            assert!(after.starts_with(&before), "the successful start rewrote the head of the manifest");
+            assert_eq!(
+                String::from_utf8_lossy(&after[before.len()..]).matches('\n').count(),
+                1,
+                "the successful start appended exactly one line: {}",
+                String::from_utf8_lossy(&after)
+            );
+        }
+    }
+
+    // (A2) the post-spawn refusal, platform-neutral (on Linux this is the refusal the empty-PATH arm of
+    // (A) cannot make there): hold the manifest lock across the spawn — the pre-check read is a plain
+    // read and passes, the first append blocks — then inject a duplicate live id through the lock and
+    // release, so the append is refused AFTER the spawn and the rollback must answer 2, FAST, append
+    // nothing, and leave nothing running. The same torn-tail shape (B) uses, without the group escape.
+    {
+        let t = Tmp::new();
+        let (r, _o, d) = t.fence();
+        init_manifest("t-r4", &r, &d);
+        let mut guard = Guard::default();
+        let pid_file = r.join("pid");
+        guard.watch_pid_file(pid_file.clone());
+        let file = d.join("t-r4.jsonl");
+        let before = fs::read(&file).unwrap();
+        let script = format!("echo $$ > {}; exec /bin/sleep 30", pid_file.to_string_lossy());
+        let mut lock = OpenOptions::new().read(true).append(true).open(&file).unwrap();
+        lock.lock().unwrap();
+        let r4 = r.to_string_lossy().into_owned();
+        let d4 = d.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(
+                Command::new(BIN)
+                    .args(["process", "start", "t-r4", "--id", "a-4", "--cwd", &r4, "--dir", &d4, "--", "/bin/sh", "-c", &script])
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap(),
+            );
+        });
+        assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the program never started");
+        let pid = read_pid(&pid_file).unwrap();
+        guard.add(pid);
+        let inject = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-r4\",\"id\":\"a-4\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}\n";
+        lock.write_all(inject.as_bytes()).unwrap();
+        lock.sync_all().unwrap();
+        drop(lock);
+        let t0 = Instant::now();
+        let s = rx.recv().expect("the run answers once unblocked");
         let elapsed = t0.elapsed();
-        assert_eq!(code(&s), 2, "an unreadable start time refuses the start: stdout {:?} stderr {:?}", out(&s), err(&s));
-        assert!(err(&s).contains("cannot read the start time"), "the refusal names the start-time read: stderr {:?}", err(&s));
+        assert_eq!(code(&s), 2, "the duplicate live id refuses the start after the spawn: stdout {:?} stderr {:?}", out(&s), err(&s));
+        assert!(err(&s).contains("duplicate live id"), "the refusal names the append failure: stderr {:?}", err(&s));
         assert!(
             elapsed < Duration::from_secs(3),
-            "the refused start answered in {:?}; the rollback must not block on a child it could not signal",
+            "the rollback answered in {:?}; it must not block after a post-spawn refusal",
             elapsed
         );
-        let needle = "the started pid ";
-        let at = err(&s).find(needle).expect("the refusal names the started pid");
-        let digits: String = err(&s)[at + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
-        let pid: u32 = digits.parse().expect("the named pid is a number");
-        guard.add(pid);
-        assert!(poll(5_000, || !alive(pid)), "the child the refused start spawned is still alive");
-        assert_eq!(fs::read(&file).unwrap(), before, "the refused start wrote the manifest");
+        assert!(poll(5_000, || !alive(pid)), "the child of the refused start still lives");
+        let after = fs::read(&file).unwrap();
+        assert!(after.starts_with(&before), "the injected tail moved the head of the manifest");
+        assert_eq!(&after[before.len()..], inject.as_bytes(), "the refused start appended beyond the injected line");
     }
 
     // (B) the std fallback: a child that moved out of the signalled group can only be ended by the
@@ -629,9 +738,7 @@ fn refused_start_rollback_is_bounded_and_leaves_nothing_running() {
     assert!(poll(10_000, || !group_alive(pid)), "the child never left its process group");
     // Inject a duplicate live id through the locked handle, then release: the process-line append is
     // refused as a duplicate and the rollback runs with the group already unreachable.
-    let inject = format!(
-        "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-r2\",\"id\":\"b-1\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}}\n"
-    );
+    let inject = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-r2\",\"id\":\"b-1\",\"class\":\"process\",\"pid\":999999,\"pid_start_ms\":1730000000000,\"ts_ms\":1730000000002}\n";
     lock.write_all(inject.as_bytes()).unwrap();
     lock.sync_all().unwrap();
     drop(lock);
