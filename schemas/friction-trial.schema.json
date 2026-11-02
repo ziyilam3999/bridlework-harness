@@ -1,0 +1,29 @@
+{
+  "title": "friction-trial",
+  "description": "One appended line of the friction trial record, written by `harness friction patterns --record <file>` (ticket 192). The record is the keep-or-remove evidence for the kind/repeats feature: one line per weekly listing run, so that if nothing ever reaches the threshold in 4 weekly records, Governance removes the fields. The crate is the only writer; a reader checks the four keys and nothing else.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["date", "threshold", "rows", "listed"],
+  "properties": {
+    "date": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "The UTC calendar date of the listing run, written by the harness, never caller-supplied."
+    },
+    "threshold": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The N in force for this run: `friction.pattern_threshold` from the config, or the default 3 when the key is absent."
+    },
+    "rows": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Every row the inbox held at the run (friction rows included): the denominator that shows how small the feature's footprint is."
+    },
+    "listed": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+      "description": "The ids of the chain-root pattern rows whose repeat count reached the threshold, in id order. Ids only: a row's text is never recorded."
+    }
+  }
+}

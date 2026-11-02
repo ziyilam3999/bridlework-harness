@@ -18,6 +18,12 @@ use std::path::Path;
 pub const TAGS: [&str; 4] = ["skill", "gate", "memory", "wiki"];
 /// The row fields in canonical order (the JSON key order this module writes).
 pub const FIELDS: [&str; 6] = ["id", "date", "ticket", "where-it-lives", "breaks", "text"];
+/// The two optional fields (ticket 192): `kind` (the row's class, default `friction`) and `repeats` (the id of
+/// the pattern row this row repeats). Both are omitted from the canonical line at their defaults, so every
+/// six-key row written before this contract re-encodes byte-identical.
+pub const OPTIONAL_FIELDS: [&str; 2] = ["kind", "repeats"];
+/// The two legal `kind` values (the default, `friction`, needs no key).
+pub const KINDS: [&str; 2] = ["friction", "pattern"];
 /// One encoded row, bytes, including the trailing newline this module always writes.
 pub const LINE_CAP: usize = 16 * 1024;
 /// The whole inbox is read no further than this; past it the verb fails closed (exit 2).
@@ -25,7 +31,9 @@ const INBOX_CAP: u64 = 4 * 1024 * 1024;
 /// A close note is read no further than this; past it the check fails closed (exit 2).
 const NOTE_CAP: u64 = 1024 * 1024;
 
-/// One inbox row. `breaks` is empty or the id of the lesson that broke again (K-1 rule 3).
+/// One inbox row. `breaks` is empty or the id of the lesson that broke again (K-1 rule 3). `kind` is empty
+/// (= `friction`), `friction` or `pattern`; `repeats` is empty or the id of the `kind: pattern` row this row
+/// repeats (ticket 192). A `pattern` row with no `repeats` is the root of its chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
@@ -34,6 +42,8 @@ pub struct Row {
     pub tag: String,
     pub breaks: String,
     pub text: String,
+    pub kind: String,
+    pub repeats: String,
 }
 
 /// `YYYY-MM-DD` naming a real calendar date (month 1-12, the day inside that month, leap years included).
@@ -87,6 +97,12 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
     }
     if row.text.trim().is_empty() {
         return Err("text is empty: a lesson row carries its lesson".to_string());
+    }
+    if !row.kind.is_empty() && !KINDS.contains(&row.kind.as_str()) {
+        return Err("kind must be friction or pattern (empty means friction)".to_string());
+    }
+    if !row.repeats.is_empty() && !token_ok(&row.repeats) {
+        return Err("repeats must be empty or a plain row id (lowercase letters, digits, '-', '_', '.')".to_string());
     }
     Ok(())
 }
@@ -241,19 +257,23 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
     }
     let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     for (k, _) in &pairs {
-        if !FIELDS.contains(&k.as_str()) {
-            return Err("an unknown field: a row has exactly the six contract fields".to_string());
+        if !FIELDS.contains(&k.as_str()) && !OPTIONAL_FIELDS.contains(&k.as_str()) {
+            return Err("an unknown field: a row has exactly the six contract fields plus the two optional ones (kind, repeats)".to_string());
         }
     }
-    let mut row = Row { id: String::new(), date: String::new(), ticket: String::new(), tag: String::new(), breaks: String::new(), text: String::new() };
+    let mut row = Row { id: String::new(), date: String::new(), ticket: String::new(), tag: String::new(), breaks: String::new(), text: String::new(), kind: String::new(), repeats: String::new() };
     for (k, slot) in [("id", &mut row.id), ("date", &mut row.date), ("ticket", &mut row.ticket), ("where-it-lives", &mut row.tag), ("breaks", &mut row.breaks), ("text", &mut row.text)] {
         *slot = get(k).ok_or_else(|| format!("missing field {k:?}"))?;
     }
+    // The two optional fields default to their defaults when absent; an explicit empty value reads the same.
+    row.kind = get("kind").unwrap_or_default();
+    row.repeats = get("repeats").unwrap_or_default();
     validate_row(&row)?;
     Ok(row)
 }
 
-/// Canonical line WITHOUT its newline: the six fields in `FIELDS` order. Refuses an invalid row and a line over the cap.
+/// Canonical line WITHOUT its newline: the six fields in `FIELDS` order, then `kind` and `repeats` when they are
+/// not at their defaults (`kind` empty or `friction`, `repeats` empty). Refuses an invalid row and a line over the cap.
 pub fn encode_row(row: &Row) -> Result<String, String> {
     validate_row(row)?;
     let mut line = String::from("{");
@@ -262,6 +282,12 @@ pub fn encode_row(row: &Row) -> Result<String, String> {
             line.push(',');
         }
         line.push_str(&format!("{}:{}", jstr(k), jstr(v)));
+    }
+    if !row.kind.is_empty() && row.kind != "friction" {
+        line.push_str(&format!(",{}:{}", jstr("kind"), jstr(&row.kind)));
+    }
+    if !row.repeats.is_empty() {
+        line.push_str(&format!(",{}:{}", jstr("repeats"), jstr(&row.repeats)));
     }
     line.push('}');
     if line.len() + 1 > LINE_CAP {
@@ -335,8 +361,9 @@ pub fn lint_text(text: &str) -> Inbox {
     out
 }
 
-/// The six fields of a row as (name, value) pairs in `FIELDS` order: the one list every privacy scan walks.
-fn row_fields(row: &Row) -> [(&'static str, &str); 6] {
+/// The fields of a row as (name, value) pairs in canonical order (the six required, then the two optional):
+/// the one list every privacy scan walks.
+fn row_fields(row: &Row) -> [(&'static str, &str); 8] {
     [
         ("id", row.id.as_str()),
         ("date", row.date.as_str()),
@@ -344,6 +371,8 @@ fn row_fields(row: &Row) -> [(&'static str, &str); 6] {
         ("where-it-lives", row.tag.as_str()),
         ("breaks", row.breaks.as_str()),
         ("text", row.text.as_str()),
+        ("kind", row.kind.as_str()),
+        ("repeats", row.repeats.as_str()),
     ]
 }
 
@@ -364,18 +393,22 @@ pub fn privacy_problems(ctx: &crate::scan::Ctx, rows: &[(usize, Row)]) -> Vec<(u
     out
 }
 
-/// The cross-row pass a whole-file lint runs after every line parsed: duplicate ids across the file and `breaks`
-/// references (forward and back, and a row naming itself). `add` runs the same rules against the inbox plus its one
+/// The cross-row pass a whole-file lint runs after every line parsed: duplicate ids across the file, `breaks`
+/// references (forward and back, and a row naming itself), and the `repeats` pointer rules (ticket 192: a
+/// pointer must name an existing row, never itself; the row carrying it must be `kind: pattern`; and the row it
+/// names must be a `kind: pattern` chain ROOT — a pattern row with an empty `repeats` — so the repeat count of
+/// a chain is one unambiguous number). `add` runs the same rules against the inbox plus its one
 /// new row, so the verb and the lint can never disagree about what a good inbox is. The reasons name the field
 /// only: a row value that has not passed the privacy scan is never echoed.
 pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
-    // Linear by construction: two HashSets built in single passes, so a full-cap inbox (40001 rows) costs
-    // one pass, not a pass per row — the check runs INSIDE the writer lock, so a quadratic scan would hold
-    // the lock long enough to turn concurrent losers into busy timeouts instead of duplicate refusals.
+    // Linear by construction: the id sets and the id -> row map are built in single passes, so a full-cap
+    // inbox (40001 rows) costs one pass, not a pass per row — the check runs INSIDE the writer lock, so a
+    // quadratic scan would hold the lock long enough to turn concurrent losers into busy timeouts instead
+    // of duplicate refusals.
     let mut problems = Vec::new();
-    let mut ids: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(rows.len());
+    let mut by_id: std::collections::HashMap<&str, &Row> = std::collections::HashMap::with_capacity(rows.len());
     for (_, r) in rows {
-        ids.insert(r.id.as_str());
+        by_id.insert(r.id.as_str(), r);
     }
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(rows.len());
     for (line, row) in rows {
@@ -385,8 +418,21 @@ pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
         if !row.breaks.is_empty() {
             if row.breaks == row.id {
                 problems.push((*line, "breaks names its own row: a lesson cannot break itself".to_string()));
-            } else if !ids.contains(row.breaks.as_str()) {
+            } else if !by_id.contains_key(row.breaks.as_str()) {
                 problems.push((*line, "breaks names no lesson in the inbox".to_string()));
+            }
+        }
+        if !row.repeats.is_empty() {
+            if row.repeats == row.id {
+                problems.push((*line, "repeats names its own row: a pattern cannot repeat itself".to_string()));
+            } else if !by_id.contains_key(row.repeats.as_str()) {
+                problems.push((*line, "repeats names no row in the inbox".to_string()));
+            } else if row.kind != "pattern" {
+                problems.push((*line, "repeats is allowed only on a kind: pattern row".to_string()));
+            } else if by_id[row.repeats.as_str()].kind != "pattern" {
+                problems.push((*line, "repeats must name a kind: pattern row (its chain root)".to_string()));
+            } else if !by_id[row.repeats.as_str()].repeats.is_empty() {
+                problems.push((*line, "repeats must name the chain root: the row it names itself carries repeats".to_string()));
             }
         }
     }
@@ -526,7 +572,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction close-check <close-note> --ticket <t> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -558,6 +604,7 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     match sub.as_str() {
         "add" => add_cmd(rest, testmode),
         "lint" => lint_cmd(rest, testmode),
+        "patterns" => patterns_cmd(rest, testmode),
         "close-check" => close_check_cmd(rest, testmode),
         _ => {
             eprintln!("{}", FRICTION_USAGE);
@@ -592,15 +639,15 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
         eprintln!("harness: ROW NOT RECORDED");
         1
     };
-    let single = ["config", "id", "date", "ticket", "where-it-lives", "breaks", "text"];
+    let single = ["config", "id", "date", "ticket", "where-it-lives", "breaks", "text", "kind", "repeats"];
     let mut o: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         let Some(name) = arg.strip_prefix("--") else {
-            return fail("an unexpected argument (only the seven flags of the usage line are allowed)");
+            return fail("an unexpected argument (only the nine flags of the usage line are allowed)");
         };
         if !single.contains(&name) {
-            return fail("an unknown option (the usage line lists the seven flags)");
+            return fail("an unknown option (the usage line lists the nine flags)");
         }
         let Some(v) = it.next() else {
             return fail("a flag is missing its value");
@@ -633,6 +680,8 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
         tag: o["where-it-lives"].clone(),
         breaks: o.get("breaks").cloned().unwrap_or_default(),
         text: o["text"].clone(),
+        kind: o.get("kind").cloned().unwrap_or_default(),
+        repeats: o.get("repeats").cloned().unwrap_or_default(),
     };
     if let Err(e) = validate_row(&row) {
         return refuse(&e);
@@ -747,6 +796,138 @@ fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
         return 1;
     }
     println!("inbox ok rows={}", inbox.rows.len());
+    0
+}
+
+/// Today's UTC date as `YYYY-MM-DD` (std only: days since the epoch to the civil calendar). The trial
+/// record's date, nothing more.
+fn today_utc() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let z = (secs / 86400) as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `harness friction patterns [--config <file>] [--record <file>]` (ticket 192): the N-threshold listing.
+/// Runs the FULL lint first (any lint failure = the same exit and stderr as `lint`, nothing on stdout); then
+/// prints one line per chain-root pattern row whose count of `repeats` rows is >= N (`friction.pattern_threshold`,
+/// default 3), sorted by id — `pattern id=<id> repeats=<n>` — and one closing line `patterns ok threshold=<N>
+/// listed=<k>`. Ids and counts only: a row's text is never printed. Nothing is written except, when `--record`
+/// is given, ONE appended JSONL trial line (`schemas/friction-trial.schema.json`). Being listed creates zero
+/// files under any skill or ticket path. Exit codes as the family: 0 ok; 1 a refusal (the lint leg); 2 a usage
+/// or setup error (and a failed record append, so a half-written trial never reads as a clean run).
+pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    let mut file: Option<&str> = None;
+    let mut record: Option<&str> = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => {
+                let Some(v) = it.next() else {
+                    return fail("--config is missing its value");
+                };
+                if file.replace(v.as_str()).is_some() {
+                    return fail("--config was given twice");
+                }
+            }
+            "--record" => {
+                let Some(v) = it.next() else {
+                    return fail("--record is missing its value");
+                };
+                if record.replace(v.as_str()).is_some() {
+                    return fail("--record was given twice");
+                }
+            }
+            _ => {
+                // A constant message: the argument bytes have passed no privacy scan, so they are never echoed.
+                return fail("an unknown option (patterns takes only --config <file> and --record <file>)");
+            }
+        }
+    }
+    let cfg = match config_path(file) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let cfg = match crate::config::Config::load(&cfg) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    // The listing reads the inbox, so it runs the same privacy engine and fails closed without a list,
+    // exactly like `add`, `lint` and `close-check`.
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => return fail("no privacy list configured: an unscanned inbox is never listed"),
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    let inbox = match read_inbox(std::path::Path::new(cfg.friction_inbox())) {
+        Ok(i) => i,
+        Err(e) => return fail(&e),
+    };
+    // The full lint, byte for byte the `lint` verb's refusal behaviour.
+    if let Some(n) = inbox.torn_tail {
+        eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
+        return 1;
+    }
+    let mut problems = inbox.problems;
+    problems.extend(privacy_problems(&ctx, &inbox.rows));
+    if !problems.is_empty() {
+        for (n, m) in &problems {
+            eprintln!("harness: inbox line {n}: {m}");
+        }
+        return 1;
+    }
+    // The count is mechanical, never judged (the design rule): every row whose `repeats` names a root adds one
+    // to that root's count; a root is a `kind: pattern` row with an empty `repeats`.
+    let threshold = cfg.pattern_threshold();
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, row) in &inbox.rows {
+        if !row.repeats.is_empty() {
+            *counts.entry(row.repeats.as_str()).or_default() += 1;
+        }
+    }
+    let mut roots: Vec<(String, usize)> = inbox
+        .rows
+        .iter()
+        .filter(|(_, r)| r.kind == "pattern" && r.repeats.is_empty())
+        .map(|(_, r)| (r.id.clone(), counts.get(r.id.as_str()).copied().unwrap_or(0)))
+        .filter(|(_, n)| *n >= threshold as usize)
+        .collect();
+    roots.sort();
+    // The trial record is appended BEFORE anything is printed, so a failed append is a clean exit 2 with an
+    // empty stdout, never a printed listing the record disagrees with.
+    if let Some(path) = record {
+        let listed: Vec<String> = roots.iter().map(|(id, _)| jstr(id)).collect();
+        let line = format!(
+            "{{\"date\":{},\"threshold\":{},\"rows\":{},\"listed\":[{}]}}\n",
+            jstr(&today_utc()),
+            threshold,
+            inbox.rows.len(),
+            listed.join(",")
+        );
+        let mut f = match fs::OpenOptions::new().append(true).create(true).open(std::path::Path::new(path)) {
+            Ok(f) => f,
+            Err(_) => return fail("the trial record cannot be written"),
+        };
+        if f.write_all(line.as_bytes()).and_then(|()| f.sync_all()).is_err() {
+            return fail("the trial record cannot be written");
+        }
+    }
+    for (id, n) in &roots {
+        println!("pattern id={id} repeats={n}");
+    }
+    println!("patterns ok threshold={} listed={}", threshold, roots.len());
     0
 }
 

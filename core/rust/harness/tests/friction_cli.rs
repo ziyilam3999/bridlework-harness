@@ -1083,6 +1083,8 @@ fn cross_check_over_40000_rows_is_linear() {
                     tag: s("memory"),
                     breaks: if i > 0 { s(&format!("x-{}", i - 1)) } else { s("") },
                     text: s("l"),
+                    kind: s(""),
+                    repeats: s(""),
                 },
             )
         })

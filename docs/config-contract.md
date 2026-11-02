@@ -2,7 +2,7 @@
 
 The harness reads one settings file. This page is the contract in plain words. `config/harness.example.yaml` is the public example of it, with placeholders only.
 
-Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 added the required `lanes.count` key; v3 adds the required `friction.inbox` key (ticket 154): the path of the friction inbox file (`docs/friction-inbox.md`). A config written against v2 is refused until it gains the key (intended, fail closed): the inbox is where lessons are captured, and the harness refuses to guess where. The operator's real file is updated in the private overlay the day the change merges.
+Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 added the required `lanes.count` key; v3 adds the required `friction.inbox` key (ticket 154): the path of the friction inbox file (`docs/friction-inbox.md`). A config written against v2 is refused until it gains the key (intended, fail closed): the inbox is where lessons are captured, and the harness refuses to guess where. Ticket 192 then adds the contract's FIRST OPTIONAL key, `friction.pattern_threshold` (absent = 3): a v3 file needs no change — an optional key breaks no existing file. The operator's real file is updated in the private overlay the day a change merges.
 
 ## 1. One file, one reader, read-only
 
@@ -21,7 +21,10 @@ Five sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`, 
 
 ### Keys
 
-Every key below is required, in its section, exactly once. Nothing else is allowed.
+Every key below is required, in its section, exactly once. Nothing else is allowed — with ONE exception, named
+here explicitly because it is the first of its kind in this contract: `friction.pattern_threshold` is OPTIONAL
+(ticket 192). It is the only key a file may omit; when present it follows every other rule (its section, exactly
+once, the value grammar below). Absent means the default, 3.
 
 ```
 budgets.s_wall_seconds
@@ -40,6 +43,7 @@ shadow.d2a_token_budget
 shadow.p7_token_budget
 lanes.count
 friction.inbox
+friction.pattern_threshold   <- OPTIONAL: the one key a file may omit; absent = 3
 ```
 
 `repos` has no fixed keys: each key is a repo id (section 5). It may be empty.
@@ -47,7 +51,7 @@ friction.inbox
 - `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys.
 - `shadow`: per capability, a ticket or dispatch cap (`p1a_cap`, `p4a_cap`, `d2a_cap`, `p7_cap`) and a token budget (`..._token_budget`).
 - `lanes`: `count`, the number of lanes. The session-name check reads it as the upper bound of a legal lane number (P1B-16); the value is policy, not private: the example ships 4.
-- `friction`: `inbox`, the path of the friction inbox file. It is a path value, not a number: the same shape rules as a `repos` folder (section 5). The real file lives only in the private overlay; `harness friction` (ticket 154) is its reader and writer.
+- `friction`: `inbox`, the path of the friction inbox file. It is a path value, not a number: the same shape rules as a `repos` folder (section 5). The real file lives only in the private overlay; `harness friction` (ticket 154) is its reader and writer. The section's second key, `pattern_threshold`, is the contract's one OPTIONAL key (ticket 192): the N a friction pattern chain's repeat count must reach before `harness friction patterns` lists it (`docs/friction-inbox.md`); a positive whole number exactly like every numeric key, absent = 3.
 
 ### The plain-value grammar (closed)
 
@@ -81,11 +85,11 @@ Anything outside this contract is a refusal. The refusal names the section and k
 
 ## 6. Values
 
-`friction.inbox` is the one string value in the file, checked by the path rules of section 5. Every budget, shadow and lanes value is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
+`friction.inbox` is the one string value in the file, checked by the path rules of section 5. Every budget, shadow and lanes value — and the optional `friction.pattern_threshold` — is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
 
 ## 7. Public file content
 
-The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. The real values live only in the private file.
+The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. `friction.pattern_threshold` ships as its default value, `3`, written out so the one optional key is visible in the public example; omitting the line means the same thing. The real values live only in the private file.
 
 ## 8. Who reads it
 

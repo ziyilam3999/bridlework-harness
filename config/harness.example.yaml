@@ -26,5 +26,8 @@ lanes:
   count: 4
 
 # The friction inbox (docs/friction-inbox.md) lives only in the private overlay; this path is a placeholder.
+# pattern_threshold (ticket 192) is the ONE OPTIONAL key in the contract: absent means 3. It is the N a
+# pattern chain's repeat count must reach before `harness friction patterns` lists it.
 friction:
   inbox: /placeholder/friction-inbox.jsonl
+  pattern_threshold: 3
