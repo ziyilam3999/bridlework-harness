@@ -27,7 +27,10 @@
 //! even that cannot prove the answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file
 //! in the worktree or any checked-out submodule's git dir, any `filter.*` or `core.attributesFile` config
 //! key in the repo or worktree scope (a clean/smudge/process filter is both a hide and an arbitrary
-//! command a "read-only" check must never run), or a `core.worktree` that redirects elsewhere. Entries git never lists (a FIFO, a socket, a device) are
+//! command a "read-only" check must never run; a `core.attributesFile` key that reaches effect only
+//! through the repo's `include.path` is not refused — the scope-limited refusal read skips includes —
+//! but neutralised the same way, by the forced `core.attributesFile=/dev/null` outranking it), or a
+//! `core.worktree` that redirects elsewhere. Entries git never lists (a FIFO, a socket, a device) are
 //! caught by a no-follow walk of the tree. Git output is read through a hard 8 MiB cap and stray entries
 //! through a 10,000 cap; the submodule pass and the walk carry their own caps; hitting any is exit 3
 //! ("too many paths"), never a truncated PASS and never an unbounded read (fail closed).
@@ -562,7 +565,7 @@ fn parse_status(bytes: &[u8], map: &mut std::collections::BTreeMap<Vec<u8>, Kind
 /// The `idx`-th space-separated field of a record, returning it together with the field at `sub_idx` (the
 /// submodule field). The path field is taken with a split limit of `idx + 1`, so it is the LAST field and a
 /// path containing spaces survives intact.
-fn field<'a>(t: &'a [u8], idx: usize, sub_idx: usize) -> Option<(&'a [u8], &'a [u8])> {
+fn field(t: &[u8], idx: usize, sub_idx: usize) -> Option<(&[u8], &[u8])> {
     let path = t.splitn(idx + 1, |&b| b == b' ').nth(idx)?;
     let sub = t.splitn(sub_idx + 1, |&b| b == b' ').nth(sub_idx)?;
     if path.is_empty() {

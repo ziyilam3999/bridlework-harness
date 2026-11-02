@@ -46,7 +46,7 @@ Stable identifiers for the later tickets (P1B-04 node_modules link, P1B-11 clean
 | branch | `ws/<ticket>` (left behind after teardown for the merge policy and the unpushed check) |
 | node_modules link | `<ticket-root>/tree/node_modules`, manifest entry id `node_modules` (class `temp_dir`) — a LINK: remove the link itself, never its contents (the target is the primary's own folder) |
 
-Later tickets find the paths with `harness manifest list <ticket> --dir <manifest-dir>`; they never rebuild them from text. The base sha is not stored (the manifest has no field for it); a later consumer takes `--base` explicitly, as `harness ticket gate` does, or uses the merge-base of `ws/<ticket>`.
+Later tickets find the paths with `harness manifest list <ticket> --dir <manifest-dir>`; they never rebuild them from text. Quarantine of unmanifested leftovers and the one explicit delete step for listed `temp_dir` entries are `harness quarantine sweep` / `harness quarantine delete-listed` (P1B-13, `docs/quarantine.md`). The base sha is not stored (the manifest has no field for it); a later consumer takes `--base` explicitly, as `harness ticket gate` does, or uses the merge-base of `ws/<ticket>`.
 
 ## Output and exit codes
 
@@ -137,7 +137,11 @@ every repo-scope route that could name one is refused below.
 Where even that cannot prove the answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file in
 the worktree's git dir or common git dir (or in any checked-out submodule's), or any `filter.*` or
 `core.attributesFile` config key set in the repo or worktree scope (a key that comes from system or global
-scope is simply not seen, because those files are never read) — a clean/smudge/process filter is both a hide
+scope is simply not seen, because those files are never read; a `core.attributesFile` key that reaches
+effect only through the repo's `include.path` is not refused — the scope-limited refusal read skips
+includes — but neutralised instead: the forced `core.attributesFile` at the null device outranks it, so the
+included file is never read; the same neutralised reading means a tracked file whose `$Id$` marker was
+expanded only through such a route reads as MODIFIED — a stray report, never a hidden edit) — a clean/smudge/process filter is both a hide
 and an arbitrary command a "read-only" check must never execute; only the key name is printed, never its
 value — or a `core.worktree` that redirects anywhere but the tree being checked. When one
 path carries two kinds, the stronger wins (order, weakest first: `untracked`, `ignored`, `modified`, `hidden`,
@@ -161,7 +165,8 @@ byte — control characters, space, DEL, any non-UTF-8 byte — prints as `\xNN`
   that is missing, is a symlink (no-follow stat) or is not a directory, a folder that is not that worktree's own
   top level, a HEAD that is detached or not `refs/heads/ws/<ticket>`, an in-progress merge/rebase/cherry-pick,
   an `info/attributes` file or a `filter.*` / `core.attributesFile` config key (repo or worktree scope; keys
-  from system or global scope are never read), a redirecting `core.worktree`, a submodule that cannot be
+  from system or global scope are never read; a `core.attributesFile` key pulled in through the repo's
+  `include.path` is neutralised by the forced `-c`, not refused), a redirecting `core.worktree`, a submodule that cannot be
   inspected, a failed git call, or a size cap.
 
 **Size caps**: any git output read is capped at 8 MiB and stray entries at 10,000; the submodule pass caps
@@ -183,7 +188,13 @@ implies, plus `--ignored=matching`).
 check does not yet force those two settings); a filter configured inside a checked-out submodule's own config
 can still run during git's own submodule status probe (the exit is still 3, but the probe happens before the
 check's refusal scan of that submodule); a stray `d/.git` file or directory at depth (not the worktree's own
-`.git`, not a checked-out gitlink's) is skipped by the walk and invisible to git alike; and several refusal
+`.git`, not a checked-out gitlink's) is skipped by the walk and invisible to git alike; a non-empty gitlink
+directory without a `.git` inside (not a checked-out submodule) is treated as absent — under that reading a
+file planted in an un-inited submodule folder is invisible to git and the walk alike; the common-dir
+`info/attributes` refusal (git reads `info/attributes` from the COMMON dir of a linked worktree; the
+current test plants it in the per-worktree git dir, which git never reads) and the non-ASCII path escape
+row (a path with non-ASCII bytes printed as \xNN escapes; pinned only where the filesystem accepts such
+bytes) have no test that goes RED when their code is removed; and several refusal
 and cap rows (`core.worktree` redirect, the submodule refusal scan, walk `.git` skip and cap, submodule count
 and depth caps, `core.trustctime` / `core.checkStat` / `core.untrackedCache` levers) have no test that goes
 RED when their code is removed.

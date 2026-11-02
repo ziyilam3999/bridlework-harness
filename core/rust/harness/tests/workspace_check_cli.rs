@@ -6,6 +6,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -189,14 +190,17 @@ fn assert_no_folder(label: &str, o: &Output, t: &Tmp) {
 }
 
 /// The full `workspace check` line for ticket `t1` with HOME pointed at a scratch folder (never the real
-/// HOME), run from an unrelated folder: the caller's user-level git config must be exactly what the test
-/// planted and nothing else.
+/// HOME) and XDG_CONFIG_HOME cleared, run from an unrelated folder: the caller's user-level git
+/// config must be exactly what the test planted and nothing else — with the variable cleared, the
+/// attributes file git reads by default is the planted <scratch-HOME>/.config/git/attributes one,
+/// never whatever the ambient XDG path points at.
 fn check_home(t: &Tmp, home: &Path) -> Output {
     let (unrelated, _) = t.both("unrelated");
     fs::create_dir_all(&unrelated).unwrap();
     let mut c = Command::new(BIN);
     c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
         .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
         .current_dir(&unrelated)
         .stdin(Stdio::null());
     c.output().unwrap()
@@ -208,8 +212,8 @@ fn check_home(t: &Tmp, home: &Path) -> Output {
 fn commit_filter_fixture(tree: &Path) {
     fs::write(tree.join("g.txt"), "one\n").unwrap();
     fs::write(tree.join(".gitattributes"), "g.txt filter=h\n").unwrap();
-    git(&tree, &["add", "g.txt", ".gitattributes"]);
-    git(&tree, &["commit", "-q", "-m", "filter fixture"]);
+    git(tree, &["add", "g.txt", ".gitattributes"]);
+    git(tree, &["commit", "-q", "-m", "filter fixture"]);
     fs::write(tree.join("g.txt"), "twp\n").unwrap();
     // Any mtime other than the index-recorded one (with the size unchanged) forces the content compare.
     let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
@@ -652,7 +656,7 @@ fn case14_changed_submodule_is_stray() {
     git(&s_raw, &["add", "s.txt"]);
     git(&s_raw, &["commit", "-q", "-m", "s1"]);
     let (r, _tree, _) = mk_ws(&t, false);
-    git(&r, &["-c", "protocol.file.allow=always", "submodule", "add", "--name", "sub", &s_raw.to_str().unwrap(), "sub"]);
+    git(&r, &["-c", "protocol.file.allow=always", "submodule", "add", "--name", "sub", s_raw.to_str().unwrap(), "sub"]);
     git(&r, &["add", ".gitmodules"]);
     git(&r, &["commit", "-q", "-m", "add sub"]);
     // A workspace from that base, the submodule materialised, then its HEAD advanced.
@@ -900,8 +904,8 @@ fn case20_nontoplevel_folder_of_another_repo_is_exit_3() {
     let text = fs::read_to_string(&m).unwrap();
     let (tree_raw, tree_canon) = t.both("W/t1/tree");
     let updated = text
-        .replace(&*tree_canon.to_string_lossy(), &*inner.to_string_lossy())
-        .replace(&*tree_raw.to_string_lossy(), &*inner.to_string_lossy());
+        .replace(&*tree_canon.to_string_lossy(), &inner.to_string_lossy())
+        .replace(&*tree_raw.to_string_lossy(), &inner.to_string_lossy());
     assert!(updated != text, "fixture: the worktree entry path was not found in the manifest");
     fs::write(&m, updated).unwrap();
     let o = check(&t);
@@ -1768,4 +1772,122 @@ fn repo_scope_filter_key_still_refuses() {
     assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
     assert!(err(&o).contains("filter") || err(&o).contains("attributes"), "stderr names why: {}", err(&o));
     assert!(!marker.exists(), "the check must never execute a repo-configured command");
+}
+
+// ------------------------------ fix round 5, F2/F3: the two config-neutralising lines each get a RED-on-removal test
+
+/// Commit `id.txt` = `v=$Id$`, then re-check it out with the `ident` attribute active (the scratch call
+/// forces the attrs file on itself), so the working file carries the expanded `$Id: <40 hex> $` marker;
+/// then rewrite the payload inside the marker with a DIFFERENT same-size value. Plain `git status` under
+/// the planted `ident` attribute sees nothing (the clean step collapses the marker back to `$Id$`), so the
+/// edit is invisible to every git read that follows the attribute — only the check's own forced
+/// `-c core.attributesFile=/dev/null` (which no repo or user route outranks) can name it.
+fn commit_ident_fixture(tree: &Path, attrs: &Path) {
+    fs::write(tree.join("id.txt"), "v=$Id$\n").unwrap();
+    git(tree, &["add", "id.txt"]);
+    git(tree, &["commit", "-q", "-m", "ident fixture"]);
+    fs::remove_file(tree.join("id.txt")).unwrap();
+    let af = format!("core.attributesFile={}", attrs.display());
+    git(tree, &["-c", &af, "checkout", "--", "id.txt"]);
+    let b = fs::read(tree.join("id.txt")).unwrap();
+    let text = String::from_utf8(b.clone()).unwrap();
+    let trimmed = text.trim_end();
+    assert!(trimmed.starts_with("v=$Id: ") && trimmed.ends_with(" $"), "ident marker did not expand: {text:?}");
+    // Same-size payload: every byte inside the marker flips to 'd' (the marker text itself is untouched).
+    let start = text.find("$Id: ").unwrap() + "$Id: ".len();
+    let end = trimmed.len() - " $".len();
+    let mut b2 = b.clone();
+    for byte in &mut b2[start..end] {
+        *byte = b'd';
+    }
+    assert_eq!(b2.len(), b.len(), "the payload rewrite must not change the file size");
+    fs::write(tree.join("id.txt"), &b2).unwrap();
+    // Sanity: a plain status under the planted attribute reads the tree as clean (the hide is real).
+    let st = git(tree, &["-c", &af, "status", "--porcelain"]);
+    assert!(st.is_empty(), "the ident edit must be invisible to a plain status under the attribute: {st}");
+}
+
+#[test]
+fn user_xdg_ident_attributes_cannot_hide_an_edit() {
+    // must-fire (F2, the forced `-c core.attributesFile=/dev/null` is the ONLY guard): `* ident` in the
+    // USER's XDG attributes file (`<scratch-HOME>/.config/git/attributes`, with XDG_CONFIG_HOME cleared
+    // by check_home) plus a tracked id.txt whose `$Id$` payload was rewritten same-size still exits 2
+    // naming id.txt. With the forced `-c` line removed this test goes RED (exit 0 `workspace=clean`
+    // while the planted edit sits in the tree).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let (home, _) = t.both("ident-home");
+    fs::create_dir_all(home.join(".config/git")).unwrap();
+    let attrs = home.join(".config/git/attributes");
+    fs::write(&attrs, "* ident\n").unwrap();
+    commit_ident_fixture(&tree, &attrs);
+    let o = check_home(&t, &home);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray modified id.txt"), "lines: {:?}", out(&o));
+    assert!(out(&o).contains("workspace=stray ticket=t1 count=1"), "summary: {}", out(&o));
+    assert_no_folder("xdg-ident", &o, &t);
+}
+
+#[test]
+fn repo_include_path_attributes_file_is_neutralised_not_missed() {
+    // must-fire (F2, the repo route): the repo's own `include.path` pulls in a file that sets
+    // `core.attributesFile` to an `* ident` file. The refusal scan reads that key scope-limited
+    // (`--local`/`--worktree`), and a scoped read does NOT follow include.path, so no exit 3 fires;
+    // the forced `-c core.attributesFile=/dev/null` outranks the included key instead, the attribute
+    // is never read, and the same-size `$Id$` payload edit is still named (exit 2, never a pass).
+    // With the forced `-c` line removed this test goes RED (exit 0 `workspace=clean`).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let (attrs, _) = t.both("inc-attrs");
+    fs::write(&attrs, "* ident\n").unwrap();
+    let (inc, _) = t.both("inc-config");
+    fs::write(&inc, format!("[core]\n\tattributesFile = {}\n", attrs.display())).unwrap();
+    git(&tree, &["config", "include.path", inc.to_str().unwrap()]);
+    commit_ident_fixture(&tree, &attrs);
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray modified id.txt"), "lines: {:?}", out(&o));
+    assert!(out(&o).contains("workspace=stray ticket=t1 count=1"), "summary: {}", out(&o));
+    assert_no_folder("inc-ident", &o, &t);
+}
+
+#[test]
+fn system_scope_config_through_a_git_wrapper_does_not_refuse() {
+    // must-not-fire (F3, `GIT_CONFIG_NOSYSTEM=1` is the ONLY guard): a scratch `git` wrapper FIRST on
+    // PATH exports `GIT_CONFIG_SYSTEM` pointing at a scratch system file carrying the standard
+    // git-lfs filter block, then execs the real git (its own directory stripped from PATH, so `git`
+    // resolves past the wrapper). On a clean tree the check still exits 0. With the
+    // `GIT_CONFIG_NOSYSTEM=1` line removed this test goes RED (exit 3: the system-scope lfs filter
+    // key refuses every check — the CI-red shape on a host whose system gitconfig carries lfs).
+    let t = Tmp::new();
+    let (_, _, _) = mk_ws(&t, false);
+    let (sys, _) = t.both("sys-scope.gitconfig");
+    fs::write(&sys, "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n").unwrap();
+    let (bin, _) = t.both("shim-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let wrapper = bin.join("git");
+    fs::write(&wrapper, format!("#!/bin/sh\nexport GIT_CONFIG_SYSTEM='{}'\nd=$(dirname -- \"$0\")\nPATH=${{PATH#\"$d\":}}\nexport PATH\nexec git \"$@\"\n", sys.display())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Shim sanity: through the wrapper, the system-scope lfs key IS what git reads.
+    let probe = Command::new(&wrapper)
+        .args(["config", "--system", "--get", "filter.lfs.required"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(probe.status.success(), "shim must feed the system config: {}", String::from_utf8_lossy(&probe.stderr));
+    assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "true");
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let (home, _) = t.both("syswrap-home");
+    fs::create_dir_all(&home).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env("PATH", format!("{}:{}", bin.display(), env!("PATH")))
+        .current_dir(&unrelated)
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), "workspace=clean ticket=t1\n");
 }

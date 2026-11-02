@@ -93,7 +93,7 @@ fn has_email(r: &str) -> bool {
         while e < b.len() && (b[e].is_ascii_alphanumeric() || b[e] == b'.' || b[e] == b'-') {
             e += 1;
         }
-        let dom = r[i + 1..e].trim_end_matches(|c| c == '.' || c == '-');
+        let dom = r[i + 1..e].trim_end_matches(['.', '-']);
         if !valid_domain(dom) {
             continue;
         }

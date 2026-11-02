@@ -216,12 +216,79 @@ if names_ok "$root/.github/workflows"; then ok B2-reported-names; else bad B2-re
 if G -C "$root" rev-parse --verify -q origin/master >/dev/null; then oldbase=origin/master
 elif G -C "$root" rev-parse --verify -q 'HEAD^1' >/dev/null; then oldbase='HEAD^1'
 else oldbase=""; fi
+# ticket 163 changes privacy-gate.yml and privacy-text.yml on purpose, and ONLY these ways: each job declares
+# `environment: privacy-gate`, and privacy-text.yml loses its `release:` trigger. priv_frozen NAME CURRENT-FILE compares the
+# current file with the base copy after dropping those two allowed differences from the base copy, and the one environment line
+# from the current copy (which must carry exactly one); any other change in either file is red. ticket 198 sanctions one
+# rust-test.yml difference: exactly the two Clippy lines (`- name: Clippy` / `run: sh ci/rust-clippy.sh`) appended after the
+# Build and test step; rust_frozen CURRENT-FILE below accepts the base copy plus exactly those two appended lines, so any
+# other rust-test.yml change (extra lines, a softened Clippy step, the lines moved elsewhere) is still red.
+priv_frozen() {
+  [ -n "$oldbase" ] || return 1
+  G -C "$root" show "$oldbase:.github/workflows/$1" > "$tmp/priv-old.yml" 2>/dev/null || return 1
+  python3 -I - "$1" "$tmp/priv-old.yml" "$2" <<'PYX'
+import re, sys
+name, oldp, curp = sys.argv[1:4]
+env = "    environment: privacy-gate"
+old = open(oldp, encoding="utf-8").read().split("\n")
+cur = open(curp, encoding="utf-8").read().split("\n")
+if cur.count(env) != 1:
+    sys.exit(1)
+o = [l for l in old if l != env]
+if name == "privacy-text.yml":
+    t = "\n".join(o)
+    t = re.sub(r"^  release:\n    types: \[created, edited, published\]\n", "", t, flags=re.M)
+    o = t.split("\n")
+sys.exit(0 if o == [l for l in cur if l != env] else 1)
+PYX
+}
+# rust_frozen CURRENT-FILE: exit 0 only when the file is either byte-identical to the base rust-test.yml (PRs that
+# do not carry the Clippy step) or the base plus exactly the two sanctioned Clippy lines appended at the end (right
+# after the Build and test step); every other difference, including the same two lines moved before Build and test,
+# any extra line, or a continue-on-error on the Clippy step, is red.
+rust_frozen() {
+  [ -n "$oldbase" ] || return 1
+  G -C "$root" show "$oldbase:.github/workflows/rust-test.yml" > "$tmp/rust-old.yml" 2>/dev/null || return 1
+  cmp -s "$tmp/rust-old.yml" "$1" && return 0
+  { cat "$tmp/rust-old.yml"; printf '      - name: Clippy\n        run: sh ci/rust-clippy.sh\n'; } > "$tmp/rust-want.yml"
+  cmp -s "$tmp/rust-want.yml" "$1"
+}
 if [ -z "$oldbase" ]; then
   echo "skip B2-old-workflows-untouched (no base to compare with)"
-elif G -C "$root" diff --quiet "$oldbase" -- .github/workflows/privacy-gate.yml .github/workflows/privacy-text.yml .github/workflows/rust-test.yml 2>/dev/null; then
-  ok B2-old-workflows-untouched
 else
-  bad B2-old-workflows-untouched
+  fz=ok
+  rust_frozen "$root/.github/workflows/rust-test.yml" || fz=bad
+  priv_frozen privacy-gate.yml "$root/.github/workflows/privacy-gate.yml" || fz=bad
+  priv_frozen privacy-text.yml "$root/.github/workflows/privacy-text.yml" || fz=bad
+  $fz B2-old-workflows-untouched
+  # planted twins: one extra line / a lost allowed change in a scratch copy of each privacy workflow must go red
+  for n in privacy-gate.yml privacy-text.yml; do
+    cp "$root/.github/workflows/$n" "$tmp/priv-cur.yml"
+    printf '# x\n' >> "$tmp/priv-cur.yml"
+    if priv_frozen "$n" "$tmp/priv-cur.yml"; then bad "B2-twin-$n-extra-line-detected"; else ok "B2-twin-$n-extra-line-detected"; fi
+    sed -E '/^    environment: privacy-gate$/d' "$root/.github/workflows/$n" > "$tmp/priv-cur.yml"
+    if priv_frozen "$n" "$tmp/priv-cur.yml"; then bad "B2-twin-$n-no-environment-detected"; else ok "B2-twin-$n-no-environment-detected"; fi
+    sed -E 's/^(    environment: privacy-gate)$/\1\n\1/' "$root/.github/workflows/$n" > "$tmp/priv-cur.yml"
+    if priv_frozen "$n" "$tmp/priv-cur.yml"; then bad "B2-twin-$n-two-environment-lines-detected"; else ok "B2-twin-$n-two-environment-lines-detected"; fi
+  done
+  sed -E 's/^(  issues:)$/  release:\n    types: [created, edited, published]\n\1/' "$root/.github/workflows/privacy-text.yml" > "$tmp/priv-cur.yml"
+  if priv_frozen privacy-text.yml "$tmp/priv-cur.yml"; then bad B2-twin-privacy-text-release-trigger-back-detected; else ok B2-twin-privacy-text-release-trigger-back-detected; fi
+  # ticket 198 twins (rust-test.yml): the sanctioned shape and an untouched base copy stay green; every other
+  # shape goes red. The must-fire fixtures are planted on a saved copy of the SANCTIONED shape (base + the two
+  # Clippy lines), never on the live file, so the twins still fire on a tree that does not carry the Clippy step.
+  if rust_frozen "$root/.github/workflows/rust-test.yml"; then ok B2-twin-rust-test-sanctioned-only-green; else bad B2-twin-rust-test-sanctioned-only-green; fi
+  cp "$tmp/rust-old.yml" "$tmp/rust-cur.yml"
+  if rust_frozen "$tmp/rust-cur.yml"; then ok B2-twin-rust-test-untouched-green; else bad B2-twin-rust-test-untouched-green; fi
+  { cat "$tmp/rust-old.yml"; printf '      - name: Clippy\n        run: sh ci/rust-clippy.sh\n'; } > "$tmp/rust-sanctioned.yml"
+  # must-fire: one extra unrelated run: line appended after the Clippy step
+  { cat "$tmp/rust-sanctioned.yml"; printf '        run: echo hi\n'; } > "$tmp/rust-cur.yml"
+  if rust_frozen "$tmp/rust-cur.yml"; then bad B2-twin-rust-test-extra-run-line-detected; else ok B2-twin-rust-test-extra-run-line-detected; fi
+  # must-fire: the Clippy step softened with continue-on-error
+  sed -E 's/^(      - name: Clippy)$/\1\n        continue-on-error: true/' "$tmp/rust-sanctioned.yml" > "$tmp/rust-cur.yml"
+  if rust_frozen "$tmp/rust-cur.yml"; then bad B2-twin-rust-test-clippy-soft-fail-detected; else ok B2-twin-rust-test-clippy-soft-fail-detected; fi
+  # must-fire: the two Clippy lines moved before the Build and test step
+  sed -e '/^      - name: Clippy$/d' -e '/^        run: sh ci\/rust-clippy\.sh$/d' "$tmp/rust-sanctioned.yml" | sed 's/^\(      - name: Build and test\)$/      - name: Clippy\n        run: sh ci\/rust-clippy.sh\n\1/' > "$tmp/rust-cur.yml"
+  if rust_frozen "$tmp/rust-cur.yml"; then bad B2-twin-rust-test-clippy-before-build-detected; else ok B2-twin-rust-test-clippy-before-build-detected; fi
 fi
 if sh "$here/workflow-lint.sh"; then ok B5-lint-passes-all-workflows; else bad B5-lint-passes-all-workflows; fi
 

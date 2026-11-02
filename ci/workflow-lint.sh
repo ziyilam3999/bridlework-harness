@@ -17,6 +17,14 @@ exec python3 -I - "$@" <<'PY'
 import os, re, sys
 
 ALLOWED_PERMS = {"contents", "issues", "pull-requests"}
+# The four workflows that hold the list secret (ticket 163, review r1 F1): every step, job and top-level key must be one the
+# smoke driver (ci/gate-secret-smoke.sh) models or allows, because a key it does not model (working-directory, shell, defaults,
+# container, services, strategy ...) can move where the secret step runs without any smoke noticing. Keep the sets in step with it.
+SECRET_WORKFLOWS = {"privacy-gate.yml", "privacy-gate-next.yml", "privacy-text.yml", "privacy-release-text.yml"}
+SECRET_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "if", "working-directory"}
+SECRET_JOB_KEYS = {"runs-on", "timeout-minutes", "environment", "steps"}
+SECRET_TOP_KEYS = {"name", "on", "permissions", "jobs"}
+SECRET_WD = "core/rust"        # the engine build dir: allowed as a working-directory only, and never on a step that holds the secret
 FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore", "types"}
 # A YAML mapping key, with optional quotes and optional space before the colon: `if: x`, `"if": x`, `'if' : x`.
 KEY_RE = re.compile(r"""^(\s*)(-\s+)?(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))\s*:(?:\s+(.*))?$""")
@@ -237,6 +245,45 @@ def skeleton_bad(path):
     return bad
 
 
+def secret_keys_bad(cl):
+    """(line, rule) for each unmodelled step / job / top-level key in a secret-holding workflow (never prints a value)."""
+    bad = []
+    jobs_sec = section(cl, "jobs")
+    for i, c in enumerate(cl):
+        if not c.strip():
+            continue
+        n = i + 1
+        k = kv(c)
+        ind = len(c) - len(c.lstrip())
+        if ind == 0:
+            if not k or k[1] not in SECRET_TOP_KEYS:
+                bad.append((n, "secret-workflow-top-key"))
+            continue
+        if not jobs_sec or not (jobs_sec[0] < i < jobs_sec[1]):
+            continue
+        if ind == 2:
+            if not k or k[3]:
+                bad.append((n, "secret-workflow-job-id"))
+        elif ind == 4:
+            if not k or k[1] not in SECRET_JOB_KEYS:
+                bad.append((n, "secret-workflow-job-key"))
+        elif indent(c) == 8 and ind in (6, 8) and (ind == 8 or c.lstrip().startswith("- ")):
+            if c.lstrip().startswith("-   "):
+                bad.append((n, "secret-workflow-step-key"))
+            elif not k or k[1] not in SECRET_STEP_KEYS:
+                bad.append((n, "secret-workflow-step-key"))
+            elif k[1] == "working-directory":
+                s0 = i
+                while s0 > 0 and not re.match(r"^      - ", cl[s0]):
+                    s0 -= 1
+                e0 = i + 1
+                while e0 < len(cl) and not re.match(r"^      - ", cl[e0]) and not (cl[e0].strip() and indent(cl[e0]) <= 4):
+                    e0 += 1
+                if k[3] != SECRET_WD or any("secrets." in x for x in cl[s0:e0]):
+                    bad.append((n, "secret-workflow-working-directory"))
+    return bad
+
+
 def lint(path):
     bad = []
     lines = open(path, encoding="utf-8").read().split("\n")
@@ -298,7 +345,7 @@ def lint(path):
                 bad.append((s + 1, "checkout-persist-credentials"))
             if re.search(r"^\s*(-\s+)?(ref|repository):", text, re.M):
                 bad.append((s + 1, "checkout-ref"))
-        if "secrets." in text and not re.search(r"ci/privacy-(gate|text)\.sh", text):
+        if "secrets." in text and not re.search(r"ci/privacy-(gate|text|release-text)\.sh", text):
             bad.append((s + 1, "secret-outside-scan-step"))
         # ${{ github.event.* }} inside a run: script
         for j, line in enumerate(body):
@@ -317,6 +364,9 @@ def lint(path):
         if "secrets." in c and i not in covered:
             bad.append((i + 1, "secret-outside-scan-step"))
     bad.extend(lint_14c(path, cl))
+    # by name, or by content (a renamed or copied workflow that reads the list secret is held to the same rule)
+    if os.path.basename(path) in SECRET_WORKFLOWS or "PRIVACY_LIST" in "\n".join(lines):
+        bad.extend(secret_keys_bad(cl))
     if os.path.basename(path) == "final-gate.yml":
         bad.extend(skeleton_bad(path))
     return bad
