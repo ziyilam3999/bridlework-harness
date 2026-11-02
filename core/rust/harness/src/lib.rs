@@ -20,6 +20,8 @@ pub mod intake;
 pub mod manifest;
 pub mod overlay;
 pub mod path_map;
+#[cfg(unix)]
+pub mod quarantine;
 pub mod repo_id;
 pub mod runner;
 #[cfg(unix)]

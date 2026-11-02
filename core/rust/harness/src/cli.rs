@@ -504,6 +504,15 @@ pub fn run(mut args: Vec<String>) -> i32 {
             return 2;
         }
     }
+    if !args.is_empty() && args[0] == "quarantine" {
+        #[cfg(unix)]
+        return crate::quarantine::quarantine_cmd(&args[1..]);
+        #[cfg(not(unix))]
+        {
+            eprintln!("harness: error: quarantine is not available on this platform");
+            return 2;
+        }
+    }
     if !args.is_empty() && args[0] == "status" {
         return crate::status::status_cmd(&args[1..]);
     }
