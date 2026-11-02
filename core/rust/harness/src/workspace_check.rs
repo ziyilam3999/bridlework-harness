@@ -47,7 +47,10 @@
 //! stray scan above does not run in this mode): after steps 1-6 of the clean-state check run unchanged, it
 //! asks one more read-only question — is every commit on `ws/<ticket>` also on the branch's upstream
 //! remote-tracking ref? — answered without any network: the upstream is resolved from the repo's own config
-//! and compared as local refs only. `<worktree>/.git` must be a linked-worktree pointer FILE, `--repo` a main
+//! and compared as local refs only, and the exact tracking-ref name rebuilt from that config must EQUAL git's
+//! own `@{upstream}` answer (which applies the remote's fetch refspec and the first `branch.<b>.merge` value);
+//! any disagreement — a non-default fetch refspec, a second merge value, a symref at the tracking ref — is
+//! exit 3, never a pass. `<worktree>/.git` must be a linked-worktree pointer FILE, `--repo` a main
 //! work tree (a real directory whose `.git` is a real directory) of the SAME repository (the canonical git
 //! common dir of the worktree must equal canonical `<repo>/.git`, and `<repo>` must be its own top level),
 //! all by no-follow stat before any git call of this mode reads them; `info/grafts` or a `shallow` file in
@@ -154,18 +157,23 @@ fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>), i3
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--manifest-dir" => {
-                let val = it.next().ok_or_else(|| usage3("--manifest-dir is missing its value"))?;
+                let val = it
+                    .next()
+                    .ok_or_else(|| usage3("--manifest-dir is missing its value"))?;
                 if md.replace(val.as_str()).is_some() {
                     return Err(usage3("--manifest-dir was given twice"));
                 }
-            }            "--pushed" => {
+            }
+            "--pushed" => {
                 if pushed {
                     return Err(usage3("--pushed was given twice"));
                 }
                 pushed = true;
             }
             "--repo" => {
-                let val = it.next().ok_or_else(|| usage3("--repo is missing its value"))?;
+                let val = it
+                    .next()
+                    .ok_or_else(|| usage3("--repo is missing its value"))?;
                 if repo.replace(val.as_str()).is_some() {
                     return Err(usage3("--repo was given twice"));
                 }
@@ -184,10 +192,16 @@ fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>), i3
         return Err(usage3("the ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"));
     }
     if !dir_arg_ok(md) {
-        return Err(usage3("--manifest-dir must be an absolute path with no `..` component"));
+        return Err(usage3(
+            "--manifest-dir must be an absolute path with no `..` component",
+        ));
     }
     let repo = match repo {
-        Some(r) if !dir_arg_ok(r) => return Err(usage3("--repo must be an absolute path with no `..` component")),
+        Some(r) if !dir_arg_ok(r) => {
+            return Err(usage3(
+                "--repo must be an absolute path with no `..` component",
+            ))
+        }
         Some(r) => Some(r.to_string()),
         None => None,
     };
@@ -246,9 +260,20 @@ fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
     // failing every check (the CI-red shape).
     c.env("GIT_CONFIG_NOSYSTEM", "1");
     c.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    let mut child = match c.stdin(Stdio::null()).stderr(Stdio::null()).stdout(Stdio::piped()).spawn() {
+    let mut child = match c
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
         Ok(ch) => ch,
-        Err(_) => return GitOut { ok: false, overflow: false, bytes: Vec::new() },
+        Err(_) => {
+            return GitOut {
+                ok: false,
+                overflow: false,
+                bytes: Vec::new(),
+            }
+        }
     };
     let mut bytes = Vec::new();
     let mut overflow = false;
@@ -271,14 +296,20 @@ fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
         }
     }
     let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-    GitOut { ok, overflow, bytes }
+    GitOut {
+        ok,
+        overflow,
+        bytes,
+    }
 }
 
 /// A git call that must succeed as UTF-8 text under the cap (rev-parse-style queries). Anything else is None.
 fn git_text(tree: &Path, args: &[&str]) -> Option<Result<String, i32>> {
     let g = git_bytes(tree, args);
     if g.overflow {
-        return Some(Err(stop3("too many paths: a git answer went over the read cap")));
+        return Some(Err(stop3(
+            "too many paths: a git answer went over the read cap",
+        )));
     }
     if !g.ok {
         return None;
@@ -301,17 +332,31 @@ fn git_text(tree: &Path, args: &[&str]) -> Option<Result<String, i32>> {
 /// - `core.worktree` pointing anywhere but the tree being scanned (git's own plumbing value for an
 ///   absorbed submodule points at that submodule and passes; anything else redirects the work tree).
 fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
-    let gitdir = git_text(tree, &["rev-parse", "--path-format=absolute", "--absolute-git-dir"]);
+    let gitdir = git_text(
+        tree,
+        &["rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+    );
     let gitdir = match gitdir {
         Some(Ok(g)) => PathBuf::from(g),
         Some(Err(code)) => return Err(code),
-        None => return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed"))),
+        None => {
+            return Err(stop3(&format!(
+                "{label} cannot be inspected: a git call inside it failed"
+            )))
+        }
     };
-    let common = git_text(tree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let common = git_text(
+        tree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
     let common = match common {
         Some(Ok(g)) => Some(PathBuf::from(g)),
         Some(Err(code)) => return Err(code),
-        None => return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed"))),
+        None => {
+            return Err(stop3(&format!(
+                "{label} cannot be inspected: a git call inside it failed"
+            )))
+        }
     };
     for d in std::iter::once(&gitdir).chain(common.iter()) {
         if d.join("info").join("attributes").exists() {
@@ -322,7 +367,9 @@ fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
     }
     let g = git_bytes(tree, &["config", "-z", "--get-regexp", "^filter\\."]);
     if g.overflow {
-        return Err(stop3("too many paths: a config answer went over the read cap"));
+        return Err(stop3(
+            "too many paths: a config answer went over the read cap",
+        ));
     }
     if g.ok && !g.bytes.is_empty() {
         // `-z --get-regexp` records are `key\nvalue\0`: the key ends at the newline; only the key is printed.
@@ -342,9 +389,20 @@ fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
     // the check's own forced `-c core.attributesFile=/dev/null` key and refuse on itself. Together the two
     // scopes cover the repo config file and the `config.worktree` extension file and nothing else.
     for scope in ["--local", "--worktree"] {
-        let g = git_bytes(tree, &["config", "-z", scope, "--get-regexp", "^core\\.attributesFile$"]);
+        let g = git_bytes(
+            tree,
+            &[
+                "config",
+                "-z",
+                scope,
+                "--get-regexp",
+                "^core\\.attributesFile$",
+            ],
+        );
         if g.overflow {
-            return Err(stop3("too many paths: a config answer went over the read cap"));
+            return Err(stop3(
+                "too many paths: a config answer went over the read cap",
+            ));
         }
         if g.ok && !g.bytes.is_empty() {
             let key = g.bytes.split(|&b| b == b'\n').next().unwrap_or(b"");
@@ -357,7 +415,9 @@ fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
     }
     let g = git_bytes(tree, &["config", "--get", "core.worktree"]);
     if g.overflow {
-        return Err(stop3("too many paths: a config answer went over the read cap"));
+        return Err(stop3(
+            "too many paths: a config answer went over the read cap",
+        ));
     }
     if g.ok && !g.bytes.is_empty() {
         // The value may be relative (git's absorbed-submodule plumbing writes `../../sub`); it resolves
@@ -367,7 +427,11 @@ fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
         let resolved = if p.is_absolute() { p } else { gitdir.join(p) };
         match resolved.canonicalize() {
             Ok(c) if c == tree => {}
-            _ => return Err(stop3(&format!("core.worktree redirects the work tree of {label}; cannot check"))),
+            _ => {
+                return Err(stop3(&format!(
+                    "core.worktree redirects the work tree of {label}; cannot check"
+                )))
+            }
         }
     }
     Ok(())
@@ -378,14 +442,20 @@ fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
 fn gitlinks(tree: &Path, label: &str) -> Result<Vec<Vec<u8>>, i32> {
     let g = git_bytes(tree, &["ls-files", "-s", "-z"]);
     if g.overflow {
-        return Err(stop3("too many paths: the tracked-file answer went over the read cap"));
+        return Err(stop3(
+            "too many paths: the tracked-file answer went over the read cap",
+        ));
     }
     if !g.ok {
-        return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+        return Err(stop3(&format!(
+            "{label} cannot be inspected: a git call inside it failed"
+        )));
     }
     let mut v = Vec::new();
     for t in g.bytes.split(|&b| b == 0) {
-        let Some(tab) = t.iter().position(|&b| b == b'\t') else { continue };
+        let Some(tab) = t.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
         if t.starts_with(b"160000 ") {
             v.push(t[tab + 1..].to_vec());
         }
@@ -403,7 +473,9 @@ enum GitlinkState {
 }
 
 fn gitlink_state(p: &Path) -> GitlinkState {
-    let Ok(m) = std::fs::symlink_metadata(p) else { return GitlinkState::Absent };
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return GitlinkState::Absent;
+    };
     if !m.file_type().is_dir() {
         return GitlinkState::Absent; // a file or link where a gitlink sits: status reports it as a change
     }
@@ -438,7 +510,9 @@ fn check_submodule(
     map: &mut std::collections::BTreeMap<Vec<u8>, Kind>,
 ) -> Result<(), i32> {
     if depth >= SUBMODULE_DEPTH_CAP {
-        return Err(stop3("too many paths: submodule nesting is over the depth cap"));
+        return Err(stop3(
+            "too many paths: submodule nesting is over the depth cap",
+        ));
     }
     *visited += 1;
     if *visited > SUBMODULE_CAP {
@@ -448,27 +522,43 @@ fn check_submodule(
     refuse_scan(tree, &label)?;
     let status = git_bytes(tree, &STATUS_ARGS);
     if status.overflow {
-        return Err(stop3(&format!("too many paths: the status answer of {label} went over the read cap")));
+        return Err(stop3(&format!(
+            "too many paths: the status answer of {label} went over the read cap"
+        )));
     }
     if !status.ok {
-        return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+        return Err(stop3(&format!(
+            "{label} cannot be inspected: a git call inside it failed"
+        )));
     }
-    let dirty = status.bytes.split(|&b| b == 0).any(|t| !t.is_empty() && t[0] != b'#');
+    let dirty = status
+        .bytes
+        .split(|&b| b == 0)
+        .any(|t| !t.is_empty() && t[0] != b'#');
     let hidden = if dirty {
         None
     } else {
         let h = git_bytes(tree, &["ls-files", "-v", "-z"]);
         if h.overflow {
-            return Err(stop3(&format!("too many paths: the tracked-file answer of {label} went over the read cap")));
+            return Err(stop3(&format!(
+                "too many paths: the tracked-file answer of {label} went over the read cap"
+            )));
         }
         if !h.ok {
-            return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+            return Err(stop3(&format!(
+                "{label} cannot be inspected: a git call inside it failed"
+            )));
         }
         Some(h)
     };
-    let dirty = dirty || hidden
-        .map(|h| h.bytes.split(|&b| b == 0).any(|t| t.len() >= 3 && t[1] == b' ' && t[0] != b'H'))
-        .unwrap_or(false);
+    let dirty = dirty
+        || hidden
+            .map(|h| {
+                h.bytes
+                    .split(|&b| b == 0)
+                    .any(|t| t.len() >= 3 && t[1] == b' ' && t[0] != b'H')
+            })
+            .unwrap_or(false);
     if dirty {
         insert(map, rel.to_vec(), Kind::Submodule);
         return Ok(());
@@ -510,12 +600,20 @@ fn walk_special(
 ) -> Result<(), i32> {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
-        Err(_) => return Err(stop3("the worktree could not be walked: a folder could not be read")),
+        Err(_) => {
+            return Err(stop3(
+                "the worktree could not be walked: a folder could not be read",
+            ))
+        }
     };
     for entry in rd {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => return Err(stop3("the worktree could not be walked: a folder could not be read")),
+            Err(_) => {
+                return Err(stop3(
+                    "the worktree could not be walked: a folder could not be read",
+                ))
+            }
         };
         let name = entry.file_name();
         let name_bytes = name.as_bytes();
@@ -528,7 +626,11 @@ fn walk_special(
         }
         let m = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => return Err(stop3("the worktree could not be walked: a path could not be read")),
+            Err(_) => {
+                return Err(stop3(
+                    "the worktree could not be walked: a path could not be read",
+                ))
+            }
         };
         let ft = m.file_type();
         let mut child_rel = rel.to_vec();
@@ -576,7 +678,15 @@ fn parse_status(bytes: &[u8], map: &mut std::collections::BTreeMap<Vec<u8>, Kind
                 p.pop();
             }
             if !p.is_empty() {
-                insert(map, p, if t[0] == b'?' { Kind::Untracked } else { Kind::Ignored });
+                insert(
+                    map,
+                    p,
+                    if t[0] == b'?' {
+                        Kind::Untracked
+                    } else {
+                        Kind::Ignored
+                    },
+                );
             }
             continue;
         }
@@ -678,7 +788,9 @@ fn pushed_git(tree: &Path, args: &[&str]) -> GitOut {
 fn pushed_git_text(tree: &Path, args: &[&str]) -> Option<Result<String, i32>> {
     let g = pushed_git(tree, args);
     if g.overflow {
-        return Some(Err(stop3("too many paths: a git answer went over the read cap")));
+        return Some(Err(stop3(
+            "too many paths: a git answer went over the read cap",
+        )));
     }
     if !g.ok {
         return None;
@@ -704,7 +816,9 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     //     exit 3) and `--repo` a main work tree (a real directory whose `.git` is a real directory).
     match std::fs::symlink_metadata(tree.join(".git")) {
         Ok(m) if m.file_type().is_file() => {}
-        _ => return stop3("the worktree is not a linked worktree (its .git is not a pointer file)"),
+        _ => {
+            return stop3("the worktree is not a linked worktree (its .git is not a pointer file)")
+        }
     }
     match std::fs::symlink_metadata(repo) {
         Ok(m) if m.file_type().is_dir() => {}
@@ -724,7 +838,10 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     // (b) Same repository: the worktree's canonical git COMMON dir must be exactly canonical `<repo>/.git`
     //     (a worktree of another repo, or a standalone clone planted as the tree, is exit 3), and `<repo>`
     //     must be its own top level.
-    let common = match pushed_git_text(tree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+    let common = match pushed_git_text(
+        tree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
         Some(Ok(c)) => PathBuf::from(c),
         Some(Err(c)) => return c,
         None => return stop3("a git call in the worktree failed"),
@@ -735,7 +852,10 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     if common != repo_git {
         return stop3("the worktree does not belong to --repo");
     }
-    match pushed_git_text(repo, &["rev-parse", "--path-format=absolute", "--show-toplevel"]) {
+    match pushed_git_text(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    ) {
         Some(Ok(top)) => {
             let Ok(top) = Path::new(&top).canonicalize() else {
                 return stop3("the --repo top level cannot be resolved");
@@ -752,7 +872,10 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     //     can make the tracking commit claim any ancestry, and a `shallow` file cuts the walk short.
     for name in ["info/grafts", "shallow"] {
         if common.join(name).symlink_metadata().is_ok() {
-            return stop3(&format!("a history-rewriting file is present in the repo ({}); cannot check", name));
+            return stop3(&format!(
+                "a history-rewriting file is present in the repo ({}); cannot check",
+                name
+            ));
         }
     }
 
@@ -764,7 +887,10 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     // The `@{upstream}` suffix resolves against a branch NAME (`refs/heads/<b>@{upstream}` is not a form git
     // accepts); the ticket token is already validated (no `/`, no `@`, no `{`), so the name is inert.
     let upstream = format!("ws/{}@{{upstream}}", ticket);
-    let upstream = match pushed_git_text(tree, &["rev-parse", "--verify", "--symbolic-full-name", &upstream]) {
+    let upstream = match pushed_git_text(
+        tree,
+        &["rev-parse", "--verify", "--symbolic-full-name", &upstream],
+    ) {
         Some(Ok(u)) if !u.is_empty() => u,
         Some(Err(c)) => return c,
         _ => return stop3("the ticket branch has no upstream"),
@@ -793,11 +919,17 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
         if rec.is_empty() {
             continue;
         }
-        let Some(nl) = rec.iter().position(|&b| b == b'\n') else { continue };
+        let Some(nl) = rec.iter().position(|&b| b == b'\n') else {
+            continue;
+        };
         let key = String::from_utf8_lossy(&rec[..nl]).into_owned();
         let value = String::from_utf8_lossy(&rec[nl + 1..]).trim().to_string();
-        let Some(rest) = key.strip_prefix("branch.") else { continue };
-        let Some((sub, name)) = rest.rsplit_once('.') else { continue };
+        let Some(rest) = key.strip_prefix("branch.") else {
+            continue;
+        };
+        let Some((sub, name)) = rest.rsplit_once('.') else {
+            continue;
+        };
         if sub != want_sub {
             continue;
         }
@@ -817,19 +949,40 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
         return stop3("the ticket branch's upstream is not a remote-tracking ref");
     };
     let tracking = format!("refs/remotes/{}/{}", remote, short);
+    // The rebuilt name is NEVER trusted over git's answer: `@{upstream}` applies the remote's fetch
+    // refspec (which may map `refs/heads/ws/<t>` somewhere other than `refs/remotes/<remote>/ws/<t>`)
+    // and uses the FIRST `branch.<b>.merge` value, while the rebuild above is last-wins and refspec-blind
+    // — the two can disagree, and a rebuild that lands on a stale or wrong ref can pass commits git says
+    // are unpushed. Any disagreement is exit 3, never a pass (a symref at the tracking ref also fails
+    // here: `@{upstream}` follows it to the target, which is not the rebuilt name).
+    if tracking != upstream {
+        return stop3("the upstream tracking ref cannot be verified");
+    }
 
     // (f) The tracking ref must be a PLAIN ref: exactly one answer of `<sha> <symref>` with an empty symref
     //     field. A symbolic ref (textual or a symlink git reads as one, for example pointing back at
     //     `refs/heads/ws/<ticket>` so the upstream sha equals the branch tip and every unpushed commit
     //     would pass, or at another remote-tracking ref) is exit 3. Its object must peel to a commit.
-    let g = pushed_git(tree, &["for-each-ref", "--format=%(objectname) %(symref)", "--", &tracking]);
+    let g = pushed_git(
+        tree,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(symref)",
+            "--",
+            &tracking,
+        ],
+    );
     if g.overflow {
         return stop3("too many paths: a git answer went over the read cap");
     }
     if !g.ok {
         return stop3("a git call in the worktree failed");
     }
-    let line = g.bytes.split(|&b| b == b'\n').find(|t| !t.is_empty()).map(|t| t.to_vec());
+    let line = g
+        .bytes
+        .split(|&b| b == b'\n')
+        .find(|t| !t.is_empty())
+        .map(|t| t.to_vec());
     let Some(line) = line else {
         return stop3("the upstream tracking ref cannot be read");
     };
@@ -845,17 +998,21 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
         return stop3("the upstream tracking ref cannot be read");
     }
     let peel = format!("{}^{{commit}}", obj);
-    let upstream_sha = match pushed_git_text(tree, &["rev-parse", "--verify", "--end-of-options", &peel]) {
-        Some(Ok(s)) if sha40(&s) => s,
-        Some(Err(c)) => return c,
-        _ => return stop3("the upstream ref does not point at a commit"),
-    };
+    let upstream_sha =
+        match pushed_git_text(tree, &["rev-parse", "--verify", "--end-of-options", &peel]) {
+            Some(Ok(s)) if sha40(&s) => s,
+            Some(Err(c)) => return c,
+            _ => return stop3("the upstream ref does not point at a commit"),
+        };
 
     // (g) The list: commits reachable from the branch and not from the upstream commit — reachability, not
     //     recency, so a force-moved upstream lists every ticket commit it no longer contains and an upstream
     //     AHEAD of the branch that contains it passes. Full shas only, after `--end-of-options`, capped:
     //     more than `PUSHED_CAP` commits is exit 3, never a truncated answer. Empty means pushed.
-    let branch_sha = match pushed_git_text(tree, &["rev-parse", "--verify", "--end-of-options", &branch]) {
+    let branch_sha = match pushed_git_text(
+        tree,
+        &["rev-parse", "--verify", "--end-of-options", &branch],
+    ) {
         Some(Ok(s)) if sha40(&s) => s,
         Some(Err(c)) => return c,
         _ => return stop3("the ticket branch cannot be resolved"),
@@ -890,7 +1047,10 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     }
     let upstream_esc = escape(tracking.as_bytes());
     if commits.is_empty() {
-        println!("workspace=pushed ticket={} branch=ws/{} upstream={}", ticket, ticket, upstream_esc);
+        println!(
+            "workspace=pushed ticket={} branch=ws/{} upstream={}",
+            ticket, ticket, upstream_esc
+        );
         return 0;
     }
     for c in &commits {
@@ -955,7 +1115,10 @@ pub fn check_cmd(a: &[String]) -> i32 {
     };
 
     // 4. It must be its own git work tree's top level (a folder inside the tree is not the worktree).
-    let Some(top) = git_text(&tree, &["rev-parse", "--path-format=absolute", "--show-toplevel"]) else {
+    let Some(top) = git_text(
+        &tree,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    ) else {
         return stop3("a git call in the worktree failed");
     };
     match top {
@@ -964,7 +1127,9 @@ pub fn check_cmd(a: &[String]) -> i32 {
                 return stop3("the worktree top level cannot be resolved");
             };
             if top != tree {
-                return stop3("the listed worktree folder is not the top level of its git work tree");
+                return stop3(
+                    "the listed worktree folder is not the top level of its git work tree",
+                );
             }
         }
         Err(code) => return code,
@@ -994,7 +1159,9 @@ pub fn check_cmd(a: &[String]) -> i32 {
     let in_progress = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]
         .iter()
         .any(|f| gitdir.join(f).exists())
-        || ["rebase-merge", "rebase-apply", "sequencer"].iter().any(|d| gitdir.join(d).is_dir());
+        || ["rebase-merge", "rebase-apply", "sequencer"]
+            .iter()
+            .any(|d| gitdir.join(d).is_dir());
     if in_progress {
         return stop3("a merge, rebase or cherry-pick is in progress in the worktree");
     }
@@ -1079,7 +1246,9 @@ pub fn check_cmd(a: &[String]) -> i32 {
     //    canonicalized first (canonicalizing the node_modules path would follow the link out of the worktree).
     for e in &read.live {
         let Target::Path(p) = &e.target else { continue };
-        let Ok(rel) = Path::new(p.as_str()).strip_prefix(&tree) else { continue };
+        let Ok(rel) = Path::new(p.as_str()).strip_prefix(&tree) else {
+            continue;
+        };
         if rel == Path::new("") {
             continue; // the worktree entry itself
         }

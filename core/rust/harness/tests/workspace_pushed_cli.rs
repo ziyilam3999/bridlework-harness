@@ -333,13 +333,15 @@ fn symref_upstream_refused() {
     let o = pushed_run(&t, &r_raw);
     assert_refused("symref_to_branch", &o, "not a remote-tracking ref");
     assert_no_folder("symref_to_branch", &o, &t);
-    // A symref to ANOTHER remote-tracking ref passes the prefix rule and must be refused by the symref rule
-    // itself: without it the upstream sha would be `origin/other`'s and the unpushed commit C would pass.
+    // A symref to ANOTHER remote-tracking ref passes the prefix rule; git's own `@{upstream}` answer
+    // FOLLOWS it to the target (`refs/remotes/origin/other`), which is not the name rebuilt from config,
+    // so the equality rule refuses it before the symref rule is even reached. Without either rule the
+    // upstream sha would be `origin/other`'s and the unpushed commit C would pass.
     let base = git(&tree, &["rev-parse", "ws/t1~1"]);
     git(&tree, &["push", "-q", "origin", &format!("{}:refs/heads/other", base)]);
     git(&tree, &["symbolic-ref", "refs/remotes/origin/ws/t1", "refs/remotes/origin/other"]);
     let o = pushed_run(&t, &r_raw);
-    assert_refused("symref_upstream_refused", &o, "symbolic");
+    assert_refused("symref_upstream_refused", &o, "cannot be verified");
     assert_no_folder("symref_upstream_refused", &o, &t);
 }
 
@@ -533,8 +535,17 @@ fn no_folder_printed() {
 #[test]
 fn read_only() {
     let t = Tmp::new();
-    let (r_raw, tree, _) = ws_pushed(&t);
+    let (r_raw, tree, remote) = ws_pushed(&t);
     commit(&tree, "c.txt", "C");
+    // The remote is left AHEAD of the local tracking ref: a SECOND clone pushes one more commit to the
+    // bare repo (pushing from the tree itself would update its own tracking ref), so the bare's ws/t1
+    // holds a commit the tree's refs/remotes/origin/ws/t1 has never fetched. An injected `git fetch`
+    // before the check would move that ref and turn the ref snapshot below red; the local branch keeps
+    // unpushed commit C, so the observed outcome stays exit 4.
+    let (second, _) = t.both("second");
+    git(&t.raw, &["clone", "-q", "--branch", "ws/t1", remote.to_str().unwrap(), second.to_str().unwrap()]);
+    commit(&second, "ahead.txt", "ahead");
+    git(&second, &["push", "-q", "origin", "ws/t1"]);
     let common = PathBuf::from(git(&tree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]));
     let gitdir = PathBuf::from(git(&tree, &["rev-parse", "--path-format=absolute", "--absolute-git-dir"]));
     let refs_before = git(&tree, &["for-each-ref", "--format=%(refname) %(objectname) %(symref)"]);
@@ -547,4 +558,52 @@ fn read_only() {
     assert_eq!(config_before, fs::read(common.join("config")).unwrap(), "the repo config changed across the run");
     assert_eq!(index_before, fs::read(gitdir.join("index")).unwrap(), "the index changed across the run");
     assert_no_folder("read_only", &o, &t);
+}
+
+// ------------------------------------------- test 17: rebuilt tracking ref must equal git's upstream (refspec)
+
+#[test]
+fn rebuilt_tracking_ref_must_match_git_upstream_odd_refspec() {
+    let t = Tmp::new();
+    let (r_raw, tree, remote) = ws_pushed(&t);
+    commit(&tree, "c.txt", "C");
+    // Retarget origin's fetch refspec at a mirror namespace: the leftover `refs/remotes/origin/ws/t1`
+    // (which holds C) survives, while git's own `@{upstream}` answer now resolves through the refspec to
+    // `refs/remotes/mirror/ws/t1`. The server then force-resets ws/t1 (dropping C) and the tree fetches,
+    // so git says 1 commit ahead — a rebuild from config alone checks the STALE leftover ref and passes.
+    git(&tree, &["config", "--unset-all", "remote.origin.fetch"]);
+    git(&tree, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/mirror/*"]);
+    let base = git(&tree, &["rev-parse", "ws/t1~1"]);
+    git(&remote, &["update-ref", "refs/heads/ws/t1", &base]);
+    git(&tree, &["fetch", "-q", "origin"]);
+    assert_eq!(
+        git(&tree, &["rev-parse", "--verify", "--symbolic-full-name", "ws/t1@{upstream}"]),
+        "refs/remotes/mirror/ws/t1",
+        "git's upstream must resolve through the refspec for this shape to mean anything"
+    );
+    let o = pushed_run(&t, &r_raw);
+    assert_refused("odd_refspec", &o, "the upstream tracking ref cannot be verified");
+    assert_no_folder("odd_refspec", &o, &t);
+}
+
+// ------------------------------------------- test 18: rebuilt tracking ref must equal git's upstream (two merges)
+
+#[test]
+fn rebuilt_tracking_ref_must_match_git_upstream_two_merges() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_pushed(&t);
+    let c = commit(&tree, "c.txt", "C"); // C is pushed to `side` below so the last merge value holds it
+    // A second `branch.ws/t1.merge` value: git's `@{upstream}` uses the FIRST value (ws/t1, which lacks
+    // C) while a last-wins rebuild uses `side` (pushed so it holds C), so the rebuilt name checks the
+    // wrong ref and reports pushed. The rebuilt name must equal git's own answer or the check refuses.
+    git(&tree, &["push", "-q", "origin", &format!("{}:refs/heads/side", c)]);
+    git(&tree, &["config", "--add", "branch.ws/t1.merge", "refs/heads/side"]);
+    assert_eq!(
+        git(&tree, &["rev-parse", "--verify", "--symbolic-full-name", "ws/t1@{upstream}"]),
+        "refs/remotes/origin/ws/t1",
+        "git's upstream must keep the first merge value for this shape to mean anything"
+    );
+    let o = pushed_run(&t, &r_raw);
+    assert_refused("two_merges", &o, "the upstream tracking ref cannot be verified");
+    assert_no_folder("two_merges", &o, &t);
 }
