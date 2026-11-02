@@ -576,31 +576,36 @@ fn prestage_identity(pid: u64, recorded: u64) -> Identity {
 }
 
 /// The `cfg(test)`-only fault injection behind the pre-stage probes (fix r2, N1): the pid whose
-/// liveness / identity pre-stage probe answers Unknown. Keyed by pid, so tests running in parallel
-/// never cross; zeroed (off) in every non-test build — no env var, no flag, nothing in a release
-/// binary can trip it.
+/// liveness / identity pre-stage probe answers Unknown. THREAD-LOCAL and keyed by pid: every test
+/// runs on its own thread and drives the command functions on that same thread, so a fault is
+/// invisible to the tests running in parallel (a process-wide seam made one test's `clear()` wipe
+/// another test's mid-flight fault and its entries get SIGNALLED — a real measured flake), and it
+/// cannot leak past the test's own thread. Nothing exists in a non-test build — no env var, no flag,
+/// nothing in a release binary can trip it.
 #[cfg(test)]
 mod prestage_fault {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::Cell;
 
-    static LIVENESS_PID: AtomicU64 = AtomicU64::new(0);
-    static IDENTITY_PID: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static LIVENESS_PID: Cell<u64> = const { Cell::new(0) };
+        static IDENTITY_PID: Cell<u64> = const { Cell::new(0) };
+    }
 
     pub fn liveness_unknown_for(pid: u64) {
-        LIVENESS_PID.store(pid, Ordering::SeqCst);
+        LIVENESS_PID.with(|c| c.set(pid));
     }
     pub fn identity_unknown_for(pid: u64) {
-        IDENTITY_PID.store(pid, Ordering::SeqCst);
+        IDENTITY_PID.with(|c| c.set(pid));
     }
     pub fn clear() {
-        LIVENESS_PID.store(0, Ordering::SeqCst);
-        IDENTITY_PID.store(0, Ordering::SeqCst);
+        LIVENESS_PID.with(|c| c.set(0));
+        IDENTITY_PID.with(|c| c.set(0));
     }
     pub(super) fn liveness_unknown(pid: u64) -> bool {
-        pid != 0 && LIVENESS_PID.load(Ordering::SeqCst) == pid
+        pid != 0 && LIVENESS_PID.with(|c| c.get()) == pid
     }
     pub(super) fn identity_unknown(pid: u64) -> bool {
-        pid != 0 && IDENTITY_PID.load(Ordering::SeqCst) == pid
+        pid != 0 && IDENTITY_PID.with(|c| c.get()) == pid
     }
 }
 
@@ -2337,8 +2342,19 @@ mod prestage_tests {
         manifest::read_manifest(dir, ticket).unwrap().live.iter().any(|e| e.id == id)
     }
 
-    fn pid_alive(pid: u64) -> bool {
-        matches!(probe_alive_at(Path::new("/bin/kill"), pid), Liveness::Alive)
+    /// "Provably alive" for the nothing-was-signalled asserts: a BOUNDED poll in which one `Alive`
+    /// answer wins and a proven `NoSuch` fails the test — a transient `Unknown` (a probe that could
+    /// not run under the test harness's parallel fork load) is retried, never read as "dead".
+    fn provably_alive(pid: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match probe_alive_at(Path::new("/bin/kill"), pid) {
+                Liveness::Alive => return,
+                Liveness::NoSuch | Liveness::Denied => panic!("pid {pid} was signalled or gone despite the refusal"),
+                Liveness::Unknown(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                Liveness::Unknown(_) => panic!("pid {pid}: the liveness probe stayed inconclusive for 5 s"),
+            }
+        }
     }
 
     /// Poll (bounded, a state poll) until the pid's age reads at least `ms` — off Linux the age is
@@ -2423,7 +2439,7 @@ mod prestage_tests {
         prestage_fault::clear();
         assert_eq!(rc, 2, "an inconclusive pre-stage identity is a refusal");
         assert!(entry_live(&dir, "tk", "a"), "the entry is kept for a later run");
-        assert!(pid_alive(pid), "nothing was signalled");
+        provably_alive(pid);
         no_record(&dir, "tk", &log);
         let _ = child.kill();
         let _ = child.wait();
@@ -2459,7 +2475,7 @@ mod prestage_tests {
         prestage_fault::clear();
         assert_eq!(rc, 2, "an inconclusive pre-stage liveness is a refusal");
         assert!(entry_live(&dir, "tk", "a"), "the entry is kept");
-        assert!(pid_alive(pid), "nothing was signalled");
+        provably_alive(pid);
         no_record(&dir, "tk", &log);
         let _ = child.kill();
         let _ = child.wait();
@@ -2520,8 +2536,10 @@ mod prestage_tests {
         ]);
         prestage_fault::clear();
         assert_eq!(rc, 2, "the two unproven entries make the run a refusal");
-        assert!(entry_live(&dir, "tk", "a") && pid_alive(pid_a), "a is refused, unsignalled and kept");
-        assert!(entry_live(&dir, "tk", "b") && pid_alive(pid_b), "b is refused, unsignalled and kept");
+        assert!(entry_live(&dir, "tk", "a"), "a is refused and kept");
+        provably_alive(pid_a);
+        assert!(entry_live(&dir, "tk", "b"), "b is refused and kept");
+        provably_alive(pid_b);
         assert!(!entry_live(&dir, "tk", "c"), "the proven-live entry is resolved");
         let hand_c = dir.join("tk.deaths").join(format!("c.{pid_c}.{sc}.json"));
         let text = fs::read_to_string(&hand_c).unwrap_or_default();
