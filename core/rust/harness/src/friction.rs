@@ -18,12 +18,16 @@ use std::path::Path;
 pub const TAGS: [&str; 4] = ["skill", "gate", "memory", "wiki"];
 /// The row fields in canonical order (the JSON key order this module writes).
 pub const FIELDS: [&str; 6] = ["id", "date", "ticket", "where-it-lives", "breaks", "text"];
-/// The two optional fields (ticket 192): `kind` (the row's class, default `friction`) and `repeats` (the id of
-/// the pattern row this row repeats). Both are omitted from the canonical line at their defaults, so every
-/// six-key row written before this contract re-encodes byte-identical.
-pub const OPTIONAL_FIELDS: [&str; 2] = ["kind", "repeats"];
+/// The three optional fields: `kind` and `repeats` (ticket 192) and `source` (ticket 193). `kind` is the
+/// row's class (default `friction`) and `repeats` the id of the pattern row this row repeats; `source` is the
+/// row's origin (default empty = hand-written; the only other value is `event`, the T-9.3 event rows the
+/// `friction_event` mapper produces). All three are omitted from the canonical line at their defaults, so
+/// every six-key row written before this contract re-encodes byte-identical.
+pub const OPTIONAL_FIELDS: [&str; 3] = ["kind", "repeats", "source"];
 /// The two legal `kind` values (the default, `friction`, needs no key).
 pub const KINDS: [&str; 2] = ["friction", "pattern"];
+/// The legal non-default `source` values (the default, hand-written, needs no key).
+pub const SOURCES: [&str; 1] = ["event"];
 /// One encoded row, bytes, including the trailing newline this module always writes.
 pub const LINE_CAP: usize = 16 * 1024;
 /// The whole inbox is read no further than this; past it the verb fails closed (exit 2).
@@ -33,7 +37,8 @@ const NOTE_CAP: u64 = 1024 * 1024;
 
 /// One inbox row. `breaks` is empty or the id of the lesson that broke again (K-1 rule 3). `kind` is empty
 /// (= `friction`), `friction` or `pattern`; `repeats` is empty or the id of the `kind: pattern` row this row
-/// repeats (ticket 192). A `pattern` row with no `repeats` is the root of its chain.
+/// repeats (ticket 192); `source` is empty (hand-written) or `event` (the T-9.3 mapper, ticket 193). A
+/// `pattern` row with no `repeats` is the root of its chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
@@ -44,6 +49,7 @@ pub struct Row {
     pub text: String,
     pub kind: String,
     pub repeats: String,
+    pub source: String,
 }
 
 /// `YYYY-MM-DD` naming a real calendar date (month 1-12, the day inside that month, leap years included).
@@ -103,6 +109,9 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
     }
     if !row.repeats.is_empty() && !token_ok(&row.repeats) {
         return Err("repeats must be empty or a plain row id (lowercase letters, digits, '-', '_', '.')".to_string());
+    }
+    if !row.source.is_empty() && !SOURCES.contains(&row.source.as_str()) {
+        return Err("source must be event (empty means a hand-written row)".to_string());
     }
     Ok(())
 }
@@ -258,22 +267,24 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
     let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     for (k, _) in &pairs {
         if !FIELDS.contains(&k.as_str()) && !OPTIONAL_FIELDS.contains(&k.as_str()) {
-            return Err("an unknown field: a row has exactly the six contract fields plus the two optional ones (kind, repeats)".to_string());
+            return Err("an unknown field: a row has exactly the six contract fields plus the three optional ones (kind, repeats, source)".to_string());
         }
     }
-    let mut row = Row { id: String::new(), date: String::new(), ticket: String::new(), tag: String::new(), breaks: String::new(), text: String::new(), kind: String::new(), repeats: String::new() };
+    let mut row = Row { id: String::new(), date: String::new(), ticket: String::new(), tag: String::new(), breaks: String::new(), text: String::new(), kind: String::new(), repeats: String::new(), source: String::new() };
     for (k, slot) in [("id", &mut row.id), ("date", &mut row.date), ("ticket", &mut row.ticket), ("where-it-lives", &mut row.tag), ("breaks", &mut row.breaks), ("text", &mut row.text)] {
         *slot = get(k).ok_or_else(|| format!("missing field {k:?}"))?;
     }
-    // The two optional fields default to their defaults when absent; an explicit empty value reads the same.
+    // The three optional fields default to their defaults when absent; an explicit empty value reads the same.
     row.kind = get("kind").unwrap_or_default();
     row.repeats = get("repeats").unwrap_or_default();
+    row.source = get("source").unwrap_or_default();
     validate_row(&row)?;
     Ok(row)
 }
 
-/// Canonical line WITHOUT its newline: the six fields in `FIELDS` order, then `kind` and `repeats` when they are
-/// not at their defaults (`kind` empty or `friction`, `repeats` empty). Refuses an invalid row and a line over the cap.
+/// Canonical line WITHOUT its newline: the six fields in `FIELDS` order, then `kind`, `repeats` and `source`
+/// when they are not at their defaults (`kind` empty or `friction`, `repeats` empty, `source` empty). Refuses
+/// an invalid row and a line over the cap.
 pub fn encode_row(row: &Row) -> Result<String, String> {
     validate_row(row)?;
     let mut line = String::from("{");
@@ -288,6 +299,9 @@ pub fn encode_row(row: &Row) -> Result<String, String> {
     }
     if !row.repeats.is_empty() {
         line.push_str(&format!(",{}:{}", jstr("repeats"), jstr(&row.repeats)));
+    }
+    if !row.source.is_empty() {
+        line.push_str(&format!(",{}:{}", jstr("source"), jstr(&row.source)));
     }
     line.push('}');
     if line.len() + 1 > LINE_CAP {
@@ -363,7 +377,7 @@ pub fn lint_text(text: &str) -> Inbox {
 
 /// The fields of a row as (name, value) pairs in canonical order (the six required, then the two optional):
 /// the one list every privacy scan walks.
-fn row_fields(row: &Row) -> [(&'static str, &str); 8] {
+fn row_fields(row: &Row) -> [(&'static str, &str); 9] {
     [
         ("id", row.id.as_str()),
         ("date", row.date.as_str()),
@@ -373,6 +387,7 @@ fn row_fields(row: &Row) -> [(&'static str, &str); 8] {
         ("text", row.text.as_str()),
         ("kind", row.kind.as_str()),
         ("repeats", row.repeats.as_str()),
+        ("source", row.source.as_str()),
     ]
 }
 
@@ -572,7 +587,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -639,15 +654,15 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
         eprintln!("harness: ROW NOT RECORDED");
         1
     };
-    let single = ["config", "id", "date", "ticket", "where-it-lives", "breaks", "text", "kind", "repeats"];
+    let single = ["config", "id", "date", "ticket", "where-it-lives", "breaks", "text", "kind", "repeats", "source"];
     let mut o: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         let Some(name) = arg.strip_prefix("--") else {
-            return fail("an unexpected argument (only the nine flags of the usage line are allowed)");
+            return fail("an unexpected argument (only the ten flags of the usage line are allowed)");
         };
         if !single.contains(&name) {
-            return fail("an unknown option (the usage line lists the nine flags)");
+            return fail("an unknown option (the usage line lists the ten flags)");
         }
         let Some(v) = it.next() else {
             return fail("a flag is missing its value");
@@ -682,6 +697,7 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
         text: o["text"].clone(),
         kind: o.get("kind").cloned().unwrap_or_default(),
         repeats: o.get("repeats").cloned().unwrap_or_default(),
+        source: o.get("source").cloned().unwrap_or_default(),
     };
     if let Err(e) = validate_row(&row) {
         return refuse(&e);

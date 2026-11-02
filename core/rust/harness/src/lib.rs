@@ -15,6 +15,7 @@ pub mod explain;
 pub mod fix_tier;
 pub mod fixtures;
 pub mod friction;
+pub mod friction_event;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;
