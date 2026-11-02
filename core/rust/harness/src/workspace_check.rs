@@ -13,9 +13,19 @@
 //!
 //! The check never writes, deletes, moves or locks anything: it never touches the manifest (read through the
 //! existing reader only), and every git call runs under `--no-optional-locks` with fsmonitor off, so not even the
-//! index's stat cache is refreshed. Repo configuration cannot hide anything: untracked-files mode, submodule
-//! ignoring and fsmonitor are forced on the command line, and ignored files are listed, not skipped. Git output
-//! is read through a hard 8 MiB cap and stray entries through a 10,000 cap; hitting either is exit 3
+//! index's stat cache is refreshed. No repo-controlled setting or index flag is trusted when deciding clean:
+//! every git call forces `--no-optional-locks`, `--no-replace-objects` (a replace ref cannot swap what HEAD
+//! looks like), no hooks, fsmonitor/trustctime/checkStat/filemode/untrackedCache/sparseCheckout off-or-default
+//! on the command line (command-line config outranks repo, worktree and global config), every inherited
+//! `GIT_*` name is stripped, ignored paths are listed (`--ignored=matching`), and the same forced reads run
+//! recursively INSIDE every checked-out submodule (the submodule's own config, exclude files and index bits
+//! hide nothing; a submodule that cannot be inspected is exit 3 naming it). Where even that cannot prove the
+//! answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file in the worktree or any
+//! checked-out submodule's git dir, any `filter.*` or `core.attributesFile` config key in any scope (a
+//! clean/smudge/process filter is both a hide and an arbitrary command a "read-only" check must never run),
+//! or a `core.worktree` that redirects elsewhere. Entries git never lists (a FIFO, a socket, a device) are
+//! caught by a no-follow walk of the tree. Git output is read through a hard 8 MiB cap and stray entries
+//! through a 10,000 cap; the submodule pass and the walk carry their own caps; hitting any is exit 3
 //! ("too many paths"), never a truncated PASS and never an unbounded read (fail closed).
 //!
 //! Exit codes: 0 clean (one line `workspace=clean ticket=<t>`); 2 at least one stray path (one `stray <kind>
@@ -40,6 +50,22 @@ pub const USAGE: &str = "usage: harness workspace check <ticket> --manifest-dir 
 const GIT_CAP: usize = 8 * 1024 * 1024;
 /// The hard cap on stray entries: a folder with more strays than this cannot be proven clean, so it is exit 3.
 const STRAY_CAP: usize = 10_000;
+/// The hard cap on checked-out submodules inspected in one run (recursion included): past it, exit 3.
+const SUBMODULE_CAP: usize = 100;
+/// The hard cap on submodule nesting: a stack deeper than this cannot be proven clean, so it is exit 3.
+const SUBMODULE_DEPTH_CAP: usize = 8;
+/// The hard cap on entries visited by the tree walk: past it the tree cannot be proven clean, so it is exit 3.
+const WALK_CAP: usize = 200_000;
+/// The forced status read, identical for the worktree and every checked-out submodule.
+const STATUS_ARGS: [&str; 7] = [
+    "status",
+    "--porcelain=v2",
+    "--branch",
+    "-z",
+    "--untracked-files=all",
+    "--ignored=matching",
+    "--ignore-submodules=none",
+];
 
 /// One stray kind. The order is the priority: a path carrying two kinds is reported once, with the stronger.
 /// `missing` (a listed thing is gone) outranks everything; a submodule change outranks a plain content change;
@@ -117,8 +143,12 @@ fn parse_args(a: &[String]) -> Result<(String, String), i32> {
 }
 
 /// One captured git call: read-only (`--no-optional-locks`, so not even the index stat cache is refreshed),
-/// no hooks, no inherited `GIT_*` name (an inherited `GIT_DIR` cannot redirect it), no stdin, stderr dropped
-/// (git's own message may name a folder). The stdout read is hard-capped: past `GIT_CAP` the flag `overflow`
+/// replace refs off (`--no-replace-objects`, so a `git replace` cannot swap what HEAD looks like), no hooks,
+/// no fsmonitor and no stat levers (command-line config outranks repo, worktree and global config, so
+/// `core.trustctime=false`, `core.checkStat=minimal`, `core.filemode=false`, `core.untrackedCache=true` and
+/// `core.sparseCheckout=true` in the repo cannot relax the comparison), no inherited `GIT_*` name (an
+/// inherited `GIT_DIR`/`GIT_CONFIG_*` cannot redirect or reconfigure it), no stdin, stderr dropped (git's
+/// own message may name a folder). The stdout read is hard-capped: past `GIT_CAP` the flag `overflow`
 /// is set and the rest is drained and discarded, never buffered.
 struct GitOut {
     ok: bool,
@@ -129,9 +159,16 @@ struct GitOut {
 fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
     let mut c = Command::new("git");
     c.arg("--no-optional-locks")
+        .arg("--no-replace-objects")
         .arg("-C")
         .arg(tree)
-        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.trustctime=true"])
+        .args(["-c", "core.checkStat=default"])
+        .args(["-c", "core.filemode=true"])
+        .args(["-c", "core.untrackedCache=false"])
+        .args(["-c", "core.sparseCheckout=false"])
         .args(args);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("GIT_") {
@@ -176,6 +213,242 @@ fn git_text(tree: &Path, args: &[&str]) -> Option<Result<String, i32>> {
         return None;
     }
     Some(Ok(String::from_utf8_lossy(&g.bytes).trim().to_string()))
+}
+
+/// The repo-settings refusal scan, run once for the worktree and once for every checked-out submodule:
+/// anything that could convert, filter or redirect git's view of the tree is exit 3, never a pass. `label`
+/// names the repo being scanned ("the worktree" or "submodule <rel>") — folder-free either way.
+///
+/// - `$GIT_DIR/info/attributes` (and the common git dir's copy, which a linked worktree reads): attributes
+///   can change what status compares, and a `filter=` attribute would run a repo-configured command;
+/// - any `filter.*` or `core.attributesFile` key in ANY config scope (system, global, repo, worktree): a
+///   clean/smudge/process filter is both a hide and an arbitrary command a "read-only" check must never
+///   execute (only the KEY NAME is ever printed, never the value — a value is a command line);
+/// - `core.worktree` pointing anywhere but the tree being scanned (git's own plumbing value for an
+///   absorbed submodule points at that submodule and passes; anything else redirects the work tree).
+fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
+    let gitdir = git_text(tree, &["rev-parse", "--path-format=absolute", "--absolute-git-dir"]);
+    let gitdir = match gitdir {
+        Some(Ok(g)) => PathBuf::from(g),
+        Some(Err(code)) => return Err(code),
+        None => return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed"))),
+    };
+    let common = git_text(tree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let common = match common {
+        Some(Ok(g)) => Some(PathBuf::from(g)),
+        Some(Err(code)) => return Err(code),
+        None => return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed"))),
+    };
+    for d in std::iter::once(&gitdir).chain(common.iter()) {
+        if d.join("info").join("attributes").exists() {
+            return Err(stop3(&format!(
+                "an info/attributes file is present in {label}; cannot check (attributes can change what git compares, and a filter would run a command)"
+            )));
+        }
+    }
+    let g = git_bytes(tree, &["config", "-z", "--get-regexp", "^(filter\\.|core\\.attributesFile)"]);
+    if g.overflow {
+        return Err(stop3("too many paths: a config answer went over the read cap"));
+    }
+    if g.ok && !g.bytes.is_empty() {
+        // `-z --get-regexp` records are `key\nvalue\0`: the key ends at the newline; only the key is printed.
+        let key = g.bytes.split(|&b| b == b'\n').next().unwrap_or(b"");
+        return Err(stop3(&format!(
+            "a filter or attributes config key is set ({}) in {}; cannot check (a filter would run a command)",
+            String::from_utf8_lossy(key),
+            label
+        )));
+    }
+    let g = git_bytes(tree, &["config", "--get", "core.worktree"]);
+    if g.overflow {
+        return Err(stop3("too many paths: a config answer went over the read cap"));
+    }
+    if g.ok && !g.bytes.is_empty() {
+        // The value may be relative (git's absorbed-submodule plumbing writes `../../sub`); it resolves
+        // against the git dir. The VALUE is a path and is never printed.
+        let v = String::from_utf8_lossy(&g.bytes).trim().to_string();
+        let p = PathBuf::from(&v);
+        let resolved = if p.is_absolute() { p } else { gitdir.join(p) };
+        match resolved.canonicalize() {
+            Ok(c) if c == tree => {}
+            _ => return Err(stop3(&format!("core.worktree redirects the work tree of {label}; cannot check"))),
+        }
+    }
+    Ok(())
+}
+
+/// Every gitlink (mode 160000 index entry) of a tree, raw relative path bytes. `ls-files -s -z` records are
+/// `<mode> <sha> <stage>\t<path>`; only gitlinks can hold checked-out sub-repositories.
+fn gitlinks(tree: &Path, label: &str) -> Result<Vec<Vec<u8>>, i32> {
+    let g = git_bytes(tree, &["ls-files", "-s", "-z"]);
+    if g.overflow {
+        return Err(stop3("too many paths: the tracked-file answer went over the read cap"));
+    }
+    if !g.ok {
+        return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+    }
+    let mut v = Vec::new();
+    for t in g.bytes.split(|&b| b == 0) {
+        let Some(tab) = t.iter().position(|&b| b == b'\t') else { continue };
+        if t.starts_with(b"160000 ") {
+            v.push(t[tab + 1..].to_vec());
+        }
+    }
+    Ok(v)
+}
+
+/// How a gitlink path sits on disk. `Absent` (nothing checked out — git created an empty directory at
+/// checkout, or it was deinitialised), `CheckedOut` (a directory with a `.git` of its own), or `Odd` (a
+/// non-empty directory with no `.git`: contents git cannot see — refuse rather than guess).
+enum GitlinkState {
+    Absent,
+    CheckedOut,
+    Odd,
+}
+
+fn gitlink_state(p: &Path) -> GitlinkState {
+    let Ok(m) = std::fs::symlink_metadata(p) else { return GitlinkState::Absent };
+    if !m.file_type().is_dir() {
+        return GitlinkState::Absent; // a file or link where a gitlink sits: status reports it as a change
+    }
+    match std::fs::read_dir(p) {
+        Ok(mut it) => {
+            if it.next().is_none() {
+                return GitlinkState::Absent; // the empty directory git leaves for an un-updated submodule
+            }
+        }
+        Err(_) => return GitlinkState::Odd,
+    }
+    if p.join(".git").exists() {
+        GitlinkState::CheckedOut
+    } else {
+        GitlinkState::Odd
+    }
+}
+
+/// The forced reads INSIDE one checked-out submodule at `tree` (worktree-relative `rel`), recursing into
+/// nested submodules. Any hit — a status entry, an untracked or ignored path, a non-`H` ls-files tag, all
+/// read with the same forced flags and neutral config as the superproject — makes the SUBMODULE stray
+/// (`stray submodule <rel>`, the submodule's own path, never a path inside it). The outermost level that
+/// can see the change names it, so once a level is dirty its own nested submodules need no separate
+/// verdict; a level that looks clean is exactly where git's own probe may have been blinded by the inner
+/// repo's settings, so the descent continues there. Depth, total count and every git output are capped
+/// (exit 3 past any); a submodule that cannot be inspected is exit 3 naming it.
+fn check_submodule(
+    tree: &Path,
+    rel: &[u8],
+    depth: usize,
+    visited: &mut usize,
+    map: &mut std::collections::BTreeMap<Vec<u8>, Kind>,
+) -> Result<(), i32> {
+    if depth >= SUBMODULE_DEPTH_CAP {
+        return Err(stop3("too many paths: submodule nesting is over the depth cap"));
+    }
+    *visited += 1;
+    if *visited > SUBMODULE_CAP {
+        return Err(stop3("too many paths: over the checked-submodule cap"));
+    }
+    let label = format!("submodule {}", escape(rel));
+    refuse_scan(tree, &label)?;
+    let status = git_bytes(tree, &STATUS_ARGS);
+    if status.overflow {
+        return Err(stop3(&format!("too many paths: the status answer of {label} went over the read cap")));
+    }
+    if !status.ok {
+        return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+    }
+    let dirty = status.bytes.split(|&b| b == 0).any(|t| !t.is_empty() && t[0] != b'#');
+    let hidden = if dirty {
+        None
+    } else {
+        let h = git_bytes(tree, &["ls-files", "-v", "-z"]);
+        if h.overflow {
+            return Err(stop3(&format!("too many paths: the tracked-file answer of {label} went over the read cap")));
+        }
+        if !h.ok {
+            return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+        }
+        Some(h)
+    };
+    let dirty = dirty || hidden
+        .map(|h| h.bytes.split(|&b| b == 0).any(|t| t.len() >= 3 && t[1] == b' ' && t[0] != b'H'))
+        .unwrap_or(false);
+    if dirty {
+        insert(map, rel.to_vec(), Kind::Submodule);
+        return Ok(());
+    }
+    for sub_rel in gitlinks(tree, &label)? {
+        let child = tree.join(std::ffi::OsStr::from_bytes(&sub_rel));
+        match gitlink_state(&child) {
+            GitlinkState::Absent => continue,
+            GitlinkState::Odd => {
+                let mut child_rel = rel.to_vec();
+                child_rel.push(b'/');
+                child_rel.extend_from_slice(&sub_rel);
+                return Err(stop3(&format!(
+                    "submodule {} cannot be inspected: its folder holds no git dir",
+                    escape(&child_rel)
+                )));
+            }
+            GitlinkState::CheckedOut => {
+                let mut child_rel = rel.to_vec();
+                child_rel.push(b'/');
+                child_rel.extend_from_slice(&sub_rel);
+                check_submodule(&child, &child_rel, depth + 1, visited, map)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A no-follow walk of the tree catching what git never lists: an entry that is not a regular file, a
+/// directory or a symlink (a FIFO, a socket, a device) is `stray untracked <relpath>`. The `.git` entry is
+/// skipped at every level (nothing under it is the worktree's business), symlinks are never followed
+/// (their targets are outside this walk's ground), and the visit count is capped (exit 3 past it or on any
+/// read error — a tree that cannot be walked cannot be proven clean).
+fn walk_special(
+    dir: &Path,
+    rel: &[u8],
+    visits: &mut usize,
+    map: &mut std::collections::BTreeMap<Vec<u8>, Kind>,
+) -> Result<(), i32> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return Err(stop3("the worktree could not be walked: a folder could not be read")),
+    };
+    for entry in rd {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => return Err(stop3("the worktree could not be walked: a folder could not be read")),
+        };
+        let name = entry.file_name();
+        let name_bytes = name.as_bytes();
+        if name_bytes == b".git" {
+            continue;
+        }
+        *visits += 1;
+        if *visits > WALK_CAP {
+            return Err(stop3("too many paths: over the tree-walk visit cap"));
+        }
+        let m = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => return Err(stop3("the worktree could not be walked: a path could not be read")),
+        };
+        let ft = m.file_type();
+        let mut child_rel = rel.to_vec();
+        if !child_rel.is_empty() {
+            child_rel.push(b'/');
+        }
+        child_rel.extend_from_slice(name_bytes);
+        if ft.is_symlink() {
+            continue; // judged as a path of its own by git and the no-follow stat; never followed
+        } else if ft.is_dir() {
+            walk_special(&entry.path(), &child_rel, visits, map)?;
+        } else if !ft.is_file() {
+            insert(map, child_rel, Kind::Untracked);
+        }
+    }
+    Ok(())
 }
 
 /// Insert a stray with the strongest-kind-wins rule.
@@ -387,23 +660,19 @@ pub fn check_cmd(a: &[String]) -> i32 {
         return stop3("a merge, rebase or cherry-pick is in progress in the worktree");
     }
 
-    // 7. The status read. Repo configuration cannot hide anything: untracked-files mode, submodule ignoring and
-    //    fsmonitor are forced on the command line (a config `status.showUntrackedFiles=no` loses to the flag),
-    //    ignored paths are listed (`--ignored=matching`), paths are raw bytes (`-z`, no quoting) and every file
-    //    is named individually (`untracked-files=all`), never just its folder.
+    // 7. The repo-settings refusal scan: attributes, filters and a redirecting core.worktree are exit 3
+    //    before any content is compared (a filter must never run).
+    if let Err(code) = refuse_scan(&tree, "the worktree") {
+        return code;
+    }
+
+    // 8. The status read. Repo configuration cannot hide anything: untracked-files mode, submodule ignoring
+    //    and the stat levers are forced on the command line (a config `status.showUntrackedFiles=no` or
+    //    `core.trustctime=false` loses to the flags), ignored paths are listed (`--ignored=matching`),
+    //    paths are raw bytes (`-z`, no quoting) and every file is named individually
+    //    (`untracked-files=all`), never just its folder.
     let mut map = std::collections::BTreeMap::new();
-    let status = git_bytes(
-        &tree,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=all",
-            "--ignored=matching",
-            "--ignore-submodules=none",
-        ],
-    );
+    let status = git_bytes(&tree, &STATUS_ARGS);
     if status.overflow {
         return stop3("too many paths: the status answer went over the read cap");
     }
@@ -412,7 +681,7 @@ pub fn check_cmd(a: &[String]) -> i32 {
     }
     parse_status(&status.bytes, &mut map);
 
-    // 8. The hidden read: tracked paths carrying the assume-unchanged or skip-worktree bit are invisible to
+    // 9. The hidden read: tracked paths carrying the assume-unchanged or skip-worktree bit are invisible to
     //    status, so they get their own query.
     let hidden = git_bytes(&tree, &["ls-files", "-v", "-z"]);
     if hidden.overflow {
@@ -423,7 +692,40 @@ pub fn check_cmd(a: &[String]) -> i32 {
     }
     parse_hidden(&hidden.bytes, &mut map);
 
-    // 9. Live manifest path entries INSIDE the worktree (strictly inside; the `worktree` entry is the tree
+    // 10. The submodule pass: git's own submodule probe runs the submodule's own status, which honours the
+    //     submodule's own config and index bits — so every CHECKED-OUT gitlink gets the same forced reads
+    //     inside it (recursively), and a hit names the submodule itself.
+    let mut submodules_visited = 0usize;
+    let top_gitlinks = match gitlinks(&tree, "the worktree") {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    for rel in top_gitlinks {
+        let p = tree.join(std::ffi::OsStr::from_bytes(&rel));
+        match gitlink_state(&p) {
+            GitlinkState::Absent => continue,
+            GitlinkState::Odd => {
+                return stop3(&format!(
+                    "submodule {} cannot be inspected: its folder holds no git dir",
+                    escape(&rel)
+                ));
+            }
+            GitlinkState::CheckedOut => {
+                if let Err(code) = check_submodule(&p, &rel, 0, &mut submodules_visited, &mut map) {
+                    return code;
+                }
+            }
+        }
+    }
+
+    // 11. The walk: entries git never lists (a FIFO, a socket, a device) are stray untracked. No-follow,
+    //     `.git` skipped, symlinks never followed, visits capped.
+    let mut visits = 0usize;
+    if let Err(code) = walk_special(&tree, b"", &mut visits, &mut map) {
+        return code;
+    }
+
+    // 12. Live manifest path entries INSIDE the worktree (strictly inside; the `worktree` entry is the tree
     //    itself). One that is still what the manifest says it is — today: a no-follow stat finds a SYMLINK at
     //    that exact stored path, the P1B-04 node_modules link — is EXPECTED: that one path (never anything
     //    under it, never anything matched through the link) is removed from the strays. One that is gone or no
@@ -447,7 +749,7 @@ pub fn check_cmd(a: &[String]) -> i32 {
         }
     }
 
-    // 10. The entry cap: more strays than the bound means "cannot check", never a truncated PASS.
+    // 13. The entry cap: more strays than the bound means "cannot check", never a truncated PASS.
     if map.len() > STRAY_CAP {
         return stop3("too many paths: over the stray-entry cap");
     }
