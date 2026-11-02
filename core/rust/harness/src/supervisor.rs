@@ -80,7 +80,7 @@ const REAP_BOUND_MS: u64 = 3000;
 
 // ---------------------------------------------------------------- command entry
 
-/// `harness process start|stop` dispatch.
+/// `harness process start|stop|check|step` dispatch.
 pub fn process_cmd(a: &[String]) -> i32 {
     let Some((sub, rest)) = a.split_first() else {
         eprintln!("{}", USAGE);
@@ -700,6 +700,15 @@ enum StopDone {
     Refused(String),
 }
 
+/// Check 3's already-gone tail (#207 r1 F1, factored so `check`'s liveness-first pass resolves a gone
+/// pid through the SAME path stop does): stop's stderr line verbatim, the entries removed. Err names the
+/// manifest refusal (the file is unchanged on Err).
+fn already_gone(dir: &Path, ticket: &str, id: &str, pid: u64, port_live: bool) -> Result<(), String> {
+    remove_stopped(dir, ticket, id, port_live)?;
+    eprintln!("harness: {id} is already-gone: pid {pid} is provably no such process; nothing signalled, entries removed");
+    Ok(())
+}
+
 /// Checks 2b-7 for the live process entry `id` of `ticket`: the entry must be a LIVE `process` entry of
 /// this ticket, then liveness, identity, leadership, TERM, the KILL gate and the group-and-leader death
 /// proof (the full order is the module header). `read` is the clean manifest the caller read under its own
@@ -718,11 +727,8 @@ fn stop_live_entry(dir: &Path, ticket: &str, read: &ManifestRead, id: &str, grac
     match probe_alive_at(Path::new("/bin/kill"), pid) {
         Liveness::Alive => {}
         Liveness::NoSuch => {
-            return match remove_stopped(dir, ticket, id, port_live) {
-                Ok(()) => {
-                    eprintln!("harness: {id} is already-gone: pid {pid} is provably no such process; nothing signalled, entries removed");
-                    StopDone::Gone
-                }
+            return match already_gone(dir, ticket, id, pid, port_live) {
+                Ok(()) => StopDone::Gone,
                 Err(e) => StopDone::Refused(e),
             };
         }
@@ -877,7 +883,9 @@ fn stop_cmd(a: &[String]) -> i32 {
 
 /// The pure expiry decision (#207 decision 4). Fail closed: an age that cannot be READ, or a wall clock
 /// that reads BEFORE the `limit` line's own `ts_ms` (a detectable backward jump), is `Refuse` — nothing
-/// signalled, the entry kept; check never answers "fine" when it does not know. Expired means
+/// signalled, the entry kept; check never answers "fine" when it does not know. The CALLER proves the pid
+/// live before calling (r1 F1: the age of a gone pid is unreadable, and a gone pid resolves as
+/// already-gone instead, so this refusal is only ever about a live process). Expired means
 /// `age >= timeout_ms`; the age is the OS's own age of the process (boot-relative on Linux), so restarting
 /// the harness cannot reset the timer and a wall jump changes WHEN a process stops, never WHOM.
 enum Expiry {
@@ -952,11 +960,14 @@ fn parse_check(a: &[String]) -> Result<CheckArgs, String> {
 /// `harness process check <ticket>` (#207): one-shot, NO daemon — whoever drives the ticket runs it before
 /// every step and at finalize, so the bound is "stopped at the first check at or after the deadline", never
 /// "stopped at the deadline". Every live process entry WITH a limit is visited under the per-ticket lock;
-/// an expired one is stopped through the factored stop checks 2-7 (a clock jump can change WHEN a process
-/// is stopped, never WHOM). Exit codes: `0` nothing expired; `5` at least one expired and every expired one
-/// resolved (stopped, already-gone or pid-reused); `4` an expired one was signalled but its death was not
-/// confirmed (entry kept); `2` a refusal (usage, unclean manifest, unreadable age, clock before the limit
-/// line) — precedence `2 > 4 > 5 > 0`, every entry still visited.
+/// LIVENESS comes first (r1 F1: a gone pid resolves through the already-gone tail stop uses, never a
+/// refusal, because its age cannot be read either), then the age is read only for a proven-live pid and an
+/// expired one is stopped through the factored stop checks 2-7 (a clock jump can change WHEN a process
+/// is stopped, never WHOM). Exit codes: `0` nothing expired; `5` at least one visited entry resolved (an
+/// expired one stopped, or any visited one already-gone or pid-reused); `4` an expired one was signalled
+/// but its death was not confirmed (entry kept); `2` a refusal (usage, unclean manifest, unreadable age of
+/// a LIVE pid, a clock before the limit line, a pid that is not ours to signal, a probe that cannot run)
+/// — precedence `2 > 4 > 5 > 0`, every entry still visited.
 fn check_cmd(a: &[String]) -> i32 {
     let args = match parse_check(a) {
         Ok(x) => x,
@@ -984,25 +995,52 @@ fn check_cmd(a: &[String]) -> i32 {
     for e in &read.live {
         let Target::Process { pid, .. } = &e.target else { continue };
         let Some(limit) = &e.limit else { continue };
-        match expiry_decision(*pid, manifest::process_age_ms(*pid), limit.timeout_ms, limit.ts_ms, now_ms()) {
-            Expiry::Within => {}
-            Expiry::Expired => match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms) {
-                StopDone::Stopped(p) => {
-                    println!("{}\t{}\ttimed_out", e.id, p);
-                    codes.push(5);
-                }
-                // already-gone / pid-reused: stop's own stderr line has already printed, verbatim; resolved.
-                StopDone::Gone | StopDone::Reused => codes.push(5),
-                StopDone::NotConfirmed => codes.push(4),
-                StopDone::Refused(m) => {
+        let port_live = read.live.iter().any(|x| x.id == format!("{}.port", e.id));
+        // Liveness FIRST (#207 r1 F1): the age of a GONE pid cannot be read either (ps does not know it,
+        // /proc/<pid>/stat is gone), and a program that finished on its own is the already-gone path —
+        // resolved through the same tail stop uses — never a refusal. The age is read only for a
+        // proven-LIVE pid, so "cannot read the age" is a refusal about a live process, and a pid that
+        // answers the probe but is not ours, or a probe that cannot run, is a fail-closed refusal.
+        match probe_alive_at(Path::new("/bin/kill"), *pid) {
+            Liveness::NoSuch => match already_gone(&dir, &args.ticket, &e.id, *pid, port_live) {
+                // stop's already-gone stderr line has already printed, verbatim; resolved.
+                Ok(()) => codes.push(5),
+                Err(m) => {
                     fail(&m);
                     codes.push(2);
                 }
             },
-            Expiry::Refuse(m) => {
-                fail(&format!("{}: {}", e.id, m));
+            Liveness::Denied => {
+                fail(&format!(
+                    "{}: pid {} answers the liveness probe but is not ours to signal (kill reports no permission); nothing signalled",
+                    e.id, pid
+                ));
                 codes.push(2);
             }
+            Liveness::Unknown(why) => {
+                fail(&format!("{}: cannot prove pid {} is alive: {}; nothing signalled", e.id, pid, why));
+                codes.push(2);
+            }
+            Liveness::Alive => match expiry_decision(*pid, manifest::process_age_ms(*pid), limit.timeout_ms, limit.ts_ms, now_ms()) {
+                Expiry::Within => {}
+                Expiry::Expired => match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms) {
+                    StopDone::Stopped(p) => {
+                        println!("{}\t{}\ttimed_out", e.id, p);
+                        codes.push(5);
+                    }
+                    // already-gone / pid-reused: stop's own stderr line has already printed, verbatim; resolved.
+                    StopDone::Gone | StopDone::Reused => codes.push(5),
+                    StopDone::NotConfirmed => codes.push(4),
+                    StopDone::Refused(m) => {
+                        fail(&m);
+                        codes.push(2);
+                    }
+                },
+                Expiry::Refuse(m) => {
+                    fail(&format!("{}: {}", e.id, m));
+                    codes.push(2);
+                }
+            },
         }
     }
     check_fold(&codes)
@@ -1391,6 +1429,25 @@ mod limit_tests {
         assert!(matches!(expiry_decision(9, Ok(1000), 1000, 100, 5000), Expiry::Expired), "age == timeout is expired");
         assert!(matches!(expiry_decision(9, Ok(1001), 1000, 100, 5000), Expiry::Expired), "age > timeout is expired");
         assert!(matches!(expiry_decision(9, Ok(999), 1000, 100, 5000), Expiry::Within), "age < timeout is within");
+    }
+
+    /// #207 r1 F3 (pure fold): check's exit precedence `2 > 4 > 5 > 0`, over every shape the loop can
+    /// push. Folding 4 into 5 (the review's mutant O1) or losing the 2-beats-everything rule goes red
+    /// here.
+    #[test]
+    fn supervisor_check_fold_table() {
+        assert_eq!(check_fold(&[]), 0, "nothing visited: nothing expired");
+        assert_eq!(check_fold(&[0]), 0, "a within-limit entry is silent");
+        assert_eq!(check_fold(&[0, 0]), 0);
+        assert_eq!(check_fold(&[5]), 5, "one resolved entry is 5");
+        assert_eq!(check_fold(&[0, 5]), 5, "a resolved entry beats a silent one");
+        assert_eq!(check_fold(&[5, 0, 5]), 5);
+        assert_eq!(check_fold(&[4]), 4, "an unproven death is 4, never 5");
+        assert_eq!(check_fold(&[4, 5]), 4, "an unproven death beats a resolved one");
+        assert_eq!(check_fold(&[5, 4, 0]), 4);
+        assert_eq!(check_fold(&[2]), 2, "a refusal is a refusal");
+        assert_eq!(check_fold(&[2, 4]), 2, "a refusal beats an unproven death");
+        assert_eq!(check_fold(&[4, 2, 5, 0]), 2, "a refusal beats everything");
     }
 
     /// #207 AC 7 (reader half): an age reader pointed at a helper that cannot run answers Err — the same

@@ -1539,24 +1539,116 @@ fn reused_pid_at_limit_is_not_signalled() {
 
 // ---------------------------------------------------------------- #207 AC 7 (integration half)
 
-/// #207 AC 7: an entry whose age CANNOT be read (a pid no OS can hold, planted with an expired limit) makes
-/// check REFUSE: exit 2, the age refusal message, nothing signalled, the manifest byte-identical.
+/// #207 AC 7 after r1 F1: the unreadable-age refusal is reserved for a LIVE pid. The fixture is a REAL
+/// started entry (a live pid and its own limit line); `check` runs under a seatbelt profile that denies
+/// exec of /bin/ps ONLY — /bin/kill still runs, so liveness stays provable — so the AGE read of a
+/// proven-live pid fails and check must REFUSE: exit 2, the age refusal naming the pid, nothing
+/// signalled, the manifest byte-identical, the process alive. (A dead pid is NOT this case: a gone pid
+/// resolves as already-gone, see `naturally_exited_entry_resolves_not_refuses`. The Linux leg reads /proc
+/// instead of /bin/ps and cannot be denied this way: the pure `boot_age_ms` table and
+/// `supervisor_age_reader_unreadable_is_err` carry the same rule there.)
 #[test]
-fn unreadable_age_refuses_check() {
+#[cfg(target_os = "macos")]
+fn live_pid_unreadable_age_refuses_check() {
     let t = Tmp::new();
     let (r, _o, d) = t.fence();
     init_manifest("tl-7", &r, &d);
+    let mut guard = Guard::default();
 
-    plant_process(&d, "tl-7", "a", 4_000_000_000, 1730000000000);
-    plant_limit(&d, "tl-7", "a", 1, 1);
+    let (s, pid) = start_to("tl-7", "a", &r, None, &d, 600_000, &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
     let file = d.join("tl-7.jsonl");
     let before = fs::read(&file).unwrap();
 
-    let c = check("tl-7", None, &d);
-    assert_eq!(code(&c), 2, "an unreadable age refuses: stdout {:?} stderr {:?}", out(&c), err(&c));
-    assert!(err(&c).contains("cannot read the age of pid 4000000000"), "the refusal names the unreadable age: stderr {:?}", err(&c));
+    // The planted unrunnable helper: a profile denying exec of /bin/ps only.
+    let profile = r.join("no-ps.sb");
+    fs::write(&profile, "(version 1)(allow default)(deny process-exec (literal \"/bin/ps\"))\n").unwrap();
+    let c = Command::new("/usr/bin/sandbox-exec")
+        .arg("-f")
+        .arg(profile.to_str().unwrap())
+        .arg(BIN)
+        .args(["process", "check", "tl-7", "--dir", d.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let cs = format!("{}", c.status.code().unwrap_or(-1));
+    assert_eq!(c.status.code(), Some(2), "a live pid whose age cannot be read refuses (rc {cs}): stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains(&format!("cannot read the age of pid {pid}")), "the refusal names the unreadable age of the LIVE pid: stderr {:?}", err(&c));
+    assert!(err(&c).contains("cannot run ps"), "the refusal names the unrunnable helper: stderr {:?}", err(&c));
     assert!(err(&c).contains("nothing signalled"), "the refusal says nothing was signalled: stderr {:?}", err(&c));
     assert_eq!(fs::read(&file).unwrap(), before, "the refused check changed the manifest");
+    assert!(alive(pid), "the refused check signalled the live process");
+}
+
+/// #207 r1 F1: a limited process that EXITS ON ITS OWN is the already-gone path, never a refusal. check
+/// resolves the entry (exit 5, stop's already-gone stderr line verbatim, entries removed), and the NEXT
+/// check answers 0 — the head read the age before any liveness check and answered exit 2 forever.
+#[test]
+fn naturally_exited_entry_resolves_not_refuses() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("tl-7b", &r, &d);
+    let mut guard = Guard::default();
+
+    let (s, pid) = start_to("tl-7b", "a", &r, None, &d, 600_000, &["sleep", "1"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    // The program finished well inside its limit on its own; wait until the OS itself reports it gone
+    // (a state poll, never a wall-clock assert).
+    assert!(poll(30_000, || !alive(pid)), "the program never exited on its own");
+
+    let c = check("tl-7b", None, &d);
+    assert_eq!(code(&c), 5, "a naturally-exited entry resolves as already-gone, never a refusal: stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains("already-gone"), "the answer reuses stop's already-gone line: stderr {:?}", err(&c));
+    assert!(err(&c).contains("nothing signalled"), "the answer says nothing was signalled: stderr {:?}", err(&c));
+    let l = run(&["manifest", "list", "tl-7b", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).lines().any(|x| x.starts_with("a\t")), "the resolved entry is still listed: {}", out(&l));
+
+    let c2 = check("tl-7b", None, &d);
+    assert_eq!(code(&c2), 0, "the second check answers 0, not exit 2 again: stdout {:?} stderr {:?}", out(&c2), err(&c2));
+    assert_eq!(out(&c2), "", "the second check prints nothing: stdout {:?}", out(&c2));
+}
+
+/// #207 r1 F3: check's exit 4 reached end to end, then the r1 F1 resolution. Fixture (the #183 AC 5
+/// technique): a test-spawned leader the test NEVER reaps, signed out through the public verb, carrying
+/// an expired planted limit. The stop inside check signals it, but the unreaped zombie still answers the
+/// liveness probe, so its death is not confirmed: exit 4, the entry KEPT (still listed). Once the test
+/// reaps the zombie, the next check resolves the entry as already-gone (exit 5, entries removed).
+#[test]
+fn expired_entry_unproven_death_answers_4_then_resolves() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("tl-7c", &r, &d);
+    let mut guard = Guard::default();
+
+    let mut own = spawn_own_group("sleep", "300");
+    let pid = own.id();
+    guard.add(pid);
+    let add = manifest_add_process("tl-7c", "z", pid, &d);
+    assert_eq!(code(&add), 0, "add of the leader: {}", err(&add));
+    plant_limit(&d, "tl-7c", "z", 1, 1);
+    // The planted timeout is 1 ms, but the off-Linux age is whole seconds: wait until the OS itself
+    // reports the process as at least 1 s old, so the limit is provably past (a state poll).
+    wait_past_age(pid, 1);
+
+    let c1 = check("tl-7c", Some(200), &d);
+    assert_eq!(code(&c1), 4, "an expired entry whose death cannot be proven answers 4: stdout {:?} stderr {:?}", out(&c1), err(&c1));
+    assert!(err(&c1).contains("not confirmed"), "the answer names the unconfirmed death: stderr {:?}", err(&c1));
+    let l = run(&["manifest", "list", "tl-7c", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(out(&l).lines().any(|x| x.starts_with("z\t")), "the unconfirmed entry must stay listed: {}", out(&l));
+
+    // Reap the zombie, then the retry: the pid is provably gone, so check resolves it as already-gone.
+    let _ = own.wait();
+    assert!(poll(10_000, || !alive(pid)), "the reaped pid still answers the probe");
+    let c2 = check("tl-7c", None, &d);
+    assert_eq!(code(&c2), 5, "the retry after the reap resolves the entry: stdout {:?} stderr {:?}", out(&c2), err(&c2));
+    assert!(err(&c2).contains("already-gone"), "the retry names already-gone: stderr {:?}", err(&c2));
+    let l2 = run(&["manifest", "list", "tl-7c", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l2), 0);
+    assert!(!out(&l2).lines().any(|x| x.starts_with("z\t")), "the resolved entry is still listed: {}", out(&l2));
 }
 
 // ---------------------------------------------------------------- #207 AC 9 (integration half)
@@ -1630,6 +1722,20 @@ fn soft_limit_writes_check_in_and_continues() {
     let v = run(&["events", "verify", "--log", log.to_str().unwrap()]);
     assert_eq!(code(&v), 0, "events verify accepts the log: {}", err(&v));
     assert!(alive(pid), "the soft line stopped the live process");
+
+    // r1 F4: steps != soft. The event must carry the two counts as DIFFERENT numbers (steps 7, soft 5),
+    // and stdout's second column is the soft line — so a swap of the two (the review's mutant O4,
+    // writing `steps` where `soft_limit` belongs) goes red here.
+    let st15 = run(&[
+        "process", "step", "tl-10", "--repo", "r", "--steps", "7", "--soft", "5", "--hard", "9",
+        "--dir", d.to_str().unwrap(), "--log", log.to_str().unwrap(), "--root", r.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&st15), 0, "steps 7 soft 5 says carry on: stdout {:?} stderr {:?}", out(&st15), err(&st15));
+    assert_eq!(out(&st15), "check_in\t7\t5\n", "stdout carries the step then the soft line: stdout {:?}", out(&st15));
+    let text15 = fs::read_to_string(&log).unwrap();
+    let ci7: Vec<&str> = text15.lines().filter(|l| l.contains("\"kind\":\"check_in\"") && l.contains("\"steps\":7")).collect();
+    assert_eq!(ci7.len(), 1, "exactly one check_in for steps 7: {}", text15);
+    assert!(ci7[0].contains("\"soft_limit\":5"), "the event carries soft_limit 5, not steps 7: {}", ci7[0]);
 
     let before = fs::read(&log).unwrap();
     let st2 = run(&[

@@ -1128,6 +1128,30 @@ pub fn process_start_ms(pid: u64) -> Result<u64, String> {
 
 // ---------------------------------------------------------------- process age (#207)
 
+/// The boot-relative age arithmetic of the Linux age read (#207 r1 F2), factored PURE over the two
+/// numbers so its fail-closed rules are testable: the age is `uptime_ms - starttime_ms`, both
+/// boot-relative. An odd clock reading — a NaN, infinite or negative uptime, a finite reading that does
+/// not fit a u64 millisecond clock, or an uptime BELOW the pid's own starttime (an impossible clock) —
+/// is Err, never a saturated 0 that would read as "brand new, within every limit"; the caller refuses
+/// on Err (fail closed).
+/// Compiled on Linux (the only reader) and under `cfg(test)` everywhere, so the pure table runs on both
+/// CI legs; off-Linux non-test builds carry no dead copy of it.
+#[cfg(any(target_os = "linux", test))]
+fn boot_age_ms(up_s: f64, start_ms: u64) -> Result<u64, String> {
+    if !up_s.is_finite() || up_s < 0.0 {
+        return Err(format!("the uptime reads {up_s}, which is not a usable clock"));
+    }
+    let up_ms = up_s * 1000.0;
+    if up_ms >= u64::MAX as f64 {
+        return Err(format!("the uptime reads {up_s}s, which does not fit a millisecond clock"));
+    }
+    let up_ms = up_ms as u64;
+    if up_ms < start_ms {
+        return Err(format!("the uptime reads {up_ms}ms, before the pid's own start time {start_ms}ms"));
+    }
+    Ok(up_ms - start_ms)
+}
+
 /// The AGE of `pid` in ms, read std-only, for the supervisor's timeout decision (#207). On Linux it is
 /// `/proc/uptime` minus `/proc/<pid>/stat` starttime, both boot-relative, so a wall-clock jump cannot move
 /// it; elsewhere it is the system `ps -o etime=` (whole seconds, wall-based — a forward wall jump can stop
@@ -1156,8 +1180,7 @@ pub fn process_age_ms_at(ps: &Path, pid: u64) -> Result<u64, String> {
         let ticks: u64 = fields.get(19).ok_or("stat has no starttime field")?.parse().map_err(|_| "starttime is not an integer")?;
         // CLK_TCK is 100 on every mainstream Linux userspace; both values are boot-relative.
         let start_ms = ticks * 1000 / 100;
-        let age_ms = (up_s * 1000.0) as u64;
-        Ok(age_ms.saturating_sub(start_ms))
+        boot_age_ms(up_s, start_ms)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1204,6 +1227,25 @@ pub fn process_age_ms(pid: u64) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #207 r1 F2 (pure table): the boot-age arithmetic fails CLOSED on every odd clock — an uptime below
+    /// the pid's own starttime (an impossible clock), nan, either infinity, a negative reading, or a finite
+    /// reading that does not fit a u64 millisecond clock — never a saturated 0 that would read as "brand
+    /// new, within every limit". Normal readings answer uptime minus starttime.
+    #[test]
+    fn boot_age_ms_fails_closed_on_odd_clocks() {
+        assert_eq!(boot_age_ms(12.5, 2_500).unwrap(), 10_000, "a normal reading is uptime minus starttime");
+        assert_eq!(boot_age_ms(2.5, 2_500).unwrap(), 0, "a pid started exactly now is age 0");
+        assert_eq!(boot_age_ms(0.0, 0).unwrap(), 0, "a fresh boot with no pid read yet is age 0");
+        assert!(boot_age_ms(2.4, 2_500).is_err(), "an uptime below the starttime is an impossible clock, never age 0");
+        assert!(boot_age_ms(f64::NAN, 2_500).is_err(), "nan refuses");
+        assert!(boot_age_ms(f64::INFINITY, 2_500).is_err(), "inf refuses");
+        assert!(boot_age_ms(f64::NEG_INFINITY, 2_500).is_err(), "-inf refuses");
+        assert!(boot_age_ms(-1.0, 2_500).is_err(), "a negative uptime refuses");
+        assert!(boot_age_ms(1e300, 2_500).is_err(), "a finite reading that does not fit u64 ms refuses");
+        let why = boot_age_ms(f64::NAN, 2_500).unwrap_err();
+        assert!(why.contains("uptime"), "the refusal names the uptime: {why}");
+    }
 
     /// N-f: a later root whose line is over the cap makes init refuse with `TooLong` and leaves NOTHING on disk (no
     /// manifest dir, no file, no earlier root line). The roots here are synthetic: `write_init` takes roots already
