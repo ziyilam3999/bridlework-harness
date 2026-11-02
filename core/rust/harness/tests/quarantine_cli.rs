@@ -1130,3 +1130,27 @@ fn sweep_moves_all_when_ancestors_stable() {
         assert!(!f.root.join(format!("stray-{i:03}")).exists(), "stray-{i:03} moved");
     }
 }
+
+// ---------------------------------------------------------------- doc contract (#175)
+
+fn repo() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
+/// The `delete-listed` doc section must state the caller rule (#175): `delete_listed` changes the process
+/// working directory while it walks (saved and restored before it returns), so it is not safe to call while
+/// another thread is using the working directory or relative paths — P1B-14 teardown must call it from a
+/// single thread only. Word-presence contract in the `manifest.rs` precedent style: if the wording is ever
+/// dropped this fails; if the section heading is renamed the slice fails loud too (a false RED, never a
+/// false GREEN).
+#[test]
+fn the_doc_states_the_delete_working_directory_caller_rule() {
+    let doc = std::fs::read_to_string(repo().join("docs/quarantine.md")).expect("the doc is committed and utf-8");
+    let start = doc.find("## `harness quarantine delete-listed`").expect("the delete-listed section heading exists");
+    let end = doc[start..].find("\n## ").map(|i| start + i).expect("a section follows the delete-listed section");
+    let section = &doc[start..end];
+    let lower = section.to_lowercase();
+    assert!(lower.contains("working directory"), "the delete section states the working-directory rule");
+    assert!(lower.contains("thread"), "the delete section states the not-thread-safe rule");
+    assert!(section.contains("P1B-14"), "the delete section ties the rule to P1B-14 teardown");
+}
