@@ -20,6 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const SCHEMA_VERSION: u64 = 2;
 /// Largest accepted line in bytes, newline included. Keeps each append one small write.
 pub const LINE_CAP: usize = 4096;
+/// Largest whole-log read into memory in one go, in bytes. The cap is the LARGEST ACCEPTED length (the
+/// `config.rs` convention): a log of exactly this many bytes is read, one byte more is refused before a
+/// single log byte is buffered. The number is the constant's own value, printed in every refusal. Rotation
+/// past this size is a separate concern (deferred).
+pub const LOG_READ_CAP: u64 = 64 * 1024 * 1024;
 /// Keys of every v2 base kind, in canonical order (the PRE-B envelope, bytes as on master).
 const KEYS_V2: [&str; 9] = ["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"];
 
@@ -888,9 +893,52 @@ pub fn parse_log(bytes: &[u8]) -> LogRead {
     out
 }
 
-/// Read a log file. A missing or unreadable file is an `Err` (fail closed), not an empty log.
+/// Read a log file. A missing or unreadable file is an `Err` (fail closed), not an empty log. The read is
+/// checked and bounded BEFORE any byte is buffered: a symbolic link and anything but a regular file (a FIFO
+/// would block the open forever, a directory or device would misread) are refused on the path's own
+/// metadata, the opened handle is proven to be that same regular file, and at most `LOG_READ_CAP` bytes are
+/// read — one byte over refuses the whole read, so a giant or endlessly growing log can never eat the
+/// process's memory. A log within the cap behaves exactly as before.
 pub fn read_log(path: &Path) -> Result<LogRead, String> {
-    let bytes = fs::read(path).map_err(|e| format!("cannot read log: {}", e.kind()))?;
+    read_log_with_cap(path, LOG_READ_CAP)
+}
+
+/// The checked, bounded read behind `read_log`, with the cap as a parameter so the unit tests prove the
+/// boundary with a tiny cap instead of a 64 MiB file. The cap is the largest ACCEPTED length: exactly `cap`
+/// bytes is read and parsed, `cap + 1` is refused. The refusal messages are fixed strings — never a path,
+/// never a byte of the log; only the cap value itself is printed.
+fn read_log_with_cap(path: &Path, cap: u64) -> Result<LogRead, String> {
+    let io = |e: std::io::Error| format!("cannot read log: {}", e.kind());
+    // Pre-open check on the path's OWN metadata (lstat: the final component is not followed), so a symlink
+    // or a non-regular file is refused WITHOUT opening — a FIFO can never block the read.
+    let path_md = fs::symlink_metadata(path).map_err(io)?;
+    if path_md.file_type().is_symlink() {
+        return Err("log refused: the path is a symbolic link".to_string());
+    }
+    if !path_md.file_type().is_file() {
+        return Err("log refused: not a regular file".to_string());
+    }
+    let mut f = fs::File::open(path).map_err(io)?;
+    // Post-open re-bind: the handle must itself be a regular file and the very file the lstat saw (a swap
+    // between the check and the open is refused — the same promise as `verify_opened_handle` on the writer).
+    let handle_md = f.metadata().map_err(io)?;
+    if !handle_md.is_file() {
+        return Err("log refused: not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (handle_md.dev(), handle_md.ino()) != (path_md.dev(), path_md.ino()) {
+            return Err("log refused: the file changed between check and open".to_string());
+        }
+    }
+    // Bounded read: `take(cap + 1)` then refuse when more than `cap` arrived, so memory stays capped even
+    // when the file grows while it is being read.
+    let mut bytes = Vec::new();
+    (&mut f).take(cap + 1).read_to_end(&mut bytes).map_err(io)?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("log refused: over the {}-byte read cap; nothing was read as events", cap));
+    }
     Ok(parse_log(&bytes))
 }
 
@@ -1129,8 +1177,15 @@ pub fn append_under_run(root: &Path, log: &Path, ev: &Event, inherited: Option<&
             let id = inherited.unwrap();
             // Read through the locked handle: the file is settled (no writer of this module is mid-append), so the issue
             // check can never see a phantom torn tail or a fused line from an in-flight write.
+            // Read through the locked handle: the file is settled (no writer of this module is mid-append), so the issue
+            // check can never see a phantom torn tail or a fused line from an in-flight write. The read is bounded by
+            // `LOG_READ_CAP` (take, then refuse one over) — the same cap as `read_log`, so an inherited-id append onto
+            // a giant log is refused without buffering it, and nothing is written.
             let mut bytes = Vec::new();
-            f.read_to_end(&mut bytes).map_err(io)?;
+            (&mut f).take(LOG_READ_CAP + 1).read_to_end(&mut bytes).map_err(io)?;
+            if bytes.len() as u64 > LOG_READ_CAP {
+                return Err(bad(format!("HARNESS_RUN_ID is set, but the log is over the {}-byte read cap", LOG_READ_CAP)));
+            }
             let read = parse_log(&bytes);
             if let Some(c) = &read.corrupt {
                 return Err(bad(format!("HARNESS_RUN_ID is set, but the log is corrupt at line {} ({})", c.line, c.msg)));
@@ -1867,5 +1922,47 @@ mod tests {
         bad.role = "Executor".to_string();
         assert!(append_under_run(&t.0, &t.log(), &bad, None).is_err());
         assert!(!t.log().exists(), "neither the run_issued line nor the event was written");
+    }
+
+    // ------------------------------------------------------------ #211: the read cap (the seam proves the boundary with a tiny cap)
+
+    #[test]
+    fn the_cap_seam_accepts_exactly_at_the_cap_and_refuses_one_over() {
+        let t = Tmp::new();
+        let one = ev(Kind::Escalation, 1).encode().unwrap();
+        fs::write(t.log(), one.as_bytes()).unwrap();
+        let len = one.len() as u64;
+        let at = read_log_with_cap(&t.log(), len).unwrap();
+        assert!(at.is_clean(), "exactly at the cap is read and parsed");
+        assert_eq!(at.events.len(), 1);
+        let msg = read_log_with_cap(&t.log(), len - 1).unwrap_err();
+        assert_eq!(msg, format!("log refused: over the {}-byte read cap; nothing was read as events", len - 1));
+    }
+
+    #[test]
+    fn a_non_utf8_complete_line_under_the_cap_is_corruption_not_a_cap_or_path_refusal() {
+        let t = Tmp::new();
+        let one = ev(Kind::Escalation, 1).encode().unwrap();
+        let mut bytes = one.clone().into_bytes();
+        bytes.extend_from_slice(b"\xff\xfe\n");
+        bytes.extend_from_slice(one.as_bytes());
+        fs::write(t.log(), &bytes).unwrap();
+        let r = read_log_with_cap(&t.log(), LOG_READ_CAP).unwrap();
+        let c = r.corrupt.expect("a complete non-utf8 line is CORRUPTION");
+        assert_eq!((c.line, c.msg.as_str()), (2, "invalid utf-8"));
+        assert_eq!(r.events.len(), 1, "the line before it is still read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_log_refuses_a_symlink_or_a_directory_without_opening_it() {
+        let t = Tmp::new();
+        fs::write(t.log(), ev(Kind::Escalation, 1).encode().unwrap().as_bytes()).unwrap();
+        let link = t.0.join("link.jsonl");
+        std::os::unix::fs::symlink(t.log(), &link).unwrap();
+        assert_eq!(read_log(&link).unwrap_err(), "log refused: the path is a symbolic link");
+        assert_eq!(read_log(&t.0).unwrap_err(), "log refused: not a regular file");
+        // Twin: the real file behind the refused link reads clean under the same cap.
+        assert!(read_log(&t.log()).unwrap().is_clean());
     }
 }

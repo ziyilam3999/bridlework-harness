@@ -301,22 +301,40 @@ fn batch_name_ok(name: &str) -> bool {
 
 // ---------------------------------------------------------------- reconcile
 
-/// The `to` values of every `quarantined` event already in the log. A log that cannot be read (missing, torn,
-/// corrupt) holds no matching event, so a missing event is (re)written; the writer itself then refuses onto a torn
-/// tail, which stops the sweep before any move.
-fn quarantined_tos(log: &Path) -> Vec<String> {
-    match events::read_log(log) {
-        Ok(r) => r
-            .events
-            .iter()
-            .filter(|e| e.kind == Kind::Quarantined)
-            .filter_map(|e| match e.field("to") {
-                Some(Field::Str(s)) => Some(s.clone()),
-                _ => None,
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+/// The `to` values of every `quarantined` event already in the log, or a refusal the sweep cannot proceed past.
+/// An ABSENT log (decided here by this reader's own no-follow stat, so a dangling link is NOT absent) holds no
+/// matching event, exactly as before anything was ever written. Any other log the checked reader refuses — over
+/// the read cap, a symbolic link, not a regular file, changed between check and open, any io error — is a
+/// REFUSAL: a reconcile that cannot see the whole record must not write it again (the duplicate-event bug). A
+/// CORRUPT line is the same refusal naming the line number only (the read stops at the first bad line, so every
+/// event after it would be silently missing). A TORN TAIL keeps today's behaviour: every complete line before
+/// the fragment is returned, so the list is complete, and the fragment was never a written event.
+fn quarantined_tos(log: &Path) -> Result<Vec<String>, Stop> {
+    if let Err(e) = fs::symlink_metadata(log) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(Vec::new()); // nothing was ever written; a later write creates the log
+        }
+        // any other stat error falls through: the checked reader re-stats and reports its own fixed reason
     }
+    let read = events::read_log(log).map_err(|reason| unreadable_log(&reason))?;
+    if let Some(c) = &read.corrupt {
+        return Err(unreadable_log(&format!("corrupt at line {}", c.line)));
+    }
+    Ok(read
+        .events
+        .iter()
+        .filter(|e| e.kind == Kind::Quarantined)
+        .filter_map(|e| match e.field("to") {
+            Some(Field::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The one-line refusal for an event log the sweep cannot read whole. `<reason>` is the reader's own fixed
+/// text (names the cap, the link, the file type or the corrupt line number; never a path, never a log byte).
+fn unreadable_log(reason: &str) -> Stop {
+    err3(&format!("reconcile refused: the event log cannot be read whole ({}); nothing was moved", reason))
 }
 
 /// Reconcile every journal under `<quarantine-dir>/<ticket>/` BEFORE walking: an intent whose item sits in its batch
@@ -324,7 +342,10 @@ fn quarantined_tos(log: &Path) -> Vec<String> {
 /// still there and whose item is absent is simply found again by the walk (a fresh batch); an intent whose source AND
 /// item both exist, or neither does, cannot be decided — exit 3, nothing moved. A journal line that is torn (a final
 /// fragment with no newline) is skipped: the mover renames only after the journal line was synced whole, so a torn
-/// line never preceded a move. A COMPLETE line that cannot be parsed is undecidable: exit 3.
+/// line never preceded a move. A COMPLETE line that cannot be parsed is undecidable: exit 3. The event log is read
+/// once, lazily, before any reconcile write: a log that cannot be read WHOLE (over the read cap, a link, not a
+/// regular file, corrupt) refuses the sweep here — exit 3, nothing moved, nothing written — while an absent log
+/// still reads as no events (see `quarantined_tos`).
 fn reconcile(a: &SweepArgs, shelf: &Path, ws: &Path) -> Result<(), Stop> {
     let entries = match fs::read_dir(shelf) {
         Ok(e) => e,
@@ -357,7 +378,10 @@ fn reconcile(a: &SweepArgs, shelf: &Path, ws: &Path) -> Result<(), Stop> {
             // An intent that already has its matching event is SETTLED: the move it describes happened and was
             // recorded, so whatever sits at the source path NOW is simply a later leftover of the same name — the
             // walk's business, in a fresh batch. Only an intent with no event is decided here, from what exists.
-            let tos = tos.get_or_insert_with(|| quarantined_tos(&a.log));
+            if tos.is_none() {
+                tos = Some(quarantined_tos(&a.log)?);
+            }
+            let tos = tos.as_ref().unwrap();
             if tos.contains(&to) {
                 continue;
             }
@@ -983,7 +1007,8 @@ fn refuse_unless_single_thread() -> Result<(), Stop> {
 /// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ...` (the arguments after `quarantine`). Exit 0
 /// done (one stdout line of fixed fields, no folder); 2 refused (usage, bad or misplaced folders, a root that is a
 /// symlink or outside the base, a damaged manifest, wrong class or id); 3 cannot proceed (cross-device, over a cap,
-/// an undecidable journal intent, a rename/journal/event write failure mid-run).
+/// an undecidable journal intent, an event log that cannot be read whole by reconcile, a rename/journal/event write
+/// failure mid-run).
 pub fn quarantine_cmd(a: &[String]) -> i32 {
     let Some((sub, rest)) = a.split_first() else {
         eprintln!("{}", USAGE);
