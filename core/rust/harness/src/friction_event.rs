@@ -1,6 +1,6 @@
 //! The T-9.3 event-to-row mapper (ticket 193): the pure translator from event-log lines to friction-inbox
-//! rows. A fixed, closed list of deterministic event kinds — `replan_required` (the G3a cap signal) and
-//! `launch_refused` (a dispatcher refusal) — writes ONE inbox row per (event kind, signature) per ISO week
+//! rows. A fixed, closed list of deterministic event kinds — `replan_required` (the G3a cap signal),
+//! `launch_refused` (a dispatcher refusal) and `gate_fail` (a gate check's FAIL) — writes ONE inbox row per (event kind, signature) per ISO week
 //! through the friction verbs; every other kind maps to nothing, and no prose is ever read or written. The
 //! signature names the CAUSE of the event, not its incident: a repeat of the same cause in the same week
 //! files no second row, and next week starts a fresh row.
@@ -32,7 +32,8 @@ const MS_PER_DAY: u64 = 86_400_000;
 
 /// The signature of a mapped event: the named values that identify its CAUSE. A repeat of the same values
 /// in the same week files no second row. `launch_refused` deliberately leaves `brief_sha256` out (it differs
-/// per brief while the cause stays the same); `replan_required` names the cap check's whole condition.
+/// per brief while the cause stays the same), and `gate_fail` leaves `head_sha` out the same way (it changes
+/// with every fix push while the cause stays the same); `replan_required` names the cap check's whole condition.
 fn signature(rec: &Record) -> Result<Option<Vec<(&'static str, String)>>, String> {
     // The match is exhaustive over `Kind` on purpose (no `_` arm): a new event kind does not compile until
     // someone decides map / no-map and writes the decision here.
@@ -45,6 +46,12 @@ fn signature(rec: &Record) -> Result<Option<Vec<(&'static str, String)>>, String
         Kind::LaunchRefused => Some(vec![
             ("launch_role", field_str(rec, "launch_role")?),
             ("matched_entry", field_str(rec, "matched_entry")?),
+        ]),
+        Kind::GateFail => Some(vec![
+            ("repo", field_str(rec, "repo")?),
+            ("ticket", field_str(rec, "ticket")?),
+            ("gate_id", field_str(rec, "gate_id")?),
+            ("failure_class", field_str(rec, "failure_class")?),
         ]),
         // The twelve kinds off the closed list (spec T-9.3): zero rows, and no error either.
         Kind::Escalation

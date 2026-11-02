@@ -1,4 +1,4 @@
-//! The ten P1b event kinds (P1B-01): round trip and refusal tests, through the library writer and the real binary's
+//! The eleven P1b event kinds (P1B-01): round trip and refusal tests, through the library writer and the real binary's
 //! `events list` / `events verify`. DISCIPLINE: every line this file builds is built FROM the loader's declared key
 //! list (`Kind::keys()`), never from a key list typed here, so an envelope change (the PRE-B run identity landing in
 //! the one shared declaration) cannot silently pass these tests. The values are synthetic and were never shown to the
@@ -15,7 +15,7 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// A synthetic stamp: fixed, so the appended bytes are deterministic.
 const TS: u64 = 1731000000123;
 
-/// The ten P1b kinds, derived from the loader's own list (never typed here as a set of names).
+/// The eleven P1b kinds, derived from the loader's own list (never typed here as a set of names).
 fn p1b_kinds() -> Vec<Kind> {
     Kind::ALL.iter().copied().filter(|k| !k.is_base()).collect()
 }
@@ -106,6 +106,8 @@ fn value_for(kind: Kind, key: &str) -> Field {
         ("question_class", "size") => "S",
         ("question_class", "risk") => "low",
         ("question_class", "rule_hit") => "t2_only",
+        ("gate_fail", "head_sha") => "aa11bb22cc33dd44ee55ff6600112233445566aa",
+        ("gate_fail", "result") => "fail",
         (_, "steps") => return Field::Num(120),
         (_, "soft_limit") => return Field::Num(100),
         (_, "hard_limit") => return Field::Num(300),

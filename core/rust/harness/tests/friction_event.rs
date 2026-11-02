@@ -64,6 +64,17 @@ fn launch_line(t: u64, role: &str, brief: &str, entry: &str) -> String {
     )
 }
 
+/// Two synthetic 40-hex shas (the `head_sha` a gate judged): same cause, different heads.
+const HEAD_A: &str = "aa11bb22cc33dd44ee55ff6600112233445566aa";
+const HEAD_B: &str = "bb11bb22cc33dd44ee55ff6600112233445566bb";
+
+/// A `gate_fail` line: declared, no writer yet (the gate runner's writer is a later ticket).
+fn gate_fail_line(t: u64, repo: &str, ticket: &str, gate_id: &str, failure_class: &str, head_sha: &str) -> String {
+    format!(
+        "{{\"v\":2,\"kind\":\"gate_fail\",\"ts_ms\":{t},\"ticket\":\"{ticket}\",\"repo\":\"{repo}\",\"gate_id\":\"{gate_id}\",\"failure_class\":\"{failure_class}\",\"head_sha\":\"{head_sha}\",\"result\":\"fail\"}}"
+    )
+}
+
 /// The same replan event through the library's door (a `Record`, not a line).
 fn replan_record(t: u64, repo: &str, ticket: &str, reason: &str) -> Record {
     Record::build(
@@ -113,6 +124,17 @@ fn mapped_launch_refused_row() {
     // `brief_sha256` differs per brief while the cause stays the same: the id must not move with it.
     let other = mapped(&launch_line(ts(2026, 11, 4), "worker", BRIEF_B, "builder-state-deny"));
     assert_eq!(other.id, row.id, "the signature is the cause (launch_role, matched_entry), never the brief digest");
+}
+
+#[test]
+fn mapped_gate_fail_row() {
+    let line = gate_fail_line(ts(2026, 11, 2), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A);
+    let row = mapped(&line);
+    let want = "{\"id\":\"evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event gate_fail repo=bridlework-harness ticket=199 gate_id=rust-test failure_class=suite-fail\",\"source\":\"event\"}";
+    assert_eq!(encode_row(&row).unwrap(), want);
+    // `head_sha` moves with every fix push while the cause stays the same: it is in neither the id nor the text.
+    assert!(!row.id.contains(HEAD_A), "head_sha is not part of the row id");
+    assert!(!row.text.contains(HEAD_A), "head_sha is not part of the row text");
 }
 
 // ---------------------------------------------------------------- AC 3: the mapped rows are real inbox rows
@@ -183,9 +205,10 @@ fn mapped_rows_pass_friction_lint() {
     let rows = map_lines(&[
         &replan_line(ts(2026, 11, 2), "ai-brain", "193", "replan-threshold"),
         &launch_line(ts(2026, 11, 3), "worker", BRIEF_A, "builder-state-deny"),
+        &gate_fail_line(ts(2026, 11, 4), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A),
     ])
     .unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     let mut body = String::new();
     for r in &rows {
         body.push_str(&encode_row(r).unwrap());
@@ -195,7 +218,7 @@ fn mapped_rows_pass_friction_lint() {
     // The same leg `tests/friction_cli.rs` runs: the real binary lints the real inbox file.
     let o = run(&[s("friction"), s("lint"), s("--config"), t.config().to_str().unwrap().to_string()]);
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
-    assert_eq!(out(&o), "inbox ok rows=2\n");
+    assert_eq!(out(&o), "inbox ok rows=3\n");
 }
 
 // ---------------------------------------------------------------- AC 4: the closed list covers every kind exactly
@@ -223,6 +246,8 @@ fn value_for(kind: Kind, key: &str) -> Field {
         ("question_class", "size") => "S",
         ("question_class", "risk") => "low",
         ("question_class", "rule_hit") => "t2_only",
+        ("gate_fail", "head_sha") => HEAD_A,
+        ("gate_fail", "result") => "fail",
         (_, "steps") => return Field::Num(120),
         (_, "soft_limit") => return Field::Num(100),
         (_, "hard_limit") => return Field::Num(300),
@@ -245,7 +270,7 @@ fn good_record(kind: Kind) -> Record {
 
 #[test]
 fn unmapped_kinds_yield_none() {
-    const MAPPED: [&str; 2] = ["replan_required", "launch_refused"];
+    const MAPPED: [&str; 3] = ["replan_required", "launch_refused", "gate_fail"];
     let mut unmapped: Vec<&str> = Vec::new();
     for kind in Kind::ALL {
         if MAPPED.contains(&kind.as_str()) {
@@ -260,13 +285,13 @@ fn unmapped_kinds_yield_none() {
         let got = map_line(line).unwrap_or_else(|e| panic!("{}: a valid line must not be refused: {e}", kind.as_str()));
         assert!(got.is_none(), "{} must map to no row through the line door too", kind.as_str());
     }
-    // The closed list covers `Kind::ALL` exactly (14 today): nothing maps by accident, nothing is missed.
+    // The closed list covers `Kind::ALL` exactly (15 today): nothing maps by accident, nothing is missed.
     let mut covered: Vec<&str> = MAPPED.iter().copied().chain(unmapped.iter().copied()).collect();
     covered.sort_unstable();
     let mut all: Vec<&str> = Kind::ALL.iter().map(|k| k.as_str()).collect();
     all.sort_unstable();
     assert_eq!(covered, all, "mapped + unmapped must cover every kind exactly once");
-    assert_eq!(all.len(), 14);
+    assert_eq!(all.len(), 15);
 }
 
 // ---------------------------------------------------------------- AC 5-8: the weekly dedup key
@@ -284,6 +309,21 @@ fn same_cause_same_week_one_row() {
     let rows = map_lines(&[&sun, &mon]).unwrap();
     let rev: Vec<String> = rows.iter().map(|r| encode_row(r).unwrap()).collect();
     assert_eq!(fwd, rev, "input order never changes the written bytes");
+}
+
+#[test]
+fn gate_fail_same_cause_same_week_one_row() {
+    // One ISO week (Mon 2026-11-02 .. Sun 2026-11-08), one cause, two DIFFERENT heads the gate judged.
+    let mon = gate_fail_line(ts(2026, 11, 2), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A);
+    let sun = gate_fail_line(ts(2026, 11, 8), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_B);
+    let rows = map_lines(&[&mon, &sun]).unwrap();
+    assert_eq!(rows.len(), 1, "the same gate failing twice in one week files ONE row");
+    assert_eq!(rows[0].date, "2026-11-02", "the row is dated the earliest event of the week");
+    // The same pair a week apart (Mon 2026-11-09 opens the next week): two rows, the week is part of the key.
+    let next = gate_fail_line(ts(2026, 11, 9), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A);
+    let rows = map_lines(&[&mon, &next]).unwrap();
+    assert_eq!(rows.len(), 2, "the same cause in two different weeks files two rows");
+    assert_ne!(rows[0].id, rows[1].id);
 }
 
 #[test]
@@ -367,6 +407,39 @@ fn malformed_event_refused() {
     assert!(map_lines(&[&good, &torn]).is_err(), "one bad line fails the whole batch");
     assert!(map_lines(&[&torn, &good]).is_err(), "also when the bad line comes first");
     assert!(map_lines(&[good.as_str(), &missing_key]).is_err());
+}
+
+#[test]
+fn gate_fail_malformed_refused() {
+    let good = gate_fail_line(ts(2026, 11, 2), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A);
+    // Each fixture carries its own bad condition, derived from the good line.
+    let missing_head = good.replace(&format!(",\"head_sha\":\"{HEAD_A}\""), "");
+    let short_head = good.replace(HEAD_A, "aa11bb2");
+    let result_pass = good.replace("\"result\":\"fail\"", "\"result\":\"pass\"");
+    let upper_gate = good.replace("\"gate_id\":\"rust-test\"", "\"gate_id\":\"Rust-Test\"");
+    let extra_key = good.replace("\"result\":\"fail\"", "\"result\":\"fail\",\"extra\":\"x\"");
+    let t = Tmp::new();
+    for (name, line) in [
+        ("a missing head_sha", &missing_head),
+        ("a 7-hex head_sha", &short_head),
+        ("a result of pass", &result_pass),
+        ("an uppercase gate_id", &upper_gate),
+        ("an extra key", &extra_key),
+    ] {
+        match map_line(line) {
+            Err(e) => assert!(!e.is_empty(), "{name}: the refusal must say why"),
+            Ok(None) => panic!("{name}: must be REFUSED, never silently skipped"),
+            Ok(Some(r)) => panic!("{name}: must be REFUSED, never mapped to a row ({})", r.id),
+        }
+        // Wherever the bad line sits in a batch: the whole batch is an error with no rows.
+        assert!(map_lines(&[&good, line]).is_err(), "{name}: one bad line fails the whole batch");
+        assert!(map_lines(&[line, &good]).is_err(), "{name}: also when the bad line comes first");
+        // And the real binary's own reader refuses the same line: `events verify` exits non-zero.
+        let log = t.0.join("gate-fail-bad.jsonl");
+        fs::write(&log, format!("{line}\n")).unwrap();
+        let o = run(&[s("events"), s("verify"), log.to_str().unwrap().to_string()]);
+        assert_ne!(code(&o), 0, "{name}: events verify must refuse the line, stdout: {}", out(&o));
+    }
 }
 
 // ---------------------------------------------------------------- AC 10: the `source` row field
