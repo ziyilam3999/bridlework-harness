@@ -357,15 +357,23 @@ pub fn privacy_problems(ctx: &crate::scan::Ctx, rows: &[(usize, Row)]) -> Vec<(u
 /// new row, so the verb and the lint can never disagree about what a good inbox is. The reasons name the field
 /// only: a row value that has not passed the privacy scan is never echoed.
 pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
+    // Linear by construction: two HashSets built in single passes, so a full-cap inbox (40001 rows) costs
+    // one pass, not a pass per row — the check runs INSIDE the writer lock, so a quadratic scan would hold
+    // the lock long enough to turn concurrent losers into busy timeouts instead of duplicate refusals.
     let mut problems = Vec::new();
-    for (i, (line, row)) in rows.iter().enumerate() {
-        if rows[..i].iter().any(|(_, r)| r.id == row.id) {
+    let mut ids: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(rows.len());
+    for (_, r) in rows {
+        ids.insert(r.id.as_str());
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(rows.len());
+    for (line, row) in rows {
+        if !seen.insert(row.id.as_str()) {
             problems.push((*line, "id: a duplicate of an earlier row".to_string()));
         }
         if !row.breaks.is_empty() {
             if row.breaks == row.id {
                 problems.push((*line, "breaks names its own row: a lesson cannot break itself".to_string()));
-            } else if !rows.iter().any(|(_, r)| r.id == row.breaks) {
+            } else if !ids.contains(row.breaks.as_str()) {
                 problems.push((*line, "breaks names no lesson in the inbox".to_string()));
             }
         }
@@ -386,67 +394,84 @@ pub fn append_row(path: &Path, row: &Row) -> Result<(), String> {
     Ok(())
 }
 
-/// A lock older than this is a holder that died without releasing: it is stolen (an atomic rename decides the
-/// one stealer), far above any real critical section (read, scan, check, append, sync of a capped inbox).
-const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long a writer waits for the lock before giving up (exit 2): far above LOCK_STOLEN rounds of appends.
+/// How long a writer waits for the lock before giving up (exit 2): far above any real critical section
+/// (read, scan, check, append, sync of a capped inbox).
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The exclusive writer lock, released on every exit path (Drop). Nothing here prints the lock path.
-struct LockGuard(PathBuf);
+/// The exclusive writer lock: the open lock file, held by a kernel advisory lock (flock(2), std's file lock).
+/// The kernel releases the lock the moment the holder's file description closes — on return, on panic, on a
+/// kill -9 — so a crashed writer can never leave the inbox locked and there is no stale-steal rule to race.
+/// Dropping the guard closes the file, which releases the lock on every exit path.
+struct LockGuard(std::fs::File);
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // One last read of the lock file's own metadata: the guard OWNS the open file, and closing it
+        // (immediately after this) is what releases the kernel advisory lock.
+        let _ = self.0.metadata();
     }
 }
 
-/// The sidecar lock file path: the inbox path plus `.lock`, so it sits in the same private folder (one lock per
-/// inbox, whatever config pointed at it). The path itself is never printed.
-fn lock_path(inbox: &Path) -> PathBuf {
-    let mut s = inbox.as_os_str().to_os_string();
+/// The sidecar lock file path: the CANONICALIZED inbox (or, before the inbox exists, its canonicalized folder
+/// plus its file name) with `.lock` appended — so every spelling of one inbox (a symlinked folder, a `.`/`..`
+/// detour, the real path) takes the ONE lock of that inbox. The path itself is never printed.
+fn lock_path(inbox: &Path) -> Result<PathBuf, String> {
+    let base = match fs::canonicalize(inbox) {
+        Ok(p) => p,
+        Err(_) => {
+            let parent = inbox.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let name = inbox.file_name().ok_or_else(|| "the inbox cannot be written".to_string())?;
+            fs::canonicalize(parent)
+                .map(|p| p.join(name))
+                .map_err(|_| "the inbox cannot be written".to_string())?
+        }
+    };
+    let mut s = base.into_os_string();
     s.push(".lock");
-    PathBuf::from(s)
+    Ok(PathBuf::from(s))
 }
 
-/// Acquire the exclusive writer lock with one atomic `create_new` (O_EXCL), so two concurrent adds can never
-/// both pass the duplicate-id check. A holder that died leaves the file behind; a lock older than LOCK_STALE is
-/// stolen by an atomic rename (exactly one stealer can win the rename) and the next `create_new` decides the new
-/// holder. `Err` is a setup failure (the folder is missing, or the lock stayed busy past LOCK_WAIT).
+/// Acquire the exclusive writer lock: an OS advisory lock (flock(2), std's file lock) on the one canonical lock
+/// file of this inbox, so two concurrent adds can never both hold it (the check and the append are one critical
+/// section). A leftover lock FILE from an earlier scheme is simply opened and locked — it never blocks; a
+/// leftover lock DIRECTORY cannot be locked, so it is deleted (only a directory is ever deleted; a live
+/// holder's lock is always a regular file, which `remove_dir_all` refuses). `Err` is a setup failure: the
+/// folder is missing, or the lock stayed busy
+/// past LOCK_WAIT. Nothing here prints any path.
 fn acquire_lock(lock: &Path) -> Result<LockGuard, String> {
     let deadline = std::time::Instant::now() + LOCK_WAIT;
-    let mut steals = 0usize;
+    let mut last_progress = std::time::Instant::now();
     loop {
-        let created = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock)
-            .and_then(|mut f| f.write_all(std::process::id().to_string().as_bytes()));
-        match created {
-            Ok(()) => return Ok(LockGuard(lock.to_path_buf())),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(lock)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|d| d >= LOCK_STALE)
-                    .unwrap_or(true);
-                if stale && steals < 4 {
-                    steals += 1;
-                    let mut tmp = lock.as_os_str().to_os_string();
-                    tmp.push(format!(".stale-{}-{}", std::process::id(), steals));
-                    if fs::rename(lock, &tmp).is_ok() {
-                        let _ = fs::remove_file(&tmp);
-                    }
-                    continue;
+        match fs::OpenOptions::new().write(true).read(true).create(true).open(lock) {
+            Ok(f) => {
+                last_progress = std::time::Instant::now();
+                match f.try_lock() {
+                    Ok(()) => return Ok(LockGuard(f)),
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(std::fs::TryLockError::Error(_)) => return Err("the inbox cannot be written".to_string()),
                 }
-                if std::time::Instant::now() >= deadline {
-                    return Err("the inbox is busy (another writer holds it); try again".to_string());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(_) => return Err("the inbox cannot be written".to_string()),
+            Err(_) => {
+                // An earlier scheme could leave a lock DIRECTORY at the path. It can never be a live
+                // holder (a holder's lock is always a regular file), and only a directory is ever
+                // removed — `remove_dir_all` refuses a regular file, so a live lock file can never be
+                // deleted or moved out from under its holder (no rename step, no steal window).
+                // A directory seen at open time may already be gone by the check (another writer
+                // removed it), so an open failure alone is never fatal: retry until the path makes no
+                // progress for 2 s (then it is a setup error) or the busy deadline passes.
+                if fs::metadata(lock).map(|m| m.is_dir()).unwrap_or(false) {
+                    last_progress = std::time::Instant::now();
+                    let _ = fs::remove_dir_all(lock);
+                }
+                if std::time::Instant::now().duration_since(last_progress) >= std::time::Duration::from_secs(2) {
+                    return Err("the inbox cannot be written".to_string());
+                }
+            }
         }
+        if std::time::Instant::now() >= deadline {
+            return Err("the inbox is busy (another writer holds it); try again".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -665,7 +690,11 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     }
     // One writer at a time: the exclusive lock is held across read, check and append, and released on every
     // exit path, so the duplicate-id check can never race a concurrent add of the same id.
-    let _lock = match acquire_lock(&lock_path(&inbox_path)) {
+    let lock = match lock_path(&inbox_path) {
+        Ok(p) => p,
+        Err(m) => return fail(&m),
+    };
+    let _lock = match acquire_lock(&lock) {
         Ok(g) => g,
         Err(m) => return fail(&m),
     };
@@ -711,7 +740,11 @@ fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
                     return fail("--config was given twice");
                 }
             }
-            other => return fail(&format!("unknown option {other}")),
+            _ => {
+                // A constant message: the argument bytes (an unknown flag, a stray positional — often the
+                // inbox path) have passed no privacy scan, so they are never echoed.
+                return fail("an unknown option (lint takes only --config <file>)");
+            }
         }
     }
     let cfg = match config_path(file) {

@@ -64,7 +64,10 @@ runs, so a refusal can never echo an unscanned byte of it.
 A missing required field flag (`--where-it-lives` absent) is a row refusal (1) naming the field, not a usage
 error: K-1.1 counts "no tag" as refused. With no privacy list configured the verb fails closed (exit 2) — an
 unscanned row is never stored, and a usage error never echoes the raw flag or argument bytes either: it names
-the problem, not the value.
+the problem, not the value, on every verb's unknown-option and stray-positional paths. One refusal names a
+value by contract: a CONFIG refusal may name a lowercase token-shaped key (never a value), because that is the
+shared config contract (`docs/config-contract.md`) — so the never-echo claim here is scoped to the friction
+verbs' own arguments, rows and note lines.
 
 ### `harness friction lint`
 
@@ -114,11 +117,17 @@ exit blocks removal.
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
   the row naming the field and the class, never the bytes. Every reader of the inbox runs the same scan over
   every stored row (`add`, `lint`, `close-check`), and `close-check` scans its `lesson:` lines too.
-- One writer at a time: `add` holds an exclusive advisory lock — a sidecar `<inbox>.lock` file in the same
-  private folder — across read, scan, check and append, released on every exit path, so two concurrent adds can
-  never both store the same id (the check and the append are one critical section). A lock left behind by a
-  killed writer is stolen after 60 seconds; a lock held longer than 10 seconds by a live writer fails the verb
-  closed (exit 2). The lock path is never printed.
+- One writer at a time: `add` holds an exclusive kernel advisory lock (`flock(2)`, the std file lock) on a
+  sidecar `<inbox>.lock` file across read, scan, check and append, so two concurrent adds can never both store
+  the same id (the check and the append are one critical section) — however many writers arrive at once, and
+  however the inbox path is spelled. The lock file's path is built from the CANONICALIZED inbox (before the
+  inbox exists: its canonicalized folder plus its file name), so a symlinked folder, a `.`/`..` detour and the
+  real path all take the ONE lock of that inbox. The kernel releases the lock the moment the holder exits —
+  return, panic, or a kill -9 — so a crashed writer can never leave the inbox locked: there is NO steal rule
+  and no stale-lock age at all. A lock FILE left behind by an earlier scheme (or by a killed writer) is simply
+  opened and locked again — it never blocks; a leftover lock DIRECTORY at that path cannot be locked, so it is
+  deleted once (only a directory is ever deleted there; a live holder's lock is always a regular file). A lock
+  held longer than 10 seconds by a live writer fails the verb closed (exit 2). The lock path is never printed.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
   than 4 MiB; a close note no further than 1 MiB. Over the bound the verb refuses (1 for a row, 2 for a file).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
