@@ -565,6 +565,44 @@ fn delete_listed_temp_dir() {
     assert!(!listed.lines().any(|l| l.starts_with("gone\t")), "the remove line was written: {listed}");
 }
 
+/// #185: the delete walk changes the PROCESS working directory, which every thread in the process shares, so
+/// `delete_listed` must itself refuse (exit 3, one fixed folder-free stderr line naming threads) when another
+/// thread is alive — a rule that lives only in a doc is not a fence. The IN-PROCESS call is the whole point:
+/// the fixture carries the bad condition (a second thread, parked alive for the whole call), and every check
+/// observes the function from OUTSIDE — the returned `Stop`, the files on disk, the manifest through the real
+/// binary, the process cwd before and after. The parked thread makes the condition hold on every host (the
+/// macOS reading is sticky, the Linux one reads live thread ids), so the test cannot pass for a wrong reason.
+#[test]
+fn delete_listed_refuses_when_another_thread_is_alive() {
+    let f = fixture();
+    fs::write(f.root.join("tmp/second.txt"), b"still-here").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let parked = std::thread::spawn(move || {
+        let _ = rx.recv(); // alive until the sender drops, below
+    });
+    let args = quarantine::DeleteArgs {
+        ticket: "t-1".to_string(),
+        id: "tmp".to_string(),
+        manifest_dir: f.md.clone(),
+        ts_ms: 1731000000123,
+    };
+    let before = std::env::current_dir().unwrap();
+    match quarantine::delete_listed(&args) {
+        Err(quarantine::Stop(3, line)) => {
+            assert!(line.contains("thread"), "the refusal names threads: {line}");
+            assert!(!line.contains('/'), "the refusal line is folder-free: {line}");
+        }
+        other => panic!("expected a Stop(3) refusal, got {:?}", other.map_err(|s| s.1)),
+    }
+    assert!(f.root.join("tmp/scratch.txt").exists(), "the listed temp dir was NOT deleted");
+    assert!(f.root.join("tmp/second.txt").exists(), "nothing inside it was touched either");
+    assert_eq!(std::env::current_dir().unwrap(), before, "the process working directory is unchanged");
+    let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f.md)]));
+    assert!(listed.lines().any(|l| l.starts_with("tmp\t")), "no manifest remove line was written: {listed}");
+    drop(tx);
+    let _ = parked.join();
+}
+
 /// AC 13: the device check refuses with exit 3 and moves nothing, exercised through a test seam that reports
 /// differing device ids (the REAL two-filesystem case is not reproducible in CI — a real cross-device rename error
 /// is still covered fail-closed by construction: any rename error stops the sweep with exit 3). The equal-ids arm
@@ -1153,4 +1191,21 @@ fn the_doc_states_the_delete_working_directory_caller_rule() {
     assert!(lower.contains("working directory"), "the delete section states the working-directory rule");
     assert!(lower.contains("thread"), "the delete section states the not-thread-safe rule");
     assert!(section.contains("P1B-14"), "the delete section ties the rule to P1B-14 teardown");
+}
+
+/// #185: the v1-limits bullet must NAME the guard, not disclaim it. The old honest-gap text ("nothing in the
+/// code refuses a threaded caller") is gone; the bullet now states the refusal, the sticky macOS reading and
+/// the procfs rule (unreadable = refuse). Word-presence contract in the style above, and the slice fails loud
+/// if the heading is renamed (a false RED, never a false GREEN). Restoring the old bullet text turns this red.
+#[test]
+fn the_doc_v1_limits_names_the_thread_guard() {
+    let doc = std::fs::read_to_string(repo().join("docs/quarantine.md")).expect("the doc is committed and utf-8");
+    let start = doc.find("## v1 limits").expect("the v1 limits heading exists");
+    let section = &doc[start..];
+    let lower = section.to_lowercase();
+    assert!(!section.contains("nothing in the code refuses"), "the honest-gap disclaimer is gone: the guard exists");
+    assert!(lower.contains("thread"), "the bullet names threads");
+    assert!(lower.contains("refus"), "the bullet states the refusal, not a mere caller rule");
+    assert!(lower.contains("sticky"), "the bullet states the sticky macOS reading");
+    assert!(lower.contains("procfs"), "the bullet names the Linux procfs source of the thread count");
 }
