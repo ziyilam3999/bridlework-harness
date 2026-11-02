@@ -1,11 +1,13 @@
-//! Process-level tests for `harness process start` (P1B-05). Every check runs the real binary as a child
-//! process, spawns REAL programs, and reads the real manifest file, so the exit-code contract (0 started,
-//! 2 usage error or any refusal with nothing started, signalled or written) and "a refused start leaves
-//! nothing running that the sheet does not list" are exercised end to end. `process stop` is NOT a verb of
-//! this PR (follow-up ticket #183, stop-by-pid): one test pins the usage refusal. Every wait is a bounded
-//! poll, every port a listener the test itself holds or a fresh free port it retries, and every process a
-//! test spawns itself is registered in a guard that kills its whole group on drop, so a failed run leaves
-//! nothing behind.
+//! Process-level tests for `harness process start` and `harness process stop` (P1B-05 / #183). Every check
+//! runs the real binary as a child process, spawns REAL programs, and reads the real manifest file, so the
+//! exit-code contracts (start: 0 started, 2 usage error or any refusal with nothing started, signalled or
+//! written; stop: 0 stopped and removed, 2 refusal with nothing signalled and the manifest byte-identical,
+//! 3 already-gone / pid-reused with nothing signalled and the entries removed, 4 signalled but death not
+//! confirmed with the entry kept) and "a refused start leaves nothing running that the sheet does not
+//! list" are exercised end to end. Every wait is a bounded poll, every port a listener the test itself
+//! holds or a fresh free port it retries, and every process a test spawns itself is registered in a guard
+//! that kills its whole group on drop, so a failed run leaves nothing behind. No wall-clock assert
+//! anywhere: order is proved by bounded polls on observable state, never by elapsed time.
 #![cfg(unix)]
 use std::fs;
 use std::fs::OpenOptions;
@@ -175,6 +177,20 @@ fn spawn_own_group(program: &str, arg: &str) -> Child {
         .unwrap()
 }
 
+/// A test-spawned `/bin/sh -c <script>` in its own process group (so a buggy group signal can never hit
+/// the test itself).
+fn spawn_sh(script: &str) -> Child {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap()
+}
+
 /// `harness manifest init <ticket>` into dir `d` with the single root `r`.
 fn init_manifest(ticket: &str, r: &Path, d: &Path) {
     let i = run(&["manifest", "init", ticket, "--dir", d.to_str().unwrap(), "--root", r.to_str().unwrap()]);
@@ -257,46 +273,6 @@ fn start_records_process_and_port() {
 
     let q = run(&["manifest", "owns", "t-1", "--dir", d.to_str().unwrap(), "--pid", &pid.to_string()]);
     assert_eq!(code(&q), 0, "owns --pid of the started process: {}", err(&q));
-}
-
-// ---------------------------------------------------------------- fix round 3: stop is split out
-
-/// Fix round 3, item 1: `process stop` is not a verb of this PR (the operator split stop-by-pid into its own
-/// follow-up ticket #183), so ANY stop invocation is the usage refusal — exit 2, the usage line on stderr
-/// (naming `start` only), nothing appended to any manifest, nothing signalled. RED on the round-2 code, where
-/// `stop --pid` of a live process signalled it and answered 0.
-#[test]
-fn process_stop_is_not_a_verb() {
-    let t = Tmp::new();
-    let (r, _o, d) = t.fence();
-    init_manifest("t-sv", &r, &d);
-    let mut guard = Guard::default();
-
-    // A live process no sheet lists: a stop of it must not signal it.
-    let mut own = spawn_own_group("sleep", "60");
-    let own_pid = own.id();
-    guard.add(own_pid);
-    let file = d.join("t-sv.jsonl");
-    let before = fs::read(&file).unwrap();
-    let dstr = d.to_str().unwrap();
-    for args in [
-        vec!["process", "stop"],
-        vec!["process", "stop", "t-sv", "--id", "x-1"],
-        vec!["process", "stop", "t-sv", "--id", "x-1", "--dir", dstr],
-        vec!["process", "stop", "t-sv", "--pid", &own_pid.to_string(), "--dir", dstr, "--grace-ms", "10"],
-    ] {
-        let s = run(&args);
-        assert_eq!(code(&s), 2, "{:?} must be the usage refusal: stdout {:?} stderr {:?}", args, out(&s), err(&s));
-        assert!(err(&s).contains("usage:"), "{:?} must print the usage line: stderr {:?}", args, err(&s));
-        assert!(err(&s).contains("process start"), "{:?} usage names the start verb: stderr {:?}", args, err(&s));
-        assert!(!err(&s).contains("process stop"), "{:?} usage must not name a stop verb: stderr {:?}", args, err(&s));
-        assert_eq!(fs::read(&file).unwrap(), before, "{:?} the refused stop changed the manifest", args);
-    }
-    assert!(alive(own_pid), "stop signalled a process");
-    // Reap what this test spawned (the guard still backs the whole group): a Child never waited on
-    // would stay a zombie (clippy zombie_processes).
-    let _ = own.kill();
-    let _ = own.wait();
 }
 
 // ---------------------------------------------------------------- AC 7
@@ -527,14 +503,14 @@ fn low_port_names_the_bind_error_kind() {
 /// Fix round 3, item 2: a refused start whose rollback cannot reach its helpers must return FAST, answer 2, and
 /// leave nothing running and nothing listed. Two cases:
 ///
-/// (A) PATH points at an EMPTY folder after the spawn. The start-time read is platform-split (manifest.rs):
-///     off Linux it runs `ps` through PATH, so the empty PATH REFUSES the start right after the spawn; on
-///     Linux it reads /proc and needs no PATH, so the same start SUCCEEDS. Each arm is cfg-gated to its
-///     platform (r5 F1: one ungated arm asserted the refusal everywhere and failed every Linux CI run), and
-///     the started pid joins the cleanup guard BEFORE any assert on both arms, so a wrong assert can never
-///     leave the sleep 30 running. The rollback still ends the child — `/bin/kill` is called by absolute
-///     path and the std `Child::kill()` needs no PATH — and never blocks in `wait()` on a child it could
-///     not signal (r3 H1d: the round-2 code answered only after 8033 ms, and a server would never).
+/// (A) PATH points at an EMPTY folder after the spawn. Since #183 the start-time read runs `/bin/ps` by
+///     ABSOLUTE path (manifest.rs, one line), so the empty PATH refuses NOTHING any more — the start
+///     SUCCEEDS on every platform and PATH never decides identity (the round-4 H7 hostile: a PATH-shadowed
+///     `ps` could move a recorded start time). The started pid joins the cleanup guard BEFORE any assert,
+///     so a wrong assert can never leave the sleep 30 running. The rollback still ends the child —
+///     `/bin/kill` is called by absolute path and the std `Child::kill()` needs no PATH — and never blocks
+///     in `wait()` on a child it could not signal (r3 H1d: the round-2 code answered only after 8033 ms,
+///     and a server would never).
 /// (A2) the post-spawn refusal is ALSO proved platform-neutrally, the lock-held torn-tail way (B) uses: the
 ///     manifest lock is held across the spawn so the start blocks inside its process-line append, a
 ///     duplicate live id is injected through the lock, and on release the append is refused AFTER the
@@ -549,12 +525,11 @@ fn low_port_names_the_bind_error_kind() {
 ///     id so the append is refused and the rollback runs against an already-escaped child.
 #[test]
 fn refused_start_rollback_leaves_nothing_running() {
-    // (A) empty PATH after the spawn, cfg-gated per platform (r5 F1): off Linux the refusal comes from
-    // the start-time read (`ps` through the empty PATH); on Linux /proc needs no PATH and the start
-    // succeeds, so that arm must NOT assert a refusal — (A2) below proves the post-spawn refusal there.
-    // On both arms the started pid is registered with the guard BEFORE any assert (the pid file is
-    // watched from before the spawn; a refusal's named pid is parsed before the first assert too), so a
-    // failing assert can never leave the sleep 30 running.
+    // (A) empty PATH after the spawn: the start-time read runs `/bin/ps` by ABSOLUTE path (the #183
+    // one-line manifest change), so the empty PATH refuses nothing — the start SUCCEEDS on every
+    // platform and PATH never decides identity. The started pid is registered with the guard BEFORE any
+    // assert (the pid file is watched from before the spawn), so a failing assert can never leave the
+    // sleep 30 running.
     {
         let t = Tmp::new();
         let (r, _o, d) = t.fence();
@@ -577,50 +552,27 @@ fn refused_start_rollback_leaves_nothing_running() {
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Off Linux the start-time read runs `ps` through the empty PATH and refuses right after
-            // the spawn. The refusal names "the started pid <n>": parse and register it BEFORE the
-            // first assert (r5 F1 side effect: a failing assert must not orphan the sleep).
-            let needle = "the started pid ";
-            let named = err(&s).find(needle).map(|at| {
-                let digits: String = err(&s)[at + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
-                digits.parse::<u32>().ok()
-            });
-            if let Some(Some(pid)) = named {
-                guard.add(pid);
-            }
-            assert_eq!(code(&s), 2, "an unreadable start time refuses the start: stdout {:?} stderr {:?}", out(&s), err(&s));
-            assert!(err(&s).contains("cannot read the start time"), "the refusal names the start-time read: stderr {:?}", err(&s));
-            let pid = named.expect("the refusal names the started pid").expect("the named pid is a number");
-            assert!(poll(5_000, || !alive(pid)), "the child the refused start spawned is still alive");
-            assert_eq!(fs::read(&file).unwrap(), before, "the refused start wrote the manifest");
+        // #183: the /bin/ps start-time read needs no PATH on ANY platform, so the start succeeds —
+        // PATH never decides identity. Register the started pid BEFORE any assert.
+        let pid_stdout = out(&s).split('\t').nth(1).and_then(|f| f.trim().parse::<u32>().ok());
+        if let Some(pid) = pid_stdout {
+            guard.add(pid);
         }
-        #[cfg(target_os = "linux")]
-        {
-            // /proc is PATH-free, so the start SUCCEEDS here — exactly the CI behavior r5 caught
-            // (rc 0, stdout "a-1\t<pid>\t<ms>"). No refusal is asserted on this arm; (A2) proves
-            // the post-spawn refusal on Linux the lock-held way.
-            let pid_stdout = out(&s).split('\t').nth(1).and_then(|f| f.trim().parse::<u32>().ok());
-            if let Some(pid) = pid_stdout {
-                guard.add(pid);
-            }
-            assert_eq!(
-                code(&s), 0,
-                "on Linux the /proc start-time read needs no PATH, so the start succeeds: stdout {:?} stderr {:?} ",
-                out(&s), err(&s)
-            );
-            let pid = pid_stdout.expect("start printed the pid it started");
-            assert!(alive(pid), "the started pid is running: a refusal is NOT this arm's claim on Linux");
-            let after = fs::read(&file).unwrap();
-            assert!(after.starts_with(&before), "the successful start rewrote the head of the manifest");
-            assert_eq!(
-                String::from_utf8_lossy(&after[before.len()..]).matches('\n').count(),
-                1,
-                "the successful start appended exactly one line: {}",
-                String::from_utf8_lossy(&after)
-            );
-        }
+        assert_eq!(
+            code(&s), 0,
+            "the /bin/ps start-time read needs no PATH, so the start succeeds: stdout {:?} stderr {:?}",
+            out(&s), err(&s)
+        );
+        let pid = pid_stdout.expect("start printed the pid it started");
+        assert!(alive(pid), "the started pid is running: the empty PATH must not have refused the start");
+        let after = fs::read(&file).unwrap();
+        assert!(after.starts_with(&before), "the successful start rewrote the head of the manifest");
+        assert_eq!(
+            String::from_utf8_lossy(&after[before.len()..]).matches('\n').count(),
+            1,
+            "the successful start appended exactly one line: {}",
+            String::from_utf8_lossy(&after)
+        );
     }
 
     // (A2) the post-spawn refusal, platform-neutral (on Linux this is the refusal the empty-PATH arm of
@@ -730,4 +682,589 @@ fn refused_start_rollback_leaves_nothing_running() {
     assert_eq!(code(&s), 2, "the duplicate live id refuses the start: stdout {:?} stderr {:?}", out(&s), err(&s));
     assert!(err(&s).contains("duplicate live id"), "the refusal names the append failure: stderr {:?}", err(&s));
     assert!(poll(5_000, || !alive(pid)), "the child that left the signalled group still lives: only the std kill reaches it");
+}
+
+// ---------------------------------------------------------------- #183: process stop helpers
+
+/// Which entry a stop addresses: `--id <id>` or `--pid <n>`.
+enum StopSel<'a> {
+    Id(&'a str),
+    Pid(u32),
+}
+
+/// Run `process stop`, by id or by pid, with an optional `--grace-ms`.
+fn stop(ticket: &str, sel: StopSel, grace: Option<u64>, d: &Path) -> Output {
+    let mut v: Vec<String> = vec!["process".into(), "stop".into(), ticket.into()];
+    match sel {
+        StopSel::Id(i) => {
+            v.push("--id".into());
+            v.push(i.into());
+        }
+        StopSel::Pid(p) => {
+            v.push("--pid".into());
+            v.push(p.to_string());
+        }
+    }
+    if let Some(g) = grace {
+        v.push("--grace-ms".into());
+        v.push(g.to_string());
+    }
+    v.push("--dir".into());
+    v.push(d.to_string_lossy().into_owned());
+    let args: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    run(&args)
+}
+
+/// The process-group id of one pid, asked through the system `ps` (a TEST-side precondition check, not the
+/// code under test).
+fn pgid_of(pid: u32) -> u32 {
+    let o = Command::new("ps")
+        .arg("-o")
+        .arg("pgid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
+}
+
+/// The REAL OS start time (ms) of a live pid, read through the public `manifest add --class process` verb
+/// into a throwaway manifest (the same read the supervisor itself uses), so a planted fixture can be offset
+/// from a value the harness measured, not from one the test re-derives.
+fn real_start_ms(pid: u32) -> u64 {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("probe", &r, &d);
+    let add = run(&["manifest", "add", "probe", "--class", "process", "--id", "probe-1", "--pid", &pid.to_string(), "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&add), 0, "probe add of pid {pid}: {}", err(&add));
+    let l = run(&["manifest", "list", "probe", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    let listing = out(&l);
+    let line = listing.lines().find(|x| x.starts_with("probe-1\tprocess\t")).expect("the probe manifest lists the process line");
+    line.split('\t').nth(3).expect("the process line carries pid_start_ms").parse().expect("pid_start_ms is a number")
+}
+
+/// Plant a schema-valid `add` process line with a CHOSEN `pid_start_ms` (the fixture carrier for the
+/// re-used-pid cases: the recorded time is what the test wants it to be, not what the writer measured).
+fn plant_process(d: &Path, ticket: &str, id: &str, pid: u32, pid_start_ms: u64) {
+    let line = format!(
+        "{{\"v\":1,\"op\":\"add\",\"ticket\":\"{ticket}\",\"id\":\"{id}\",\"class\":\"process\",\"pid\":{pid},\"pid_start_ms\":{pid_start_ms},\"ts_ms\":1730000000002}}\n"
+    );
+    let mut f = OpenOptions::new().append(true).open(d.join(format!("{ticket}.jsonl"))).unwrap();
+    f.write_all(line.as_bytes()).unwrap();
+}
+
+/// Sign a live pid out through the PUBLIC `manifest add --class process` verb (records the real start time).
+fn manifest_add_process(ticket: &str, id: &str, pid: u32, d: &Path) -> Output {
+    run(&["manifest", "add", ticket, "--class", "process", "--id", id, "--pid", &pid.to_string(), "--dir", d.to_str().unwrap()])
+}
+
+/// The pids a fixture program wrote to its pid file, once each line parses as one whole number.
+fn read_pids(f: &Path) -> Vec<u32> {
+    fs::read_to_string(f)
+        .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- #183 AC 1
+
+/// #183 AC 1: a started program that forks a grandchild (both pids written to a file in the root) is stopped
+/// with exit 0; NEITHER pid exists afterwards; both entries (the process line and the `<id>.port` line) are
+/// removed. A stop that signalled only the pid (mutant: signal the pid, not its group) leaves the grandchild
+/// alive, so the "neither pid exists afterwards" poll fails.
+#[test]
+fn stop_ends_process_and_its_children() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-1", &r, &d);
+    let mut guard = Guard::default();
+    let pids_file = r.join("pids");
+    let script = format!("sleep 300 & echo $! > {}; echo $$ >> {}; wait", pids_file.to_string_lossy(), pids_file.to_string_lossy());
+    let (s, leader, _port) = start_free_port("ts-1", "p-1", &r, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(leader > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(leader);
+
+    assert!(poll(10_000, || read_pids(&pids_file).len() == 2), "the program never wrote both pids");
+    let pids = read_pids(&pids_file);
+    let (grand, lead) = (pids[0], pids[1]);
+    assert_eq!(lead, leader, "the started pid $$ is the group leader the sheet records");
+    assert_ne!(grand, lead, "the grandchild must be a second, different pid");
+    assert!(alive(grand) && alive(lead), "both pids must be live before the stop");
+
+    let st = stop("ts-1", StopSel::Id("p-1"), None, &d);
+    assert_eq!(code(&st), 0, "stop: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert!(poll(10_000, || !alive(lead) && !alive(grand)), "a pid of the stopped group still exists");
+    let l = run(&["manifest", "list", "ts-1", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    let text = out(&l);
+    assert!(!text.contains("p-1"), "the stopped id (or its port line) is still listed: {}", text);
+}
+
+// ---------------------------------------------------------------- #183 AC 2
+
+/// #183 AC 2: `stop --pid` of a live process the ticket does not list, and of a pid listed only on ANOTHER
+/// ticket, each exit 2; both processes are still alive (each is a test-owned Child checked not to have
+/// exited, so a zombie of ours cannot read as alive); both manifests are byte-identical.
+#[test]
+fn unlisted_pid_is_refused() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-2a", &r, &d);
+    init_manifest("ts-2b", &r, &d);
+    let mut guard = Guard::default();
+
+    let mut own = spawn_own_group("sleep", "60");
+    let own_pid = own.id();
+    guard.add(own_pid);
+    let mut other = spawn_own_group("sleep", "60");
+    let other_pid = other.id();
+    guard.add(other_pid);
+    // `other_pid` is listed only on ANOTHER ticket (ts-2b), through the public verb.
+    let add = manifest_add_process("ts-2b", "q-1", other_pid, &d);
+    assert_eq!(code(&add), 0, "add on the other ticket: {}", err(&add));
+
+    let fa = d.join("ts-2a.jsonl");
+    let fb = d.join("ts-2b.jsonl");
+    let (ba, bb) = (fs::read(&fa).unwrap(), fs::read(&fb).unwrap());
+    for pid in [own_pid, other_pid] {
+        assert!(alive(pid), "pid {pid} must be live before the stop");
+    }
+    assert!(own.try_wait().unwrap().is_none() && other.try_wait().unwrap().is_none(), "a fixture child exited early");
+
+    let s1 = stop("ts-2a", StopSel::Pid(own_pid), None, &d);
+    assert_eq!(code(&s1), 2, "an unlisted pid refuses: stdout {:?} stderr {:?}", out(&s1), err(&s1));
+    assert!(err(&s1).contains("is not a live entry"), "the refusal names the ownership rule: stderr {:?}", err(&s1));
+    assert!(alive(own_pid), "the refused stop signalled the unlisted pid");
+
+    let s2 = stop("ts-2a", StopSel::Pid(other_pid), None, &d);
+    assert_eq!(code(&s2), 2, "a pid of another ticket refuses: stdout {:?} stderr {:?}", out(&s2), err(&s2));
+    assert!(err(&s2).contains("is not a live entry"), "the refusal names the ownership rule: stderr {:?}", err(&s2));
+    assert!(alive(other_pid), "the refused stop signalled another ticket's pid");
+
+    assert!(own.try_wait().unwrap().is_none() && other.try_wait().unwrap().is_none(), "a refused stop ended a fixture child");
+    assert_eq!(fs::read(&fa).unwrap(), ba, "the refused stop changed this ticket's manifest");
+    assert_eq!(fs::read(&fb).unwrap(), bb, "the refused stop changed the other ticket's manifest");
+    let _ = own.kill();
+    let _ = own.wait();
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+// ---------------------------------------------------------------- #183 AC 3
+
+/// #183 AC 3: a re-used pid is never signalled. Planted fixture: a schema-valid manifest lists a LIVE
+/// foreign process (its own group leader) with `pid_start_ms` one hour off the measured real start time;
+/// the test first asserts the real start time differs from the recorded one by more than 2000 ms. `stop
+/// --id` exits 3, prints `pid-reused`, the process is still alive, and the entry is removed.
+#[test]
+fn reused_pid_is_not_signalled() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-3", &r, &d);
+    let mut guard = Guard::default();
+
+    let mut own = spawn_own_group("sleep", "60");
+    let pid = own.id();
+    guard.add(pid);
+    let real = real_start_ms(pid);
+    let recorded = real.saturating_sub(3_600_000);
+    assert!(real.abs_diff(recorded) > 2000, "the fixture must carry a recorded start time far off the real one");
+    plant_process(&d, "ts-3", "p-3", pid, recorded);
+    let before = fs::read(d.join("ts-3.jsonl")).unwrap();
+
+    let s = stop("ts-3", StopSel::Id("p-3"), None, &d);
+    assert_eq!(code(&s), 3, "a re-used pid answers 3: stdout {:?} stderr {:?}", out(&s), err(&s));
+    assert!(err(&s).contains("pid-reused"), "the answer names pid-reused: stderr {:?}", err(&s));
+    assert!(alive(pid), "the re-used pid was signalled");
+    assert!(own.try_wait().unwrap().is_none(), "the re-used pid is dead");
+    let l = run(&["manifest", "list", "ts-3", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).contains("p-3"), "the re-used entry is still listed: {}", out(&l));
+    assert!(fs::read(d.join("ts-3.jsonl")).unwrap().len() > before.len(), "the entry was not removed");
+    let _ = own.kill();
+    let _ = own.wait();
+}
+
+// ---------------------------------------------------------------- #183 AC 4
+
+/// #183 AC 4: a live pid that is NOT its own process-group leader (a background child of a shell the test
+/// spawned as the leader; the test asserts pgid != pid before stopping), signed out through the public
+/// `manifest add --class process` verb, refuses the stop: exit 2, the process alive, the manifest
+/// byte-identical.
+#[test]
+fn non_leader_pid_is_refused() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-4", &r, &d);
+    let mut guard = Guard::default();
+
+    let pid_file = r.join("bg");
+    let script = format!("sleep 300 & echo $! > {}; wait", pid_file.to_string_lossy());
+    let mut sh = spawn_sh(&script);
+    let sh_pid = sh.id();
+    guard.add(sh_pid);
+    assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the shell never wrote the background pid");
+    let bg = read_pid(&pid_file).unwrap();
+    assert_ne!(bg, sh_pid, "the background pid must differ from the leader's");
+    assert_eq!(pgid_of(bg), sh_pid, "precondition: the background pid is NOT its own group leader");
+    assert!(alive(bg), "the background pid must be live before the stop");
+
+    let add = manifest_add_process("ts-4", "p-4", bg, &d);
+    assert_eq!(code(&add), 0, "add of the non-leader: {}", err(&add));
+    let file = d.join("ts-4.jsonl");
+    let before = fs::read(&file).unwrap();
+
+    let s = stop("ts-4", StopSel::Id("p-4"), None, &d);
+    assert_eq!(code(&s), 2, "a non-leader pid refuses: stdout {:?} stderr {:?}", out(&s), err(&s));
+    assert!(alive(bg), "the refused stop signalled the non-leader pid");
+    assert!(err(&s).to_lowercase().contains("group"), "the refusal says a group signal could not prove it: stderr {:?}", err(&s));
+    assert_eq!(fs::read(&file).unwrap(), before, "the refused stop changed the manifest");
+    let _ = sh.kill();
+    let _ = sh.wait();
+}
+
+// ---------------------------------------------------------------- #183 AC 5
+
+/// #183 AC 5: stop confirms death before answering. Fixture: a test-spawned group leader the test NEVER
+/// reaps, signed out through the public verb — after the stop's KILL it is a zombie that still answers the
+/// liveness probe. `stop --id --grace-ms 200` exits 4 and the entry is still listed; once the test reaps
+/// it, a second stop exits 3 `already-gone` and the entry is removed.
+#[test]
+fn stop_confirms_death_before_answering() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-5", &r, &d);
+    let mut guard = Guard::default();
+
+    let mut own = spawn_own_group("sleep", "300");
+    let pid = own.id();
+    guard.add(pid);
+    let add = manifest_add_process("ts-5", "p-5", pid, &d);
+    assert_eq!(code(&add), 0, "add of the leader: {}", err(&add));
+    assert!(alive(pid), "the leader must be live before the stop");
+    assert!(own.try_wait().unwrap().is_none(), "precondition: the child has not exited, so its exit leaves a zombie the test never reaps");
+
+    let s1 = stop("ts-5", StopSel::Id("p-5"), Some(200), &d);
+    assert_eq!(code(&s1), 4, "an unconfirmable death answers 4: stdout {:?} stderr {:?}", out(&s1), err(&s1));
+    assert!(err(&s1).contains("not confirmed"), "the answer names the unconfirmed death: stderr {:?}", err(&s1));
+    // The unreaped zombie still answers the probe — the precondition the fixture carries.
+    assert!(alive(pid), "the killed pid must still answer while it is an unreaped zombie");
+    let l = run(&["manifest", "list", "ts-5", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(out(&l).contains("p-5"), "the unconfirmed entry must stay listed: {}", out(&l));
+
+    // Reap, then the retry: the pid is provably gone, so the entry is removed with already-gone.
+    let _ = own.wait();
+    assert!(poll(10_000, || !alive(pid)), "the reaped pid still answers the probe");
+    let s2 = stop("ts-5", StopSel::Id("p-5"), None, &d);
+    assert_eq!(code(&s2), 3, "the retry after the reap answers 3: stdout {:?} stderr {:?}", out(&s2), err(&s2));
+    assert!(err(&s2).contains("already-gone"), "the retry names already-gone: stderr {:?}", err(&s2));
+    let l2 = run(&["manifest", "list", "ts-5", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l2), 0);
+    assert!(!out(&l2).contains("p-5"), "the gone entry is still listed: {}", out(&l2));
+}
+
+// ---------------------------------------------------------------- #183 AC 7
+
+/// #183 AC 7: an entry whose process exited on its own answers 3 `already-gone` with the entry removed; a
+/// stop with NO manifest answers 2; a manifest with a torn tail answers 2 and the file is byte-identical.
+#[test]
+fn dead_and_missing_cases() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-7", &r, &d);
+    init_manifest("ts-7t", &r, &d);
+    let mut guard = Guard::default();
+
+    // (a) an entry whose process exited on its own (spawned, signed out while alive, then reaped). The
+    // fixture's lifetime is one the TEST ends (fix r2, F4): it waits for the `go` file instead of a
+    // wall-clock `sleep 2` a slow CI host could run out of during the `manifest add`.
+    let pid_file = r.join("short");
+    let go_file = r.join("short-go");
+    let script = format!("echo $$ > {}; while [ ! -f {} ]; do sleep 0.1; done", pid_file.to_string_lossy(), go_file.to_string_lossy());
+    let mut own = spawn_sh(&script);
+    guard.add(own.id());
+    assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the short program never wrote its pid");
+    let pid = read_pid(&pid_file).unwrap();
+    let add = manifest_add_process("ts-7", "p-7", pid, &d);
+    assert_eq!(code(&add), 0, "add of the short-lived pid: {}", err(&add));
+    fs::write(&go_file, b"").unwrap();
+    assert!(poll(10_000, || own.try_wait().unwrap().is_some()), "the short program never exited after go");
+    assert!(!alive(pid), "the reaped pid must be gone before the stop");
+    let s = stop("ts-7", StopSel::Id("p-7"), None, &d);
+    assert_eq!(code(&s), 3, "a dead entry answers 3: stdout {:?} stderr {:?}", out(&s), err(&s));
+    assert!(err(&s).contains("already-gone"), "the answer names already-gone: stderr {:?}", err(&s));
+    let l = run(&["manifest", "list", "ts-7", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).contains("p-7"), "the gone entry is still listed: {}", out(&l));
+
+    // (b) no manifest for the ticket.
+    let s2 = stop("ts-7none", StopSel::Id("x-1"), None, &d);
+    assert_eq!(code(&s2), 2, "a missing manifest refuses: stdout {:?} stderr {:?}", out(&s2), err(&s2));
+
+    // (c) a torn tail: bytes with no closing newline refuse the stop and change nothing.
+    let file = d.join("ts-7t.jsonl");
+    let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+    f.write_all(b"{\"v\":1,\"op\":\"add\"").unwrap();
+    drop(f);
+    let before = fs::read(&file).unwrap();
+    let s3 = stop("ts-7t", StopSel::Id("x-1"), None, &d);
+    assert_eq!(code(&s3), 2, "a torn tail refuses: stdout {:?} stderr {:?}", out(&s3), err(&s3));
+    assert!(err(&s3).contains("torn tail"), "the refusal names the torn tail: stderr {:?}", err(&s3));
+    assert_eq!(fs::read(&file).unwrap(), before, "the refused stop changed the torn manifest");
+}
+
+// ---------------------------------------------------------------- #183 AC 8
+
+/// #183 AC 8: two CONCURRENT stops of one id give {0, 2}; the loser's stderr is the pre-signal refusal
+/// (`is not a live entry`), never a manifest refusal; the group is gone; exactly one `remove` line exists
+/// for that id. Without the per-ticket supervisor lock both stops would pass the live-entry check and the
+/// loser's remove would be refused by the manifest instead (mutant: the lock removed).
+#[test]
+fn two_stops_at_once() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-8", &r, &d);
+    let mut guard = Guard::default();
+
+    let (s, pid) = start("ts-8", "p-8", &r, None, &d, &["sleep", "60"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(pid > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(pid);
+
+    let d1 = d.to_string_lossy().into_owned();
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..2 {
+        let tx = tx.clone();
+        let dd = d1.clone();
+        thread::spawn(move || {
+            let _ = tx.send(stop("ts-8", StopSel::Id("p-8"), None, Path::new(&dd)));
+        });
+    }
+    drop(tx);
+    let a = rx.recv().unwrap();
+    let b = rx.recv().unwrap();
+    let mut codes = [code(&a), code(&b)];
+    codes.sort();
+    assert_eq!(codes, [0, 2], "one stop wins, one refuses: {:?} / {:?}", (out(&a), err(&a)), (out(&b), err(&b)));
+    let loser = if code(&a) == 2 { &a } else { &b };
+    assert!(err(loser).contains("is not a live entry"), "the loser's refusal is the pre-signal one: stderr {:?}", err(loser));
+    assert!(!err(loser).contains("manifest refused"), "the loser's refusal must not be a manifest refusal: stderr {:?}", err(loser));
+    assert!(poll(10_000, || !group_alive(pid)), "the group is still alive");
+    let text = fs::read_to_string(d.join("ts-8.jsonl")).unwrap();
+    let removes = text.lines().filter(|l| l.contains("\"op\":\"remove\"") && l.contains("\"id\":\"p-8\"")).count();
+    assert_eq!(removes, 1, "exactly one remove line for the id: {}", text);
+}
+
+// ---------------------------------------------------------------- #183 AC 9 (non-Linux)
+
+/// #183 AC 9 (non-Linux, where the start-time read runs `ps`): with the harness child's PATH pointing at a
+/// fake `ps` that prints an elapsed time MATCHING the recorded (wrong) start time, a re-used-pid fixture
+/// still exits 3 `pid-reused` and is not signalled — the identity read goes through `/bin/ps` by absolute
+/// path, so a PATH-shadowed `ps` cannot bless a re-used pid. (On Linux the read is /proc and PATH is
+/// irrelevant, so this test is compiled out there.)
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn path_ps_liar_cannot_bless_a_reused_pid() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-9", &r, &d);
+    let mut guard = Guard::default();
+
+    let mut own = spawn_own_group("sleep", "60");
+    let pid = own.id();
+    guard.add(pid);
+    let real = real_start_ms(pid);
+    let recorded = real.saturating_sub(3_600_000);
+    assert!(real.abs_diff(recorded) > 2000, "the fixture must carry a recorded start time far off the real one");
+    plant_process(&d, "ts-9", "p-9", pid, recorded);
+
+    // The fake ps prints the elapsed time the RECORDED start time implies — exactly what would bless the
+    // re-used pid if the identity read consulted PATH.
+    let fakebin = t.0.join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let fake = fakebin.join("ps");
+    let recorded_s = recorded / 1000;
+    fs::write(&fake, format!("#!/bin/sh\ns=$(( $(date +%s) - {recorded_s} ))\nprintf '%d:%02d\\n' $(( s / 60 )) $(( s % 60 ))\n")).unwrap();
+    let mut perm = fs::metadata(&fake).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perm.set_mode(0o755);
+    fs::set_permissions(&fake, perm).unwrap();
+
+    let dstr = d.to_string_lossy().into_owned();
+    let v: Vec<String> = vec!["process".into(), "stop".into(), "ts-9".into(), "--id".into(), "p-9".into(), "--dir".into(), dstr];
+    let args: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    let s = Command::new(BIN)
+        .args(&args)
+        .env("PATH", fakebin.to_str().unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(code(&s), 3, "the liar PATH cannot bless the re-used pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    assert!(err(&s).contains("pid-reused"), "the answer names pid-reused: stderr {:?}", err(&s));
+    assert!(alive(pid), "the re-used pid was signalled");
+    assert!(own.try_wait().unwrap().is_none(), "the re-used pid is dead");
+    let _ = own.kill();
+    let _ = own.wait();
+}
+
+// ---------------------------------------------------------------- #183 fix r2 (F2): members that ignore TERM
+
+/// #183 fix r2, F2 (review repro H1): the started leader obeys TERM, but a group member TRAPS it. The head
+/// code gated the KILL on the LEADER's identity re-check — a leader the stop's own TERM just killed has no
+/// identity to re-read — so no KILL went, and the answer was 0 "stopped" with the entry removed while the
+/// member still ran. The stop must end the member (or answer 4 and KEEP the entry); it may never answer 0
+/// while any member of the group lives.
+#[test]
+fn stop_ends_a_group_member_that_ignores_term() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2a", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("member");
+    let script = format!("sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done' & wait", mfile.to_string_lossy());
+    let (s, leader) = start("ts-f2a", "p-1", &r, None, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(leader > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(leader);
+    assert!(poll(10_000, || read_pid(&mfile).is_some()), "the member never wrote its pid");
+    let member = read_pid(&mfile).unwrap();
+    guard.add(member);
+    assert!(alive(member) && alive(leader), "both must be live before the stop");
+    assert_eq!(pgid_of(member), leader, "precondition: the member is in the started leader's group");
+
+    let st = stop("ts-f2a", StopSel::Id("p-1"), Some(500), &d);
+    assert!(
+        code(&st) == 0 || code(&st) == 4,
+        "a surviving member must mean a KILL or a 4, never a silent leader-only success: stdout {:?} stderr {:?}",
+        out(&st),
+        err(&st)
+    );
+    if code(&st) == 0 {
+        assert!(poll(10_000, || !alive(member) && !alive(leader)), "the stop answered 0 but the group still has a member");
+        let l = run(&["manifest", "list", "ts-f2a", "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+    } else {
+        assert!(err(&st).contains("not confirmed"), "a 4 names the unconfirmed death: stderr {:?}", err(&st));
+        let l = run(&["manifest", "list", "ts-f2a", "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        assert!(out(&l).contains("p-1"), "the unconfirmed entry must stay listed: {}", out(&l));
+    }
+}
+
+/// #183 fix r2, F2 (held-out must-fire): TWO members of the group both ignore TERM — the group KILL must
+/// end both (or the answer is 4 with the entry kept); never 0 with a survivor.
+#[test]
+fn stop_ends_two_members_that_ignore_term() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2b", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("members");
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ >> {}; while :; do sleep 1; done' & sh -c 'trap \"\" TERM; echo $$ >> {}; while :; do sleep 1; done' & wait",
+        mfile.to_string_lossy(),
+        mfile.to_string_lossy()
+    );
+    let (s, leader) = start("ts-f2b", "p-1", &r, None, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(leader);
+    assert!(poll(10_000, || read_pids(&mfile).len() == 2), "the members never wrote both pids");
+    let members = read_pids(&mfile);
+    for m in &members {
+        guard.add(*m);
+        assert!(alive(*m), "member {m} must be live before the stop");
+        assert_eq!(pgid_of(*m), leader, "precondition: both members are in the started leader's group");
+    }
+
+    let st = stop("ts-f2b", StopSel::Id("p-1"), Some(500), &d);
+    assert!(
+        code(&st) == 0 || code(&st) == 4,
+        "two TERM-ignoring members must mean a group KILL or a 4: stdout {:?} stderr {:?}",
+        out(&st),
+        err(&st)
+    );
+    if code(&st) == 0 {
+        assert!(poll(10_000, || members.iter().all(|m| !alive(*m)) && !alive(leader)), "the stop answered 0 but a member still lives");
+        let l = run(&["manifest", "list", "ts-f2b", "--dir", d.to_str().unwrap()]);
+        assert_eq!(code(&l), 0);
+        assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+    } else {
+        assert!(err(&st).contains("not confirmed"), "a 4 names the unconfirmed death: stderr {:?}", err(&st));
+    }
+}
+
+/// #183 fix r2 (F2 wiring, the Alive+Same arm): the LEADER itself ignores TERM. The identity re-check must
+/// still pass (the live leader IS still the recorded process), so the KILL goes and the stop answers 0
+/// with the leader gone. A gate that KILLed only dead leaders (or never re-read identity) leaves this red.
+#[test]
+fn stop_ends_a_leader_that_ignores_term() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2c", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("leader");
+    let script = format!("trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done", mfile.to_string_lossy());
+    let (s, leader) = start("ts-f2c", "p-1", &r, None, &d, &["/bin/sh", "-c", &script]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(leader > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(leader);
+    assert!(poll(10_000, || read_pid(&mfile).is_some()), "the leader never wrote its pid");
+    assert_eq!(read_pid(&mfile).unwrap(), leader, "the started pid is the pid the script reports");
+    assert!(alive(leader), "the leader must be live before the stop");
+
+    let st = stop("ts-f2c", StopSel::Id("p-1"), Some(500), &d);
+    assert_eq!(code(&st), 0, "a live, still-ours leader that ignored TERM must be KILLed and confirmed: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert!(poll(10_000, || !alive(leader)), "the leader survived its own stop");
+    let l = run(&["manifest", "list", "ts-f2c", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).contains("p-1"), "the stopped id is still listed: {}", out(&l));
+}
+
+/// #183 fix r2 (held-out must-fire): the recorded leader is ALREADY dead when the stop begins, while a
+/// group member still lives. The stop must not answer 0 for a non-empty group: the sanctioned answer is
+/// exit 3 `already-gone` (nothing signalled — the doc's "does not cover" line; the orphan reaper P2 owns
+/// leaderless groups), and this pins that it is never 0 while the member lives.
+#[test]
+fn dead_leader_with_live_member_never_answers_stopped() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ts-f2d", &r, &d);
+    let mut guard = Guard::default();
+    let mfile = r.join("member");
+    let gofile = r.join("go");
+    // The leader forks a TERM-trapping member, then waits until the TEST lets it exit (so the entry can
+    // be recorded with the leader's REAL start time while it still lives): after `go`, the group
+    // outlives its leader.
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done' & while [ ! -f {} ]; do sleep 0.1; done",
+        mfile.to_string_lossy(),
+        gofile.to_string_lossy()
+    );
+    let mut lead = spawn_sh(&script);
+    let lead_pid = lead.id();
+    guard.add(lead_pid);
+    assert!(poll(10_000, || read_pid(&mfile).is_some()), "the member never wrote its pid");
+    let member = read_pid(&mfile).unwrap();
+    guard.add(member);
+    assert!(alive(member) && alive(lead_pid), "both must be live before the recording");
+    assert_eq!(pgid_of(member), lead_pid, "precondition: the member is in the leader's group");
+    // Record the entry with the leader's REAL start time while it lives, then let it die and reap it.
+    let recorded = real_start_ms(lead_pid);
+    plant_process(&d, "ts-f2d", "p-1", lead_pid, recorded);
+    fs::write(&gofile, b"").unwrap();
+    assert!(poll(10_000, || lead.try_wait().unwrap().is_some()), "the leader never exited");
+    assert!(!alive(lead_pid), "the leader must be gone before the stop");
+
+    let st = stop("ts-f2d", StopSel::Id("p-1"), None, &d);
+    assert_ne!(code(&st), 0, "a non-empty group must never take the 0 answer: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert_eq!(code(&st), 3, "a leader already gone answers already-gone: stdout {:?} stderr {:?}", out(&st), err(&st));
+    assert!(err(&st).contains("already-gone"), "the answer names already-gone: stderr {:?}", err(&st));
+    assert!(alive(member), "the already-gone path signalled anything (it must not)");
+    let l = run(&["manifest", "list", "ts-f2d", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).contains("p-1"), "the gone entry is still listed: {}", out(&l));
 }
