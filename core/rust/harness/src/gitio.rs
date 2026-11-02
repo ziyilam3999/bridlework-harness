@@ -48,8 +48,8 @@ fn parse_diff(text: &str) -> Result<Vec<Added>, String> {
             }
             continue;
         }
-        if l.starts_with("@@ ") {
-            let plus = l[3..].split(" +").nth(1).ok_or("bad hunk")?;
+        if let Some(after_at) = l.strip_prefix("@@ ") {
+            let plus = after_at.split(" +").nth(1).ok_or("bad hunk")?;
             let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
             ln = num.parse::<usize>().map_err(|_| "bad hunk".to_string())?;
             continue;

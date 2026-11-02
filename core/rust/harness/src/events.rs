@@ -5,7 +5,7 @@
 //! Reader: every complete line must be a valid event (else CORRUPTION, the read stops there); a final fragment with no
 //! trailing newline is a TORN TAIL, reported and never parsed. Writer: one `write()` of the whole line, then `sync_all`;
 //! refuses to append onto a torn tail (it would fuse a new event onto garbage). Recovery of a torn tail is not here.
-//! Kinds: thirteen today — the four base kinds (the PRE-B v2 shape with the run identity) and the nine P1b kinds
+//! Kinds: fourteen today — the four base kinds (the PRE-B v2 shape with the run identity) and the ten P1b kinds
 //! (payload kinds, no identity fields yet). Each kind's exact key set, value shapes and `v` are declared ONCE in the
 //! kind table below; the reader, the writer and the schema test all consult that table and nothing else.
 
@@ -23,8 +23,8 @@ pub const LINE_CAP: usize = 4096;
 /// Keys of every v2 base kind, in canonical order (the PRE-B envelope, bytes as on master).
 const KEYS_V2: [&str; 9] = ["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"];
 
-/// The single envelope declaration of the nine P1b kinds: the keys each of them carries before its payload. Today it is
-/// the trio every line shares; the PRE-B run identity (`run_id`, `role`, `model`) joins these nine kinds by editing THIS
+/// The single envelope declaration of the ten P1b kinds: the keys each of them carries before its payload. Today it is
+/// the trio every line shares; the PRE-B run identity (`run_id`, `role`, `model`) joins these ten kinds by editing THIS
 /// one list, once a run issuer exists — nowhere else.
 const P1B_ENVELOPE: [&str; 3] = ["v", "kind", "ts_ms"];
 
@@ -134,7 +134,7 @@ fn uuid_ok(s: &str) -> bool {
 /// Token segments joined by `/`: refuses a leading or doubled `/`, an empty, `.` or `..` segment, and any character a
 /// token forbids (so no `~`, no uppercase, no escapes).
 fn relpath_ok(s: &str) -> bool {
-    !s.is_empty() && s.split('/').all(|seg| token_ok(seg))
+    !s.is_empty() && s.split('/').all(token_ok)
 }
 
 /// One declared payload field of a kind: its key and its value shape.
@@ -158,7 +158,7 @@ enum Cross {
 /// anywhere else, and no literal test value is special-cased in the reader.
 struct KindDef {
     /// Keys before the payload. The four base kinds use `KEYS_V2` (the PRE-B envelope, bytes as on master, v 2); the
-    /// nine P1b kinds share `P1B_ENVELOPE` — the one declaration their envelope lives in.
+    /// ten P1b kinds share `P1B_ENVELOPE` — the one declaration their envelope lives in.
     envelope: &'static [&'static str],
     /// Payload fields after the envelope, canonical order; empty for the base kinds (their whole shape is the envelope:
     /// the trio plus six plain-token identity keys).
@@ -270,6 +270,17 @@ const HUMAN_ORIGIN_REFUSED_DEF: KindDef = KindDef {
     cross: Cross::None,
 };
 
+const QUESTION_CLASS_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "size", shape: Shape::OneOf(&["S", "M", "L", "unclassified"]) },
+        FieldDef { key: "risk", shape: Shape::OneOf(&["low", "high", "unclassified"]) },
+        FieldDef { key: "rule_hit", shape: Shape::OneOf(&["status", "advisor", "t2_only", "fail_closed"]) },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
 impl KindDef {
     /// The full key set in canonical order: envelope keys, then payload keys.
     fn key_list(&self) -> Vec<&'static str> {
@@ -292,10 +303,11 @@ pub enum Kind {
     CleanupResult,
     Quarantined,
     HumanOriginRefused,
+    QuestionClass,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 13] = [
+    pub const ALL: [Kind; 14] = [
         Kind::Escalation,
         Kind::ReplanRequired,
         Kind::BudgetExceeded,
@@ -309,6 +321,7 @@ impl Kind {
         Kind::CleanupResult,
         Kind::Quarantined,
         Kind::HumanOriginRefused,
+        Kind::QuestionClass,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -326,6 +339,7 @@ impl Kind {
             Kind::CleanupResult => "cleanup_result",
             Kind::Quarantined => "quarantined",
             Kind::HumanOriginRefused => "human_origin_refused",
+            Kind::QuestionClass => "question_class",
         }
     }
 
@@ -346,6 +360,7 @@ impl Kind {
             Kind::CleanupResult => &CLEANUP_RESULT_DEF,
             Kind::Quarantined => &QUARANTINED_DEF,
             Kind::HumanOriginRefused => &HUMAN_ORIGIN_REFUSED_DEF,
+            Kind::QuestionClass => &QUESTION_CLASS_DEF,
         }
     }
 
@@ -361,7 +376,7 @@ impl Kind {
     }
 
     /// The four base kinds (the PRE-B v2 shape, bytes as on master): the only kinds writable through the base `Event`
-    /// struct. The nine P1b kinds carry a payload and are written through `Record`.
+    /// struct. The ten P1b kinds carry a payload and are written through `Record`.
     pub fn is_base(&self) -> bool {
         matches!(self, Kind::Escalation | Kind::ReplanRequired | Kind::BudgetExceeded | Kind::RunIssued)
     }
@@ -460,6 +475,8 @@ pub struct Record {
     pub payload: Vec<(&'static str, Field)>,
 }
 
+type DeclaredPairs = Vec<(&'static str, Field)>;
+
 impl Record {
     /// The payload (or identity) value of one key.
     pub fn field(&self, key: &str) -> Option<&Field> {
@@ -499,7 +516,7 @@ impl Record {
     /// regardless of the order the pairs arrived in, so the written bytes never depend on the caller's order. Every
     /// error names the offending key. This is the single accept/refuse path: `build` (the writer's door) and
     /// `validate` (the re-check before encode) both come here.
-    fn assemble(kind: Kind, pairs: &[(&str, Field)]) -> Result<(Vec<(&'static str, Field)>, Vec<(&'static str, Field)>), String> {
+    fn assemble(kind: Kind, pairs: &[(&str, Field)]) -> Result<(DeclaredPairs, DeclaredPairs), String> {
         let def = kind.def();
         let trio = ["v", "kind", "ts_ms"];
         let mut identity: Vec<(&'static str, Field)> = Vec::new();
@@ -676,7 +693,7 @@ impl Record {
                         Val::Str(t) => t.clone(),
                         _ => return Err(format!("{k} has the wrong type")),
                     };
-                    Shape::Token.check_str(*k, &t)?;
+                    Shape::Token.check_str(k, &t)?;
                     identity.push((*k, Field::Str(t)));
                 }
             }
@@ -1712,7 +1729,7 @@ mod tests {
             }
         }
         assert_eq!(Kind::ALL.iter().filter(|k| k.is_base()).count(), 4);
-        assert_eq!(Kind::ALL.iter().filter(|k| !k.is_base()).count(), 9);
+        assert_eq!(Kind::ALL.iter().filter(|k| !k.is_base()).count(), 10);
     }
 
     #[test]

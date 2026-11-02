@@ -1,0 +1,12 @@
+# G8.4 fail-closed fixture (docs/question-class.md): one labelled row per bad condition, b1..b8.
+# Columns: id|request|ticket_size|plan_change|section7|risk_signal  ('-' = the fact is missing)
+# Columns are NOT trimmed and case is preserved: a padded, cased or wrong-vocabulary value stays
+# exactly as planted, so a row cannot pass by being silently cleaned.
+b1|-|L|no|no|none
+b2|question|-|no|no|none
+b3|question|XL|no|no|none
+b4|question|l|no|no|none
+b5|question| L|no|no|none
+b6|question|S|no|no|normal
+b7|question|M|yes|no|medium
+b8|Status|L|no|no|none

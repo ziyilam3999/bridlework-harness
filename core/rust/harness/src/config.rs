@@ -200,10 +200,10 @@ impl Config {
             let at = format!("section `{sec}` key `{}`", shown(key));
             let (val, quoted) = plain_value(raw).map_err(|why| refuse(n, &at, why))?;
             if sec == "repos" {
-                let id = RepoId::parse(key).map_err(|_| refuse(n, &format!("section `repos` key `repo_id`"), "must be a plain repo id"))?;
+                let id = RepoId::parse(key).map_err(|_| refuse(n, "section `repos` key `repo_id`", "must be a plain repo id"))?;
                 let numeric = id.as_str().parse::<f64>().is_ok() && id.as_str().starts_with(|c: char| c.is_ascii_digit() || c == '.');
                 if YAML_WORDS.contains(&id.as_str()) || numeric {
-                    return Err(refuse(n, &format!("section `repos` key `repo_id`"), "a YAML special word or number cannot be a repo id"));
+                    return Err(refuse(n, "section `repos` key `repo_id`", "a YAML special word or number cannot be a repo id"));
                 }
                 let at = format!("section `repos` repo `{}`", id.as_str());
                 if !folder_ok(val) {

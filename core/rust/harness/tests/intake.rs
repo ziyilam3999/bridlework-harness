@@ -262,7 +262,7 @@ fn broken_tickets_are_refused_and_name_the_field() {
     let pos = non_utf8.windows(8).position(|w| w == b"A title\"").unwrap();
     non_utf8[pos] = 0xff;
     let mut oversize = valid.clone().into_bytes();
-    oversize.extend(std::iter::repeat(b' ').take(MAX + 1));
+    oversize.extend(std::iter::repeat_n(b' ', MAX + 1));
     let cases: Vec<(&str, Vec<u8>, &str)> = vec![
         ("unknown key", render(&unknown).into_bytes(), "surprise"),
         ("duplicate key", render(&dup).into_bytes(), "id"),

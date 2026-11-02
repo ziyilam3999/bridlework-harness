@@ -633,7 +633,7 @@ fn verdicts_that_run_no_check_count_as_rounds() {
     git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "empty"]);
     let o = gate(&fx);
     assert_eq!(code(&o), 1);
-    assert_eq!(fs::read_to_string(fx.result_file("T-1")).unwrap().contains("no-checks"), true);
+    assert!(fs::read_to_string(fx.result_file("T-1")).unwrap().contains("no-checks"));
     assert!(fx.markers().is_empty());
     assert_eq!(fx.rec("T-1"), canon("T-1", 1, false));
 }
