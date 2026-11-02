@@ -17,3 +17,5 @@ jobs:
           persist-credentials: false
       - name: Build and test
         run: sh ci/rust-test.sh
+      - name: Clippy
+        run: sh ci/rust-clippy.sh

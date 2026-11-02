@@ -12,6 +12,7 @@
 //! 3. long (transitional): `<role>-l<n>-<slug>`, `planner-ahead-<slug>`,
 //!    `(governance|risk-review)-p<digit><slug>-signoff`
 //! 4. legacy: the frozen five-row table.
+//!
 //! `--new` (the launcher's mode) accepts family 1's round form only.
 
 /// Launcher role words: the live launcher's short seat words.

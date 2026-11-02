@@ -8,15 +8,21 @@ ticket (154) builds its first slice: capture first, so the store grows while the
 **The inbox file is not in this repo.** It lives only in the private overlay (5.2 item 4): lesson text is real
 operational text, so it is private data. This repo holds the contract, the reader and the lint — never the rows.
 
-Status: contract plus `harness friction add | lint | close-check` (ticket 154). The weekly twice-broken printout is
-154b in the private companion; the generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
+`repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
+`source` (ticket 193). The weekly listing script is 154b in the private
+companion; the generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
-One JSON object per line, exactly these six keys, every one required (a missing, empty or extra key is refused):
+One JSON object per line: exactly these six keys, every one required (a missing, empty or extra key is refused), plus
+three OPTIONAL keys — `kind` and `repeats` (ticket 192) and `source` (ticket 193) — omitted at their defaults:
 
 ```
 {"id":"les-001","date":"2026-11-01","ticket":"154","where-it-lives":"memory","breaks":"","text":"the lesson"}
+{"id":"pat-001","date":"2026-11-01","ticket":"192","where-it-lives":"memory","breaks":"","text":"the procedure that worked","kind":"pattern"}
+{"id":"pat-001-r1","date":"2026-11-02","ticket":"192","where-it-lives":"memory","breaks":"","text":"it worked again","kind":"pattern","repeats":"pat-001"}
+{"id":"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45","date":"2026-11-02","ticket":"t-9.3","where-it-lives":"memory","breaks":"","text":"event replan_required repo=ai-brain ticket=193 reason=replan-threshold","source":"event"}
 ```
 
 | field | rule |
@@ -27,6 +33,14 @@ One JSON object per line, exactly these six keys, every one required (a missing,
 | `where-it-lives` | exactly one of `skill`, `gate`, `memory`, `wiki` (K-1.1; see the table below) |
 | `breaks` | empty, or the `id` of a lesson this row says broke again (K-1 rule 3); it must name another row that exists in the inbox, never itself |
 | `text` | the lesson, non-empty; one line (a newline inside it is stored escaped, the file stays one row per line) |
+| `kind` (optional) | empty (= `friction`), `friction` or `pattern`; anything else is refused naming the field. `friction` is a lesson learned the hard way; `pattern` is a repeatable procedure that worked. Omitted at its default, so every six-key row written before this key existed re-encodes byte-identical |
+| `repeats` (optional) | empty, or a plain row id token. The pointer rules mirror `breaks`: it must name a row that exists in the inbox, never itself; the row carrying it must itself be `kind: pattern`; and the row it names must be a `kind: pattern` row with an empty `repeats` — the chain ROOT — so a chain's repeat count is one unambiguous number. A `pattern` row with no `repeats` is legal: it is the root of its chain |
+| `source` (optional) | empty (= hand-written) or `event`; anything else is refused naming the field. `event` marks a row the T-9.3 mapper produced from an event (see "Event rows" below). Omitted at its default, so every row written before this key existed re-encodes byte-identical |
+
+The count of a pattern chain is mechanical, never judged: it is the number of rows whose `repeats` names the root,
+counted by the verb, remembered nowhere. When the count reaches N (`friction.pattern_threshold`, the config contract's one
+optional key; default 3), `harness friction patterns` lists the chain as a candidate for a reusable control — and listing it creates
+zero files under any skill or ticket path (the P8 factory judges what to build, later).
 
 The tag is the ROUTE chosen at capture, nothing more (K-1 rule 2):
 
@@ -34,6 +48,37 @@ The tag is the ROUTE chosen at capture, nothing more (K-1 rule 2):
 - `gate` — a machine-checkable never-break rule;
 - `memory` — an operational lesson (before P3, this inbox row is its home);
 - `wiki` — project knowledge.
+
+### Event rows (T-9.3)
+
+The event-to-row mapper (`friction_event` in the crate, ticket 193) translates one event-log line into ONE
+inbox row over a fixed, closed list of deterministic event kinds — no prose is ever read. The list, and the
+signature (the CAUSE a repeat of which files no second row that week) per kind:
+
+| event kind | maps? | signature |
+|---|---|---|
+| `replan_required` | yes | `repo`, `ticket`, `reason` |
+| `launch_refused` | yes | `launch_role`, `matched_entry` (`brief_sha256` is left out: it differs per brief while the cause stays the same) |
+| the other twelve kinds | no — zero rows | — |
+
+Gate FAIL and a sweep `blocked` are not event kinds today, so they cannot map yet (deferred follow-ups to
+ticket 193). The mapper is pure: it never opens or writes the inbox — a later weekly sweep files its rows
+through `harness friction add`, and because the dedup key below IS the row `id`, the duplicate-id rule of
+`add`/`lint` is a second backstop against double-filing.
+
+Every event row carries the constants: `ticket` `t-9.3` (the catcher is the capturer — never the event's own
+ticket, which lives in the key and the text, so an event row never changes what a real ticket's `lesson:`
+close-check must name), `where-it-lives` `memory`, `source` `event`, `kind` at its default (`friction`),
+`breaks` empty, `date` the UTC date of the event's `ts_ms`, and a `text` built only from the kind name and
+the signature tokens (`event <kind> <key>=<value> ...`).
+
+The dedup key grammar (the row `id`): `evt.<kind>.` + each signature value as `<byte-length>_<value>`,
+joined by `.`, + `.<iso-year>-w<ww>` (ISO 8601 week, Monday-first, the year of the week's Thursday). The
+length prefix makes the join injective (tokens may contain `.`, so a bare `.`-join would collide
+`a.b`,`c` with `a`,`b.c`); the week part makes every week a fresh row — the same cause twice in one week is
+one row (dated the earliest event), Sunday 23:59:59.999 and the next Monday 00:00:00.000 are two. An event
+that cannot name a row (torn, invalid, unknown kind, wrong `v`, a `ts_ms` past year 9999) is refused fail
+closed; in the batch helper one bad line refuses the whole batch with no rows returned.
 
 ## 2. The verbs
 
@@ -50,17 +95,21 @@ if the inbox did not exist yet, it is still not created.
 
 ```
 harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> \
-  --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] --text <lesson> [--config <file>]
+  --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] \
+  [--kind <friction|pattern>] [--repeats <row-id>] [--source event] \
+  --text <lesson> [--config <file>]
 ```
 
 Appends one row. Everything is checked before anything is written, in this order: the flags, the row rules
 (section 1), every field of the new row through the same privacy engine as the rest of the harness, then — under
 one exclusive writer lock (section 4) — the same privacy engine over every stored row and the inbox cross rules
-(a duplicate `id`; a `breaks` naming no lesson or naming itself; the existing inbox must itself be clean, untorn
-and privacy-clean). Only then is one whole line (plus newline) appended and synced; the file is created when
+(a duplicate `id`; a `breaks` naming no lesson or naming itself; the `repeats` pointer rules of section 1; the
+existing inbox must itself be clean, untorn and privacy-clean). Only then is one whole line (plus newline) appended and synced; the file is created when
 absent, its folder is not; a refused row never creates the file (a first row whose only possible refusal is a
 `breaks` with nothing to name is refused before the file is opened). On success stdout is `stored id=<id>`. The new row is scanned before any cross rule
-runs, so a refusal can never echo an unscanned byte of it.
+runs, so a refusal can never echo an unscanned byte of it. `--source` accepts only `event` (anything else is
+a row refusal naming the field); the flag exists so the T-9.3 mapper's rows are fileable exactly as the
+weekly sweep will file them.
 
 A missing required field flag (`--where-it-lives` absent) is a row refusal (1) naming the field, not a usage
 error: K-1.1 counts "no tag" as refused. With no privacy list configured the verb fails closed (exit 2) — an
@@ -84,6 +133,34 @@ privacy hit or a torn tail, each named with its line on stderr. With no privacy 
 closed (exit 2): an inbox is never linted clean unscanned. Hand-written rows from before this contract and the
 154b weekly script share this one checker. A missing inbox is a setup error (2): `lint` is how a real inbox is
 audited, so it must exist.
+
+### `harness friction patterns`
+
+```
+harness friction patterns [--config <file>] [--record <file>]
+```
+
+The N-threshold listing (ticket 192). It runs the FULL lint first — any lint failure is the same exit and the same
+stderr as `friction lint`, with nothing on stdout — then prints one line per chain-root pattern row whose count of
+`repeats` rows is >= N, sorted by id:
+
+```
+pattern id=<id> repeats=<n>
+patterns ok threshold=<N> listed=<k>
+```
+
+Ids and counts only: a row's `text` is never printed, and the ids it prints have all passed the same privacy
+engine as the lint. N is `friction.pattern_threshold` from the config (the one optional key in the config
+contract; absent = 3). Being listed creates NOTHING: no skill, no ticket, no file under any skill or ticket path —
+the listing is a candidate list for the P8 factory, which judges what to build.
+
+The verb writes nothing, with one exception: when `--record <file>` is given, exactly one JSONL line is APPENDED
+to that file — `{"date":"YYYY-MM-DD","threshold":N,"rows":<rows>,"listed":["<id>",...]}` (`schemas/friction-trial.schema.json`
+is the shape; the date is the run's UTC day, written by the harness). The trial record is the keep-or-remove
+evidence for this feature: if four weekly records show nothing ever reaching N, Governance removes `kind` and
+`repeats` (the 4-run ablation decision is Governance's, not a verb's). Exit codes as the family: 0 ok; 1 the lint
+leg refused; 2 a usage or setup error — including a failed record append, so a half-written trial never reads as
+a clean run.
 
 ### `harness friction close-check`
 
@@ -137,13 +214,19 @@ exit blocks removal.
   not against an editor that ignores it. A refused row never creates the inbox file.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
   than 4 MiB; a close note no further than 1 MiB. Over the bound the verb refuses (1 for a row, 2 for a file).
+  `patterns` never writes the inbox at all, and its only output file is the one `--record` line; the listing
+  itself cannot loop or grow past its bound (one pass over the already-capped inbox, one line per root).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
   append): reported by `lint` with its line number, never read as a row; `add` refuses to append onto it.
 
 ## 5. Not in slice 1 (where each piece went)
 
-- The weekly twice-broken printout (lessons at 2 `breaks`, open gate tickets with their age) — 154b, in the
-  private companion repo, because its printed list carries lesson text.
+- The weekly sweep that reads the event log, runs the T-9.3 mapper and files its rows through
+  `harness friction add` — a follow-up to ticket 193 (the mapper itself, and `source`, are in this repo).
+- The weekly printout (lessons at 2 `breaks`, open gate tickets with their age, the pattern candidates at N
+  repeats) — 154b, in the private companion repo, because its printed list carries lesson text; it calls
+  `harness friction patterns --record` (ticket 192) for the pattern half, so the public trial record grows
+  one line per weekly run.
 - Wiring `close-check` into the automated S-1.6 removal step — 154c (until then it runs by hand).
 - The generated lessons index, `harness find` over the inbox — slice 2 (K-1 rule 4, X-81a).
 - Promotion of lessons to the wiki / W3 Lesson Store, and the tag-vs-`controls` lint (K-1.3) — P3.

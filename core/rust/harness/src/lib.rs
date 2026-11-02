@@ -15,6 +15,7 @@ pub mod explain;
 pub mod fix_tier;
 pub mod fixtures;
 pub mod friction;
+pub mod friction_event;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;
@@ -22,6 +23,7 @@ pub mod intake;
 pub mod manifest;
 pub mod overlay;
 pub mod path_map;
+pub mod question_class;
 #[cfg(unix)]
 pub mod quarantine;
 pub mod repo_id;

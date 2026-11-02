@@ -390,7 +390,8 @@ fn ac08_a_result_directory_that_is_not_a_real_outside_directory_is_refused() {
     fs::create_dir_all(fx.other.join("res-rel")).unwrap();
     fs::create_dir_all(fx.repo.join("out")).unwrap();
     fs::create_dir_all(fx.repo.join("out2")).unwrap();
-    for d in ["res-rel"] {
+    {
+        let d = "res-rel";
         fs::write(fx.other.join(d).join("EX-1.json"), fail_note(&fx.c[1]).to_json().unwrap()).unwrap();
     }
     for d in ["out", "out2"] {
@@ -888,7 +889,7 @@ fn ac24_a_record_the_reader_refuses_is_refused() {
         ("for another ticket", record_bytes("EX-2", "r", 2, false).into_bytes()),
         ("for another repo id", record_bytes("EX-1", "q", 2, false).into_bytes()),
         ("reordered keys", b"{\"v\":1,\"repo_id\":\"r\",\"ticket\":\"EX-1\",\"fix_rounds\":2,\"in_flight\":false}\n".to_vec()),
-        ("padded with spaces", format!("{{\"v\":1,\"ticket\":\"EX-1\",\"repo_id\":\"r\", \"fix_rounds\":2,\"in_flight\":false}}\n").into_bytes()),
+        ("padded with spaces", "{\"v\":1,\"ticket\":\"EX-1\",\"repo_id\":\"r\", \"fix_rounds\":2,\"in_flight\":false}\n".to_string().into_bytes()),
         ("fix_rounds 5", record_bytes("EX-1", "r", 5, false).into_bytes()),
         ("fix_rounds 256", record_bytes("EX-1", "r", 0, false).replace("\"fix_rounds\":0", "\"fix_rounds\":256").into_bytes()),
         ("fix_rounds negative", record_bytes("EX-1", "r", 0, false).replace("\"fix_rounds\":0", "\"fix_rounds\":-1").into_bytes()),

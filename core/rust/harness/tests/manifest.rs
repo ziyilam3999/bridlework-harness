@@ -356,9 +356,9 @@ fn a_process_add_needs_an_integer_pid_start_ms() {
         .unwrap();
     let g = g.trim_end_matches('\n');
     let missing = g.replacen(",\"pid_start_ms\":7", "", 1);
-    assert!(Line::decode(&missing).unwrap_err().contains("pid_start_ms missing"), "missing pid_start_ms: {}", &missing);
+    assert!(Line::decode(&missing).unwrap_err().contains("pid_start_ms missing"), "missing pid_start_ms: {}", missing);
     let not_int = g.replace("\"pid_start_ms\":7", "\"pid_start_ms\":\"7\"");
-    assert!(Line::decode(&not_int).unwrap_err().contains("pid_start_ms has the wrong type"), "non-integer pid_start_ms: {}", &not_int);
+    assert!(Line::decode(&not_int).unwrap_err().contains("pid_start_ms has the wrong type"), "non-integer pid_start_ms: {}", not_int);
     assert!(Line::decode(g).is_ok(), "twin: the integer one decodes");
 }
 
@@ -428,7 +428,7 @@ fn a_second_init_an_add_and_a_remove_before_init_are_refused_unchanged() {
     let err = apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n-1", port: 8080 }, ts(2)).unwrap_err();
     assert!(err.to_string().contains("run init first"), "{err}");
     assert!(matches!(apply(&t.manifest_dir(), "t-1", &Op::Remove { id: "n-1" }, ts(2)), Err(ManifestError::Invalid(_))));
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n-1", port: 8080 }, ts(3)).unwrap();
     let before = t.bytes("t-1");
     let err = init(&t, &[r]).unwrap_err();
@@ -442,7 +442,7 @@ fn the_fence_refuses_outside_paths_traversal_and_symlink_escapes() {
     let r = t.sub("roots/r");
     let o = t.sub("outside/o");
     std::os::unix::fs::symlink(&o, r.join("link")).unwrap();
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "ok", class: Class::TempDir, path: &r.join("in").join("x") }, ts(2)).unwrap();
 
     let before = t.bytes("t-1");
@@ -474,7 +474,7 @@ fn b7_a_dangling_symlink_in_a_root_is_refused_not_stored_as_missing() {
     let o = t.sub("outside/o");
     std::os::unix::fs::symlink(o.join("missing"), r.join("dang")).unwrap();
     std::os::unix::fs::symlink(o.join("missing-dir"), r.join("dangdir")).unwrap();
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     let before = t.bytes("t-1");
 
     // (a) the dangling link is the final component: refused, the file is byte-identical, the target stays missing
@@ -516,7 +516,7 @@ fn b7_v2_a_chain_of_links_to_a_missing_target_is_refused() {
     let o = t.sub("outside/o");
     std::os::unix::fs::symlink(r.join("b"), r.join("a")).unwrap();
     std::os::unix::fs::symlink(o.join("missing"), r.join("b")).unwrap();
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     let before = t.bytes("t-1");
     for (name, p) in [("the link itself", r.join("a")), ("through the chain", r.join("a").join("x"))] {
         let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "v2", class: Class::TempDir, path: &p }, ts(2)).unwrap_err();
@@ -551,7 +551,7 @@ fn b7_v1_a_dangling_symlink_in_the_manifest_dir_prefix_is_refused() {
     let o = t.sub("outside/o");
     let mdir = t.0.join("manlink");
     std::os::unix::fs::symlink(o.join("missing-man"), &mdir).unwrap();
-    let err = apply(&mdir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap_err();
+    let err = apply(&mdir, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap_err();
     assert!(matches!(err, ManifestError::Invalid(_)), "v1 {err}");
     assert!(!mdir.join("t-1.jsonl").exists(), "v1: no manifest file was written");
     assert!(!o.join("missing-man").exists(), "v1: the dangling target was not created");
@@ -572,7 +572,7 @@ fn b7_v4_a_link_to_an_existing_in_root_file_is_accepted_as_its_target() {
     let f = r.join("target-file");
     std::fs::write(&f, b"x").unwrap();
     std::os::unix::fs::symlink(&f, r.join("lin")).unwrap();
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "lin", class: Class::Log, path: &r.join("lin") }, ts(2)).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
     let want = Target::Path(f.canonicalize().unwrap().to_string_lossy().into_owned());
@@ -588,7 +588,7 @@ fn n_i_a_dot_dot_after_a_plain_file_component_is_refused() {
     let r = t.sub("roots/r");
     let file = r.join("file");
     std::fs::write(&file, b"x").unwrap();
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     let before = t.bytes("t-1");
     let err = apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "ni", class: Class::TempDir, path: &r.join("file").join("..").join("x") }, ts(2)).unwrap_err();
     assert!(matches!(err, ManifestError::Invalid(_)), "n-i {err}");
@@ -606,7 +606,7 @@ fn n_i_a_dot_dot_after_a_plain_file_component_is_refused() {
 fn add_then_remove_round_trips_and_ownership_follows_the_live_state() {
     let t = Tmp::new("cycle");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }, ts(2)).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
     assert_eq!(read.live.len(), 1);
@@ -631,7 +631,7 @@ fn add_then_remove_round_trips_and_ownership_follows_the_live_state() {
 fn duplicate_live_ids_paths_pids_and_ports_are_refused() {
     let t = Tmp::new("dup");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }, ts(2)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddProcess { id: "p", pid: 4242, pid_start_ms: 7 }, ts(3)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(4)).unwrap();
@@ -656,11 +656,11 @@ fn a_manifest_dir_inside_a_root_is_refused_and_nothing_is_created() {
     let t = Tmp::new("f2");
     let r = t.sub("roots/r");
     let inside = r.join("man");
-    let err = apply(&inside, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap_err();
+    let err = apply(&inside, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap_err();
     assert!(err.to_string().contains("inside one of the ticket's roots"), "{err}");
     assert!(!inside.exists(), "the refused init created no folder");
     // the root itself as the manifest dir is refused the same way
-    assert!(apply(&r, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).is_err());
+    assert!(apply(&r, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).is_err());
     // twin: a dir outside the roots is fine
     apply(&t.manifest_dir(), "t-1", &Op::Init { roots: &[r] }, ts(1)).unwrap();
 }
@@ -835,7 +835,7 @@ fn an_add_or_remove_on_an_existing_init_less_file_is_refused_run_init_first() {
 fn a_damaged_manifest_owns_nothing_for_path_pid_and_port() {
     let t = Tmp::new("owns-dmg");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }, ts(2)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddProcess { id: "p", pid: 4242, pid_start_ms: 7 }, ts(3)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(4)).unwrap();
@@ -887,7 +887,7 @@ fn a_relative_manifest_dir_with_a_missing_parent_is_answered_for_the_cwd() {
     let rel = RelDir::new("reldir");
     // no part of the relative dir exists yet, so the walk has to reach the current folder before anything resolves
     let dir = rel.path().join("fresh").join("manifests");
-    apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+    apply(&dir, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap();
     assert!(dir.join("t-1.jsonl").exists(), "the relative dir was joined onto the cwd and created");
     // twin: a relative dir that lands INSIDE a root is still refused
     let root2_rel = rel.path().join("roots").join("r");
@@ -924,7 +924,7 @@ fn a_hand_written_path_entry_outside_every_root_is_corruption_on_read() {
 fn a_live_path_owns_children_but_not_a_sibling_sharing_a_string_prefix() {
     let t = Tmp::new("sib");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &r.join("x") }, ts(2)).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
     assert!(read.is_clean());
@@ -942,7 +942,7 @@ fn a_manifest_file_over_one_mib_is_refused_as_corrupt() {
     let r = t.sub("roots/r");
     init(&t, &[r]).unwrap();
     let mut big = t.bytes("t-1");
-    big.extend(std::iter::repeat(b'x').take(CAP + 1));
+    big.extend(std::iter::repeat_n(b'x', CAP + 1));
     std::fs::write(t.manifest_dir().join("t-1.jsonl"), &big).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
     let c = read.corrupt.as_ref().expect("an over-cap file is corruption");
@@ -953,10 +953,10 @@ fn a_manifest_file_over_one_mib_is_refused_as_corrupt() {
     assert_eq!(t.bytes("t-1"), before, "the refused write changed nothing");
     // twin: a file of exactly the cap is not corrupt (a missing final newline there is a torn tail, as always)
     let mut at_cap = t.bytes("t-1");
-    at_cap.truncate(0);
+    at_cap.clear();
     at_cap.extend_from_slice(b"{\"v\":1,\"op\":\"root\",\"ticket\":\"t-1\",\"path\":\"/scratch/r\",\"ts_ms\":1}\n");
     let fill = CAP - at_cap.len();
-    at_cap.extend(std::iter::repeat(b'x').take(fill));
+    at_cap.extend(std::iter::repeat_n(b'x', fill));
     assert_eq!(at_cap.len(), CAP);
     let read = parse_manifest(&at_cap, "t-1");
     assert!(read.corrupt.is_none(), "a file at the cap is not corrupt");
@@ -994,7 +994,7 @@ fn a_non_plain_ticket_is_refused_for_every_op_and_creates_nothing_anywhere() {
     let r = t.sub("roots/r");
     for bad in ["../escape", "a/b", "UPPER", "", ".", ".."] {
         for (name, op) in [
-            ("init", Op::Init { roots: &[r.clone()] }),
+            ("init", Op::Init { roots: std::slice::from_ref(&r) }),
             ("add", Op::AddPort { id: "n", port: 8080 }),
             ("remove", Op::Remove { id: "n" }),
         ] {
@@ -1028,7 +1028,7 @@ fn concurrent_adds_of_one_id_leave_exactly_one_winner_and_a_clean_file() {
     let r = t.sub("roots/r");
     for round in 0..25 {
         let dir = t.0.join(format!("man-{round}"));
-        apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+        apply(&dir, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -1055,7 +1055,7 @@ fn concurrent_removes_of_one_id_leave_the_file_readable() {
     let r = t.sub("roots/r");
     for round in 0..25 {
         let dir = t.0.join(format!("man-{round}"));
-        apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+        apply(&dir, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap();
         apply(&dir, "t-1", &Op::AddPort { id: "n", port: 8080 }, ts(2)).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let mut handles = Vec::new();
@@ -1162,7 +1162,7 @@ fn concurrent_adds_of_distinct_ids_sharing_one_port_leave_one_winner() {
     let r = t.sub("roots/r");
     for round in 0..25 {
         let dir = t.0.join(format!("man-{round}"));
-        apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+        apply(&dir, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let mut handles = Vec::new();
         for i in 0..8 {
@@ -1215,7 +1215,7 @@ fn an_over_long_plain_ticket_is_still_fenced_inside_the_manifest_dir() {
     let t = Tmp::new("longticket");
     let r = t.sub("roots/r");
     let long = format!("x{}", "a".repeat(200));
-    apply(&t.manifest_dir(), &long, &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+    apply(&t.manifest_dir(), &long, &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap();
     assert!(t.manifest_dir().join(format!("{long}.jsonl")).exists(), "the long plain ticket inits inside the dir");
     let mut found = Vec::new();
     jsonl_under(&t.0, &mut found);
@@ -1257,7 +1257,7 @@ fn concurrent_adds_of_distinct_ids_and_ports_all_land() {
 fn a_lower_case_ticket_with_digits_and_hyphens_is_accepted() {
     let t = Tmp::new("plain-ticket");
     let r = t.sub("roots/r");
-    apply(&t.manifest_dir(), "p1b-02", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap();
+    apply(&t.manifest_dir(), "p1b-02", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap();
     assert!(t.manifest_dir().join("p1b-02.jsonl").exists());
     let read = read_manifest(&t.manifest_dir(), "p1b-02").unwrap();
     assert!(read.is_clean() && read.roots.len() == 1);
@@ -1297,7 +1297,7 @@ fn tree(p: &Path) -> Vec<PathBuf> {
 fn assert_path_refused_and_nothing_created(tag: &str, rel_to_root: &str) {
     let t = Tmp::new(tag);
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     let before = t.bytes("t-1");
     let tree_before = tree(&t.0);
     let p = r.join(rel_to_root); // `join` keeps the text as given, `.` and `..` included
@@ -1325,7 +1325,7 @@ fn b6_a_dot_dot_after_a_missing_component_that_stays_inside_is_refused_too() {
 fn b6_a_plain_missing_component_is_still_accepted_and_stored_as_given() {
     let t = Tmp::new("b6c");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &r.join("ne").join("x") }, ts(2)).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
     assert_eq!(read.live[0].target, Target::Path(r.join("ne").join("x").to_string_lossy().into_owned()));
@@ -1354,7 +1354,7 @@ fn v3_a_path_ending_in_dot_dot_after_a_missing_component_is_refused() {
 fn v5_two_plain_missing_components_are_accepted_as_given() {
     let t = Tmp::new("v5");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     let p = r.join("ne").join("deep").join("er");
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &p }, ts(2)).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
@@ -1366,7 +1366,7 @@ fn v5_two_plain_missing_components_are_accepted_as_given() {
 fn v6_a_dot_dot_through_existing_ancestors_still_resolves_and_is_accepted() {
     let t = Tmp::new("v6");
     let r = t.sub("roots/r");
-    init(&t, &[r.clone()]).unwrap();
+    init(&t, std::slice::from_ref(&r)).unwrap();
     let p = r.join("..").join("r").join("x");
     apply(&t.manifest_dir(), "t-1", &Op::AddPath { id: "x", class: Class::TempDir, path: &p }, ts(2)).unwrap();
     let read = read_manifest(&t.manifest_dir(), "t-1").unwrap();
@@ -1404,7 +1404,7 @@ fn s3_a_live_id_is_refused_by_every_class_of_add_and_the_file_is_byte_identical(
     for (first, second, id) in cases {
         let t = Tmp::new("s3");
         let r = t.sub("roots/r");
-        init(&t, &[r.clone()]).unwrap();
+        init(&t, std::slice::from_ref(&r)).unwrap();
         add(&t, &r, first, id, 1, 2).unwrap();
         let before = t.bytes("t-1");
         let err = add(&t, &r, second, id, 2, 3).unwrap_err();
@@ -1418,7 +1418,7 @@ fn s3_a_live_id_is_refused_by_every_class_of_add_and_the_file_is_byte_identical(
     for k in [K::Path, K::Process, K::Port] {
         let t = Tmp::new("s3-same");
         let r = t.sub("roots/r");
-        init(&t, &[r.clone()]).unwrap();
+        init(&t, std::slice::from_ref(&r)).unwrap();
         add(&t, &r, k, "z", 1, 2).unwrap();
         let before = t.bytes("t-1");
         let err = add(&t, &r, k, "z", 2, 3).unwrap_err();
@@ -1478,7 +1478,7 @@ fn a_manifest_dir_with_a_dot_dot_after_a_missing_component_is_refused_and_nothin
     let r = t.sub("roots/r");
     let tree_before = tree(&t.0);
     let dir = t.0.join("roots").join("ne").join("..").join("r").join("m");
-    let err = apply(&dir, "t-1", &Op::Init { roots: &[r.clone()] }, ts(1)).unwrap_err();
+    let err = apply(&dir, "t-1", &Op::Init { roots: std::slice::from_ref(&r) }, ts(1)).unwrap_err();
     assert!(matches!(err, ManifestError::Invalid(_)), "{err}");
     assert_eq!(tree(&t.0), tree_before, "nothing was created");
     // twin: plain missing components outside the roots are fine

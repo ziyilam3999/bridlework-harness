@@ -1,4 +1,4 @@
-//! The nine P1b event kinds (P1B-01): round trip and refusal tests, through the library writer and the real binary's
+//! The ten P1b event kinds (P1B-01): round trip and refusal tests, through the library writer and the real binary's
 //! `events list` / `events verify`. DISCIPLINE: every line this file builds is built FROM the loader's declared key
 //! list (`Kind::keys()`), never from a key list typed here, so an envelope change (the PRE-B run identity landing in
 //! the one shared declaration) cannot silently pass these tests. The values are synthetic and were never shown to the
@@ -15,7 +15,7 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 /// A synthetic stamp: fixed, so the appended bytes are deterministic.
 const TS: u64 = 1731000000123;
 
-/// The nine P1b kinds, derived from the loader's own list (never typed here as a set of names).
+/// The ten P1b kinds, derived from the loader's own list (never typed here as a set of names).
 fn p1b_kinds() -> Vec<Kind> {
     Kind::ALL.iter().copied().filter(|k| !k.is_base()).collect()
 }
@@ -103,6 +103,9 @@ fn value_for(kind: Kind, key: &str) -> Field {
         ("quarantined", "reason") => "unmanifested",
         ("human_origin_refused", "target") => "config",
         ("human_origin_refused", "path") => "cfg/harness.conf",
+        ("question_class", "size") => "S",
+        ("question_class", "risk") => "low",
+        ("question_class", "rule_hit") => "t2_only",
         (_, "steps") => return Field::Num(120),
         (_, "soft_limit") => return Field::Num(100),
         (_, "hard_limit") => return Field::Num(300),
@@ -465,7 +468,7 @@ fn f3_a_number_where_a_string_shape_is_declared_is_refused_at_read_and_at_write(
         let kind = Kind::SessionStarted;
         let swap = |ps: Vec<(&'static str, Field)>| ps.into_iter().map(|(k, v)| (k, if k == key { Field::Num(7) } else { v })).collect::<Vec<_>>();
         // Read: the stored line with a bare number for the key is refused naming the key.
-        refused_at_read(kind, &raw_line(kind, |ps| swap(ps)), key);
+        refused_at_read(kind, &raw_line(kind, swap), key);
         // Write: the pairs with a number for the key are refused naming the key.
         refused_at_write(kind, &swap(pairs_for(kind)), key);
     }

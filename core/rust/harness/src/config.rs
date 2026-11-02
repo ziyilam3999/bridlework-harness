@@ -34,6 +34,13 @@ pub const KEYS: [&str; 15] = [
 /// value shape differs. A refusal over it never carries the value (the path names a private folder).
 pub const INBOX_KEY: &str = "friction.inbox";
 
+/// The one OPTIONAL key in the contract (ticket 192): `friction.pattern_threshold`, the N a pattern chain's
+/// repeat count must reach before `harness friction patterns` lists it. Absent means the default, 3. It is the
+/// first key in the contract a file may omit; every other key stays required.
+pub const PATTERN_THRESHOLD_KEY: &str = "friction.pattern_threshold";
+/// The default N when `friction.pattern_threshold` is absent.
+pub const PATTERN_THRESHOLD_DEFAULT: u64 = 3;
+
 /// The config v4 string key (ticket 190): the tier the factory designs new fixes at (G8.3). One of
 /// `T1`, `T2`, `T3` — a tier, never a brand; `T4` is refused (the design tier is never the top of the
 /// ladder). A refusal over it never carries the value.
@@ -70,6 +77,8 @@ pub struct Config {
     nums: [u64; 15],
     /// The `friction.inbox` path (v3). Never printed.
     inbox: String,
+    /// The optional `friction.pattern_threshold` (default 3 when absent).
+    pattern_threshold: u64,
     /// The `factory.design_tier` tier (v4, ticket 190): the tier the factory designs new fixes at.
     design_tier: Tier,
 }
@@ -140,6 +149,7 @@ impl Config {
         let mut repos: Vec<(RepoId, String)> = Vec::new();
         let mut nums: [Option<u64>; 15] = [None; 15];
         let mut inbox: Option<String> = None;
+        let mut pattern_threshold: Option<u64> = None;
         let mut design_tier: Option<Tier> = None;
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
@@ -190,10 +200,10 @@ impl Config {
             let at = format!("section `{sec}` key `{}`", shown(key));
             let (val, quoted) = plain_value(raw).map_err(|why| refuse(n, &at, why))?;
             if sec == "repos" {
-                let id = RepoId::parse(key).map_err(|_| refuse(n, &format!("section `repos` key `repo_id`"), "must be a plain repo id"))?;
+                let id = RepoId::parse(key).map_err(|_| refuse(n, "section `repos` key `repo_id`", "must be a plain repo id"))?;
                 let numeric = id.as_str().parse::<f64>().is_ok() && id.as_str().starts_with(|c: char| c.is_ascii_digit() || c == '.');
                 if YAML_WORDS.contains(&id.as_str()) || numeric {
-                    return Err(refuse(n, &format!("section `repos` key `repo_id`"), "a YAML special word or number cannot be a repo id"));
+                    return Err(refuse(n, "section `repos` key `repo_id`", "a YAML special word or number cannot be a repo id"));
                 }
                 let at = format!("section `repos` repo `{}`", id.as_str());
                 if !folder_ok(val) {
@@ -208,17 +218,28 @@ impl Config {
                 repos.push((id, val.to_string()));
             } else if sec == "friction" {
                 let at = format!("section `{sec}` key `{}`", shown(key));
-                if key != "inbox" {
+                if key == "pattern_threshold" {
+                    // The one OPTIONAL key (ticket 192): a positive whole number exactly like every numeric
+                    // key, but a file may omit it (absent = the default 3).
+                    if pattern_threshold.is_some() {
+                        return Err(refuse(n, &at, "duplicate key"));
+                    }
+                    if quoted {
+                        return Err(refuse(n, &at, "a number must not be quoted"));
+                    }
+                    pattern_threshold = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
+                } else if key == "inbox" {
+                    if inbox.is_some() {
+                        return Err(refuse(n, &at, "duplicate key"));
+                    }
+                    if !folder_ok(val) {
+                        return Err(refuse(n, &at, "the inbox path must be absolute, with no `..` component, no control character and no trailing `/`"));
+                    }
+                    inbox = Some(val.to_string());
+                } else {
                     return Err(refuse(n, &at, "unknown key"));
                 }
-                if inbox.is_some() {
-                    return Err(refuse(n, &at, "duplicate key"));
-                }
-                if !folder_ok(val) {
-                    return Err(refuse(n, &at, "the inbox path must be absolute, with no `..` component, no control character and no trailing `/`"));
-                }
-                inbox = Some(val.to_string());
-            } else if sec == "factory" {
+} else if sec == "factory" {
                 let at = format!("section `{sec}` key `{}`", shown(key));
                 if key != "design_tier" {
                     return Err(refuse(n, &at, "unknown key"));
@@ -264,8 +285,13 @@ impl Config {
         for (i, slot) in nums.iter().enumerate() {
             out[i] = slot.ok_or_else(|| format!("config: missing key `{}`", KEYS[i]))?;
         }
-        Ok(Config { repos, nums: out, inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))?, design_tier: design_tier.ok_or_else(|| format!("config: missing key `{DESIGN_TIER_KEY}`"))? })
-    }
+        Ok(Config {
+            repos,
+            nums: out,
+            inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))?,
+            pattern_threshold: pattern_threshold.unwrap_or(PATTERN_THRESHOLD_DEFAULT),
+            design_tier: design_tier.ok_or_else(|| format!("config: missing key `{DESIGN_TIER_KEY}`"))?,
+        })    }
 
     /// Read at most the cap plus one byte, then parse. No search, no default location: the caller names the file. Errors never carry the path.
     pub fn load(path: &Path) -> Result<Config, String> {
@@ -312,6 +338,12 @@ impl Config {
     /// The configured friction inbox path (`friction.inbox`, v3). Read by `harness friction`; never printed.
     pub fn friction_inbox(&self) -> &str {
         &self.inbox
+    }
+
+    /// The configured N a pattern chain's repeat count must reach before `friction patterns` lists it
+    /// (`friction.pattern_threshold`, optional; the default 3 when absent).
+    pub fn pattern_threshold(&self) -> u64 {
+        self.pattern_threshold
     }
 
     /// The configured design tier (`factory.design_tier`, v4): one of T1, T2, T3. Read by the G8.3
@@ -573,9 +605,37 @@ mod tests {
             let e = refused(&valid().replace("/synthetic-inbox.jsonl", bad));
             assert!(e.contains("`friction`") && e.contains("`inbox`") && !e.contains("synthetic-inbox"), "{bad}: {e}");
         }
-        // only `inbox` lives under friction
+        // only `inbox` and the optional `pattern_threshold` live under friction
         let e = refused(&valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  extra: 1"));
         assert!(e.contains("unknown key"), "{e}");
+    }
+
+
+    #[test]
+    fn pattern_threshold_is_optional_shape_checked_and_read() {
+        // absent: the default 3
+        assert_eq!(Config::parse(&valid()).unwrap().pattern_threshold(), 3);
+        // present: read from the text, not compiled in
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: 5");
+        assert_eq!(Config::parse(&t).unwrap().pattern_threshold(), 5);
+        // 0, a non-number, a fraction, a negative, a leading zero: refused naming the section and the key
+        for bad in ["0", "x", "1.5", "-1", "007", ""] {
+            let t = valid().replace("  inbox: /synthetic-inbox.jsonl", &format!("  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: {bad}"));
+            let e = refused(&t);
+            assert!(e.contains("`friction`") && e.contains("`pattern_threshold`") && e.contains("positive whole number"), "{bad:?}: {e}");
+        }
+        // a quoted value is refused as a type error, naming the section and the key
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: \"3\"");
+        let e = refused(&t);
+        assert!(e.contains("`pattern_threshold`") && e.contains("quoted"), "{e}");
+        // a second line under friction is refused as a duplicate key
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: 3\n  pattern_threshold: 4");
+        let e = refused(&t);
+        assert!(e.contains("`pattern_threshold`") && e.contains("duplicate key"), "{e}");
+        // a refusal never carries the value
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", &format!("  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: {SECRET}"));
+        let e = refused(&t);
+        assert!(!leaks(&e, SECRET), "{e}");
     }
 
 
