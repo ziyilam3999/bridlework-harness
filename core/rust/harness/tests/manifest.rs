@@ -70,6 +70,7 @@ fn samples() -> Vec<Line> {
         Line::AddPath { ticket: "t-1".into(), id: "e-1".into(), class: Class::Evidence, path: "/scratch/roots/r/e".into(), ts_ms: ts(8) },
         Line::AddProcess { ticket: "t-1".into(), id: "p-1".into(), pid: 4242, pid_start_ms: 1730000000000, ts_ms: ts(9) },
         Line::AddPort { ticket: "t-1".into(), id: "n-1".into(), port: 8080, ts_ms: ts(10) },
+        Line::Limit { ticket: "t-1".into(), id: "p-1".into(), timeout_ms: 60000, ts_ms: ts(12) },
         Line::Remove { ticket: "t-1".into(), id: "w-1".into(), ts_ms: ts(11) },
     ]
 }
@@ -274,6 +275,10 @@ fn encoded_lines_carry_the_exact_fixed_key_order() {
     assert_eq!(
         Line::AddPort { ticket: "t-1".into(), id: "n-1".into(), port: 8080, ts_ms: 10 }.encode().unwrap(),
         "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"n-1\",\"class\":\"port\",\"port\":8080,\"ts_ms\":10}\n"
+    );
+    assert_eq!(
+        Line::Limit { ticket: "t-1".into(), id: "p-1".into(), timeout_ms: 60000, ts_ms: 12 }.encode().unwrap(),
+        "{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"timeout_ms\":60000,\"ts_ms\":12}\n"
     );
     assert_eq!(
         Line::Remove { ticket: "t-1".into(), id: "w-1".into(), ts_ms: 11 }.encode().unwrap(),
@@ -1483,4 +1488,64 @@ fn a_manifest_dir_with_a_dot_dot_after_a_missing_component_is_refused_and_nothin
     assert_eq!(tree(&t.0), tree_before, "nothing was created");
     // twin: plain missing components outside the roots are fine
     apply(&t.0.join("man").join("deeper"), "t-1", &Op::Init { roots: &[r] }, ts(1)).unwrap();
+}
+
+// ---------------------------------------------------------------- #207: the limit line
+
+/// #207 AC 9: the reader rules for a `limit` line. A limit is valid ONLY for an id that is a LIVE
+/// `process` entry with no limit yet; anything else reads as corruption naming that line. A `remove` of
+/// the id ends the limit.
+#[test]
+fn limit_line_reader_rules() {
+    let root = "{\"v\":1,\"op\":\"root\",\"ticket\":\"t-1\",\"path\":\"/scratch/roots/r\",\"ts_ms\":1}\n";
+    let add_p = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"class\":\"process\",\"pid\":4242,\"pid_start_ms\":1730000000000,\"ts_ms\":2}\n";
+    let add_port = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"n-1\",\"class\":\"port\",\"port\":8080,\"ts_ms\":2}\n";
+    let add_path = "{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"w-1\",\"class\":\"worktree\",\"path\":\"/scratch/roots/r/w\",\"ts_ms\":2}\n";
+    let lim = |id: &str, t: u64| format!("{{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-1\",\"id\":\"{id}\",\"timeout_ms\":{t},\"ts_ms\":3}}\n");
+
+    // good: the limit lands on the live process entry and the entry carries it.
+    let r = parse_manifest((root.to_string() + add_p + &lim("p-1", 60000)).as_bytes(), "t-1");
+    assert!(r.is_clean(), "{:?}", r.corrupt);
+    let e = r.live.iter().find(|e| e.id == "p-1").unwrap();
+    let limit = e.limit.as_ref().expect("the entry carries its limit");
+    assert_eq!((limit.timeout_ms, limit.ts_ms), (60000, 3));
+
+    // a remove of the id ends the limit (the entry, limit and all, leaves the live set).
+    let rm = "{\"v\":1,\"op\":\"remove\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"ts_ms\":4}\n";
+    let r2 = parse_manifest((root.to_string() + add_p + &lim("p-1", 60000) + rm).as_bytes(), "t-1");
+    assert!(r2.is_clean());
+    assert!(r2.live.is_empty(), "the remove ended the entry and its limit");
+
+    // each broken placement reads as corruption naming that line.
+    for (name, text, want) in [
+        ("not live", root.to_string() + &lim("ghost", 1), "not live"),
+        ("a port entry", root.to_string() + add_port + &lim("n-1", 1), "non-process"),
+        ("a path entry", root.to_string() + add_path + &lim("w-1", 1), "non-process"),
+        ("a second limit", root.to_string() + add_p + &lim("p-1", 1) + &lim("p-1", 2), "second limit"),
+        ("before init", lim("p-1", 1), "before init"),
+    ] {
+        let r = parse_manifest(text.as_bytes(), "t-1");
+        let c = r.corrupt.as_ref().unwrap_or_else(|| panic!("{name}: read as clean"));
+        assert_eq!(c.line, text.lines().count(), "{name}: the corrupt line is the limit line");
+        assert!(c.msg.contains(want), "{name}: the message names the rule: {}", c.msg);
+    }
+
+    // the field itself: missing / string / negative / zero timeout_ms.
+    assert!(Line::decode("{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"ts_ms\":3}").unwrap_err().contains("timeout_ms missing"));
+    assert!(Line::decode("{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"timeout_ms\":\"60000\",\"ts_ms\":3}").unwrap_err().contains("timeout_ms has the wrong type"));
+    assert!(Line::decode("{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"timeout_ms\":-5,\"ts_ms\":3}").unwrap_err().contains("unexpected value"));
+    assert!(Line::decode("{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-1\",\"id\":\"p-1\",\"timeout_ms\":0,\"ts_ms\":3}").unwrap_err().contains("timeout_ms must be an integer >= 1"));
+}
+
+/// #207: the WRITER mirrors the reader rule — `Op::Limit` is refused for an id that is not live (and for
+/// a second limit), so a sheet this module wrote can never read back as corrupt.
+#[test]
+fn limit_write_refused_for_a_non_live_id() {
+    let base = std::env::temp_dir().join(format!("manifest-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let err = apply(&base, "t-1", &Op::Limit { id: "ghost", timeout_ms: 60000 }, 1).unwrap_err();
+    assert!(matches!(err, ManifestError::Invalid(_)), "{err}");
+    assert!(!base.join("t-1.jsonl").exists(), "the refused limit wrote a manifest into being");
+    let _ = std::fs::remove_dir_all(&base);
 }
