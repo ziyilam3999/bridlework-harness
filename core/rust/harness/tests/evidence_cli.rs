@@ -601,3 +601,335 @@ fn evidence_dead_waiter_writes_no_exit_record() {
     assert!(!poll(5000, || rd.join("exit").exists()), "a dead waiter must leave no exit record (unknown, never fabricated)");
     assert!(!rd.join("exit.tmp").exists(), "no temp record either");
 }
+
+// ---------------------------------------------------------------- fix round 1, F1: the drain bound is a bound in every path
+
+/// Launch the hidden waiter directly (the AC 12 shape) against `prog` and hand back the child plus the
+/// PROGRAM's pid from the handshake. The caller owns the commit pipe (the child's stdin).
+fn spawn_waiter(rd: &Path, cwd: &Path, prog: &[&str]) -> (Child, u32) {
+    let mut v: Vec<String> = vec![
+        "process".into(),
+        "waiter".into(),
+        rd.to_string_lossy().into_owned(),
+        cwd.to_string_lossy().into_owned(),
+        "0".into(),
+        "--".into(),
+    ];
+    for a in prog {
+        v.push((*a).into());
+    }
+    let args: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    let mut child: Child = Command::new(BIN)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let pid: u32 = line
+        .trim_end()
+        .strip_prefix("ok ")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("the waiter reported garbage: {line:?}"));
+    assert!(pid > 1, "the handshake names the program pid");
+    (child, pid)
+}
+
+/// A real run dir under `r` (evidence, evidence/proc and `<name>`), the layout the waiter expects.
+fn plant_run_dir(r: &Path, name: &str) -> PathBuf {
+    let rd = r.join("evidence/proc").join(name);
+    fs::DirBuilder::new().mode(0o700).create(r.join("evidence")).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(r.join("evidence/proc")).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&rd).unwrap();
+    rd
+}
+
+/// Fix round 1, F1 (decision 5, and mutant OWN4's red test): a grandchild that keeps BOTH pipes open
+/// must not defeat the 2000 ms drain bound. The program exits at once and leaves `sleep 8` behind
+/// holding stdout and stderr; the waiter still writes its `exit` record within about 4 s of the exit
+/// (a bounded poll, never an elapsed assert) with `output_open_after_exit` TRUE. Before the fix each
+/// copier held the stat lock across its whole copy, the main thread blocked on that lock past the
+/// bound, and the record landed only when the grandchild died (8 s) — or never.
+#[test]
+fn evidence_grandchild_holding_both_pipes_still_gets_a_bounded_record() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-f1a", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid) = start("ev-f1a", "g", &r, None, &d, &["/bin/sh", "-c", "sleep 8 & exit 0"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(pid > 1, "start printed no pid: stdout {:?} stderr {:?}", out(&s), err(&s));
+    guard.add(pid); // the whole program group (the sleeping grandchild included) is cleaned on drop
+    let rd = run_dir_of(&d, "ev-f1a", "g");
+    wait_exit(&rd, 4000);
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "true", "the pipes were still open past the bound");
+    assert_eq!(pair(&pairs, "outcome"), "exited");
+    assert_eq!(pair(&pairs, "code"), "0");
+    assert_eq!(pair(&pairs, "committed"), "true");
+}
+
+/// Fix round 1, F1's second required case: the program is STOPPED while an escaped (setsid) grandchild
+/// holds both pipes — the waiter must still END and leave an `exit` record naming the stop signal, with
+/// the open-output flag TRUE. Before the fix the waiter stayed alive with no record for as long as the
+/// grandchild lived. The escape needs python3 (no `setsid` helper exists on every host); skipped with
+/// a printed note where the host has none. The program is a python script whose child setsids, touches
+/// a marker and sleeps 12 — the program waits for the marker, so the escape is PROVABLE before the
+/// stop fires (a stop that races the setsid kills the grandchild too, and the flag would read false).
+#[test]
+fn evidence_stopped_program_with_an_escaped_grandchild_still_records() {
+    if !Path::new("/usr/bin/python3").exists() {
+        println!("SKIP: no /usr/bin/python3 on this host, so the setsid grandchild cannot be spawned");
+        return;
+    }
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-f1b", &r, &d);
+    let mut guard = Guard::default();
+    // the grandchild leaves the program's group (setsid) AND inherits both pipes; the program itself
+    // waits for the escape marker, then stays alive until the stop
+    let escaped = r.join("escaped");
+    let script_path = r.join("escape.py");
+    let script = format!(
+        "import os, time\n\
+         pid = os.fork()\n\
+         if pid == 0:\n\
+         \x20   os.setsid()\n\
+         \x20   open({escaped:?}, 'w').write('x')\n\
+         \x20   time.sleep(12)\n\
+         else:\n\
+         \x20   while not os.path.exists({escaped:?}):\n\
+         \x20       time.sleep(0.02)\n\
+         \x20   time.sleep(30)\n"
+    );
+    fs::write(&script_path, script).unwrap();
+    let (s, pid) = start("ev-f1b", "g", &r, None, &d, &["/usr/bin/python3", script_path.to_str().unwrap()]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(pid > 1);
+    guard.add(pid);
+    // the escape is provable BEFORE the stop: the marker exists, so the grandchild is out of the
+    // program's group (the stop's TERM cannot reach it) and holds both pipes
+    assert!(poll(10_000, || escaped.exists()), "the grandchild never escaped its group");
+    // the waiter is the program's parent, found while the program still runs
+    let ppid = Command::new("ps").arg("-o").arg("ppid=").arg("-p").arg(pid.to_string()).stdin(Stdio::null()).output().unwrap();
+    let waiter: u32 = String::from_utf8_lossy(&ppid.stdout).trim().parse().expect("ps prints the waiter pid");
+    assert!(waiter > 1 && waiter != pid, "the waiter pid is neither 0 nor the program's");
+
+    let st = run(&["process", "stop", "ev-f1b", "--id", "g", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&st), 0, "stop answers 0: stdout {:?} stderr {:?}", out(&st), err(&st));
+    let rd = run_dir_of(&d, "ev-f1b", "g");
+    wait_exit(&rd, 6000);
+    assert!(poll(4000, || !alive(waiter)), "the waiter ended past its bounded drain while the grandchild still holds the pipes");
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "true");
+    assert_eq!(pair(&pairs, "outcome"), "signalled");
+    let signal = pair(&pairs, "signal").parse::<i32>().unwrap();
+    assert!(signal == 15 || signal == 9, "the record names the stop's TERM or KILL: {signal}");
+    assert_eq!(pair(&pairs, "committed"), "true");
+}
+
+/// Held-out v1 (must-fire): the program exits at once and a background child holds STDERR only — the
+/// record still lands within the bound with the open-output flag TRUE (stdout's pipe closed at the
+/// exit, stderr's is held). Mutant "hold the stat lock across the copy" (the F1 defect) turns this red.
+#[test]
+fn evidence_stderr_only_holder_is_bounded() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-v1", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid) = start("ev-v1", "g", &r, None, &d, &["/bin/sh", "-c", "sleep 8 >&2 & exit 0"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    let rd = run_dir_of(&d, "ev-v1", "g");
+    wait_exit(&rd, 4000);
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "true", "stderr was still open past the bound");
+    assert_eq!(pair(&pairs, "outcome"), "exited");
+    assert_eq!(pair(&pairs, "code"), "0");
+    assert_eq!(pair(&pairs, "committed"), "true");
+}
+
+/// Held-out v2 (must-fire): BOTH streams are held by a grandchild that RELEASES them inside the bound
+/// (`sleep 1`) — exactly ONE exit record lands, once, with the open-output flag FALSE (both copiers
+/// finished inside the 2000 ms bound). This is the deterministic killer for mutant OWN4
+/// (`DRAIN_BOUND_MS = 0`): a zero bound answers "still open" while the 1 s holder lives, the flag
+/// turns TRUE and this goes red.
+#[test]
+fn evidence_short_holder_inside_the_bound_closes_both_streams() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-v2", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid) = start("ev-v2", "g", &r, None, &d, &["/bin/sh", "-c", "sleep 1 & exit 3"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    let rd = run_dir_of(&d, "ev-v2", "g");
+    wait_exit(&rd, 5000);
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "false", "both holders released inside the bound");
+    assert_eq!(pair(&pairs, "outcome"), "exited");
+    assert_eq!(pair(&pairs, "code"), "3");
+    // one record, once: a single line (exit_pairs asserts that) and no temp name left or kept
+    assert!(!rd.join("exit.tmp").exists(), "the record was written once, atomically");
+    assert_eq!(fs::read_dir(&rd).unwrap().count(), 3, "exactly stdout, stderr and exit exist");
+}
+
+/// Held-out v3 (must-fire): a program that dies BY SIGNAL while a grandchild holds the pipes — the
+/// record names the signal and the open-output flag. `kill -TERM $$` ends the shell itself; the
+/// background child (same group, never signalled) keeps both pipes open past the bound.
+#[test]
+fn evidence_signal_death_with_holder_records_signal_and_flag() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-v3", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid) = start("ev-v3", "g", &r, None, &d, &["/bin/sh", "-c", "sleep 8 & kill -TERM $$"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    let rd = run_dir_of(&d, "ev-v3", "g");
+    wait_exit(&rd, 4000);
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "outcome"), "signalled");
+    assert_eq!(pair(&pairs, "signal"), "15");
+    assert_eq!(pair(&pairs, "code"), "-1");
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "true");
+    assert_eq!(pair(&pairs, "committed"), "true");
+}
+
+/// Held-out v4 (must-not-fire): a plain exit with no grandchild changes nothing — the flag is FALSE,
+/// the streams are byte-exact and the record keeps its shape. With the lock-holding defect (or a zero
+/// drain bound) the flag would turn TRUE here and the byte counts could snapshot early.
+#[test]
+fn evidence_plain_exit_closes_both_streams() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-v4", &r, &d);
+    let (s, pid) = start("ev-v4", "g", &r, None, &d, &["/bin/sh", "-c", "printf out; printf err >&2; exit 7"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    assert!(pid > 1);
+    let rd = run_dir_of(&d, "ev-v4", "g");
+    wait_exit(&rd, 5000);
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "false", "both pipes closed at the exit");
+    assert_eq!(pair(&pairs, "stdout_bytes"), "3");
+    assert_eq!(pair(&pairs, "stderr_bytes"), "3");
+    assert_eq!(pair(&pairs, "stdout_truncated"), "false");
+    assert_eq!(pair(&pairs, "stderr_truncated"), "false");
+    assert_eq!(fs::read(rd.join("stdout")).unwrap(), b"out", "stdout is byte-exact, not an early snapshot");
+    assert_eq!(fs::read(rd.join("stderr")).unwrap(), b"err", "stderr is byte-exact, not an early snapshot");
+}
+
+/// Held-out v5 (must-not-fire): a large but UNDER-CAP output is copied fully — byte-identical, no
+/// truncation marker, no flag. 1 MiB of zeros against the 4 MiB cap.
+#[test]
+fn evidence_under_cap_output_is_byte_identical() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("ev-v5", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid) = start("ev-v5", "g", &r, None, &d, &["/bin/sh", "-c", "head -c 1048576 /dev/zero"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    let rd = run_dir_of(&d, "ev-v5", "g");
+    wait_exit(&rd, 10_000);
+    let bytes = fs::read(rd.join("stdout")).unwrap();
+    assert_eq!(bytes.len(), 1_048_576, "every byte is kept under the cap");
+    assert!(bytes.iter().all(|b| *b == 0), "byte-identical, no marker inserted");
+    let pairs = exit_pairs(&rd);
+    assert_eq!(pair(&pairs, "stdout_bytes"), "1048576");
+    assert_eq!(pair(&pairs, "stdout_truncated"), "false");
+    assert_eq!(pair(&pairs, "output_open_after_exit"), "false");
+}
+
+// ---------------------------------------------------------------- fix round 1, F4: the waiter-side re-verify
+
+/// Fix round 1, F4 (mutant OWN1's red test): the WAITER re-verifies the run dir before creating
+/// anything — a run dir swapped into a symlink between start and waiter is refused (`fail evidence
+/// refused: ... does not verify`), nothing is created through the link, and the program never runs.
+/// Mutant "the waiter skips verify_run_dir" creates both capture files through the symlink and runs
+/// the program, and this goes red on both counts.
+#[test]
+fn the_waiter_refuses_a_swapped_run_dir_before_creating_anything() {
+    let t = Tmp::new();
+    let (r, _o, _d) = t.fence();
+    let real = r.join("real-run");
+    fs::DirBuilder::new().mode(0o700).create(&real).unwrap();
+    let linked = plant_run_dir(&r, "w.1");
+    let _ = fs::remove_dir(&linked); // plant the NAME as a symlink instead of a dir
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let marker = r.join("ran");
+    let script = format!("echo ran > {}", marker.to_string_lossy());
+
+    let o = Command::new(BIN)
+        .args([
+            "process", "waiter",
+            linked.to_str().unwrap(), r.to_str().unwrap(), "0",
+            "--", "/bin/sh", "-c", &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    let line = out(&o);
+    assert!(line.starts_with("fail evidence refused: "), "the waiter refuses the swapped run dir: {line:?}");
+    assert!(line.contains("does not verify"), "the refusal names the re-verify: {line:?}");
+    assert!(line.contains("symlink"), "the refusal names the shape: {line:?}");
+    assert!(!line.contains(&r.to_string_lossy().to_string()), "no absolute path is printed: {line:?}");
+    assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "nothing was created through the swapped run dir");
+    assert!(!marker.exists(), "the program never ran");
+}
+
+// ---------------------------------------------------------------- fix round 1, F2: the rollback's close-before-signal
+
+/// Fix round 1, F2: on a refused HANDSHAKE the rollback signals the WAITER's own group, and the
+/// program runs in a group of its own — so the uncommitted commit-pipe close (which makes a LIVE
+/// waiter kill its program itself) must reach the waiter BEFORE any signal aimed at the waiter, or
+/// the signal kills the waiter and its watcher while the program keeps running. The real `start`
+/// handshake cannot be forced to fail slowly, so both halves are replayed here against the REAL
+/// waiter subcommand:
+///   (1) the hazard, pinned: a TERM to the waiter's group kills the waiter (no record) and the
+///       program KEEPS RUNNING — exactly what the old order did to a handshake-failure rollback;
+///   (2) the fix's order: the uncommitted close reaches the live waiter FIRST; it kills its program
+///       itself, writes the record (`committed:false`, signalled) and ends with no signal at all.
+#[test]
+fn the_uncommitted_close_beats_a_signal_at_the_waiters_group() {
+    // (1) the hazard: the group signal at the waiter cannot reach the program
+    {
+        let t = Tmp::new();
+        let (r, _o, _d) = t.fence();
+        let rd = plant_run_dir(&r, "w.1");
+        let mut guard = Guard::default();
+        let (mut child, pid) = spawn_waiter(&rd, &r, &["sleep", "30"]);
+        guard.add(child.id());
+        guard.add(pid);
+        assert!(alive(pid), "the program runs before any signal");
+        let k = Command::new("kill").arg("-TERM").arg("--").arg(format!("-{}", child.id())).stdin(Stdio::null()).output().unwrap();
+        assert!(k.status.success(), "the TERM at the waiter's group ran: {}", String::from_utf8_lossy(&k.stderr));
+        assert!(poll(5000, || child.try_wait().map(|s| s.is_some()).unwrap_or(false)), "the waiter died on its own group's TERM");
+        assert!(alive(pid), "the program outlived the waiter: the group signal never reached it — the close must come first");
+        assert!(!poll(2000, || rd.join("exit").exists()), "a waiter killed by its group's TERM leaves no record");
+    }
+    // (2) the fix: the uncommitted close reaches the LIVE waiter first, and that alone is enough
+    {
+        let t = Tmp::new();
+        let (r, _o, _d) = t.fence();
+        let rd = plant_run_dir(&r, "w.2");
+        let mut guard = Guard::default();
+        let (mut child, pid) = spawn_waiter(&rd, &r, &["sleep", "30"]);
+        guard.add(child.id());
+        guard.add(pid);
+        drop(child.stdin.take()); // the uncommitted end-of-input, BEFORE any signal
+        assert!(poll(5000, || !alive(pid)), "the live waiter killed its program itself");
+        assert!(poll(5000, || child.try_wait().map(|s| s.is_some()).unwrap_or(false)), "the waiter ended on its own once its program was dead");
+        wait_exit(&rd, 5000);
+        let pairs = exit_pairs(&rd);
+        assert_eq!(pair(&pairs, "committed"), "false");
+        assert_eq!(pair(&pairs, "outcome"), "signalled");
+        assert_eq!(pair(&pairs, "signal"), "9", "the waiter's own kill is the absolute-path KILL");
+    }
+}
