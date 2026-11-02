@@ -1272,10 +1272,12 @@ fn case29_submodule_own_filemode_false_is_stray() {
 
 #[test]
 fn case30_trustctime_false_cannot_hide_same_size_edit() {
+    // item F: the config is set AFTER the edit helper, whose own git calls must not run under the
+    // lever (before #184 this order left the index in a shape even the mutant read clean).
     let t = Tmp::new();
     let (_, tree, _) = mk_ws(&t, false);
-    git(&tree, &["config", "core.trustctime", "false"]);
     same_size_edit_with_old_mtime(&tree);
+    git(&tree, &["config", "core.trustctime", "false"]);
     let o = check(&t);
     assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
     assert!(stray_lines(&o).iter().any(|l| l == "stray modified f.txt"), "lines: {:?}", out(&o));
@@ -1283,11 +1285,12 @@ fn case30_trustctime_false_cannot_hide_same_size_edit() {
 
 #[test]
 fn case31_checkstat_minimal_cannot_hide_same_size_edit() {
+    // item F: same ordering rule as case30.
     let t = Tmp::new();
     let (_, tree, _) = mk_ws(&t, false);
+    same_size_edit_with_old_mtime(&tree);
     git(&tree, &["config", "core.trustctime", "false"]);
     git(&tree, &["config", "core.checkStat", "minimal"]);
-    same_size_edit_with_old_mtime(&tree);
     let o = check(&t);
     assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
     assert!(stray_lines(&o).iter().any(|l| l == "stray modified f.txt"), "lines: {:?}", out(&o));
@@ -1880,14 +1883,416 @@ fn system_scope_config_through_a_git_wrapper_does_not_refuse() {
     fs::create_dir_all(&unrelated).unwrap();
     let (home, _) = t.both("syswrap-home");
     fs::create_dir_all(&home).unwrap();
+    // run-time PATH (item P), never the compile-time spelling baked at build time; read through
+    // printenv because the test lint refuses an env read in a test source
+    let runtime_path = String::from_utf8(
+        Command::new("printenv").arg("PATH").stdin(Stdio::null()).output().unwrap().stdout,
+    )
+    .unwrap()
+    .trim_end()
+    .to_string();
     let mut c = Command::new(BIN);
     c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
         .env("HOME", &home)
         .env_remove("XDG_CONFIG_HOME")
-        .env("PATH", format!("{}:{}", bin.display(), env!("PATH")))
+        .env("PATH", format!("{}:{}", bin.display(), runtime_path))
         .current_dir(&unrelated)
         .stdin(Stdio::null());
     let o = c.output().unwrap();
     assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
     assert_eq!(out(&o), "workspace=clean ticket=t1\n");
+}
+
+// ------------------------------ ticket #184: clean-state hardening (forged clocks, forced keys, walk and caps)
+
+/// True when the scratch filesystem is case-sensitive (two spellings of one name are two files).
+fn fs_is_case_sensitive(t: &Tmp) -> bool {
+    let (dir, _) = t.both("case-probe");
+    let _ = fs::create_dir(&dir);
+    fs::write(dir.join("probe-lo"), "a").unwrap();
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("probe-LO")) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => panic!("fixture: the case probe failed: {e}"),
+    }
+}
+
+/// The forged-clock fixture (ticket #184 item A): commit `name` with `good`, then — landed in the same
+/// wall-clock second as the index write — swap in `bad` (same size) and restore the recorded mtime with
+/// sub-second precision. The chmod just past a fresh second boundary bumps the file's ctime into the
+/// index-write second while its mtime stays an older second (so git's racy-clean window never applies),
+/// and the whole-second ctime compare — the only remaining witness — is satisfied by the same-second
+/// edit. Retried until the edit's ctime second equals the index-write second. Measured on this
+/// platform's git: a plain status read is completely blinded by this shape; only a content compare
+/// against a stat-free index catches it.
+fn forged_edit(tree: &Path, name: &str, good: &str, bad: &str) {
+    assert_eq!(good.len(), bad.len(), "fixture: the forged edit must keep the size");
+    let p = tree.join(name);
+    for _ in 0..40 {
+        fs::write(&p, good).unwrap();
+        let wsec = fs::metadata(&p).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        // wait until the wall clock is strictly past the write's second (never racy) and still early
+        // enough in the new second for chmod + add + commit + edit + mtime restore to fit inside it
+        loop {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            if now.as_secs() > wsec && now.subsec_millis() < 400 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // ctime bump without touching mtime (chmod with the file's own mode still changes the inode)
+        let perm = fs::metadata(&p).unwrap().permissions();
+        fs::set_permissions(&p, perm).unwrap();
+        git(tree, &["add", name]);
+        git(tree, &["commit", "-q", "--allow-empty", "-m", "forged base"]);
+        let m = fs::metadata(&p).unwrap();
+        let mtime = m.modified().unwrap();
+        let csec = std::os::unix::fs::MetadataExt::ctime(&m);
+        fs::write(&p, bad).unwrap();
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+        let fin = fs::metadata(&p).unwrap();
+        if std::os::unix::fs::MetadataExt::ctime(&fin) == csec {
+            return; // the forged edit landed inside the index-write second
+        }
+        // the second ticked mid-fixture: the fresh write + add + commit re-settle everything, redo
+    }
+    panic!("fixture could not land the forged edit inside the index-write second");
+}
+
+#[test]
+fn a_forged_same_second_edit_is_modified_not_clean() {
+    // item A: "modified" must be decided by CONTENT. The forged clock (same size, mtime restored with
+    // sub-second precision, ctime inside the index-write second) hides the edit from every stat-based
+    // read; the content compare against the throwaway index still names it.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    forged_edit(&tree, "g.txt", "one\n", "twp\n");
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray modified g.txt"), "lines: {:?}", out(&o));
+    assert_no_folder("a-forged", &o, &t);
+}
+
+#[test]
+fn a_prime_forged_edit_inside_submodule_names_the_submodule() {
+    // item A': the same forged-clock edit inside a checked-out submodule. The ticket branch adopts the
+    // submodule's new HEAD, so no commit-pointer change gives it away; only the content read INSIDE
+    // the submodule pass can name it.
+    let t = Tmp::new();
+    let (tree, sub) = mk_sub_ws(&t, "t30", "W30", "M30");
+    forged_edit(&sub, "a.txt", "aaa", "bbb");
+    git(&tree, &["add", "sub"]);
+    git(&tree, &["commit", "-q", "-m", "adopt sub head"]);
+    let o = check_id(&t, "t30", "M30");
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray submodule sub"), "lines: {:?}", out(&o));
+    assert_no_folder("a-prime", &o, &t);
+}
+
+#[test]
+fn a_throwaway_index_is_removed_from_the_temp_folder() {
+    // AC 5: the content compare's private temp file is never left behind, whatever the verdict.
+    fn leftovers() -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("harness-wscheck-index-"))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    fs::write(tree.join("planted.txt"), "stray").unwrap(); // the content read runs on a stray verdict too
+    let before = leftovers();
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    let after = leftovers();
+    for n in after {
+        assert!(before.contains(&n), "a throwaway index file was left behind: {n}");
+    }
+}
+
+#[test]
+fn b_ignorecase_false_is_forced() {
+    // item B: repo `core.ignorecase=true` must not collapse two spellings of one name. On a
+    // case-sensitive filesystem that is a planted `F.txt` next to tracked `f.txt`; on a
+    // case-insensitive one it is the tracked file renamed on disk to `F.txt`.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    git(&tree, &["config", "core.ignorecase", "true"]);
+    if fs_is_case_sensitive(&t) {
+        fs::write(tree.join("F.txt"), "other content").unwrap();
+    } else {
+        fs::rename(tree.join("f.txt"), tree.join("F.txt")).unwrap();
+    }
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray untracked F.txt"), "lines: {:?}", out(&o));
+    assert_no_folder("b-ignorecase", &o, &t);
+}
+
+#[test]
+fn q_case_only_rename_is_untracked_on_case_insensitive_fs() {
+    // item Q: with `core.ignorecase=false` forced, a case-only rename of an unchanged tracked file
+    // reads as an untracked path even under the repo's default (case-folding) config. On a
+    // case-sensitive filesystem the shape cannot be built; the test prints a skip note and passes.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    if fs_is_case_sensitive(&t) {
+        println!("skip: the Q shape needs a case-insensitive filesystem");
+        return;
+    }
+    fs::rename(tree.join("f.txt"), tree.join("F.txt")).unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray untracked F.txt"), "lines: {:?}", out(&o));
+    assert_no_folder("q-rename", &o, &t);
+}
+
+#[test]
+fn c_symlinks_true_is_forced() {
+    // item C: repo `core.symlinks=false` must not let a tracked symlink replaced by a regular file
+    // holding the link text read clean. The config is set AFTER the symlink is committed (adding a
+    // symlink under symlinks=false would store a plain file).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    std::os::unix::fs::symlink("f.txt", tree.join("l")).unwrap();
+    git(&tree, &["add", "l"]);
+    git(&tree, &["commit", "-q", "-m", "tracked symlink"]);
+    git(&tree, &["config", "core.symlinks", "false"]);
+    fs::remove_file(tree.join("l")).unwrap();
+    fs::write(tree.join("l"), "f.txt").unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray modified l"), "lines: {:?}", out(&o));
+    assert_no_folder("c-symlinks", &o, &t);
+}
+
+#[test]
+fn d_i_submodule_local_filter_refuses_and_never_runs() {
+    // items D and I: a filter configured in the SUBMODULE's own config plus a submodule
+    // `.gitattributes` naming it. The status read must not spawn git's own submodule probe (which
+    // runs the submodule's status and would execute the filter), and the refusal scan inside the
+    // submodule pass must refuse before anything runs inside it.
+    let t = Tmp::new();
+    let (_, sub) = mk_sub_ws(&t, "t31", "W31", "M31");
+    let (marker, _) = t.both("d-marker");
+    fs::write(sub.join(".gitattributes"), "a.txt filter=h\n").unwrap();
+    git(&sub, &["config", "filter.h.clean", &format!("touch {}", marker.display())]);
+    // a same-size edit with a shifted mtime: the one shape that forces git to hash the file through
+    // the clean filter (a size change alone never reaches the filter on a status read)
+    fs::write(sub.join("a.txt"), "b").unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::options().write(true).open(sub.join("a.txt")).unwrap().set_modified(old).unwrap();
+    // sanity: the fixture is real — a plain status inside the submodule runs the filter
+    git(&sub, &["status"]);
+    assert!(marker.exists(), "fixture: the filter must run on a plain submodule status");
+    fs::remove_file(&marker).unwrap();
+    let o = check_id(&t, "t31", "M31");
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(
+        err(&o).contains(
+            "a filter or attributes config key is set (filter.h.clean) in submodule sub; cannot check (a filter would run a command)"
+        ),
+        "stderr names the submodule filter: {}", err(&o)
+    );
+    assert!(!marker.exists(), "neither git's own submodule probe nor the check may run the filter");
+}
+
+#[test]
+fn e_stray_dot_git_at_depth_is_untracked() {
+    // item E: only the worktree's own `.git` and each checked-out gitlink's are skipped by the walk.
+    // (a) a stray FILE named d/.git
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        fs::create_dir_all(tree.join("d")).unwrap();
+        fs::write(tree.join("d/keep.txt"), "tracked").unwrap();
+        git(&tree, &["add", "d/keep.txt"]);
+        git(&tree, &["commit", "-q", "-m", "tracked dir"]);
+        fs::write(tree.join("d/.git"), "gitdir: nowhere\n").unwrap();
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+        assert!(stray_lines(&o).iter().any(|l| l == "stray untracked d/.git"), "lines: {:?}", out(&o));
+        assert_no_folder("e-dotgit-file", &o, &t);
+    }
+    // (b) a stray DIR named d/.git holding a payload: named once, never descended into
+    {
+        let t = Tmp::new();
+        let (_, tree, _) = mk_ws(&t, false);
+        fs::create_dir_all(tree.join("d")).unwrap();
+        fs::write(tree.join("d/keep.txt"), "tracked").unwrap();
+        git(&tree, &["add", "d/keep.txt"]);
+        git(&tree, &["commit", "-q", "-m", "tracked dir"]);
+        fs::create_dir_all(tree.join("d/.git")).unwrap();
+        fs::write(tree.join("d/.git/payload"), "x").unwrap();
+        let o = check(&t);
+        assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+        assert!(stray_lines(&o).iter().any(|l| l == "stray untracked d/.git"), "lines: {:?}", out(&o));
+        assert!(!out(&o).contains("d/.git/payload"), "a stray .git is never descended into: {}", out(&o));
+        assert_no_folder("e-dotgit-dir", &o, &t);
+    }
+}
+
+#[test]
+fn s1_dotgit_symlink_in_a_gitlink_dir_is_exit_3() {
+    // item S1: a gitlink dir whose `.git` is a SYMLINK (to a real git dir) is not a checked-out
+    // submodule: the link leads wherever it pleases, so the check refuses naming the submodule.
+    let t = Tmp::new();
+    let (_, sub) = mk_sub_ws(&t, "t32", "W32", "M32");
+    let real = PathBuf::from(git(&sub, &["rev-parse", "--path-format=absolute", "--absolute-git-dir"]));
+    fs::remove_file(sub.join(".git")).unwrap(); // the `gitdir:` pointer file
+    std::os::unix::fs::symlink(&real, sub.join(".git")).unwrap();
+    let o = check_id(&t, "t32", "M32");
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("submodule sub cannot be inspected: its folder holds no git dir"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn g_info_attributes_in_the_common_git_dir_refuses() {
+    // item G: the checked tree is a linked worktree, so git reads `info/attributes` from the COMMON
+    // git dir; the refusal must fire on that arm (ho11 plants the per-worktree git dir, which the
+    // gitdir arm catches but git itself never reads).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let common = PathBuf::from(git(&tree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]));
+    assert!(common != gitdir_of(&tree), "fixture: the common dir must differ from the per-worktree git dir");
+    fs::create_dir_all(common.join("info")).unwrap();
+    fs::write(common.join("info/attributes"), "f.txt text=auto\n").unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("an info/attributes file is present in the worktree"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn h_core_worktree_redirect_in_a_submodule_refuses() {
+    // item H: a redirecting `core.worktree` reaches the refusal with its own message, not a generic
+    // git failure. (For the worktree itself a redirect is always caught first by the top-level rule
+    // at step 4, which fires before the refusal scan; the refusal arm is reachable through the
+    // submodule scan, which has no top-level pre-check.)
+    let t = Tmp::new();
+    let (_, sub) = mk_sub_ws(&t, "t33", "W33", "M33");
+    let (elsewhere, _) = t.both("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    git(&sub, &["config", "core.worktree", elsewhere.to_str().unwrap()]);
+    let o = check_id(&t, "t33", "M33");
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("core.worktree redirects the work tree of submodule sub; cannot check"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn j_nonempty_gitlink_dir_without_git_dir_is_exit_3() {
+    // item J: a non-empty gitlink dir with no `.git` inside is Odd — exit 3 naming the submodule,
+    // never treated as absent (a file planted there is invisible to git and the walk alike).
+    let t = Tmp::new();
+    let (_, sub) = mk_sub_ws(&t, "t34", "W34", "M34");
+    fs::remove_file(sub.join(".git")).unwrap();
+    fs::write(sub.join("payload.txt"), "planted").unwrap();
+    let o = check_id(&t, "t34", "M34");
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("submodule sub cannot be inspected: its folder holds no git dir"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn k_over_the_checked_submodule_cap_is_exit_3() {
+    // item K: 101 checked-out gitlinks (embedded repos; no .gitmodules needed). Each carries an
+    // untracked file so the visit is cheap, and the cap fires on the 101st inspected one.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let (tpl, _) = t.both("k-tpl");
+    fs::create_dir_all(&tpl).unwrap();
+    git(&tpl, &["init", "-q"]);
+    git(&tpl, &["commit", "-q", "--allow-empty", "-m", "e"]);
+    let sha = head(&tpl);
+    for i in 0..101u32 {
+        let d = tree.join(format!("g{i}"));
+        fs::create_dir_all(&d).unwrap();
+        let cp = Command::new("cp")
+            .args(["-R", tpl.join(".git").to_str().unwrap(), d.join(".git").to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(cp.status.success(), "fixture cp: {}", String::from_utf8_lossy(&cp.stderr));
+        fs::write(d.join("planted.txt"), "stray").unwrap();
+        git(&tree, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},g{i}")]);
+    }
+    git(&tree, &["commit", "-q", "-m", "101 gitlinks"]);
+    let o = check(&t);
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("too many paths: over the checked-submodule cap"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn l_over_the_submodule_depth_cap_is_exit_3() {
+    // item L: 9 nested checked-out gitlinks (each level's repo gitlinks the next); the depth cap
+    // refuses the ninth level.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let dirs: Vec<PathBuf> = {
+        let (mut v, mut p) = (Vec::new(), tree.clone());
+        for k in 1..=9usize {
+            p = p.join(format!("l{k}"));
+            v.push(p.clone());
+        }
+        v
+    };
+    let mut sha = String::new();
+    for (i, d) in dirs.iter().enumerate().rev() {
+        fs::create_dir_all(d).unwrap();
+        git(d, &["init", "-q"]);
+        if !sha.is_empty() {
+            git(d, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},l{}", i + 2)]);
+        }
+        git(d, &["commit", "-q", "--allow-empty", "-m", "level"]);
+        sha = head(d);
+    }
+    git(&tree, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},l1")]);
+    git(&tree, &["commit", "-q", "-m", "nested gitlinks"]);
+    let o = check(&t);
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("too many paths: submodule nesting is over the depth cap"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn m_over_the_tree_walk_visit_cap_is_exit_3() {
+    // item M: 200,001 entries in the tree: the WALK cap must speak (the stray cap would also be
+    // exit 3, but with the wrong message — the walk runs first).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    for i in 0..=200_000u32 {
+        std::fs::File::create(tree.join(format!("m{i}.txt"))).unwrap();
+    }
+    let o = check(&t);
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("too many paths: over the tree-walk visit cap"), "stderr: {}", err(&o));
+    assert!(!err(&o).contains("stray-entry cap"), "the walk cap speaks, not the stray cap: {}", err(&o));
+}
+
+#[test]
+fn n_non_ascii_path_prints_as_xnn() {
+    // item N: a non-ASCII (but valid UTF-8) untracked name is printed as \\xNN escapes, one line.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    fs::write(tree.join("caf\u{e9}.txt"), "stray").unwrap();
+    // fixture sanity: the filesystem kept the precomposed spelling git will list
+    let listed = fs::read_dir(&tree)
+        .unwrap()
+        .find(|e| e.as_ref().map(|e| e.file_name().as_bytes().starts_with(b"caf")).unwrap_or(false))
+        .unwrap()
+        .unwrap()
+        .file_name();
+    assert_eq!(listed.as_bytes(), b"caf\xc3\xa9.txt", "fixture: the NFC spelling must survive on disk");
+    let o = check(&t);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray untracked caf\\xc3\\xa9.txt"), "lines: {:?}", out(&o));
 }

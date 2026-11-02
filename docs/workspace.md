@@ -72,9 +72,11 @@ None. No P1b event kind names workspace creation, and the manifest file is the d
 
 Before a ticket is marked Done, its workspace must hold only what belongs there, so a stray edit cannot ride
 into Done unnoticed. `harness workspace check` is that look, and it is READ-ONLY: it never writes, deletes,
-moves or locks anything, never touches the manifest (it reads it through the existing reader only), and every
-git call runs under `--no-optional-locks` with fsmonitor forced off, so not even the index's stat cache is
-refreshed. P1B-15 wires it into `harness ticket finalize`; this command only answers the question.
+moves or locks anything in the repo or the manifest (it reads the manifest through the existing reader only),
+and every git call runs under `--no-optional-locks` with fsmonitor forced off, so not even the index's stat
+cache is refreshed. Its one write anywhere is a single private throwaway index file in the system temp folder
+(never inside any repo, holding nothing but paths git itself derived from HEAD) that the content compare
+below builds and removes before the command returns. P1B-15 wires it into `harness ticket finalize`; this command only answers the question.
 
 ```
 harness workspace check <ticket> --manifest-dir <absolute-dir>
@@ -106,10 +108,12 @@ follow the link out of the worktree).
   the skip-worktree bit, both at once (git folds them into one lowercase `s` tag), or any unknown or future
   tag — fail closed (invisible to `git status`, so it gets its own `git ls-files -v` read; the bit alone is
   stray, whether or not the file was also edited);
-- `submodule` — a submodule with any change, named by the submodule path. The check does NOT stop at git's own
-  submodule probe (that probe runs the submodule's own `git status`, which honours the submodule's own config
-  and index bits): every checked-out submodule gets the same forced status (`--untracked-files=all
-  --ignored=matching`), the same `ls-files -v` hidden read and the same refusal scan INSIDE it, recursively into
+- `submodule` — a submodule with any change, named by the submodule path. The status read never spawns git's
+  own submodule probe (that probe would run the submodule's own `git status`, which honours the submodule's own
+  config and index bits, so a submodule-local filter could execute): it compares submodule commit pointers only
+  (`--ignore-submodules=dirty`), and every checked-out submodule gets the same forced status
+  (`--untracked-files=all --ignored=matching`), the same `ls-files -v` hidden read, the same refusal scan and
+  the same content read INSIDE it, recursively into
   nested submodules, all with the same neutral config. The outermost checked-out level that can see the change
   names it; where the outer probe is blinded by the inner repo's own settings, the check descends and names the
   inner submodule itself (`stray submodule sub/inner`). A submodule whose folder cannot be inspected (no git dir,
@@ -121,9 +125,17 @@ No repo-controlled setting or index flag is trusted when deciding clean. Every g
 inside every checked-out submodule) forces `--no-optional-locks` and `--no-replace-objects` (a `git replace` of
 HEAD cannot swap what the tree looks like), and forces on the command line — which outranks system, global, repo
 and worktree config alike: no hooks, `core.fsmonitor=false`, `core.trustctime=true`, `core.checkStat=default`,
-`core.filemode=true`, `core.untrackedCache=false`, `core.sparseCheckout=false`. The status read additionally
-forces `--untracked-files=all` and `--ignore-submodules=none` (a repo config `status.showUntrackedFiles=no`
-loses to the flag), and ignored paths are listed (`--ignored=matching`). Every inherited `GIT_*` environment
+`core.filemode=true`, `core.untrackedCache=false`, `core.sparseCheckout=false`, `core.ignorecase=false` (a repo
+`core.ignorecase=true` cannot fold two spellings of one name into one path: a case twin or a case-only rename
+still reads as an untracked path), and `core.symlinks=true` (a repo `core.symlinks=false` cannot make a tracked
+symlink replaced by a regular file holding the link text read clean). The status read additionally
+forces `--untracked-files=all` and `--ignore-submodules=dirty` (a repo config `status.showUntrackedFiles=no`
+loses to the flag), and ignored paths are listed (`--ignored=matching`). "Modified" is decided by CONTENT, not
+by the stat cache: on top of the status read, every repo checked (the worktree and each checked-out submodule)
+gets a second tracked-file read against a throwaway index rebuilt from HEAD that carries no stat information at
+all, so git must hash every tracked file and compare bytes — a same-size edit whose mtime and ctime were forged
+back into the index-write second cannot read clean. The `core.trustctime` / `core.checkStat` forced values are
+kept as defence in depth on top of that content compare. Every inherited `GIT_*` environment
 name is stripped before each call, so a caller's `GIT_DIR`, `GIT_CONFIG_COUNT` or `GIT_CONFIG_GLOBAL` can neither
 redirect nor reconfigure the check. User-level config is not the repo's doing and never changes what the check
 sees, so it is neither read nor refused: every git call runs with the system config switched off
@@ -175,33 +187,36 @@ is exit 3 with `too many paths` (or a naming refusal), never a truncated PASS an
 
 **Symlinks**: a symlink anywhere inside the worktree is judged as a path of its own (by git, by no-follow stat,
 by the walk) and never followed, so files outside the worktree are never listed or looked at. A symlinked
-worktree path itself is exit 3. The walk skips every entry named `.git` (at any depth) and never descends into
-a git dir.
+worktree path itself is exit 3. The walk skips only the worktree's own `.git` and the `.git` of each
+checked-out submodule (a gitlink dir whose `.git` is a symlink is not checked out but refused — exit 3 naming
+the submodule); any other entry named `.git`, at any depth, is `stray untracked <path>` in its own right and is
+never descended into.
 
 **Git version**: the check uses `git status --porcelain=v2 -z --ignored=matching` and
 `git rev-parse --absolute-git-dir`; it assumes git 2.32 or newer (the same floor `--path-format=absolute`
 implies, plus `--ignored=matching`).
 
-**Not in this PR** (known limits of this version of the check, filed as the follow-up ticket
-`clean-state-hardening`, #184): a repo that sets `core.ignorecase=true` on a case-sensitive filesystem, or
-`core.symlinks=false` with a tracked symlink replaced by a regular file, can read clean when it is not (the
-check does not yet force those two settings); a filter configured inside a checked-out submodule's own config
-can still run during git's own submodule status probe (the exit is still 3, but the probe happens before the
-check's refusal scan of that submodule); a stray `d/.git` file or directory at depth (not the worktree's own
-`.git`, not a checked-out gitlink's) is skipped by the walk and invisible to git alike; a non-empty gitlink
-directory without a `.git` inside (not a checked-out submodule) is treated as absent — under that reading a
-file planted in an un-inited submodule folder is invisible to git and the walk alike; the common-dir
-`info/attributes` refusal (git reads `info/attributes` from the COMMON dir of a linked worktree; the
-current test plants it in the per-worktree git dir, which git never reads) and the non-ASCII path escape
-row (a path with non-ASCII bytes printed as \xNN escapes; pinned only where the filesystem accepts such
-bytes) have no test that goes RED when their code is removed; and several refusal
-and cap rows (`core.worktree` redirect, the submodule refusal scan, walk `.git` skip and cap, submodule count
-and depth caps, `core.trustctime` / `core.checkStat` / `core.untrackedCache` levers) have no test that goes
-RED when their code is removed.
+**Known limits accepted with #184** (each measured equivalent to a guard that already fires, or git's own
+semantics, none with a measured hide):
+
+- R: `core.trustctime` / `core.checkStat` levers — after the content compare they are EQUIVALENT mutants (the
+  content compare alone catches the shape); the forced values are kept as defence in depth;
+- S: `core.untrackedCache` — no measured way for plain git to hide a file through the cache under
+  `--no-optional-locks` (the check never writes the cache; the existing test is a smoke, not a guard);
+- T: `core.hooksPath` — a status read runs no hooks, so the lever is equivalent;
+- U: a `u` (unmerged) entry whose operation is not in progress is also named `hidden` by its `ls-files -v` `M`
+  tag — near-equivalent, the same path is named either way;
+- V: an unmerged path without an operation in progress is labelled `hidden` (documented above); the exit is
+  still 2, never a pass;
+- W: the walk's 200,000-visit cap counts tracked files too, so a 200k-entry tree is exit 3 (fail closed); the
+  finalize caller must treat 3 as "not proven" anyway;
+- X: a committed `ident` / `eol` attribute can hide bytes inside a `$Id: ... $` marker — git's own semantics:
+  those bytes can never be committed differently, so there is nothing to hide from a commit;
+- Y: `core.precomposeUnicode` is not forced (a fold only merges two spellings the filesystem itself already
+  treats as one file; no measured hide).
 
 Ignored build output inside the tree (for example `target/`) fails the check on purpose: clean it before
 finalize or list it on the manifest, as described in the P1B-11 plan. Not covered here: unpushed commits
 (P1B-12), moving leftovers to quarantine (P1B-13), anything in the ticket root outside `tree` (the
-quarantine sweep's ground), and a case-only rename of an unchanged file on a case-insensitive filesystem
-(git cannot see it and nothing would be committed differently). No new event kind; P1B-15 records the
+quarantine sweep's ground). No new event kind; P1B-15 records the
 finalize result.
