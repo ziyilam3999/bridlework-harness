@@ -4,7 +4,9 @@
 //! line of a self-issued run is a `run_issued` event. An event missing any of these is refused, never guessed or defaulted.
 //! Reader: every complete line must be a valid event (else CORRUPTION, the read stops there); a final fragment with no
 //! trailing newline is a TORN TAIL, reported and never parsed. Writer: one `write()` of the whole line, then `sync_all`;
-//! refuses to append onto a torn tail (it would fuse a new event onto garbage). Recovery of a torn tail is not here.
+//! refuses to append onto a torn tail (it would fuse a new event onto garbage) and refuses an append that would take the
+//! log past `LOG_READ_CAP` (the same cap the reader enforces, so a written log is never made unreadable by its own writer).
+//! Recovery of a torn tail is not here.
 //! Kinds: fifteen today — the four base kinds (the PRE-B v2 shape with the run identity) and the eleven P1b kinds
 //! (payload kinds, no identity fields yet). Each kind's exact key set, value shapes and `v` are declared ONCE in the
 //! kind table below; the reader, the writer and the schema test all consult that table and nothing else.
@@ -20,10 +22,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const SCHEMA_VERSION: u64 = 2;
 /// Largest accepted line in bytes, newline included. Keeps each append one small write.
 pub const LINE_CAP: usize = 4096;
-/// Largest whole-log read into memory in one go, in bytes. The cap is the LARGEST ACCEPTED length (the
-/// `config.rs` convention): a log of exactly this many bytes is read, one byte more is refused before a
-/// single log byte is buffered. The number is the constant's own value, printed in every refusal. Rotation
-/// past this size is a separate concern (deferred).
+/// Largest whole-log read into memory in one go, in bytes — and, since #213, the largest log the writers will
+/// produce: an append that would take the log past this cap is refused before a byte is written. The cap is
+/// the LARGEST ACCEPTED length (the `config.rs` convention): a log of exactly this many bytes is read (and may
+/// be written to exactly), one byte more is refused before a single log byte is buffered. One constant binds
+/// both faces; the number is the constant's own value, printed in every refusal. Rotation past this size is a
+/// separate concern (deferred).
 pub const LOG_READ_CAP: u64 = 64 * 1024 * 1024;
 /// Keys of every v2 base kind, in canonical order (the PRE-B envelope, bytes as on master).
 const KEYS_V2: [&str; 9] = ["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"];
@@ -949,6 +953,9 @@ pub enum AppendError {
     Invalid(String),
     TooLong(usize),
     TornTail,
+    /// The append is refused because it would take the log past `LOG_READ_CAP` (the value carried here),
+    /// the same cap the reader enforces; nothing was written.
+    OverCap(u64),
     Path(String),
     Io(String),
 }
@@ -959,6 +966,7 @@ impl fmt::Display for AppendError {
             AppendError::Invalid(m) => write!(f, "event refused: {m}"),
             AppendError::TooLong(n) => write!(f, "event refused: line is {n} bytes, over the {LINE_CAP}-byte cap"),
             AppendError::TornTail => write!(f, "log refused: torn tail (the last line has no newline); nothing was appended"),
+            AppendError::OverCap(cap) => write!(f, "log refused: the append would take the log over the {cap}-byte read cap; nothing was appended"),
             AppendError::Path(m) => write!(f, "log path refused: {m}"),
             AppendError::Io(m) => write!(f, "log write failed: {m}"),
         }
@@ -1005,19 +1013,34 @@ pub fn check_log_path(root: &Path, log: &Path) -> Result<PathBuf, AppendError> {
 }
 
 /// Append one event: validate and encode (cap), check the path, open in append mode (create if absent), refuse a torn tail,
+/// refuse when the append would take the log past `LOG_READ_CAP` (the whole payload counts, nothing is written on refusal),
 /// issue exactly ONE write of the whole line, then `sync_all`. Success means the line is on disk. The torn-tail check looks only
 /// at the last byte; it does not validate the rest of the log.
 pub fn append(root: &Path, log: &Path, ev: &Event) -> Result<(), AppendError> {
-    append_impl(root, log, ev, true)
+    append_impl(root, log, ev, true, LOG_READ_CAP)
+}
+
+/// `append` under a caller-chosen cap: the exact boundary is proven in unit tests with a tiny cap the same way
+/// `read_log_with_cap` proves the reader's. Every production entry point passes `LOG_READ_CAP`.
+fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool, cap: u64) -> Result<(), AppendError> {
+    let line = ev.encode()?;
+    let mut f = open_locked(root, log, true)?;
+    write_locked(&mut f, line.as_bytes(), do_sync, cap)
 }
 
 /// Append one record of ANY kind (the writer the P1b kinds are written through; later tickets call it, this ticket's
 /// code does not). Same file protocol as `append`: validate and encode first (a refused record never touches the
-/// file), path check, lock, torn-tail check, ONE write of the whole line, then `sync_all`.
+/// file), path check, lock, torn-tail check, the `LOG_READ_CAP` write check, ONE write of the whole line, then
+/// `sync_all`.
 pub fn append_record(root: &Path, log: &Path, rec: &Record) -> Result<(), AppendError> {
+    append_record_impl(root, log, rec, LOG_READ_CAP)
+}
+
+/// `append_record` under a caller-chosen cap (unit tests only; production always passes `LOG_READ_CAP`).
+fn append_record_impl(root: &Path, log: &Path, rec: &Record, cap: u64) -> Result<(), AppendError> {
     let line = rec.encode()?;
     let mut f = open_locked(root, log, true)?;
-    write_locked(&mut f, line.as_bytes(), true)
+    write_locked(&mut f, line.as_bytes(), true, cap)
 }
 
 /// Open the checked path for appending, creating it only when `create`, then re-bind the path check to the OPENED
@@ -1087,9 +1110,18 @@ fn open_locked(root: &Path, log: &Path, create: bool) -> Result<File, AppendErro
     Ok(f)
 }
 
-/// Write the already-encoded bytes and (optionally) sync. One `write` of the whole payload.
-fn write_locked(f: &mut File, bytes: &[u8], do_sync: bool) -> Result<(), AppendError> {
+/// Write the already-encoded bytes and (optionally) sync. One `write` of the whole payload. Before the write,
+/// under the same exclusive lock the torn-tail check holds, the LOCKED handle's own length plus the payload is
+/// checked against `cap` (the writer-side face of the same `LOG_READ_CAP` the reader enforces): an append that
+/// would take the log past the cap is refused with nothing written, so this module can never produce a log its
+/// own reader refuses. The length is the OPENED handle's (the resolved target's), never an lstat of the given
+/// path — a symlinked log is measured at its target.
+fn write_locked(f: &mut File, bytes: &[u8], do_sync: bool, cap: u64) -> Result<(), AppendError> {
     let io = |e: std::io::Error| AppendError::Io(e.kind().to_string());
+    let len = f.metadata().map_err(io)?.len();
+    if len.saturating_add(bytes.len() as u64) > cap {
+        return Err(AppendError::OverCap(cap));
+    }
     let n = f.write(bytes).map_err(io)?;
     if n != bytes.len() {
         return Err(AppendError::Io("short write".to_string()));
@@ -1098,12 +1130,6 @@ fn write_locked(f: &mut File, bytes: &[u8], do_sync: bool) -> Result<(), AppendE
         sync(f).map_err(io)?;
     }
     Ok(())
-}
-
-fn append_impl(root: &Path, log: &Path, ev: &Event, do_sync: bool) -> Result<(), AppendError> {
-    let line = ev.encode()?;
-    let mut f = open_locked(root, log, true)?;
-    write_locked(&mut f, line.as_bytes(), do_sync)
 }
 
 // ---------------------------------------------------------------- run identity (v2)
@@ -1134,8 +1160,20 @@ pub fn new_run_id() -> String {
 /// nothing is written — an id from the environment is inherited, never trusted on faith.
 ///
 /// Both lines are encoded (validated, capped) before any byte is written: a refused event leaves no orphaned `run_issued`
-/// line. The event's own `run_id` field is ignored (overwritten by the resolved id).
+/// line. The `LOG_READ_CAP` write check counts the WHOLE payload (both lines of a self-issue, one line of an inherited
+/// append): a refusal writes nothing. The event's own `run_id` field is ignored (overwritten by the resolved id).
 pub fn append_under_run(root: &Path, log: &Path, ev: &Event, inherited: Option<&str>) -> Result<String, AppendError> {
+    append_under_run_impl(root, log, ev, inherited, LOG_READ_CAP)
+}
+
+/// `append_under_run` under a caller-chosen cap (unit tests only; production always passes `LOG_READ_CAP`).
+fn append_under_run_impl(
+    root: &Path,
+    log: &Path,
+    ev: &Event,
+    inherited: Option<&str>,
+    cap: u64,
+) -> Result<String, AppendError> {
     let bad = |m: String| AppendError::Invalid(m);
     if let Some(id) = inherited {
         if !token_ok(id) {
@@ -1200,7 +1238,7 @@ pub fn append_under_run(root: &Path, log: &Path, ev: &Event, inherited: Option<&
             (id.to_string(), under.encode()?)
         }
     };
-    write_locked(&mut f, payload.as_bytes(), true)?;
+    write_locked(&mut f, payload.as_bytes(), true, cap)?;
     Ok(run_id)
 }
 
@@ -1575,7 +1613,7 @@ mod tests {
         let t = Tmp::new();
         assert_eq!(syncs_during(|| append(&t.0, &t.log(), &ev(Kind::Escalation, 1)).unwrap()), 1, "the real writer must fsync");
         // Planted: the no-fsync writer registers zero calls, which is exactly what the assertion above would fail on.
-        assert_eq!(syncs_during(|| append_impl(&t.0, &t.log(), &ev(Kind::Escalation, 2), false).unwrap()), 0);
+        assert_eq!(syncs_during(|| append_impl(&t.0, &t.log(), &ev(Kind::Escalation, 2), false, LOG_READ_CAP).unwrap()), 0);
         // A refused append never reaches the sync.
         let mut bad = ev(Kind::Escalation, 0);
         bad.ticket = "BAD".to_string();
@@ -1964,5 +2002,151 @@ mod tests {
         assert_eq!(read_log(&t.0).unwrap_err(), "log refused: not a regular file");
         // Twin: the real file behind the refused link reads clean under the same cap.
         assert!(read_log(&t.log()).unwrap().is_clean());
+    }
+
+    // ------------------------------------------------------------ #213: the writer-side cap (the same constant, proven per writer at a tiny cap)
+
+    /// The exact `OverCap` refusal text for a given cap (the number is printed from the cap the seam was given;
+    /// production entry points always pass `LOG_READ_CAP`).
+    fn over_cap_msg(cap: u64) -> String {
+        format!("log refused: the append would take the log over the {cap}-byte read cap; nothing was appended")
+    }
+
+    #[test]
+    fn ac5_213_append_accepts_exactly_to_the_cap_and_refuses_one_past() {
+        let base = ev(Kind::Escalation, 1).encode().unwrap();
+        let l = base.len() as u64;
+        let second = ev(Kind::ReplanRequired, 2);
+        let n = second.encode().unwrap().len() as u64;
+        // Ok half: a log of L bytes, cap exactly L + n — the append lands to the byte and reads clean under it.
+        let t = Tmp::new();
+        fs::write(t.log(), base.as_bytes()).unwrap();
+        append_impl(&t.0, &t.log(), &second, true, l + n).unwrap();
+        assert_eq!(fs::read(t.log()).unwrap().len() as u64, l + n, "exactly at the cap: written, not refused");
+        assert!(read_log_with_cap(&t.log(), l + n).unwrap().is_clean(), "the result reads clean under the very same cap");
+        // Err half: one byte of cap less refuses the whole append and changes nothing.
+        let t2 = Tmp::new();
+        fs::write(t2.log(), base.as_bytes()).unwrap();
+        let e = append_impl(&t2.0, &t2.log(), &second, true, l + n - 1).unwrap_err();
+        assert_eq!(e, AppendError::OverCap(l + n - 1));
+        assert_eq!(e.to_string(), over_cap_msg(l + n - 1));
+        assert_eq!(fs::read(t2.log()).unwrap(), base.as_bytes(), "byte-identical: nothing was appended");
+    }
+
+    #[test]
+    fn ac5_213_append_record_accepts_exactly_to_the_cap_and_refuses_one_past() {
+        let base = ev(Kind::Escalation, 1).encode().unwrap();
+        let l = base.len() as u64;
+        let second = rec(&ev(Kind::ReplanRequired, 2));
+        let n = second.encode().unwrap().len() as u64;
+        let t = Tmp::new();
+        fs::write(t.log(), base.as_bytes()).unwrap();
+        append_record_impl(&t.0, &t.log(), &second, l + n).unwrap();
+        assert_eq!(fs::read(t.log()).unwrap().len() as u64, l + n);
+        assert!(read_log_with_cap(&t.log(), l + n).unwrap().is_clean());
+        let t2 = Tmp::new();
+        fs::write(t2.log(), base.as_bytes()).unwrap();
+        let e = append_record_impl(&t2.0, &t2.log(), &second, l + n - 1).unwrap_err();
+        assert_eq!(e, AppendError::OverCap(l + n - 1));
+        assert_eq!(e.to_string(), over_cap_msg(l + n - 1));
+        assert_eq!(fs::read(t2.log()).unwrap(), base.as_bytes());
+    }
+
+    /// Burn run ids until the sequence part is at least 16 away from its next power of ten, so every id minted
+    /// over the next handful of calls has one width: a self-issue payload (two lines carrying the fresh id) is
+    /// then the same length call to call and its exact boundary can be pinned without guessing the id.
+    fn stable_run_id_width() {
+        loop {
+            let seq: u64 = new_run_id().rsplit('-').next().unwrap().parse().unwrap();
+            let mut next = 1u64;
+            while next <= seq {
+                next *= 10;
+            }
+            if next - seq >= 16 {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn ac5_213_a_self_issued_append_under_run_accepts_exactly_to_the_cap_and_refuses_one_past() {
+        stable_run_id_width();
+        let base = ev(Kind::Escalation, 1).encode().unwrap();
+        let l = base.len() as u64;
+        let second = ev(Kind::ReplanRequired, 2);
+        // Measure the two-line payload (run_issued + event) of a self-issue of `second`: with the id width
+        // pinned, every self-issue of `second` in this window writes exactly n bytes.
+        let probe = Tmp::new();
+        append_under_run_impl(&probe.0, &probe.log(), &second, None, u64::MAX).unwrap();
+        let n = fs::read(probe.log()).unwrap().len() as u64;
+        assert_eq!(read_log(&probe.log()).unwrap().events.len(), 2, "the probe wrote issue + event");
+        // Ok half: cap exactly L + n — BOTH lines land and the log still reads clean under that cap.
+        let t = Tmp::new();
+        fs::write(t.log(), base.as_bytes()).unwrap();
+        append_under_run_impl(&t.0, &t.log(), &second, None, l + n).unwrap();
+        assert_eq!(fs::read(t.log()).unwrap().len() as u64, l + n);
+        assert!(read_log_with_cap(&t.log(), l + n).unwrap().is_clean());
+        // Err half: one byte less refuses the WHOLE payload, so no orphan run_issued line is left behind.
+        let t2 = Tmp::new();
+        fs::write(t2.log(), base.as_bytes()).unwrap();
+        let e = append_under_run_impl(&t2.0, &t2.log(), &second, None, l + n - 1).unwrap_err();
+        assert!(matches!(e, AppendError::OverCap(_)), "{e}");
+        assert_eq!(fs::read(t2.log()).unwrap(), base.as_bytes(), "no orphan run_issued line: byte-identical");
+    }
+
+    #[test]
+    fn ac5_213_an_inherited_append_under_run_accepts_exactly_to_the_cap_and_refuses_one_past() {
+        // The log already holds the run_issued line for "run-1" (L bytes); an inherited append adds exactly ONE line.
+        let issue = Event {
+            kind: Kind::RunIssued,
+            ts_ms: 1,
+            run_id: "run-1".to_string(),
+            ticket: "t-1".to_string(),
+            repo: "my-repo".to_string(),
+            reason: REASON_RUN_ISSUED.to_string(),
+            role: "executor".to_string(),
+            model: "m-1".to_string(),
+        }
+        .encode()
+        .unwrap();
+        let l = issue.len() as u64;
+        let second = ev(Kind::ReplanRequired, 2);
+        let n = Event { run_id: "run-1".to_string(), ..second.clone() }.encode().unwrap().len() as u64;
+        let t = Tmp::new();
+        fs::write(t.log(), issue.as_bytes()).unwrap();
+        append_under_run_impl(&t.0, &t.log(), &second, Some("run-1"), l + n).unwrap();
+        assert_eq!(fs::read(t.log()).unwrap().len() as u64, l + n);
+        assert!(read_log_with_cap(&t.log(), l + n).unwrap().is_clean());
+        let t2 = Tmp::new();
+        fs::write(t2.log(), issue.as_bytes()).unwrap();
+        let e = append_under_run_impl(&t2.0, &t2.log(), &second, Some("run-1"), l + n - 1).unwrap_err();
+        assert_eq!(e, AppendError::OverCap(l + n - 1));
+        assert_eq!(fs::read(t2.log()).unwrap(), issue.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ac6_213_a_symlinked_log_is_measured_at_its_target_and_refused_at_the_cap() {
+        let t = Tmp::new();
+        // The TARGET (L bytes) plus the payload (n bytes) sits one byte past a tiny cap, so the append is
+        // refused on the target's size. The link's own lstat size is its 7-byte relative target name, far under
+        // the cap: measuring the GIVEN PATH instead of the opened handle would let the append through.
+        let one = ev(Kind::Escalation, 1).encode().unwrap();
+        let l = one.len() as u64;
+        let second = ev(Kind::ReplanRequired, 2);
+        let n = second.encode().unwrap().len() as u64;
+        fs::write(t.log(), one.as_bytes()).unwrap();
+        let link = t.0.join("link.jsonl");
+        std::os::unix::fs::symlink("events.jsonl", &link).unwrap();
+        let e = append_impl(&t.0, &link, &second, true, l + n - 1).unwrap_err();
+        assert_eq!(e, AppendError::OverCap(l + n - 1), "the refusal is the cap, and the size is the target's");
+        assert_eq!(fs::read(t.log()).unwrap(), one.as_bytes(), "the target is byte-identical");
+        // Twin: one byte more of cap and the same append goes through the link onto the TARGET.
+        let t2 = Tmp::new();
+        fs::write(t2.log(), one.as_bytes()).unwrap();
+        let link2 = t2.0.join("link.jsonl");
+        std::os::unix::fs::symlink("events.jsonl", &link2).unwrap();
+        append_impl(&t2.0, &link2, &second, true, l + n).unwrap();
+        assert_eq!(read_log(&t2.log()).unwrap().events.len(), 2, "the bytes reached the target");
     }
 }
