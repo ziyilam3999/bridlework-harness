@@ -553,6 +553,85 @@ fn probe_identity(pid: u64, recorded: u64) -> Identity {
     }
 }
 
+/// The pre-stage probes of `check`'s expiry arm and `step`'s hard line (fix r2, N1): the SAME readers
+/// the factored stop's own checks 3 and 4 use, gathered behind one door so the rule they serve is stated
+/// once — an entry may be SIGNALLED for a limit only through a probe this run found CONCLUSIVE. In a
+/// release build each wrapper is its plain probe, byte for byte; under `cfg(test)` a fault seam lets a
+/// test make exactly one pid's pre-stage probe answer Unknown, to prove the inconclusive path refuses
+/// (nothing staged, nothing signalled, the entry kept) instead of signalling an unstaged limit kill.
+fn prestage_liveness(pid: u64) -> Liveness {
+    #[cfg(test)]
+    if prestage_fault::liveness_unknown(pid) {
+        return Liveness::Unknown("the pre-stage liveness probe was made inconclusive (test seam)".to_string());
+    }
+    probe_alive_at(Path::new("/bin/kill"), pid)
+}
+
+fn prestage_identity(pid: u64, recorded: u64) -> Identity {
+    #[cfg(test)]
+    if prestage_fault::identity_unknown(pid) {
+        return Identity::Unknown("the pre-stage identity read was made inconclusive (test seam)".to_string());
+    }
+    probe_identity(pid, recorded)
+}
+
+/// The `cfg(test)`-only fault injection behind the pre-stage probes (fix r2, N1): the pid whose
+/// liveness / identity pre-stage probe answers Unknown. Keyed by pid, so tests running in parallel
+/// never cross; zeroed (off) in every non-test build — no env var, no flag, nothing in a release
+/// binary can trip it.
+#[cfg(test)]
+mod prestage_fault {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static LIVENESS_PID: AtomicU64 = AtomicU64::new(0);
+    static IDENTITY_PID: AtomicU64 = AtomicU64::new(0);
+
+    pub fn liveness_unknown_for(pid: u64) {
+        LIVENESS_PID.store(pid, Ordering::SeqCst);
+    }
+    pub fn identity_unknown_for(pid: u64) {
+        IDENTITY_PID.store(pid, Ordering::SeqCst);
+    }
+    pub fn clear() {
+        LIVENESS_PID.store(0, Ordering::SeqCst);
+        IDENTITY_PID.store(0, Ordering::SeqCst);
+    }
+    pub(super) fn liveness_unknown(pid: u64) -> bool {
+        pid != 0 && LIVENESS_PID.load(Ordering::SeqCst) == pid
+    }
+    pub(super) fn identity_unknown(pid: u64) -> bool {
+        pid != 0 && IDENTITY_PID.load(Ordering::SeqCst) == pid
+    }
+}
+
+/// The pure pre-stage decision (fix r2, N1), ONE table shared by check's expiry arm and step's hard
+/// line: may this entry be STAGED (proven live and still the recorded process — the one the limit is
+/// about to signal), handed to the factored stop UNSTAGED (a CONCLUSIVE other answer: already-gone and
+/// pid-reused record `died` through the stop's own arms, a denied pid is refused with nothing
+/// signalled), or REFUSED outright (an INCONCLUSIVE probe: nothing staged, nothing signalled, the
+/// entry kept — because the stop RE-PROBES, and its own later probe succeeding would signal a limit
+/// kill with nothing staged, which the stopped arm would read as a deliberate stop and remove with NO
+/// record)?
+enum PreStage {
+    Stage,
+    Resolve,
+    Refuse(String),
+}
+
+fn prestage_verdict(pid: u64, live: Liveness, identity: impl FnOnce() -> Identity) -> PreStage {
+    match live {
+        Liveness::Alive => match identity() {
+            Identity::Same => PreStage::Stage,
+            Identity::Reused => PreStage::Resolve,
+            Identity::Unknown(why) => PreStage::Refuse(format!(
+                "cannot prove pid {pid} is still the recorded process before staging its limit stop: {why}"
+            )),
+        },
+        Liveness::NoSuch | Liveness::Denied => PreStage::Resolve,
+        Liveness::Unknown(why) => PreStage::Refuse(format!("cannot prove pid {pid} is alive before staging its limit stop: {why}")),
+    }
+}
+
 /// Is the pid its OWN process-group leader (pgid == pid), so a signal to the group provably ends the
 /// family it heads? Linux reads `/proc/<pid>/stat` (field 5); elsewhere `/bin/ps` by ABSOLUTE path prints
 /// the pgid. A helper that cannot run, or a pgid that cannot be read, is Unknown: stop refuses (2, entry
@@ -906,6 +985,26 @@ fn death_not_recorded(id: &str, reason: &str) {
     eprintln!("harness: DEATH NOT RECORDED");
 }
 
+/// What record mode asks of the factored stop (fix r2, N1). A DELIBERATE stop (the stop verb) records
+/// nothing on the stopped arm — it was asked for. A LIMIT stop (check's expiry, step's hard line, and
+/// check's vanished-entry resolution) must arrive with the entry's handover already STAGED: a limit
+/// stop that reaches the stopped arm with nothing staged refuses with `DEATH NOT RECORDED` and keeps
+/// the entry (rc 2), because the stopped arm otherwise reads "nothing staged" as a deliberate stop and
+/// would remove the entry with NO record — the one outcome this ticket promises cannot happen.
+enum RecordStop<'a> {
+    Deliberate(&'a RecordRun<'a>),
+    Limit { run: &'a RecordRun<'a>, staged: Option<death::Staged> },
+}
+
+impl RecordStop<'_> {
+    /// The run both variants carry (the ends-without-signal arms record through it).
+    fn run(&self) -> &RecordRun<'_> {
+        match self {
+            RecordStop::Deliberate(run) | RecordStop::Limit { run, .. } => run,
+        }
+    }
+}
+
 /// The outcome of stopping ONE live process entry through checks 2-7 (#207: the factored stop body —
 /// `stop`, `check` and `step` all call it under the per-ticket lock the CALLER holds). Every stderr
 /// message prints HERE, byte-identical to the old inline stop; the stdout line is the CALLER's (stop
@@ -942,18 +1041,19 @@ fn already_gone(dir: &Path, ticket: &str, id: &str, pid: u64, port_live: bool) -
 /// proof (the full order is the module header). `read` is the clean manifest the caller read under its own
 /// lock; the `remove` lines write through `dir`. A stop signal goes ONLY when every check passes.
 ///
-/// `record` is the record-mode run (#210, decision 6): every REMOVING arm records the death first — the
-/// arms that end without a signal (already-gone, pid-reused) stage and commit `died`; the stopped arm
-/// commits the handover the CALLER staged before the signal (a timeout) and records nothing when there
-/// is none (a deliberate stop). A failed record keeps the entry (`DeathNotRecorded`, the caller answers
-/// 2). The `recorded` stdout line rides the variant so the caller prints it after its own line.
+/// `record` is the record-mode ask (#210, decision 6, fix r2 N1): every REMOVING arm records the death
+/// first — the arms that end without a signal (already-gone, pid-reused) stage and commit `died`; the
+/// stopped arm commits the handover the CALLER staged before the signal (a limit stop), records nothing
+/// for a DELIBERATE stop, and REFUSES (`DeathNotRecorded`, entry kept) for a limit stop that arrives
+/// unstaged. A failed record keeps the entry (the caller answers 2). The `recorded` stdout line rides
+/// the variant so the caller prints it after its own line.
 fn stop_live_entry(
     dir: &Path,
     ticket: &str,
     read: &ManifestRead,
     id: &str,
     grace_ms: u64,
-    record: Option<(&RecordRun<'_>, Option<death::Staged>)>,
+    record: Option<RecordStop<'_>>,
 ) -> StopDone {
     let Some(entry) = read.live.iter().find(|e| e.id == id) else {
         return StopDone::Refused(format!("id {id} is not a live entry of ticket {ticket}"));
@@ -971,8 +1071,8 @@ fn stop_live_entry(
     match probe_alive_at(Path::new("/bin/kill"), pid) {
         Liveness::Alive => {}
         Liveness::NoSuch => {
-            if let Some((run, _)) = record {
-                match record_unsignalled_death(dir, read, &Life { ticket, id, pid, pid_start_ms: recorded }, run) {
+            if let Some(rec) = &record {
+                match record_unsignalled_death(dir, read, &Life { ticket, id, pid, pid_start_ms: recorded }, rec.run()) {
                     Ok(line) => recorded_line = Some(line),
                     Err(reason) => {
                         death_not_recorded(id, &reason);
@@ -995,8 +1095,8 @@ fn stop_live_entry(
     match probe_identity(pid, recorded) {
         Identity::Same => {}
         Identity::Reused => {
-            if let Some((run, _)) = record {
-                match record_unsignalled_death(dir, read, &Life { ticket, id, pid, pid_start_ms: recorded }, run) {
+            if let Some(rec) = &record {
+                match record_unsignalled_death(dir, read, &Life { ticket, id, pid, pid_start_ms: recorded }, rec.run()) {
                     Ok(line) => recorded_line = Some(line),
                     Err(reason) => {
                         death_not_recorded(id, &reason);
@@ -1059,28 +1159,38 @@ fn stop_live_entry(
     let group_gone = matches!(kill_helper(pid, "0"), Ran::Yes(false));
     let leader_gone = matches!(probe_alive_at(Path::new("/bin/kill"), pid), Liveness::NoSuch);
     if death_proven(group_gone, leader_gone) {
-        // Decision 6c: for a death the caller STAGED before the signal (a timeout), the `timed_out`
-        // event is appended BEFORE the remove lines; a deliberate stop (nothing staged) records nothing.
-        if let Some((run, Some(staged))) = &record {
-            let spec = death::DeathSpec {
-                ticket,
-                id,
-                pid,
-                pid_start_ms: recorded,
-                cause: staged.cause,
-                limit: limit_of(read, id).0,
-                timeout_ms: limit_of(read, id).1,
-                steps: run.steps,
-                hard_limit: run.hard_limit,
-                repo: run.repo,
-                checkpoint: run.checkpoint,
-                session_id: run.session_id,
-            };
-            if let Err(reason) = death::commit(&spec, staged, &run.lr.log, &run.lr.root, now_ms()) {
-                death_not_recorded(id, &reason);
+        // Decision 6c: for a death the caller STAGED before the signal (a limit stop), the `timed_out`
+        // event is appended BEFORE the remove lines; a deliberate stop (the stop verb) records nothing.
+        // Fix r2 (N1, the second line): a LIMIT stop that arrives with nothing staged can never be read
+        // as a deliberate stop — it refuses with `DEATH NOT RECORDED` and keeps the entry, so no limit
+        // kill is ever removed from the sheet without a committed death record.
+        match &record {
+            Some(RecordStop::Limit { run, staged: Some(staged) }) => {
+                let spec = death::DeathSpec {
+                    ticket,
+                    id,
+                    pid,
+                    pid_start_ms: recorded,
+                    cause: staged.cause,
+                    limit: limit_of(read, id).0,
+                    timeout_ms: limit_of(read, id).1,
+                    steps: run.steps,
+                    hard_limit: run.hard_limit,
+                    repo: run.repo,
+                    checkpoint: run.checkpoint,
+                    session_id: run.session_id,
+                };
+                if let Err(reason) = death::commit(&spec, staged, &run.lr.log, &run.lr.root, now_ms()) {
+                    death_not_recorded(id, &reason);
+                    return StopDone::DeathNotRecorded;
+                }
+                recorded_line = Some(format!("recorded\t{id}\t{}\t{}", staged.cause.as_str(), staged.relpath));
+            }
+            Some(RecordStop::Limit { staged: None, .. }) => {
+                death_not_recorded(id, "a limit stop reached the stopped arm with no staged handover");
                 return StopDone::DeathNotRecorded;
             }
-            recorded_line = Some(format!("recorded\t{id}\t{}\t{}", staged.cause.as_str(), staged.relpath));
+            Some(RecordStop::Deliberate(_)) | None => {}
         }
         return match remove_stopped(dir, ticket, id, port_live) {
             Ok(()) => StopDone::Stopped { pid, recorded: recorded_line },
@@ -1154,10 +1264,10 @@ fn stop_cmd(a: &[String]) -> i32 {
     // Record mode (#210, decision 1): a DELIBERATE stop is not a death and records nothing — the run is
     // passed only so the ends-without-signal arms (already-gone, pid-reused) record their `died`.
     let rec_lr = args.record.as_ref().map(|rc| (rc, resolve_log_root(rc.log.as_deref(), rc.root.as_deref())));
-    let rec_run = rec_lr.as_ref().map(|(rc, lr)| (RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 }, None));
+    let rec_run = rec_lr.as_ref().map(|(rc, lr)| RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 });
     // Checks 2b-7 run in the factored body (#207) under THIS command's lock, so `check` and `step` can
     // stop an entry under a lock they already hold; stop's own behaviour and messages are unchanged.
-    match stop_live_entry(&dir, &args.ticket, &read, &id, args.grace_ms, rec_run.as_ref().map(|(r, s)| (r, s.clone()))) {
+    match stop_live_entry(&dir, &args.ticket, &read, &id, args.grace_ms, rec_run.as_ref().map(RecordStop::Deliberate)) {
         StopDone::Stopped { pid, recorded } => {
             println!("{id}\t{pid}\tstopped");
             if let Some(line) = recorded {
@@ -1354,14 +1464,16 @@ fn check_cmd(a: &[String]) -> i32 {
         // resolved through the same tail stop uses — never a refusal. The age is read only for a
         // proven-LIVE pid, so "cannot read the age" is a refusal about a live process, and a pid that
         // answers the probe but is not ours, or a probe that cannot run, is a fail-closed refusal.
-        match probe_alive_at(Path::new("/bin/kill"), *pid) {
+        // The probe runs through `prestage_liveness` (fix r2 N1): in record mode this IS the pre-stage
+        // liveness probe, and an inconclusive answer must refuse before anything is staged or signalled.
+        match prestage_liveness(*pid) {
             Liveness::NoSuch => {
                 // Record mode: the vanished program is a death (`died`, decision 1), recorded BEFORE the
                 // remove through the same factored body (its already-gone arm carries the record step).
                 // Legacy: exactly today's resolution.
                 if let Some((rc, lr)) = &rec {
                     let run = RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 };
-                    match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms, Some((&run, None))) {
+                    match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms, Some(RecordStop::Limit { run: &run, staged: None })) {
                         // stop's already-gone stderr line has already printed, verbatim; resolved.
                         StopDone::Gone { recorded } | StopDone::Reused { recorded } => {
                             if let Some(line) = recorded {
@@ -1414,11 +1526,19 @@ fn check_cmd(a: &[String]) -> i32 {
                         // has just identified as the recorded process. A live pid whose number was
                         // re-used is a `died` the factored stop's own pid-reused arm records; staging
                         // `timeout` here would put a cause the very next probe contradicts on disk, and
-                        // decision 7 makes that cause permanent. An unreadable identity stages nothing
-                        // either: the stop refuses on it anyway, and a refused stop must not leave a
-                        // mislabelled intent file behind.
-                        match probe_identity(*pid, *recorded) {
-                            Identity::Same => {
+                        // decision 7 makes that cause permanent.
+                        // Fix r2 (N1): the pre-stage probe must be CONCLUSIVE. An UNREADABLE identity
+                        // is not "the stop will refuse on it too" — the stop RE-PROBES, and when its own
+                        // later probe succeeds it signals a limit kill with nothing staged, and the
+                        // stopped arm reads "nothing staged" as a deliberate stop: the entry would be
+                        // removed with NO record and NO event. An inconclusive probe refuses HERE —
+                        // rc 2, nothing signalled, the entry kept, the cause named — and a mislabelled
+                        // intent file is never left behind either.
+                        // The liveness answer is already conclusive here (Alive — the loop's own probe
+                        // routed the entry to this arm), so the table sees Alive and decides on the
+                        // identity probe alone.
+                        match prestage_verdict(*pid, Liveness::Alive, || prestage_identity(*pid, *recorded)) {
+                            PreStage::Stage => {
                                 let run = RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 };
                                 match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *recorded }, &run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Time, timeout_ms: limit.timeout_ms }) {
                                     Ok(st) => staged = Some(st),
@@ -1429,13 +1549,20 @@ fn check_cmd(a: &[String]) -> i32 {
                                     }
                                 }
                             }
-                            Identity::Reused | Identity::Unknown(_) => {}
+                            // Conclusive: the pid was re-used. Nothing is staged; the factored stop's
+                            // own pid-reused arm stages and commits `died` (limit from the entry).
+                            PreStage::Resolve => {}
+                            PreStage::Refuse(why) => {
+                                fail(&format!("{}: {}; nothing signalled", e.id, why));
+                                codes.push(2);
+                                continue;
+                            }
                         }
                     }
-                    let rec_ref = rec.as_ref().map(|(rc, lr)| {
+                    let rec_pair = rec.as_ref().map(|(rc, lr)| {
                         (RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 }, staged.clone())
                     });
-                    match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms, rec_ref.as_ref().map(|(r, st)| (r, st.clone()))) {
+                    match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms, rec_pair.as_ref().map(|(run, st)| RecordStop::Limit { run, staged: st.clone() })) {
                         StopDone::Stopped { pid: p, recorded } => {
                             println!("{}\t{}\ttimed_out", e.id, p);
                             if let Some(line) = recorded {
@@ -1753,17 +1880,15 @@ fn step_cmd(a: &[String]) -> i32 {
             0
         }
         StepClass::Hard => {
-            let ids: Vec<String> = read
-                .live
-                .iter()
-                .filter(|e| matches!(e.target, Target::Process { .. }))
-                .map(|e| e.id.clone())
-                .collect();
-            // Record mode (#210, decision 6): the handover of every entry THIS RUN IS ABOUT TO SIGNAL
-            // is staged BEFORE any signal — and before the `step_limit_stop` event, which stays the
-            // FIRST thing a hard stop writes to the log. A failed stage answers 2 with `DEATH NOT
-            // RECORDED`, nothing signalled, every entry kept (the record precedes the signal).
+            // Record mode (#210, decision 6) + fix r2 (N1): the handover of every entry THIS RUN IS
+            // ABOUT TO SIGNAL is staged BEFORE any signal — and before the `step_limit_stop` event,
+            // which stays the FIRST thing a hard stop writes to the log. A failed stage answers 2 with
+            // `DEATH NOT RECORDED`, nothing signalled, every entry kept (the record precedes the
+            // signal). An entry whose pre-stage probe is INCONCLUSIVE is not signalled AT ALL: the hard
+            // line refuses it (rc 2, nothing signalled, the entry kept) and goes on resolving the
+            // entries it CAN prove, exactly as a refused stop inside the fold always has.
             let mut staged: Vec<(String, death::Staged)> = Vec::new();
+            let mut unproven_refusal = false;
             let rec_run = args.record.as_ref().map(|(session, checkpoint)| RecordRun {
                 repo: &args.repo,
                 checkpoint,
@@ -1772,33 +1897,47 @@ fn step_cmd(a: &[String]) -> i32 {
                 steps: args.steps,
                 hard_limit: args.hard,
             });
-            if let Some(run) = &rec_run {
-                for e in read.live.iter().filter(|e| matches!(e.target, Target::Process { .. })) {
-                    let Target::Process { pid, pid_start_ms } = &e.target else { continue };
+            let mut ids: Vec<String> = Vec::new();
+            for e in read.live.iter().filter(|e| matches!(e.target, Target::Process { .. })) {
+                let Target::Process { pid, pid_start_ms } = &e.target else { continue };
+                if let Some(run) = &rec_run {
                     // Fix r1 (F1): a cause is decided by what is OBSERVED about the process BEFORE any
                     // record is written, never by which verb is running. A `timeout`/`step` handover is
                     // staged ONLY for an entry this run has just proven LIVE and still the recorded
                     // process — the one the hard line is about to signal. An entry that is provably
-                    // gone, or whose pid was re-used, is NOT staged here at all: the factored stop's
+                    // GONE, or whose pid was re-used, is NOT staged here at all: the factored stop's
                     // already-gone / pid-reused arms stage and commit `died` (limit from the entry) with
-                    // no pre-existing handover to override, exactly as in check and stop. A denied or
-                    // unreadable probe also stages nothing — the stop refuses on it anyway.
-                    match probe_alive_at(Path::new("/bin/kill"), *pid) {
-                        Liveness::Alive => match probe_identity(*pid, *pid_start_ms) {
-                            Identity::Same => {}
-                            Identity::Reused | Identity::Unknown(_) => continue,
-                        },
-                        Liveness::NoSuch | Liveness::Denied | Liveness::Unknown(_) => continue,
-                    }
-                    let (_limit_kind, timeout_ms) = limit_of(&read, &e.id);
-                    match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *pid_start_ms }, run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Step, timeout_ms }) {
-                        Ok(st) => staged.push((e.id.clone(), st)),
-                        Err(reason) => {
-                            death_not_recorded(&e.id, &reason);
-                            return 2;
+                    // no pre-existing handover to override, exactly as in check and stop. A DENIED pid
+                    // is conclusive too — the stop refuses on it with nothing signalled.
+                    // Fix r2 (N1): an UNKNOWN probe is INCONCLUSIVE, and inconclusive is not "the stop
+                    // will refuse on it too" — the stop RE-PROBES, and when its own later probe
+                    // succeeds it signals a limit kill with nothing staged, and the stopped arm reads
+                    // "nothing staged" as a deliberate stop: the entry would be removed with NO record
+                    // and NO event. The entry is excluded from the stop, refused (rc 2) and kept.
+                    match prestage_verdict(*pid, prestage_liveness(*pid), || prestage_identity(*pid, *pid_start_ms)) {
+                        PreStage::Stage => {
+                            let (_limit_kind, timeout_ms) = limit_of(&read, &e.id);
+                            match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *pid_start_ms }, run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Step, timeout_ms }) {
+                                Ok(st) => staged.push((e.id.clone(), st)),
+                                Err(reason) => {
+                                    death_not_recorded(&e.id, &reason);
+                                    return 2;
+                                }
+                            }
+                        }
+                        // Conclusive: provably gone, re-used or denied. Nothing is staged; the entry
+                        // still goes to the stop, whose own arms resolve it (already-gone and
+                        // pid-reused record `died`; a denied pid is refused, nothing signalled).
+                        PreStage::Resolve => {}
+                        // Inconclusive: excluded from the stop, refused (rc 2) and kept.
+                        PreStage::Refuse(why) => {
+                            fail(&format!("{}: {}; nothing signalled", e.id, why));
+                            unproven_refusal = true;
+                            continue;
                         }
                     }
                 }
+                ids.push(e.id.clone());
             }
             let ticket = args.ticket.clone();
             let repo = args.repo.clone();
@@ -1806,7 +1945,7 @@ fn step_cmd(a: &[String]) -> i32 {
             let hard = args.hard;
             let root = lr.root.clone();
             let log = lr.log.clone();
-            hard_limit_body(
+            let folded = hard_limit_body(
                 steps,
                 hard,
                 move || {
@@ -1814,7 +1953,9 @@ fn step_cmd(a: &[String]) -> i32 {
                 },
                 &ids,
                 |id| {
-                    let rec = rec_run.as_ref().map(|run| (run, staged.iter().find(|(i, _)| i == id).map(|(_, st)| st.clone())));
+                    let rec = rec_run
+                        .as_ref()
+                        .map(|run| RecordStop::Limit { run, staged: staged.iter().find(|(i, _)| i == id).map(|(_, st)| st.clone()) });
                     match stop_live_entry(&dir, &args.ticket, &read, id, args.grace_ms, rec) {
                         StopDone::Stopped { pid, recorded } => {
                             println!("{id}\t{pid}\tstopped");
@@ -1837,7 +1978,14 @@ fn step_cmd(a: &[String]) -> i32 {
                         StopDone::DeathNotRecorded => 2,
                     }
                 },
-            )
+            );
+            // Fix r2 (N1): an entry the pre-stage pass could not prove was refused and KEPT above; its
+            // refusal is a 2 at the top of the fold, like every other stop refusal.
+            if unproven_refusal {
+                2
+            } else {
+                folded
+            }
         }
     }
 }
@@ -2116,5 +2264,309 @@ mod stop_tests {
         assert!(!death_proven(false, true), "a dead leader alone must never prove 'stopped' (the fix-r2 rule)");
         assert!(!death_proven(true, false), "an empty group alone must never prove 'stopped' (the pid could be a zombie elsewhere)");
         assert!(!death_proven(false, false), "nothing proven");
+    }
+}
+
+// ---------------------------------------------------------------- fix r2 N1: the pre-stage rule (tests)
+
+/// Fix r2 (N1): an entry that `check`/`step` signals for a LIMIT must have its handover staged first,
+/// or must not be signalled at all. The tests drive the REAL command functions in-process (the
+/// `prestage_fault` seam exists only under `cfg(test)`, never in the binary the CLI tests run) with
+/// REAL sleeper processes, and assert the full contract: refused (2), NOTHING signalled, the entry
+/// kept, no handover, no event — and the second line, that a limit stop reaching the stopped arm
+/// unstaged refuses with `DEATH NOT RECORDED` and keeps the entry.
+#[cfg(test)]
+mod prestage_tests {
+    use super::*;
+    use std::fs;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const SESSION: &str = "0b6e3c1a-2f4d-4c8e-9a7b-1d2e3f405162";
+    const CHECKPOINT: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn tmp() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("sup-prestage-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Kills the whole group of every registered pid when dropped (TERM then KILL).
+    #[derive(Default)]
+    struct Guard(Vec<u32>);
+    impl Guard {
+        fn add(&mut self, pid: u32) {
+            self.0.push(pid);
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for (pid, sig) in self.0.iter().flat_map(|p| [(*p, "TERM"), (*p, "KILL")]) {
+                let _ = Command::new("kill").arg(format!("-{sig}")).arg("--").arg(format!("-{pid}")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
+        }
+    }
+
+    /// One REAL live entry: a sleeper in its own process group on a fresh sheet with root `root`.
+    fn live_entry(dir: &Path, root: &Path, ticket: &str, id: &str, limit_ms: Option<u64>) -> (Child, u64, u64) {
+        let ts = now_ms();
+        let c = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = c.id() as u64;
+        let start_ms = manifest::process_start_ms(pid).unwrap();
+        manifest::apply(dir, ticket, &manifest::Op::Init { roots: std::slice::from_ref(&root.to_path_buf()) }, ts).unwrap();
+        manifest::apply(dir, ticket, &manifest::Op::AddProcess { id, pid, pid_start_ms: start_ms }, ts).unwrap();
+        if let Some(ms) = limit_ms {
+            manifest::apply(dir, ticket, &manifest::Op::Limit { id, timeout_ms: ms }, ts).unwrap();
+        }
+        (c, pid, start_ms)
+    }
+
+    fn entry_live(dir: &Path, ticket: &str, id: &str) -> bool {
+        manifest::read_manifest(dir, ticket).unwrap().live.iter().any(|e| e.id == id)
+    }
+
+    fn pid_alive(pid: u64) -> bool {
+        matches!(probe_alive_at(Path::new("/bin/kill"), pid), Liveness::Alive)
+    }
+
+    /// Poll (bounded, a state poll) until the pid's age reads at least `ms` — off Linux the age is
+    /// whole seconds, so a 1 ms limit is expired only once `ps etime` ticks past zero.
+    fn wait_age(pid: u64, ms: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if manifest::process_age_ms(pid).is_ok_and(|a| a >= ms) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("pid {pid} never reached an age of {ms} ms");
+    }
+
+    /// Reap a signalled child while the stop runs: in-process, THIS test is the parent, and a killed
+    /// child stays a ZOMBIE (still answering `kill -0`) until waited — the CLI tests get reaping for
+    /// free because their parent is the harness binary, which exits. A BLOCKING wait reaps at the
+    /// instant of death, comfortably before the stop's own post-signal probes (each a fork+exec of
+    /// /bin/kill) can run.
+    fn reaper(child: Arc<Mutex<Child>>) {
+        thread::spawn(move || {
+            let _ = child.lock().unwrap().wait();
+        });
+    }
+
+    fn no_record(dir: &Path, ticket: &str, log: &Path) {
+        assert!(!dir.join(format!("{ticket}.deaths")).exists(), "no deaths folder may exist");
+        assert!(!log.exists(), "no event may be written");
+    }
+
+    /// N1 line 1, the pure table: Stage only for a conclusive Alive+Same; Resolve for every conclusive
+    /// other answer (reused, gone, denied); Refuse for either inconclusive probe. Collapsing Refuse
+    /// into Resolve (the r1 behaviour — stage nothing but signal anyway) goes red here.
+    #[test]
+    fn prestage_verdict_table() {
+        assert!(matches!(prestage_verdict(9, Liveness::Alive, || Identity::Same), PreStage::Stage), "Alive+Same is the one staged case");
+        assert!(matches!(prestage_verdict(9, Liveness::Alive, || Identity::Reused), PreStage::Resolve), "a re-used pid resolves through the stop's own arm");
+        assert!(matches!(prestage_verdict(9, Liveness::NoSuch, || panic!("a gone liveness must not read identity")), PreStage::Resolve), "provably gone resolves through the stop's own arm");
+        assert!(matches!(prestage_verdict(9, Liveness::Denied, || panic!("a denied liveness must not read identity")), PreStage::Resolve), "denied resolves through the stop's own refusal");
+        let why = "helper gone once".to_string();
+        assert!(
+            matches!(prestage_verdict(9, Liveness::Alive, || Identity::Unknown(why.clone())), PreStage::Refuse(m) if m.contains("cannot prove pid 9 is still the recorded process")),
+            "an inconclusive IDENTITY refuses"
+        );
+        assert!(
+            matches!(prestage_verdict(9, Liveness::Unknown(why), || panic!("an unknown liveness must not read identity")), PreStage::Refuse(m) if m.contains("cannot prove pid 9 is alive")),
+            "an inconclusive LIVENESS refuses"
+        );
+    }
+
+    /// N1 line 1, check arm: an expired live entry whose pre-stage IDENTITY probe is inconclusive is
+    /// refused — rc 2, nothing signalled, the entry kept, no handover, no event. The r1 behaviour
+    /// (stage nothing but stop anyway; the stop's own re-probe then succeeds and the stopped arm reads
+    /// "nothing staged" as a deliberate stop) removes the entry with no record and goes red here.
+    #[test]
+    fn check_inconclusive_prestage_identity_refuses_unsignalled() {
+        let dir = tmp();
+        let root = dir.join("r");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("events.jsonl");
+        let (mut child, pid, _start) = live_entry(&dir, &root, "tk", "a", Some(1));
+        let mut guard = Guard::default();
+        guard.add(child.id());
+        wait_age(pid, 1);
+        prestage_fault::identity_unknown_for(pid);
+        let rc = check_cmd(&[
+            "tk".to_string(),
+            "--dir".into(),
+            dir.to_string_lossy().into_owned(),
+            "--session".into(),
+            SESSION.into(),
+            "--checkpoint".into(),
+            CHECKPOINT.into(),
+            "--repo".into(),
+            "r".into(),
+            "--log".into(),
+            log.to_string_lossy().into_owned(),
+            "--root".into(),
+            root.to_string_lossy().into_owned(),
+        ]);
+        prestage_fault::clear();
+        assert_eq!(rc, 2, "an inconclusive pre-stage identity is a refusal");
+        assert!(entry_live(&dir, "tk", "a"), "the entry is kept for a later run");
+        assert!(pid_alive(pid), "nothing was signalled");
+        no_record(&dir, "tk", &log);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// N1 line 1, check arm (held-out v2): an expired live entry whose pre-stage LIVENESS probe is
+    /// inconclusive is refused the same way — rc 2, nothing signalled, kept, no record.
+    #[test]
+    fn check_inconclusive_prestage_liveness_refuses_unsignalled() {
+        let dir = tmp();
+        let root = dir.join("r");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("events.jsonl");
+        let (mut child, pid, _start) = live_entry(&dir, &root, "tk", "a", Some(1));
+        let mut guard = Guard::default();
+        guard.add(child.id());
+        prestage_fault::liveness_unknown_for(pid);
+        let rc = check_cmd(&[
+            "tk".to_string(),
+            "--dir".into(),
+            dir.to_string_lossy().into_owned(),
+            "--session".into(),
+            SESSION.into(),
+            "--checkpoint".into(),
+            CHECKPOINT.into(),
+            "--repo".into(),
+            "r".into(),
+            "--log".into(),
+            log.to_string_lossy().into_owned(),
+            "--root".into(),
+            root.to_string_lossy().into_owned(),
+        ]);
+        prestage_fault::clear();
+        assert_eq!(rc, 2, "an inconclusive pre-stage liveness is a refusal");
+        assert!(entry_live(&dir, "tk", "a"), "the entry is kept");
+        assert!(pid_alive(pid), "nothing was signalled");
+        no_record(&dir, "tk", &log);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// N1 line 1, step arm (held-out v1): at the hard line with TWO entries whose pre-stage probes are
+    /// inconclusive (one liveness, one identity) and ONE proven live entry, the two are refused
+    /// unsignalled and KEPT, the live one alone is stopped and recorded `timeout`/`step`, and the run
+    /// answers 2.
+    #[test]
+    fn step_inconclusive_prestage_refuses_kept_live_entry_stopped() {
+        let dir = tmp();
+        let root = dir.join("r");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("events.jsonl");
+        let ts = now_ms();
+        manifest::apply(&dir, "tk", &manifest::Op::Init { roots: std::slice::from_ref(&root) }, ts).unwrap();
+        let mut guard = Guard::default();
+        let mk = |id: &str| {
+            let c = Command::new("sleep").arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn().unwrap();
+            let pid = c.id() as u64;
+            let start_ms = manifest::process_start_ms(pid).unwrap();
+            manifest::apply(&dir, "tk", &manifest::Op::AddProcess { id, pid, pid_start_ms: start_ms }, ts).unwrap();
+            (c, pid, start_ms)
+        };
+        let (mut ca, pid_a, _sa) = mk("a");
+        let (mut cb, pid_b, _sb) = mk("b");
+        let (cc, pid_c, sc) = mk("c");
+        guard.add(ca.id());
+        guard.add(cb.id());
+        guard.add(cc.id());
+        let cc_shared = Arc::new(Mutex::new(cc));
+        reaper(Arc::clone(&cc_shared));
+        prestage_fault::liveness_unknown_for(pid_a);
+        prestage_fault::identity_unknown_for(pid_b);
+        let rc = step_cmd(&[
+            "tk".to_string(),
+            "--repo".into(),
+            "r".into(),
+            "--steps".into(),
+            "9".into(),
+            "--soft".into(),
+            "5".into(),
+            "--hard".into(),
+            "9".into(),
+            "--grace-ms".into(),
+            "500".into(),
+            "--dir".into(),
+            dir.to_string_lossy().into_owned(),
+            "--log".into(),
+            log.to_string_lossy().into_owned(),
+            "--root".into(),
+            root.to_string_lossy().into_owned(),
+            "--session".into(),
+            SESSION.into(),
+            "--checkpoint".into(),
+            CHECKPOINT.into(),
+        ]);
+        prestage_fault::clear();
+        assert_eq!(rc, 2, "the two unproven entries make the run a refusal");
+        assert!(entry_live(&dir, "tk", "a") && pid_alive(pid_a), "a is refused, unsignalled and kept");
+        assert!(entry_live(&dir, "tk", "b") && pid_alive(pid_b), "b is refused, unsignalled and kept");
+        assert!(!entry_live(&dir, "tk", "c"), "the proven-live entry is resolved");
+        let hand_c = dir.join("tk.deaths").join(format!("c.{pid_c}.{sc}.json"));
+        let text = fs::read_to_string(&hand_c).unwrap_or_default();
+        assert!(text.contains("\"cause\":\"timeout\"") && text.contains("\"limit\":\"step\""), "c's handover is timeout/step: {text}");
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("step_limit_stop"), "the hard-stop event is first: {log_text}");
+        assert_eq!(log_text.lines().filter(|l| l.contains("\"kind\":\"timed_out\"")).count(), 1, "exactly one death event: {log_text}");
+        assert!(log_text.contains(&format!("tk.deaths/c.{pid_c}.{sc}.json")), "the event names c's handover: {log_text}");
+        for c in [&mut ca, &mut cb] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let mut cc = cc_shared.lock().unwrap();
+        let _ = cc.kill();
+        let _ = cc.wait();
+    }
+
+    /// N1 line 2: a LIMIT stop that reaches the stopped arm with NOTHING staged refuses with
+    /// `DEATH NOT RECORDED` and keeps the entry — the stopped arm never reads "nothing staged" as a
+    /// deliberate stop for a limit stop. Driven at the factored body itself (the only caller-visible
+    /// way to arrive unstaged now that line 1 refuses first).
+    #[test]
+    fn limit_stop_unstaged_refuses_on_the_stopped_arm() {
+        let dir = tmp();
+        let root = dir.join("r");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("events.jsonl");
+        let ts = now_ms();
+        manifest::apply(&dir, "tk", &manifest::Op::Init { roots: std::slice::from_ref(&root) }, ts).unwrap();
+        let c = Command::new("sleep").arg("30").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn().unwrap();
+        let pid = c.id() as u64;
+        let start_ms = manifest::process_start_ms(pid).unwrap();
+        manifest::apply(&dir, "tk", &manifest::Op::AddProcess { id: "a", pid, pid_start_ms: start_ms }, ts).unwrap();
+        let read = manifest::read_manifest(&dir, "tk").unwrap();
+        let c_shared = Arc::new(Mutex::new(c));
+        reaper(Arc::clone(&c_shared));
+        let lr = resolve_log_root(Some(log.to_str().unwrap()), Some(root.to_str().unwrap()));
+        let run = RecordRun { repo: "r", checkpoint: CHECKPOINT, session_id: SESSION, lr: &lr, steps: 0, hard_limit: 0 };
+        let done = stop_live_entry(&dir, "tk", &read, "a", 500, Some(RecordStop::Limit { run: &run, staged: None }));
+        assert!(matches!(done, StopDone::DeathNotRecorded), "an unstaged limit stop refuses, never resolves as deliberate");
+        assert!(entry_live(&dir, "tk", "a"), "the entry is kept");
+        assert!(!dir.join("tk.deaths").exists(), "no handover was invented by the refusal");
+        assert!(!log.exists(), "no event was written");
+        let mut c = c_shared.lock().unwrap();
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }
