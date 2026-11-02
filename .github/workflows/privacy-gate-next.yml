@@ -3,7 +3,7 @@ name: privacy-gate-next
 # Base-only privacy gate (ticket 163). It runs on the base side: the checkout, the engine build and the script are all the
 # BASE commit. The pull request is only read as git data (fetched into a ref, never checked out), so no PR file is on disk
 # and nothing from the PR is built, sourced or run. Only the Scan step holds the list secret.
-# PR-A: job `gate-next` is NOT a required check. A later PR renames it.
+# PR-B: the job takes the name `gate` (job id and name), so this base-only run produces the required check name `gate`.
 
 on:
   pull_request_target:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  gate-next:
+  gate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: privacy-gate

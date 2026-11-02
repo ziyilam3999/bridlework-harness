@@ -196,14 +196,15 @@ reported_names() {
     ' "$f"
   done
 }
-# names_ok DIR : final-gate.yml has exactly one job reporting final-gate; no other file reports final-gate; only privacy-gate.yml reports gate.
+# names_ok DIR : final-gate.yml has exactly one job reporting final-gate; no other file reports final-gate; only privacy-gate.yml and privacy-gate-next.yml report gate (ticket 163 PR-B).
 names_ok() {
   r=$(reported_names "$1")
   [ "$(printf '%s\n' "$r" | grep -c '^final-gate.yml ')" -eq 1 ] || return 1
   printf '%s\n' "$r" | grep -qx 'final-gate.yml final-gate' || return 1
   printf '%s\n' "$r" | grep -v '^final-gate.yml ' | grep -q ' final-gate$' && return 1
-  printf '%s\n' "$r" | grep -v '^privacy-gate.yml ' | grep -q ' gate$' && return 1
+  printf '%s\n' "$r" | grep -v -e '^privacy-gate.yml ' -e '^privacy-gate-next.yml ' | grep -q ' gate$' && return 1
   printf '%s\n' "$r" | grep -qx 'privacy-gate.yml gate' || return 1
+  printf '%s\n' "$r" | grep -qx 'privacy-gate-next.yml gate' || return 1
   return 0
 }
 
