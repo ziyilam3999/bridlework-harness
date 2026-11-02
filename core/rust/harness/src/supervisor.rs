@@ -1753,4 +1753,31 @@ mod stop_tests {
         assert!(!death_proven(true, false), "an empty group alone must never prove 'stopped' (the pid could be a zombie elsewhere)");
         assert!(!death_proven(false, false), "nothing proven");
     }
+/// #209 fix round 1, F2: the rollback's ORDER — the commit pipe closes (uncommitted) BEFORE any
+/// signal aimed at the spawn, and the spawn gets a bounded grace to end on its own. Pinned through
+/// the real `kill_own_spawn` with a stand-in spawn that behaves like a live waiter where it matters:
+/// it IGNORES TERM and ends BY ITSELF the moment its stdin closes (`cat`). In the fixed order the
+/// close lands first, `cat` sees end-of-input and exits cleanly inside the grace — exit code 0, no
+/// signal ever needed. A rollback that signals first (the old order: TERM, 5 s, KILL, then the
+/// close) can only end this child with the KILL — exit by signal — and turns this red.
+    #[test]
+    fn supervisor_rollback_closes_the_pipe_before_any_signal() {
+        use std::process::Command;
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; exec cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("the stand-in spawn runs");
+        let pid = child.id() as u64;
+        // the rollback under test: on a refused handshake `pid` is the spawn's OWN group, exactly this
+        let outcome = kill_own_spawn(&mut child, pid);
+        let status = child.wait().expect("the stand-in spawn is reaped");
+        assert!(outcome.is_ok(), "the rollback confirms its kill: {outcome:?}");
+        assert_eq!(status.code(), Some(0), "the spawn ended BY ITSELF on the end-of-input (exit 0), not by a signal ({status}) — the close must reach it before any signal");
+    }
+
 }
