@@ -1007,7 +1007,7 @@ pub fn process_start_ms(pid: u64) -> Result<u64, String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| "clock is before the epoch".to_string())?
             .as_millis() as u64;
-        let out = std::process::Command::new("ps")
+        let out = std::process::Command::new("/bin/ps")
             .arg("-o")
             .arg("etime=")
             .arg("-p")

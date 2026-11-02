@@ -5,9 +5,9 @@ processes — under **ticket ownership**: a started process and its port are sig
 [resource manifest](resource-manifest.md) before `start` answers, and a start that cannot record its
 spawn is rolled back, so a refused start leaves nothing running and nothing listed.
 
-**Stopping a recorded process is not part of this PR** (follow-up ticket #183, stop-by-pid): nothing
-here reads, signals or removes a process that a `start` of this run did not create. See
-["Not in this PR"](#not-in-this-pr-stop-by-pid) below.
+**Stopping a recorded process** is `harness process stop` (#183): it signals a pid only when the sheet
+proves the ticket still owns that exact process, and it answers "stopped" only after the death is proven.
+See ["stop, in order"](#stop-in-order) below.
 
 Code: `core/rust/harness/src/supervisor.rs` (unix only) and the `harness process` command in
 `core/rust/harness/src/cli.rs`. Nothing new in the manifest format: one existing `add` process line and, with
@@ -17,12 +17,13 @@ Code: `core/rust/harness/src/supervisor.rs` (unix only) and the `harness process
 
 ```
 harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--dir <manifest-dir>] -- <program> [args...]
+harness process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>]
 ```
 
 `--dir` defaults to `.harness/manifests`, the same default as `harness manifest`. Listing stays
 `harness manifest list` (it already prints `id, class, pid, pid_start_ms`); no new list verb exists.
-`process stop` is not a verb: any `stop` invocation is the usage refusal (exit 2), and nothing is
-signalled, written or removed by it.
+`process stop` addresses one entry by `--id`, or by a `--pid` matched against the ticket's live process
+entries.
 
 ## start, in order
 
@@ -77,22 +78,63 @@ waits are skipped and the refusal names the unconfirmed kill.
   checks takes the per-ticket lock file `<manifest-dir>/<ticket>.proc.lock` (step 2 of `start`); a parser or
   token refusal (bad `--port`, bad ticket or id) exits before the lock, so no lock file is made either. It is a
   std file-lock helper, not a record — it holds no data and is safe to delete between commands.
+- **No orphan reaping for stop escapees** (P2) and **no finalize/teardown that calls stop for every live
+  process of a ticket** (P1B-14).
 - **No output capture** (stdout, stderr, exit codes, timing, traces: P1B-08), **no timeouts or step limits**
-  (P1B-06), **no worker-death record** (P1B-07), **no orphan reaping** (P2), **no network allow-list** (G1b/P4a),
-  **no finalize/teardown** (P1B-14).
+  (P1B-06), **no worker-death record** (P1B-07), **no network allow-list** (G1b/P4a).
 
-## Not in this PR: stop-by-pid
+## stop, in order
 
-Stopping a recorded process was split into its own follow-up ticket (#183, stop-by-pid) after review found
-the round-3 `stop` could answer success without proving the process died. This PR keeps only the start and
-record behaviour that passed review; it never signals or removes a process its own `start` did not create.
-The follow-up must handle at least:
+`process stop` holds the same per-ticket supervisor lock for the WHOLE stop, then checks, in order — a stop
+SIGNALS only when every check passes:
 
-- **a non-leader pid** listed through the public `harness manifest add --class process` verb: a group signal
-  to `-<pid>` hits no group when the pid is not its own group leader, so "stopped" would be a lie while the
-  process lives (r3 finding 1);
-- **`kill` / `ps` not runnable**: signal and probe by absolute path (as the rollback here does), and treat a
-  helper that cannot be run as "unknown" — never as "gone", "empty" or "already dead" — refusing with exit 2
-  and keeping the entry (r3 finding 2, all three sites);
-- **a post-signal liveness check**: answer 0 "stopped" and append the `remove` lines only after the recorded
-  pid is provably dead (`kill -0` failing for the pid itself, not just the group).
+1. Read the manifest; missing, torn or corrupt: **exit 2**, nothing signalled, the file byte-identical.
+2. The target must be a LIVE `process` entry of THIS ticket (by `--id`, or a `--pid` matched against the
+   live entries). A pid not listed here — including one listed only on ANOTHER ticket — is **exit 2**
+   (`... is not a live entry of ticket ...`), nothing signalled, the manifest byte-identical.
+3. Liveness, asked through `/bin/kill` by absolute path. Provably no such process: **exit 3**
+   `already-gone`, nothing signalled, the entries removed. A helper that could not RUN is "unknown" —
+   never "gone": **exit 2**, entry kept, nothing written.
+4. Identity: the live pid's start time must equal the recorded `pid_start_ms` (exact on Linux, within
+   2000 ms elsewhere — the [resource manifest](resource-manifest.md) tolerance rule). Mismatch means the
+   recorded process exited and the number was re-used: **exit 3** `pid-reused`, nothing signalled, the
+   entries removed. Unreadable: **exit 2**, entry kept.
+5. Group leadership: the live pid must be its own process-group leader (pgid == pid), so a signal to the
+   group provably ends the family it heads. A non-leader pid (for example one signed out through the
+   public `harness manifest add --class process`) is **exit 2**, nothing signalled, entry kept — the
+   message says a group signal could not prove it ends this process.
+6. TERM to the whole group, then a bounded wait (`--grace-ms`, default 5000). Before any KILL the identity
+   is re-checked (a leader still alive must still pass check 4) and a group already provably empty gets no
+   KILL; while any member lives, the group id cannot be re-issued as a pid, so a KILL to a non-empty group
+   cannot hit a stranger.
+7. Post-signal proof: the recorded pid must be PROVABLY dead (`kill -0` failing for the pid itself, not
+   just the group) before the answer 0 and the `remove` lines (the process entry, and `<id>.port` when
+   live). Still answering — an unreaped zombie does — or a probe that could not run: **exit 4**
+   "signalled, death not confirmed", the entry KEPT, so a later stop can retry (and a retry after a reap
+   answers `already-gone`).
+
+### stop exit codes
+
+| Case | stdout | exit |
+|---|---|---|
+| stopped and removed | `id<TAB>pid<TAB>stopped` | 0 |
+| refusal (dirty manifest, not a live entry of this ticket, unknown liveness, unreadable identity, non-leader pid) | — (stderr names it) | 2 |
+| `already-gone` / `pid-reused` (nothing signalled, entries removed) | — (stderr names it) | 3 |
+| signalled, death not confirmed (entry kept so a later stop can retry) | — (stderr names it) | 4 |
+
+A pid re-used by another user's process answers the liveness probe "no permission", read as not ours:
+**exit 2**, nothing signalled — the safe direction. The identity read itself runs `/bin/ps` by ABSOLUTE
+path (never through `PATH`), so a PATH-shadowed `ps` cannot bless a re-used pid.
+
+## What stop does not cover
+
+- **Check-to-signal race.** Between the identity check and TERM the process could exit and the pid be
+  re-used. Closing that needs pidfds (Linux only) or a crate; std only here. Shrunk (the identity is
+  re-checked before KILL), not closed.
+- **Start-time precision off Linux.** `ps etime` is whole seconds; with the 2000 ms tolerance a pid
+  re-used within ~2 s of the original start could pass. Linux is exact.
+- **A non-leader entry can never be stopped by this verb** (always exit 2): an honest refusal over a false
+  "stopped"; the message says why. The orphan reaper (P2) owns what a group signal cannot reach.
+- **Children that leave the group** (`setsid`) and a group whose leader already exited (`already-gone`,
+  members not signalled: no live leader to prove identity) are not stopped.
+- **`kill -0` EPERM** names a pid of another user: read as not ours, exit 2, no signal.

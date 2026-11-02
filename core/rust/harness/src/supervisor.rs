@@ -6,11 +6,22 @@
 //! `add` port line with id `<id>.port` — that id convention is the only link between a process and its port.
 //! Nothing new in the manifest format and no event kind: the manifest line IS the durable record.
 //!
-//! Stopping a recorded process is NOT part of this module (follow-up ticket #183, stop-by-pid): nothing here
-//! reads, signals or removes a process that a `start` of this run did not create, and `process stop` is the
-//! usage refusal. The one signal path left is the start ROLLBACK, and it touches only the group this run just
-//! spawned: a start that cannot record its spawn stops that group and answers 2, so a refused start leaves
-//! nothing running and nothing listed. The rollback signals through `/bin/kill` by ABSOLUTE path (never
+//! `process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>]` (#183) ends a
+//! process the sheet lists, and it is the dangerous half: a pid is just a number and numbers get re-used,
+//! so a stop SIGNALS only when every check passes, in order, under the per-ticket lock held for the whole
+//! stop: the target is a LIVE `process` entry of THIS ticket (a pid listed only on another ticket is never
+//! signalled); the pid provably exists (a helper that cannot RUN is "unknown", never "gone"); the live
+//! pid's start time still equals the recorded `pid_start_ms` (exact on Linux, 2000 ms elsewhere — a
+//! re-used pid is never signalled, its stale entry is removed with exit 3); and the pid is its OWN
+//! process-group leader, so a signal to the group provably ends the family. After TERM to the group and a
+//! bounded wait — with the identity re-checked before any KILL, and no KILL to a group already provably
+//! empty — the recorded pid must be PROVABLY dead before the answer 0 and the `remove` lines; otherwise
+//! the answer is 4 ("signalled, death not confirmed") and the entry is KEPT, so a later stop can retry.
+//! Every helper call goes by ABSOLUTE path (`/bin/kill`, `/bin/ps`), never through PATH.
+//!
+//! The other signal path is the start ROLLBACK, and it touches only the group this run just spawned: a
+//! start that cannot record its spawn stops that group and answers 2, so a refused start leaves nothing
+//! running and nothing listed. The rollback signals through `/bin/kill` by ABSOLUTE path (never
 //! through PATH), falls back to std `Child::kill()` (which needs no PATH) BEFORE reaping, and never waits
 //! longer than REAP_BOUND_MS on a child it could not signal. A helper that cannot be RUN is "unknown", never
 //! "gone" or "empty": a rollback that cannot confirm its kill says so in the refusal instead.
@@ -19,13 +30,17 @@
 //! uses) is held for the WHOLE start, so supervisor operations on one ticket serialise. A parser or token
 //! refusal (bad `--port`, bad ticket or id) exits BEFORE the lock, so it creates no lock file either.
 //!
-//! Exit codes: `0` started; `2` a usage error or any refusal (nothing listed, nothing left running — except
+//! Exit codes for `start`: `0` started; `2` a usage error or any refusal (nothing listed, nothing left running — except
 //! that a refusal AFTER the spawn has already killed the group it made, and a rollback that could not confirm
 //! its kill names that in the message). Every input is validated before the first spawn or write: `--port`
 //! must be an integer in 1..=65535 (checked in the parser, so an out-of-range port is refused with nothing
 //! run), and the port-free bind check covers 127.0.0.1 only — a bind refused for privilege (ports below 1024
 //! need privilege even on 127.0.0.1) is reported as its error kind, not as "already bound"; only `AddrInUse`
 //! says "already bound".
+//!
+//! Exit codes for `stop`: `0` stopped and removed; `2` a refusal (nothing signalled, the manifest
+//! byte-identical); `3` `already-gone` or `pid-reused` (nothing signalled, the entries removed); `4`
+//! signalled but the death could not be confirmed (the entry kept).
 
 use crate::manifest::{self, ManifestRead, Target};
 use std::fs::{File, OpenOptions};
@@ -35,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--dir <manifest-dir>] -- <program> [args...]";
+pub const USAGE: &str = "usage: harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--dir <manifest-dir>] -- <program> [args...] | process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>]";
 
 /// Default manifest dir, the same default as `harness manifest`.
 const DEFAULT_DIR: &str = ".harness/manifests";
@@ -51,7 +66,7 @@ const REAP_BOUND_MS: u64 = 3000;
 
 // ---------------------------------------------------------------- command entry
 
-/// `harness process start` dispatch. `stop` is not a verb of this PR (follow-up ticket #183).
+/// `harness process start|stop` dispatch.
 pub fn process_cmd(a: &[String]) -> i32 {
     let Some((sub, rest)) = a.split_first() else {
         eprintln!("{}", USAGE);
@@ -59,6 +74,7 @@ pub fn process_cmd(a: &[String]) -> i32 {
     };
     match sub.as_str() {
         "start" => start_cmd(rest),
+        "stop" => stop_cmd(rest),
         _ => {
             eprintln!("{}", USAGE);
             2
@@ -390,4 +406,381 @@ fn start_cmd(a: &[String]) -> i32 {
     }
     println!("{}\t{}\t{}", args.id, pid, start_ms);
     0
+}
+
+
+// ---------------------------------------------------------------- stop (#183: by pid under ticket ownership)
+
+/// What a liveness probe of ONE pid (`kill -0 <pid>`, never its group) answered. `Unknown` covers both a
+/// helper that could not RUN and a failure that proves nothing about the pid: unknown is NEVER turned into
+/// a success-shaped answer ("gone", "empty", "already dead") — stop refuses with 2 and keeps the entry.
+enum Liveness {
+    /// The pid answers the probe.
+    Alive,
+    /// The helper ran and PROVED no such process exists (its stderr names it) — the only "gone" there is.
+    NoSuch,
+    /// The pid exists but is not ours to signal (the probe answered "operation not permitted").
+    Denied,
+    /// The probe could not run, or its failure proves nothing.
+    Unknown(String),
+}
+
+/// Probe one pid through the kill helper at `helper` (an ABSOLUTE path, so PATH never decides liveness).
+/// The path is a parameter so the not-runnable case is unit-testable: it must answer Unknown, which stop
+/// maps to refusal 2 with nothing written.
+fn probe_alive_at(helper: &Path, pid: u64) -> Liveness {
+    match Command::new(helper)
+        .arg("-0")
+        .arg("--")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => Liveness::Alive,
+        Ok(o) => {
+            let say = String::from_utf8_lossy(&o.stderr).trim().to_ascii_lowercase();
+            if say.contains("no such process") {
+                Liveness::NoSuch
+            } else if say.contains("not permitted") || say.contains("permission") {
+                Liveness::Denied
+            } else {
+                Liveness::Unknown(format!("kill -0 of pid {pid} failed: {say}"))
+            }
+        }
+        Err(e) => Liveness::Unknown(format!("cannot run the liveness probe {}: {}", helper.display(), e.kind())),
+    }
+}
+
+/// The start-time tolerance between the live pid's start time and the recorded one, the manifest doc's
+/// ownership rule: exact on Linux (`/proc` knows ticks), 2000 ms elsewhere (`ps etime` knows whole seconds).
+#[cfg(target_os = "linux")]
+const START_TOLERANCE_MS: u64 = 0;
+#[cfg(not(target_os = "linux"))]
+const START_TOLERANCE_MS: u64 = 2000;
+
+/// Does the live pid's start time still match the recorded one, within the platform tolerance?
+fn same_start(read: u64, recorded: u64) -> bool {
+    read.abs_diff(recorded) <= START_TOLERANCE_MS
+}
+
+/// The identity answer: Same (this is the process the sheet recorded), Reused (the recorded process must
+/// have exited and the number was re-used), or Unknown (the start time could not be read).
+enum Identity {
+    Same,
+    Reused,
+    Unknown(String),
+}
+
+/// Read the live pid's start time and compare it with the recorded one, through the same reader `start`
+/// uses (`manifest::process_start_ms`, absolute-path helpers). An unreadable start time is Unknown: stop
+/// refuses (2, entry kept) rather than signal a pid it cannot identify.
+fn probe_identity(pid: u64, recorded: u64) -> Identity {
+    match manifest::process_start_ms(pid) {
+        Ok(ms) => {
+            if same_start(ms, recorded) {
+                Identity::Same
+            } else {
+                Identity::Reused
+            }
+        }
+        Err(e) => Identity::Unknown(e),
+    }
+}
+
+/// Is the pid its OWN process-group leader (pgid == pid), so a signal to the group provably ends the
+/// family it heads? Linux reads `/proc/<pid>/stat` (field 5); elsewhere `/bin/ps` by ABSOLUTE path prints
+/// the pgid. A helper that cannot run, or a pgid that cannot be read, is Unknown: stop refuses (2, entry
+/// kept) rather than signal a group it cannot prove ends the listed process.
+enum Leadership {
+    Leader,
+    NotLeader(u64),
+    Unknown(String),
+}
+
+fn probe_leader(pid: u64) -> Leadership {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let after_paren = match stat.rsplit_once(')') {
+                    Some((_, r)) => r,
+                    None => return Leadership::Unknown("stat has no command field".to_string()),
+                };
+                let fields: Vec<&str> = after_paren.split_whitespace().collect();
+                // fields[0] is stat field 3 (state); pgrp is stat field 5, so index 5 - 3 = 2.
+                match fields.get(2).and_then(|f| f.parse::<u64>().ok()) {
+                    Some(pgid) if pgid == pid => Leadership::Leader,
+                    Some(pgid) => Leadership::NotLeader(pgid),
+                    None => Leadership::Unknown(format!("cannot read the pgid of pid {pid} from /proc")),
+                }
+            }
+            Err(e) => Leadership::Unknown(format!("cannot read /proc/{pid}/stat: {}", e.kind())),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match Command::new("/bin/ps")
+            .arg("-o")
+            .arg("pgid=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim().parse::<u64>() {
+                Ok(pgid) if pgid == pid => Leadership::Leader,
+                Ok(pgid) => Leadership::NotLeader(pgid),
+                Err(_) => Leadership::Unknown(format!("ps printed no pgid for pid {pid}")),
+            },
+            Ok(o) => Leadership::Unknown(format!(
+                "ps does not know pid {pid}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => Leadership::Unknown(format!("cannot run /bin/ps: {}", e.kind())),
+        }
+    }
+}
+
+struct StopArgs {
+    ticket: String,
+    id: Option<String>,
+    pid: Option<u64>,
+    grace_ms: u64,
+    dir: String,
+}
+
+/// Parse `process stop`'s command line: the ticket plus exactly one of `--id` / `--pid`, an optional
+/// `--grace-ms`, and the usual `--dir`. Usage errors answer 2 before the lock, so they write nothing.
+fn parse_stop(a: &[String]) -> Result<StopArgs, String> {
+    let mut ticket: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut pid: Option<u64> = None;
+    let mut grace: Option<u64> = None;
+    let mut dir: Option<String> = None;
+    let mut it = a.iter();
+    while let Some(arg) = it.next() {
+        if let Some(name) = arg.strip_prefix("--") {
+            let value = it.next().ok_or_else(|| format!("{} needs a value", arg))?;
+            match name {
+                "id" => {
+                    if id.replace(value.clone()).is_some() {
+                        return Err(format!("{} given twice", arg));
+                    }
+                }
+                "pid" => {
+                    let v = num_flag(value, "pid")?;
+                    if pid.replace(v).is_some() {
+                        return Err(format!("{} given twice", arg));
+                    }
+                }
+                "grace-ms" => {
+                    let v = num_flag(value, "grace-ms")?;
+                    if grace.replace(v).is_some() {
+                        return Err(format!("{} given twice", arg));
+                    }
+                }
+                "dir" => {
+                    if dir.replace(value.clone()).is_some() {
+                        return Err(format!("{} given twice", arg));
+                    }
+                }
+                _ => return Err(format!("unknown option {}", arg)),
+            }
+        } else if ticket.replace(arg.clone()).is_some() {
+            return Err("more than one ticket given".to_string());
+        }
+    }
+    let ticket = ticket.ok_or_else(|| "a ticket is required".to_string())?;
+    let (id, pid) = match (id, pid) {
+        (Some(i), None) => (Some(i), None),
+        (None, Some(p)) => (None, Some(p)),
+        (Some(_), Some(_)) => return Err("stop takes exactly one of --id or --pid, not both".to_string()),
+        (None, None) => return Err("stop needs exactly one of --id or --pid".to_string()),
+    };
+    Ok(StopArgs {
+        ticket,
+        id,
+        pid,
+        grace_ms: grace.unwrap_or(DEFAULT_GRACE_MS),
+        dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()),
+    })
+}
+
+/// Remove the process entry (and the `<id>.port` entry when `port_live`) — the tail of the 0 answer
+/// (stopped) and of both 3 answers (already-gone, pid-reused). Err names the manifest refusal; the file is
+/// unchanged on Err.
+fn remove_stopped(dir: &Path, ticket: &str, id: &str, port_live: bool) -> Result<(), String> {
+    manifest::apply(dir, ticket, &manifest::Op::Remove { id }, now_ms()).map_err(|e| e.to_string())?;
+    if port_live {
+        let port_id = format!("{id}.port");
+        manifest::apply(dir, ticket, &manifest::Op::Remove { id: &port_id }, now_ms()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// `harness process stop` (#183). Every refusal answers 2 with NOTHING signalled and the manifest
+/// byte-identical; the two ends-without-signalling answers are 3 (already-gone, pid-reused — the entries
+/// are removed, a stale record must not survive); 4 means signalled but the death could not be PROVEN (the
+/// entry is KEPT so a later stop can retry). The full check order is the module header.
+fn stop_cmd(a: &[String]) -> i32 {
+    let args = match parse_stop(a) {
+        Ok(x) => x,
+        Err(e) => return fail(&e),
+    };
+    if !crate::events::token_ok(&args.ticket) {
+        return fail("ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')");
+    }
+    if let Some(id) = &args.id {
+        if !crate::events::token_ok(id) {
+            return fail("id must be a plain token (lowercase letters, digits, '-', '_', '.')");
+        }
+    }
+    let dir = PathBuf::from(&args.dir);
+    // The supervisor lock is held for the whole stop (like the whole start), so two stops of one entry
+    // cannot both pass the live-entry check: the loser reads the sheet AFTER the winner's removes.
+    let _lock = match lock_ticket(&dir, &args.ticket) {
+        Ok(l) => l,
+        Err(e) => return fail(&e),
+    };
+    let read = match manifest::read_manifest(&dir, &args.ticket) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    if !read.is_clean() {
+        return fail(&damage_msg(&read));
+    }
+    // Check 2: the target must be a LIVE process entry of THIS ticket — by `--id`, or a `--pid` matched
+    // against the live process entries. A pid not listed here, including one listed only on another
+    // ticket, is never signalled.
+    let found = match (&args.id, args.pid) {
+        (Some(want), _) => read.live.iter().find(|e| e.id == *want).map(|e| (e.id.clone(), e.target.clone())),
+        (None, Some(pid)) => read
+            .live
+            .iter()
+            .find(|e| matches!(&e.target, Target::Process { pid: p, .. } if *p == pid))
+            .map(|e| (e.id.clone(), e.target.clone())),
+        (None, None) => None,
+    };
+    let Some((id, target)) = found else {
+        return fail(&match (&args.id, args.pid) {
+            (Some(w), _) => format!("id {w} is not a live entry of ticket {}", args.ticket),
+            (None, Some(p)) => format!("pid {p} is not a live entry of ticket {}", args.ticket),
+            (None, None) => unreachable!("parse_stop answers a usage error when no selector is given"),
+        });
+    };
+    let Target::Process { pid, pid_start_ms: recorded } = target else {
+        return fail(&format!("id {id} is not a live process entry of ticket {}", args.ticket));
+    };
+    let port_live = read.live.iter().any(|e| e.id == format!("{id}.port"));
+    // Check 3: liveness through the absolute-path helper. Provably no such process -> already-gone (3,
+    // entries removed); a helper that cannot run, or an answer that proves nothing -> unknown -> 2, kept.
+    match probe_alive_at(Path::new("/bin/kill"), pid) {
+        Liveness::Alive => {}
+        Liveness::NoSuch => {
+            return match remove_stopped(&dir, &args.ticket, &id, port_live) {
+                Ok(()) => {
+                    eprintln!("harness: {id} is already-gone: pid {pid} is provably no such process; nothing signalled, entries removed");
+                    3
+                }
+                Err(e) => fail(&e),
+            };
+        }
+        Liveness::Denied => {
+            return fail(&format!("pid {pid} answers the liveness probe but is not ours to signal (kill reports no permission); nothing signalled"));
+        }
+        Liveness::Unknown(e) => return fail(&e),
+    }
+    // Check 4: identity — the live pid's start time must equal the recorded one, else the number was
+    // re-used: nothing signalled, the stale entries removed (the recorded process must have exited).
+    match probe_identity(pid, recorded) {
+        Identity::Same => {}
+        Identity::Reused => {
+            return match remove_stopped(&dir, &args.ticket, &id, port_live) {
+                Ok(()) => {
+                    eprintln!("harness: {id} pid-reused: pid {pid} no longer starts at the time the sheet records; nothing signalled, entries removed");
+                    3
+                }
+                Err(e) => fail(&e),
+            };
+        }
+        Identity::Unknown(e) => return fail(&format!("cannot read the start time of pid {pid}: {e}")),
+    }
+    // Check 5: group leadership — only a leader's own group provably ends with a signal to -<pid>.
+    match probe_leader(pid) {
+        Leadership::Leader => {}
+        Leadership::NotLeader(pgid) => {
+            return fail(&format!(
+                "pid {pid} is not its own process-group leader (pgid {pgid}): a group signal could not prove it ends this process; nothing signalled"
+            ));
+        }
+        Leadership::Unknown(e) => return fail(&format!("cannot prove pid {pid} leads its process group: {e}")),
+    }
+    // Check 6: TERM to the whole group, then a bounded wait. A helper that cannot run refuses with
+    // nothing signalled; whatever happened, the post-signal proof (check 7) decides the answer.
+    if let Ran::NotRun(e) = kill_helper(pid, "TERM") {
+        return fail(&e);
+    }
+    if !wait_group_empty(pid, args.grace_ms) {
+        // Before any KILL: a leader that is still alive must STILL pass the identity check (the grace
+        // window is long enough for a pid to die and its number be re-used), and a group that is already
+        // provably empty gets no KILL. While any member lives, the group id cannot be re-issued as a pid,
+        // so a KILL to a non-empty group cannot hit a stranger.
+        let still_ours = matches!(probe_identity(pid, recorded), Identity::Same);
+        let group_gone = matches!(kill_helper(pid, "0"), Ran::Yes(false));
+        if still_ours && !group_gone {
+            if let Ran::Yes(_) = kill_helper(pid, "KILL") {
+                let _ = wait_group_empty(pid, KILL_SETTLE_MS);
+            }
+        }
+    }
+    // Check 7: the recorded pid must be PROVABLY dead before the answer 0 and the removes. Anything else —
+    // it still answers the probe, or the probe could not run — is 4 with the entry KEPT, so a later stop
+    // can retry.
+    match probe_alive_at(Path::new("/bin/kill"), pid) {
+        Liveness::NoSuch => match remove_stopped(&dir, &args.ticket, &id, port_live) {
+            Ok(()) => {
+                println!("{id}\t{pid}\tstopped");
+                0
+            }
+            Err(e) => {
+                eprintln!("harness: {id} signalled, death not confirmed: the removal failed: {e}; entry kept so a later stop can retry");
+                4
+            }
+        },
+        _ => {
+            eprintln!("harness: {id} signalled, death not confirmed: pid {pid} still answers the liveness probe; entry kept so a later stop can retry");
+            4
+        }
+    }
+}
+
+// ---------------------------------------------------------------- #183: stop (tests)
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// #183 AC 6 (liveness half): a probe whose helper path does not EXIST answers Unknown — never
+    /// NoSuch. "The helper could not run" is "I don't know", and stop maps it to refusal 2 with nothing
+    /// written; mapping it to "gone" (mutant e) turns this red.
+    #[test]
+    fn supervisor_liveness_probe_helper_not_runnable_is_unknown() {
+        let bad = Path::new("/nonexistent-harness-liveness-probe/kill");
+        assert!(!bad.exists(), "the probe helper fixture path must not exist on this host");
+        assert!(
+            matches!(probe_alive_at(bad, std::process::id() as u64), Liveness::Unknown(_)),
+            "a liveness probe whose helper cannot run must answer Unknown, never NoSuch"
+        );
+    }
+
+    /// #183 AC 6 (identity half): a pid whose start time cannot be READ answers Unknown, which stop maps
+    /// to refusal 2 with nothing written — never a blessed match, never "gone".
+    #[test]
+    fn supervisor_identity_probe_unreadable_is_unknown() {
+        // 4_000_000_000 exceeds every mainstream pid space, so no live process can hold it.
+        assert!(
+            matches!(probe_identity(4_000_000_000, 1730000000000), Identity::Unknown(_)),
+            "an unreadable identity must answer Unknown, never Same or Reused"
+        );
+    }
 }
