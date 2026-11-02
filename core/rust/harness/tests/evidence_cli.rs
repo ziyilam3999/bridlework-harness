@@ -362,7 +362,7 @@ fn evidence_caps_the_stream_and_marks_the_cut() {
 
     let bytes = fs::read(rd.join("stdout")).unwrap();
     assert_eq!(bytes.len(), 4_194_304 + 46, "stdout is the cap plus the 46-byte marker");
-    assert!(&bytes[..16] == [0u8; 16], "the first kept bytes are the program's own");
+    assert!(bytes[..16] == [0u8; 16], "the first kept bytes are the program's own");
     let marker = b"\n[harness: output truncated at 4194304 bytes]\n";
     assert_eq!(&bytes[4_194_304..], marker, "the cut ends with the exact marker");
 
@@ -425,7 +425,7 @@ fn evidence_hostile_dirs_refuse_closed() {
             set_up: |r: &Path| {
                 let outside = r.join("../evaded");
                 fs::create_dir_all(&outside).unwrap();
-                std::os::unix::fs::symlink(&outside, &r.join("evidence")).unwrap();
+                std::os::unix::fs::symlink(&outside, r.join("evidence")).unwrap();
             },
         },
         Plant {
@@ -435,7 +435,7 @@ fn evidence_hostile_dirs_refuse_closed() {
                 fs::create_dir_all(&outside).unwrap();
                 // `evidence` itself must be a WELL-FORMED 0700 dir: this plant judges `evidence/proc`.
                 fs::DirBuilder::new().mode(0o700).create(r.join("evidence")).unwrap();
-                std::os::unix::fs::symlink(&outside, &r.join("evidence/proc")).unwrap();
+                std::os::unix::fs::symlink(&outside, r.join("evidence/proc")).unwrap();
             },
         },
         Plant {

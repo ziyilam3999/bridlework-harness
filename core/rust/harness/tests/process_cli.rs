@@ -837,7 +837,7 @@ fn lock_or_early_refusal(file: &Path, id: &str, rx: &mpsc::Receiver<Output>) -> 
     // The handle is opened BEFORE the wait, so the lock itself is one syscall once the third entry is
     // seen; the poll runs at 1 ms because the window between the third entry and the process-line
     // append is itself only a few ms (the waiter spawn + handshake + ps read).
-    let mut lock = OpenOptions::new().read(true).append(true).open(file).unwrap();
+    let lock = OpenOptions::new().read(true).append(true).open(file).unwrap();
     let mut early: Option<Output> = None;
     let deadline = Instant::now() + Duration::from_millis(10_000);
     let mut saw = false;
