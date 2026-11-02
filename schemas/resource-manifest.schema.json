@@ -115,6 +115,21 @@
       }
     },
     {
+      "title": "limit",
+      "description": "A timeout bound on one live process entry, written only by `process start --timeout-ms` right after that entry's add line (#207). Reader rule: valid only for an id that is a live process entry with no limit yet; a remove of the id ends the limit.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "op", "ticket", "id", "timeout_ms", "ts_ms"],
+      "properties": {
+        "v": { "const": 1, "description": "Schema version. A reader refuses any other value." },
+        "op": { "const": "limit" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied. A wall clock that reads before this value is a detectable backward jump and the timeout check refuses." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The id of the live process entry the timeout bounds." },
+        "timeout_ms": { "type": "integer", "minimum": 1, "description": "The timeout in ms, measured from the process's own OS start time (not from the harness's clock), 1..=604800000 (7 days) at the writer." }
+      }
+    },
+    {
       "title": "remove",
       "description": "An entry was given back: the id must be live when the line is written.",
       "type": "object",
