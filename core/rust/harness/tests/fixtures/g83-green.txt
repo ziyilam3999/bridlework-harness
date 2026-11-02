@@ -1,0 +1,10 @@
+# G8.3 green fixture (docs/fix-tier.md): every row dispatches.
+# id|lesson|status|proven|requested|reason|default|want-tier|escalation ('-' = the slot is absent)
+g1|lesson-g1|validated|T2|-|-|T3|T2|no
+g2|lesson-g2|validated|T2|T3|needs-the-wider-context|T2|T3|yes
+g3|lesson-g3|validated|T2|T2|-|T3|T2|no
+g4|lesson-g4|unvalidated|T1|-|-|T3|T3|no
+g5|lesson-g5|retired|T1|T1|-|T3|T3|no
+g6|lesson-g6|validated|unproven|-|-|T3|T3|no
+g7|lesson-g7|validated|unmeasured|T4|needs-the-wider-context|T3|T3|no
+g8|-|-|-|-|-|T3|T3|no
