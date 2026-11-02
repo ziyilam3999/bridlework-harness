@@ -59,10 +59,11 @@ signature (the CAUSE a repeat of which files no second row that week) per kind:
 |---|---|---|
 | `replan_required` | yes | `repo`, `ticket`, `reason` |
 | `launch_refused` | yes | `launch_role`, `matched_entry` (`brief_sha256` is left out: it differs per brief while the cause stays the same) |
+| `gate_fail` | yes | `repo`, `ticket`, `gate_id`, `failure_class` (`head_sha` is left out: it changes with every fix push while the cause stays the same; `result` is constant `fail`) |
 | the other twelve kinds | no — zero rows | — |
 
-Gate FAIL and a sweep `blocked` are not event kinds today, so they cannot map yet (deferred follow-ups to
-ticket 193). The mapper is pure: it never opens or writes the inbox — a later weekly sweep files its rows
+A sweep `blocked` is not an event kind today, so it cannot map yet (a deferred follow-up to
+ticket 193); a gate FAIL maps through `gate_fail` (whose writer is a later ticket). The mapper is pure: it never opens or writes the inbox — a later weekly sweep files its rows
 through `harness friction add`, and because the dedup key below IS the row `id`, the duplicate-id rule of
 `add`/`lint` is a second backstop against double-filing.
 

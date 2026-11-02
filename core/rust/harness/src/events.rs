@@ -5,7 +5,7 @@
 //! Reader: every complete line must be a valid event (else CORRUPTION, the read stops there); a final fragment with no
 //! trailing newline is a TORN TAIL, reported and never parsed. Writer: one `write()` of the whole line, then `sync_all`;
 //! refuses to append onto a torn tail (it would fuse a new event onto garbage). Recovery of a torn tail is not here.
-//! Kinds: fourteen today — the four base kinds (the PRE-B v2 shape with the run identity) and the ten P1b kinds
+//! Kinds: fifteen today — the four base kinds (the PRE-B v2 shape with the run identity) and the eleven P1b kinds
 //! (payload kinds, no identity fields yet). Each kind's exact key set, value shapes and `v` are declared ONCE in the
 //! kind table below; the reader, the writer and the schema test all consult that table and nothing else.
 
@@ -23,9 +23,9 @@ pub const LINE_CAP: usize = 4096;
 /// Keys of every v2 base kind, in canonical order (the PRE-B envelope, bytes as on master).
 const KEYS_V2: [&str; 9] = ["v", "kind", "ts_ms", "run_id", "ticket", "repo", "reason", "role", "model"];
 
-/// The single envelope declaration of the ten P1b kinds: the keys each of them carries before its payload. Today it is
-/// the trio every line shares; the PRE-B run identity (`run_id`, `role`, `model`) joins these ten kinds by editing THIS
-/// one list, once a run issuer exists — nowhere else.
+/// The single envelope declaration of the eleven P1b kinds: the keys each of them carries before its payload. Today it
+/// is the trio every line shares; the PRE-B run identity (`run_id`, `role`, `model`) joins these eleven kinds by editing
+/// THIS one list, once a run issuer exists — nowhere else.
 const P1B_ENVELOPE: [&str; 3] = ["v", "kind", "ts_ms"];
 
 /// The reason token of the `run_issued` line a self-issuing invocation appends before its first event.
@@ -158,7 +158,7 @@ enum Cross {
 /// anywhere else, and no literal test value is special-cased in the reader.
 struct KindDef {
     /// Keys before the payload. The four base kinds use `KEYS_V2` (the PRE-B envelope, bytes as on master, v 2); the
-    /// ten P1b kinds share `P1B_ENVELOPE` — the one declaration their envelope lives in.
+    /// eleven P1b kinds share `P1B_ENVELOPE` — the one declaration their envelope lives in.
     envelope: &'static [&'static str],
     /// Payload fields after the envelope, canonical order; empty for the base kinds (their whole shape is the envelope:
     /// the trio plus six plain-token identity keys).
@@ -281,6 +281,20 @@ const QUESTION_CLASS_DEF: KindDef = KindDef {
     cross: Cross::None,
 };
 
+const GATE_FAIL_DEF: KindDef = KindDef {
+    envelope: &P1B_ENVELOPE,
+    fields: &[
+        FieldDef { key: "ticket", shape: Shape::Token },
+        FieldDef { key: "repo", shape: Shape::Token },
+        FieldDef { key: "gate_id", shape: Shape::Token },
+        FieldDef { key: "failure_class", shape: Shape::Token },
+        FieldDef { key: "head_sha", shape: Shape::Sha },
+        FieldDef { key: "result", shape: Shape::OneOf(&["fail"]) },
+    ],
+    v: SCHEMA_VERSION,
+    cross: Cross::None,
+};
+
 impl KindDef {
     /// The full key set in canonical order: envelope keys, then payload keys.
     fn key_list(&self) -> Vec<&'static str> {
@@ -304,10 +318,11 @@ pub enum Kind {
     Quarantined,
     HumanOriginRefused,
     QuestionClass,
+    GateFail,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 14] = [
+    pub const ALL: [Kind; 15] = [
         Kind::Escalation,
         Kind::ReplanRequired,
         Kind::BudgetExceeded,
@@ -322,6 +337,7 @@ impl Kind {
         Kind::Quarantined,
         Kind::HumanOriginRefused,
         Kind::QuestionClass,
+        Kind::GateFail,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -340,6 +356,7 @@ impl Kind {
             Kind::Quarantined => "quarantined",
             Kind::HumanOriginRefused => "human_origin_refused",
             Kind::QuestionClass => "question_class",
+            Kind::GateFail => "gate_fail",
         }
     }
 
@@ -361,6 +378,7 @@ impl Kind {
             Kind::Quarantined => &QUARANTINED_DEF,
             Kind::HumanOriginRefused => &HUMAN_ORIGIN_REFUSED_DEF,
             Kind::QuestionClass => &QUESTION_CLASS_DEF,
+            Kind::GateFail => &GATE_FAIL_DEF,
         }
     }
 
@@ -376,7 +394,7 @@ impl Kind {
     }
 
     /// The four base kinds (the PRE-B v2 shape, bytes as on master): the only kinds writable through the base `Event`
-    /// struct. The ten P1b kinds carry a payload and are written through `Record`.
+    /// struct. The eleven P1b kinds carry a payload and are written through `Record`.
     pub fn is_base(&self) -> bool {
         matches!(self, Kind::Escalation | Kind::ReplanRequired | Kind::BudgetExceeded | Kind::RunIssued)
     }
@@ -1729,7 +1747,7 @@ mod tests {
             }
         }
         assert_eq!(Kind::ALL.iter().filter(|k| k.is_base()).count(), 4);
-        assert_eq!(Kind::ALL.iter().filter(|k| !k.is_base()).count(), 10);
+        assert_eq!(Kind::ALL.iter().filter(|k| !k.is_base()).count(), 11);
     }
 
     #[test]
