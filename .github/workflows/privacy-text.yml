@@ -9,8 +9,6 @@ on:
     types: [created, edited]
   pull_request_review:
     types: [submitted, edited]
-  release:
-    types: [created, edited, published]
 
 permissions:
   contents: read
@@ -20,6 +18,7 @@ permissions:
 jobs:
   text:
     runs-on: ubuntu-latest
+    environment: privacy-gate
     steps:
       - uses: actions/checkout@v4
         with:

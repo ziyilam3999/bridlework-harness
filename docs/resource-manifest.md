@@ -1,6 +1,6 @@
 # Resource manifest (v1)
 
-The resource manifest is the sign-out sheet of a ticket: one durable list of everything the ticket owns — worktrees, temp folders, processes, ports, logs, kept evidence — so cleanup may touch only what is listed. Anything inside the ticket's roots that is NOT on the list is a leftover, to be quarantined (later tickets), never silently trusted. The file survives a crash and survives removal of the ticket's worktree, because it lives outside the roots.
+The resource manifest is the sign-out sheet of a ticket: one durable list of everything the ticket owns — worktrees, temp folders, processes, ports, logs, kept evidence — so cleanup may touch only what is listed. Anything inside the ticket's roots that is NOT on the list is a leftover, to be quarantined by `harness quarantine sweep` (P1B-13, `docs/quarantine.md`), never silently trusted. The file survives a crash and survives removal of the ticket's worktree, because it lives outside the roots.
 
 It is one append-only JSON Lines file per ticket, `<manifest-dir>/<ticket>.jsonl` (default `<manifest-dir>`: `.harness/manifests/` in the working folder, git-ignored; `--dir` overrides it). `schemas/resource-manifest.schema.json` is the machine mirror of the shapes below; a test pins the two together.
 

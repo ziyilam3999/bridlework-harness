@@ -46,7 +46,7 @@ Stable identifiers for the later tickets (P1B-04 node_modules link, P1B-11 clean
 | branch | `ws/<ticket>` (left behind after teardown for the merge policy and the unpushed check) |
 | node_modules link | `<ticket-root>/tree/node_modules`, manifest entry id `node_modules` (class `temp_dir`) — a LINK: remove the link itself, never its contents (the target is the primary's own folder) |
 
-Later tickets find the paths with `harness manifest list <ticket> --dir <manifest-dir>`; they never rebuild them from text. The base sha is not stored (the manifest has no field for it); a later consumer takes `--base` explicitly, as `harness ticket gate` does, or uses the merge-base of `ws/<ticket>`.
+Later tickets find the paths with `harness manifest list <ticket> --dir <manifest-dir>`; they never rebuild them from text. Quarantine of unmanifested leftovers and the one explicit delete step for listed `temp_dir` entries are `harness quarantine sweep` / `harness quarantine delete-listed` (P1B-13, `docs/quarantine.md`). The base sha is not stored (the manifest has no field for it); a later consumer takes `--base` explicitly, as `harness ticket gate` does, or uses the merge-base of `ws/<ticket>`.
 
 ## Output and exit codes
 

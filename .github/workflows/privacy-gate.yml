@@ -11,6 +11,7 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    environment: privacy-gate
     steps:
       - uses: actions/checkout@v4
         with:

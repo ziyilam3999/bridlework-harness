@@ -5,12 +5,14 @@
 //! A refusal is one line naming the offending part of the name.
 //!
 //! Families (the closed allowlist; the role word picks the ONE family the rest must match):
-//! 1. launcher: `<role>-L<n>-t<slug>-<S|M|L>-<model>-<effort>`
+//! 1. launcher: `<role>-L<n>-t<slug>-r<n>-<S|M|L>-<model>-<effort>` (#177); the round token
+//!    `-r<n>` after the task part is optional in the default mode until the P1b cut-over, so the
+//!    pre-#177 roundless five-part form is still accepted there.
 //! 2. `Orchestrator`, exactly.
 //! 3. long (transitional): `<role>-l<n>-<slug>`, `planner-ahead-<slug>`,
 //!    `(governance|risk-review)-p<digit><slug>-signoff`
 //! 4. legacy: the frozen five-row table.
-//! `--new` (the launcher's mode) accepts family 1 only.
+//! `--new` (the launcher's mode) accepts family 1's round form only.
 
 /// Launcher role words: the live launcher's short seat words.
 pub const LAUNCHER_ROLES: [&str; 10] =
@@ -47,13 +49,17 @@ pub struct Verdict {
     pub lane: Option<u64>,
     /// The ticket slug when the family carries one.
     pub ticket: Option<String>,
+    /// The round number when the launcher name carries the round token `-r<n>` (#177).
+    pub round: Option<u64>,
 }
 
 impl Verdict {
     /// The one stdout line of an accepted name. Each family carries exactly the fields its
-    /// read-back defines: the launcher form reads back role, lane and ticket; the long form reads
-    /// back lane and ticket (`-` when the shape carries neither slot's value); the legacy table
-    /// reads back the ticket only; the coordinator name reads back nothing (`lane=- ticket=-`).
+    /// read-back defines: the launcher form reads back role, lane and ticket, plus `round=<n>`
+    /// exactly when the name carries the round token (a roundless line is byte-identical to the
+    /// pre-#177 read-back); the long form reads back lane and ticket (`-` when the shape carries
+    /// neither slot's value); the legacy table reads back the ticket only; the coordinator name
+    /// reads back nothing (`lane=- ticket=-`).
     pub fn line(&self) -> String {
         let lane = match self.lane {
             Some(n) => n.to_string(),
@@ -62,7 +68,11 @@ impl Verdict {
         let ticket = self.ticket.clone().unwrap_or_else(|| "-".to_string());
         match self.kind {
             "launcher" => {
-                format!("ok kind=launcher role={} lane={} ticket={}", self.role, lane, ticket)
+                let round = match self.round {
+                    Some(n) => format!(" round={n}"),
+                    None => String::new(),
+                };
+                format!("ok kind=launcher role={} lane={} ticket={}{}", self.role, lane, ticket, round)
             }
             "legacy" => format!("ok kind=legacy ticket={ticket}"),
             k => format!("ok kind={} lane={} ticket={}", k, lane, ticket),
@@ -72,8 +82,8 @@ impl Verdict {
 
 /// Check one session name against the closed allowlist. `lanes` is the configured lane count (the
 /// upper bound of a legal lane number, `lanes.count`); `new_only` is the launcher's `--new` mode,
-/// which accepts the launcher family only. `Ok` carries the verdict and read-back; `Err` is a
-/// one-line reason naming the offending part.
+/// which accepts the launcher family's round form only. `Ok` carries the verdict and read-back;
+/// `Err` is a one-line reason naming the offending part.
 pub fn check(name: &str, lanes: u64, new_only: bool) -> Result<Verdict, String> {
     if name.is_empty() {
         return Err("name: the session name is empty".to_string());
@@ -84,9 +94,15 @@ pub fn check(name: &str, lanes: u64, new_only: bool) -> Result<Verdict, String> 
         Some(w) => return Err(format!("role: `{w}` is a start word with no family")),
         None => {
             if name == "Orchestrator" {
-                Verdict { kind: "orchestrator", role: "-", lane: None, ticket: None }
+                Verdict { kind: "orchestrator", role: "-", lane: None, ticket: None, round: None }
             } else if let Some((_, ticket)) = LEGACY.iter().find(|(n, _)| *n == name) {
-                Verdict { kind: "legacy", role: "-", lane: None, ticket: ticket.map(|t| t.to_string()) }
+                Verdict {
+                    kind: "legacy",
+                    role: "-",
+                    lane: None,
+                    ticket: ticket.map(|t| t.to_string()),
+                    round: None,
+                }
             } else {
                 return Err(format!(
                     "role: `{}` does not start with a known role word and is not in the legacy table",
@@ -95,11 +111,19 @@ pub fn check(name: &str, lanes: u64, new_only: bool) -> Result<Verdict, String> 
             }
         }
     };
-    if new_only && verdict.kind != "launcher" {
-        return Err(format!(
-            "--new: a `{}` name is not accepted; --new accepts the launcher form only",
-            verdict.kind
-        ));
+    if new_only {
+        if verdict.kind != "launcher" {
+            return Err(format!(
+                "--new: a `{}` name is not accepted; --new accepts the launcher form only",
+                verdict.kind
+            ));
+        }
+        if verdict.round.is_none() {
+            return Err(
+                "round: the name carries no round token; --new accepts the round form only (`-r<n>` after the task part)"
+                    .to_string(),
+            );
+        }
     }
     Ok(verdict)
 }
@@ -130,13 +154,23 @@ fn starts_word(name: &str, w: &str) -> bool {
     name.len() > w.len() + 1 && name.starts_with(w) && name[w.len()] == b'-'
 }
 
-/// Family 1: `<role>-L<n>-t<slug>-<S|M|L>-<model>-<effort>`. Each part is checked in order and the
-/// first bad one is named; a part count other than five is a task-part defect by construction
-/// (every other part is hyphen-free).
+/// Family 1: `<role>-L<n>-t<slug>-r<n>-<S|M|L>-<model>-<effort>` (#177), with the round token
+/// optional in the default mode until the P1b cut-over (the roundless pre-#177 five-part form).
+/// Each part is checked in order and the first bad one is named; a part count other than the
+/// form's is a task-part defect by construction (every other part is hyphen-free). A third
+/// segment beginning with `r` or `R` claims the round slot — no size, model or effort word can,
+/// so no valid name is ambiguous — and a malformed claim is refused naming `round`.
 fn launcher(name: &str, word: &'static str, lanes: u64) -> Result<Verdict, String> {
     let rest = &name[word.len() + 1..];
     let segs: Vec<&str> = rest.split('-').collect();
-    if segs.len() > 5 {
+    let round_slot = matches!(segs.get(2), Some(s) if s.starts_with('r') || s.starts_with('R'));
+    if segs.len() > if round_slot { 6 } else { 5 } {
+        if round_slot {
+            return Err(format!(
+                "round: {} `-`-separated parts follow the role word, 6 expected with the round token (only one round token is allowed and the task slug cannot contain `-`)",
+                segs.len()
+            ));
+        }
         return Err(format!(
             "task: {} `-`-separated parts follow the role word, 5 expected (the task slug cannot contain `-`)",
             segs.len()
@@ -153,22 +187,30 @@ fn launcher(name: &str, word: &'static str, lanes: u64) -> Result<Verdict, Strin
             .to_string(),
         None => return Err("task: the `t<slug>` part is missing".to_string()),
     };
-    match segs.get(2) {
+    let mut at = 2;
+    let mut round = None;
+    if round_slot {
+        let s = segs[2];
+        round = Some(round_number(s)
+            .ok_or_else(|| format!("round: `{s}` is not `r<n>`, a round number 1..=999999 with no leading zero"))?);
+        at = 3;
+    }
+    match segs.get(at) {
         Some(&"S") | Some(&"M") | Some(&"L") => {}
         Some(s) => return Err(format!("size: `{s}` is not one of S, M, L")),
         None => return Err("size: the size part is missing".to_string()),
     }
-    match segs.get(3) {
+    match segs.get(at + 1) {
         Some(s) if MODELS.contains(s) => {}
         Some(s) => return Err(format!("model: `{s}` is not a known model word")),
         None => return Err("model: the model part is missing".to_string()),
     }
-    match segs.get(4) {
+    match segs.get(at + 2) {
         Some(s) if EFFORTS.contains(s) => {}
         Some(s) => return Err(format!("effort: `{s}` is not a known effort word")),
         None => return Err("effort: the effort part is missing".to_string()),
     }
-    Ok(Verdict { kind: "launcher", role: word, lane: Some(lane), ticket: Some(ticket) })
+    Ok(Verdict { kind: "launcher", role: word, lane: Some(lane), ticket: Some(ticket), round })
 }
 
 /// Family 3 (transitional): `<role>-l<n>-<slug>`, `planner-ahead-<slug>`,
@@ -184,14 +226,20 @@ fn long(name: &str, word: &'static str, lanes: u64) -> Result<Verdict, String> {
         if !lower_slug(tail) {
             return Err(format!("task: `{tail}` is not a slug of lowercase letters, digits and `-`"));
         }
-        return Ok(Verdict { kind: "long", role: word, lane: Some(lane), ticket: Some(tail.to_string()) });
+        return Ok(Verdict {
+            kind: "long",
+            role: word,
+            lane: Some(lane),
+            ticket: Some(tail.to_string()),
+            round: None,
+        });
     }
     if word == "planner" {
         if let Some(slug) = rest.strip_prefix("ahead-") {
             if !lower_slug(slug) {
                 return Err(format!("task: `{slug}` is not a slug of lowercase letters, digits and `-`"));
             }
-            return Ok(Verdict { kind: "long", role: word, lane: None, ticket: Some(slug.to_string()) });
+            return Ok(Verdict { kind: "long", role: word, lane: None, ticket: Some(slug.to_string()), round: None });
         }
     }
     if word == "governance" || word == "risk-review" {
@@ -201,7 +249,7 @@ fn long(name: &str, word: &'static str, lanes: u64) -> Result<Verdict, String> {
                     && inner.as_bytes()[0].is_ascii_digit()
                     && inner.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
                 if ok {
-                    return Ok(Verdict { kind: "long", role: word, lane: None, ticket: None });
+                    return Ok(Verdict { kind: "long", role: word, lane: None, ticket: None, round: None });
                 }
                 return Err(format!("task: `{rest}` is not `p<digit><slug>-signoff`"));
             }
@@ -225,6 +273,23 @@ fn lane_number(seg: &str, letter: char, lanes: u64) -> Option<u64> {
     }
     let n: u64 = digits.parse().ok()?;
     if n < 1 || n > lanes {
+        return None;
+    }
+    Some(n)
+}
+
+/// `r` plus 1..=6 digits: the round token has one spelling (#177) — digits only, no leading zero,
+/// never zero.
+fn round_number(seg: &str) -> Option<u64> {
+    let digits = seg.strip_prefix('r')?;
+    if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    if n < 1 {
         return None;
     }
     Some(n)
@@ -508,13 +573,57 @@ mod tests {
     #[test]
     fn new_mode_accepts_the_launcher_form_only() {
         accept("exec-L1-t113-M-son-med", 4);
-        let e = check("exec-L1-t113-M-son-med", 4, true);
+        // #177 contract change: --new takes the round form only, so the ok-assertion moved
+        let e = check("exec-L1-t113-r1-M-son-med", 4, true);
         assert!(e.is_ok(), "{e:?}");
         for name in ["execution-l1-p1a13", "builder1-p1a13", "Orchestrator", "planner-ahead-pre5", "governance-p1a-signoff"] {
             match check(name, 4, true) {
                 Ok(v) => panic!("--new must refuse: {name}: {v:?}"),
                 Err(e) => assert!(e.contains("--new"), "{name}: {e}"),
             }
+        }
+    }
+
+    // ---- #177: the round token ----
+
+    #[test]
+    fn round_form_read_back_and_twins() {
+        assert_eq!(
+            accept("e-rvw-L2-t180-r2-M-opu-hig", 4).line(),
+            "ok kind=launcher role=e-rvw lane=2 ticket=180 round=2"
+        );
+        // the roundless line is byte-identical to today
+        assert_eq!(
+            accept("e-rvw-L2-t180-M-opu-hig", 4).line(),
+            "ok kind=launcher role=e-rvw lane=2 ticket=180"
+        );
+        // the round digit boundaries: one digit and the six-digit cap
+        accept("exec-L1-t113-r1-M-son-med", 4);
+        accept("exec-L1-t113-r999999-M-son-med", 4);
+        // every malformed spelling is refused naming `round`
+        for name in [
+            "exec-L1-t113-r0-M-son-med",
+            "exec-L1-t113-r01-M-son-med",
+            "exec-L1-t113-r-M-son-med",
+            "exec-L1-t113-R2-M-son-med",
+            "exec-L1-t113-r1234567-M-son-med",
+            "exec-L1-t113-r1x-M-son-med",
+            "exec-L1-t113-r1-r2-M-son-med",
+        ] {
+            refuse(name, 4, "round");
+        }
+        // a round token out of place is refused naming a part
+        refuse("exec-L1-r2-t113-M-son-med", 4, "task"); // round before the task part
+        refuse("exec-L1-t113-M-r2-son-med", 4, "task"); // round after the size part
+    }
+
+    #[test]
+    fn new_mode_requires_the_round_form() {
+        let e = check("exec-L1-t113-r1-M-son-med", 4, true);
+        assert!(e.is_ok(), "{e:?}");
+        match check("exec-L1-t113-M-son-med", 4, true) {
+            Ok(v) => panic!("--new must refuse the roundless form: {v:?}"),
+            Err(e) => assert!(e.contains("round"), "the refusal must name `round`: {e}"),
         }
     }
 }

@@ -222,12 +222,14 @@ fn read_back_lines() {
 }
 
 // ---- AC 10: --new accepts the launcher form only ----
+// #177 contract change: under --new the launcher form must carry the round token (`-r<n>`),
+// so the accepted name below is the round form, not the roundless one.
 
 #[test]
 fn new_flag_accepts_the_launcher_form_only() {
     let t = Tmp::new();
     let c4 = t.config(4);
-    let o = run(&check_name("exec-L1-t113-M-son-med", &c4, &["--new"]));
+    let o = run(&check_name("exec-L1-t113-r1-M-son-med", &c4, &["--new"]));
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
     for name in ["execution-l1-p1a13", "builder1-p1a13", "Orchestrator"] {
         let o = run(&check_name(name, &c4, &["--new"]));
@@ -235,6 +237,85 @@ fn new_flag_accepts_the_launcher_form_only() {
         assert!(out(&o).is_empty());
         assert!(err(&o).contains("--new"), "{name}: {}", err(&o));
     }
+}
+
+// ---- AC 1 / #177: the round token reads back ----
+
+#[test]
+fn round_token_reads_back() {
+    let t = Tmp::new();
+    let c4 = t.config(4);
+    let o = run(&check_name("e-rvw-L2-t180-r2-M-opu-hig", &c4, &[]));
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(out(&o), "ok kind=launcher role=e-rvw lane=2 ticket=180 round=2\n");
+    // the roundless line is byte-identical to today (the AC 2 guard)
+    let o = run(&check_name("e-rvw-L2-t180-M-opu-hig", &c4, &[]));
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(out(&o), "ok kind=launcher role=e-rvw lane=2 ticket=180\n");
+    // the round digit boundaries: one digit and the six-digit cap
+    for (name, line) in [
+        ("exec-L1-t113-r1-M-son-med", "ok kind=launcher role=exec lane=1 ticket=113 round=1"),
+        ("exec-L1-t113-r999999-M-son-med", "ok kind=launcher role=exec lane=1 ticket=113 round=999999"),
+    ] {
+        let o = run(&check_name(name, &c4, &[]));
+        assert_eq!(code(&o), 0, "{name}: stderr: {}", err(&o));
+        assert_eq!(out(&o).trim(), line, "{name}");
+    }
+}
+
+// ---- AC 3 / #177: --new requires the round token ----
+
+#[test]
+fn new_flag_requires_the_round_token() {
+    let t = Tmp::new();
+    let c4 = t.config(4);
+    let o = run(&check_name("exec-L1-t113-r1-M-son-med", &c4, &["--new"]));
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    let o = run(&check_name("exec-L1-t113-M-son-med", &c4, &["--new"]));
+    assert_eq!(code(&o), 1);
+    assert!(out(&o).is_empty());
+    assert!(err(&o).contains("round"), "{}", err(&o));
+    // a malformed round token is refused under --new too, still naming `round`
+    let o = run(&check_name("exec-L1-t113-r0-M-son-med", &c4, &["--new"]));
+    assert_eq!(code(&o), 1);
+    assert!(err(&o).contains("round"), "{}", err(&o));
+}
+
+// ---- AC 4 / #177: the round twins, each refusal naming its part ----
+
+#[test]
+fn round_twins_are_refused() {
+    let t = Tmp::new();
+    let c4 = t.config(4);
+    // the positive half: AC 1's round name passes in the default mode
+    let o = run(&check_name("e-rvw-L2-t180-r2-M-opu-hig", &c4, &[]));
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    // one malformed round spelling per twin, each refused naming `round`
+    for name in [
+        "exec-L1-t113-r0-M-son-med",       // round zero
+        "exec-L1-t113-r01-M-son-med",      // leading zero
+        "exec-L1-t113-r-M-son-med",        // no digits
+        "exec-L1-t113-R2-M-son-med",       // uppercase R
+        "exec-L1-t113-r1234567-M-son-med", // seven digits
+        "exec-L1-t113-r1-r2-M-son-med",    // two round tokens
+    ] {
+        let o = run(&check_name(name, &c4, &[]));
+        assert_eq!(code(&o), 1, "{name}: exit");
+        assert!(out(&o).is_empty(), "{name}: refusal stdout must be empty");
+        assert!(err(&o).contains("round"), "{name}: refusal must name `round`: {}", err(&o));
+        assert!(err(&o).contains(name), "{name}: refusal must name the name: {}", err(&o));
+    }
+    // the round token before the task part: refused naming `task` or `round`
+    let o = run(&check_name("exec-L1-r2-t113-M-son-med", &c4, &[]));
+    assert_eq!(code(&o), 1);
+    let e = err(&o);
+    assert!(e.contains("task") || e.contains("round"), "round before task must name a part: {e}");
+    // the round token after the size part: refused naming a part
+    let o = run(&check_name("exec-L1-t113-M-r2-son-med", &c4, &[]));
+    assert_eq!(code(&o), 1);
+    let e = err(&o);
+    let parts = ["lane", "task", "round", "size", "model", "effort", "role"];
+    assert!(parts.iter().any(|p| e.contains(p)), "round after size must name a part: {e}");
 }
 
 // ---- AC 11: no config source is an error, never a default count ----

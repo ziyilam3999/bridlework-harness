@@ -333,7 +333,8 @@ fn config_cmd(a: &[String]) -> i32 {
 const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new]";
 
 /// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
-/// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->`); 1 the name is
+/// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->` for the launcher
+/// family, plus ` round=<n>` exactly when the name carries the round token `r<n>`, #177); 1 the name is
 /// refused (stdout empty, one stderr line naming the name and the reason); 2 usage or config error
 /// (stdout empty). The config source is resolved exactly as `harness config check` resolves it:
 /// `--config`, else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -504,6 +505,15 @@ pub fn run(mut args: Vec<String>) -> i32 {
             return 2;
         }
     }
+    if !args.is_empty() && args[0] == "quarantine" {
+        #[cfg(unix)]
+        return crate::quarantine::quarantine_cmd(&args[1..]);
+        #[cfg(not(unix))]
+        {
+            eprintln!("harness: error: quarantine is not available on this platform");
+            return 2;
+        }
+    }
     if !args.is_empty() && args[0] == "status" {
         return crate::status::status_cmd(&args[1..]);
     }
@@ -514,8 +524,11 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "fixtures" {
         return fixtures_cmd(&args[1..]);
     }
+    if !args.is_empty() && args[0] == "friction" {
+        return crate::friction::friction_cmd(&args[1..], testmode);
+    }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | status <ticket-file> | process start <ticket> ... | workspace create <ticket-file> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|close-check | status <ticket-file> ... | process start <ticket> ... | workspace create <ticket-file> ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";
