@@ -1,0 +1,77 @@
+name: privacy-gate-next
+
+# Base-only privacy gate (ticket 163). It runs on the base side: the checkout, the engine build and the script are all the
+# BASE commit. The pull request is only read as git data (fetched into a ref, never checked out), so no PR file is on disk
+# and nothing from the PR is built, sourced or run. Only the Scan step holds the list secret.
+# PR-A: job `gate-next` is NOT a required check. A later PR renames it.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  gate-next:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: privacy-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Event read
+        run: |
+          python3 -I - >> "$GITHUB_ENV" <<'PY'
+          import json, os, re, sys
+          ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+          pr = ev.get("pull_request")
+          if not isinstance(pr, dict):
+              sys.exit("gate: no pull request in the event")
+          n = pr.get("number")
+          if isinstance(n, bool) or not isinstance(n, (int, str)):
+              sys.exit("gate: bad PR number")
+          n = str(n)
+          if not re.fullmatch(r"[0-9]+", n):
+              sys.exit("gate: bad PR number")
+          head = pr.get("head")
+          sha = head.get("sha") if isinstance(head, dict) else None
+          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit("gate: bad head sha")
+          hrepo = head.get("repo") if isinstance(head, dict) else None
+          hname = hrepo.get("full_name") if isinstance(hrepo, dict) else None
+          brepo = ev.get("repository")
+          bname = brepo.get("full_name") if isinstance(brepo, dict) else None
+          if not isinstance(hname, str) or not isinstance(bname, str) or hname != bname:
+              sys.exit("gate: fork pull request refused")
+          print("PR_NUMBER=" + n)
+          print("PR_HEAD_SHA=" + sha)
+          PY
+      - name: Fetch data
+        run: |
+          git config core.hooksPath /dev/null
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/gate/head"
+          got=$(git rev-parse refs/gate/head)
+          case "$got" in *[!0-9a-f]*) echo "gate: fetched head is not hex" >&2; exit 1 ;; esac
+          if [ "${#got}" -ne 40 ]; then echo "gate: fetched head is not 40 chars" >&2; exit 1; fi
+          if [ "$got" != "$PR_HEAD_SHA" ]; then echo "gate: fetched head differs from the event head" >&2; exit 1; fi
+          mb=$(git merge-base refs/gate/head HEAD)
+          case "$mb" in *[!0-9a-f]*) echo "gate: merge base is not hex" >&2; exit 1 ;; esac
+          if [ "${#mb}" -ne 40 ]; then echo "gate: merge base is not 40 chars" >&2; exit 1; fi
+          echo "GATE_MERGE_BASE=$mb" >> "$GITHUB_ENV"
+          git worktree add --no-checkout --detach "$RUNNER_TEMP/gate-data" refs/gate/head
+      - name: Build engine
+        run: cargo build --release --locked
+        working-directory: core/rust
+      - name: Scan
+        env:
+          HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}
+        run: |
+          rc=0
+          base="$PWD"
+          cd "$RUNNER_TEMP/gate-data"
+          sh "$base/ci/privacy-gate.sh" --tree || rc=1
+          sh "$base/ci/privacy-gate.sh" --range refs/gate/head "^$GATE_MERGE_BASE" || rc=1
+          exit "$rc"

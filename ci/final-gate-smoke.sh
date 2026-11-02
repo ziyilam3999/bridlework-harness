@@ -218,7 +218,9 @@ elif G -C "$root" rev-parse --verify -q 'HEAD^1' >/dev/null; then oldbase='HEAD^
 else oldbase=""; fi
 if [ -z "$oldbase" ]; then
   echo "skip B2-old-workflows-untouched (no base to compare with)"
-elif G -C "$root" diff --quiet "$oldbase" -- .github/workflows/privacy-gate.yml .github/workflows/privacy-text.yml .github/workflows/rust-test.yml 2>/dev/null; then
+# ticket 163 changes privacy-gate.yml and privacy-text.yml on purpose (they now declare environment: privacy-gate), so only
+# rust-test.yml stays frozen here; the privacy workflows are covered by ci/gate-secret-smoke.sh static.
+elif G -C "$root" diff --quiet "$oldbase" -- .github/workflows/rust-test.yml 2>/dev/null; then
   ok B2-old-workflows-untouched
 else
   bad B2-old-workflows-untouched

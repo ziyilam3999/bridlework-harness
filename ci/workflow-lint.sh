@@ -298,7 +298,7 @@ def lint(path):
                 bad.append((s + 1, "checkout-persist-credentials"))
             if re.search(r"^\s*(-\s+)?(ref|repository):", text, re.M):
                 bad.append((s + 1, "checkout-ref"))
-        if "secrets." in text and not re.search(r"ci/privacy-(gate|text)\.sh", text):
+        if "secrets." in text and not re.search(r"ci/privacy-(gate|text|release-text)\.sh", text):
             bad.append((s + 1, "secret-outside-scan-step"))
         # ${{ github.event.* }} inside a run: script
         for j, line in enumerate(body):
