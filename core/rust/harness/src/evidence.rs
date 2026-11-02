@@ -18,7 +18,10 @@
 //! waiter re-verifies the run dir, creates the capture files, spawns the program in the program's OWN
 //! group (group id = program pid, exactly as before, so `stop`'s checks are unchanged), reports
 //! `ok <pid> <start_ms>`, reaps the program as soon as it exits, drains both pipes (a bounded 2000 ms
-//! past the exit for grandchildren that hold them), and writes the ending atomically (temp name, sync,
+//! past the exit for grandchildren that hold them — and the bound HOLDS even while a grandchild keeps
+//! a pipe open forever: the copiers publish their progress and never hold a lock across a read, so the
+//! record with `output_open_after_exit:true` lands and the waiter ends), and writes the ending
+//! atomically (temp name, sync,
 //! rename): a reader sees a whole record or no `exit` file at all. No `exit` file means "outcome
 //! unknown", NEVER success. It is not a daemon: it lives exactly as long as the program (plus the
 //! bounded drain) and nothing runs when no ticket program runs.
@@ -27,9 +30,10 @@
 //! appended, `start` writes a `commit` line and closes the pipe. A waiter that sees end-of-input
 //! WITHOUT the commit word kills its program (SIGKILL through `/bin/kill` by ABSOLUTE path — PATH
 //! never decides; the std `Child::kill` needs the Child handle, which the event-driven reaper below
-//! holds inside a blocking `wait()`) and records `committed:false`, so a start that refuses after the
-//! spawn, or dies hard after it, no longer leaves a running unlisted program — unless the waiter
-//! itself is killed too (then there is no record at all: unknown).
+//! holds inside a blocking `wait()`), but only while the program is not yet reaped: past the reap the
+//! pid is free and a recycled pid must never be signalled. It records `committed:false`, so a start
+//! that refuses after the spawn, or dies hard after it, no longer leaves a running unlisted program —
+//! unless the waiter itself is killed too (then there is no record at all: unknown).
 //!
 //! The reap itself is EVENT-DRIVEN, not polled: the waiter's main thread blocks in `Child::wait()`, so
 //! the program is reaped the instant it dies. A polled `try_wait` would leave a zombie for up to one
@@ -205,14 +209,19 @@ impl StreamStat {
 /// reading and discarding to end-of-input whatever happens to the writer. Raw bytes: nothing is ever
 /// decoded, lossified or rewritten.
 pub fn capped_copy<R: Read, W: Write>(r: &mut R, w: &mut W) -> StreamStat {
-    let mut stat = StreamStat::default();
-    capped_copy_into(r, w, &mut stat);
-    stat
+    capped_copy_publishing(r, w, &mut |_| {})
 }
 
-/// `capped_copy` writing into a caller-owned stat (so a copier thread's partial progress is readable
-/// while it runs).
-pub fn capped_copy_into<R: Read, W: Write>(r: &mut R, w: &mut W, stat: &mut StreamStat) {
+/// `capped_copy` with a LIVE publisher: after every chunk (and at every return) the current stat is
+/// handed to `publish` — with NO lock of the caller's held across a read (#209 fix round 1, F1). A
+/// copier thread publishes into a shared stat by locking only around the publish itself, so a main
+/// thread that snapshots the shared stat past the drain bound is never blocked by a pipe a grandchild
+/// still holds open. The returned stat is the final one (identical to the last publish).
+pub fn capped_copy_publishing<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    publish: &mut dyn FnMut(&StreamStat),
+) -> StreamStat {
     // `truncated` claims ONLY the cap: `kept` reached STREAM_CAP with bytes still coming. A WRITE
     // error loses data too, but that is `<stream>_error`'s story — a flag named "truncated" must not
     // claim a marker that was never written.
@@ -220,11 +229,13 @@ pub fn capped_copy_into<R: Read, W: Write>(r: &mut R, w: &mut W, stat: &mut Stre
     let mut buf = vec![0u8; CHUNK];
     let mut kept: u64 = 0; // bytes of the program's own output actually written
     let mut marked = false; // the one-time marker
+    let mut stat = StreamStat::default();
     loop {
         match r.read(&mut buf) {
             Ok(0) => {
                 stat.truncated = cut_by_cap(kept, stat.bytes);
-                return;
+                publish(&stat);
+                return stat;
             }
             Ok(n) => {
                 stat.bytes += n as u64;
@@ -244,11 +255,13 @@ pub fn capped_copy_into<R: Read, W: Write>(r: &mut R, w: &mut W, stat: &mut Stre
                     }
                 }
                 stat.truncated = cut_by_cap(kept, stat.bytes);
+                publish(&stat);
             }
             Err(e) => {
                 stat.err_kind(&e);
                 stat.truncated = cut_by_cap(kept, stat.bytes);
-                return;
+                publish(&stat);
+                return stat;
             }
         }
     }
@@ -448,11 +461,29 @@ fn kill_pid_abs(pid: u32) -> bool {
 }
 
 /// Watch the commit pipe for the literal `commit` line. The verdict is delivered the moment it is
-/// known, and a `No` verdict KILLS the program at once (while it still runs — a refused or dead start
-/// must not leave a running unlisted program behind).
-fn watch_commit(verdict: std::sync::Arc<std::sync::Mutex<Option<bool>>>, pid: u32) {
+/// known, and a `No` verdict KILLS the program at once — but only while it is NOT yet reaped (F5):
+/// after the main thread's `wait()` the pid is free, and a recycled same-user pid must never be
+/// signalled. `reaped` is that fact, shared with the main thread.
+fn watch_commit(
+    verdict: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    pid: u32,
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    watch_commit_on(std::io::stdin(), kill_pid_abs, pid, verdict, reaped);
+}
+
+/// `watch_commit` with the input and the kill injected, so the decision table is unit-testable: the
+/// reader and the killer are parameters, the verdict lands in the shared slot exactly once.
+fn watch_commit_on<R: Read + Send + 'static, K: Fn(u32) -> bool + Send + 'static>(
+    sin: R,
+    kill: K,
+    pid: u32,
+    verdict: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     thread::spawn(move || {
-        let mut sin = std::io::stdin();
+        let mut sin = sin;
+        let kill = kill;
         let mut line: Vec<u8> = Vec::new();
         let mut byte = [0u8; 1];
         // one verdict, then the thread ends: the `commit` word, or end-of-input (a read error counts
@@ -476,9 +507,10 @@ fn watch_commit(verdict: std::sync::Arc<std::sync::Mutex<Option<bool>>>, pid: u3
                 Err(_) => break false,
             }
         };
-        if !committed {
-            // the program is killed while it still runs; if it is already dead the kill is a no-op
-            let _ = kill_pid_abs(pid);
+        // the program is killed while it still runs and is not yet reaped; the reaped check is what
+        // keeps a freed — possibly recycled — pid out of the signal's way (F5)
+        if !committed && !reaped.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = kill(pid);
         }
         *verdict.lock().expect("the commit verdict lock") = Some(committed);
     });
@@ -560,7 +592,10 @@ pub fn waiter_cmd(a: &[String]) -> i32 {
     }
 
     // The copier threads own the program's pipes and the capture files; the stats are shared so the
-    // record can carry partial truth if a pipe stays open past the drain bound.
+    // record can carry partial truth if a pipe stays open past the drain bound. Each publish locks
+    // the shared stat only for the instant of the assignment — NEVER across a read — so the main
+    // thread's snapshot after the drain bound cannot block on a pipe a grandchild still holds open
+    // (#209 fix round 1, F1: the bound is a bound in every path).
     let stdout_pipe = child.stdout.take().expect("stdout was piped");
     let stderr_pipe = child.stderr.take().expect("stderr was piped");
     let (out_done_tx, out_done_rx) = mpsc::channel::<()>();
@@ -572,9 +607,9 @@ pub fn waiter_cmd(a: &[String]) -> i32 {
         thread::spawn(move || {
             let mut w = out_file;
             let mut r = stdout_pipe;
-            let mut st = stat.lock().expect("the stdout stat lock");
-            capped_copy_into(&mut r, &mut w, &mut st);
-            drop(st);
+            capped_copy_publishing(&mut r, &mut w, &mut |s| {
+                *stat.lock().expect("the stdout stat lock") = s.clone();
+            });
             let _ = out_done_tx.send(());
         });
     }
@@ -583,14 +618,18 @@ pub fn waiter_cmd(a: &[String]) -> i32 {
         thread::spawn(move || {
             let mut w = err_file;
             let mut r = stderr_pipe;
-            let mut st = stat.lock().expect("the stderr stat lock");
-            capped_copy_into(&mut r, &mut w, &mut st);
-            drop(st);
+            capped_copy_publishing(&mut r, &mut w, &mut |s| {
+                *stat.lock().expect("the stderr stat lock") = s.clone();
+            });
             let _ = err_done_tx.send(());
         });
     }
     let verdict = std::sync::Arc::new(std::sync::Mutex::new(None::<bool>));
-    watch_commit(verdict.clone(), pid);
+    // The reaped flag (#209 fix round 1, F5): once the main thread's `wait()` has reaped the program,
+    // the pid is free and the watcher's uncommitted `/bin/kill -KILL <pid>` must never fire again — a
+    // recycled same-user pid could be standing in it.
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    watch_commit(verdict.clone(), pid, reaped.clone());
 
     // Main thread: the EVENT-DRIVEN reap. A blocking `wait()` returns the instant the program dies, so
     // no zombie outlives it by even one poll period (`stop`'s post-signal proof would read a zombie as
@@ -608,6 +647,8 @@ pub fn waiter_cmd(a: &[String]) -> i32 {
             None
         }
     };
+    // Reaped: from here the program's pid is free (F5) — the watcher's uncommitted kill must not fire.
+    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
     let duration_ms = spawned.elapsed().as_millis() as u64;
     // The program ended; the commit word may still be a moment away (start appends, then writes it).
     // Bounded wait for the watcher's verdict; past the bound the run counts as uncommitted.
@@ -827,5 +868,67 @@ mod tests {
         assert_eq!(st.bytes, input.len() as u64, "the reader was drained to end-of-input");
         assert_eq!(st.error, std::io::ErrorKind::WriteZero.to_string(), "the error kind is recorded");
         assert!(!st.truncated, "nothing was dropped by the CAP; the writer failed instead");
+    }
+
+    /// Fix round 1, F1 (unit half): the copier PUBLISHES its progress — one publish per chunk and one
+    /// at every return — and the last publish is exactly the returned stat, so a main thread that
+    /// snapshots the shared stat past the drain bound holds the whole truth the copier knew. Mutant
+    /// "publish only at return" (the lock held across reads again, in effect) turns this red.
+    #[test]
+    fn publishing_copy_reports_progress_per_chunk() {
+        let input = vec![5u8; 2 * CHUNK + 7];
+        let mut reader = Cursor::new(input.clone());
+        let mut sink = Vec::new();
+        let mut publishes: Vec<StreamStat> = Vec::new();
+        let st = capped_copy_publishing(&mut reader, &mut sink, &mut |s| publishes.push(s.clone()));
+        assert!(publishes.len() >= 3, "one publish per chunk, not only at return: {}", publishes.len());
+        assert_eq!(publishes.last().unwrap(), &st, "the last publish is the returned stat");
+        // intermediate publishes carry PARTIAL truth (bytes still growing)
+        assert!(publishes.iter().any(|p| p.bytes > 0 && p.bytes < st.bytes), "progress was visible before the end");
+        assert_eq!(st.bytes, input.len() as u64);
+    }
+
+    /// Fix round 1, F5: the uncommitted kill fires ONLY while the program is not yet reaped — after the
+    /// main thread's `wait()` the pid is free, and a recycled same-user pid must never be signalled.
+    /// `watch_commit_on` takes the input and the kill as parameters precisely so this table is
+    /// testable. Mutant "drop the reaped check" turns the reaped+EOF case red (the kill fires).
+    #[test]
+    fn the_uncommitted_kill_skips_a_reaped_program() {
+        fn run_case(input: &[u8], reaped: bool) -> (bool, bool) {
+            let verdict = std::sync::Arc::new(std::sync::Mutex::new(None::<bool>));
+            let reaped_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(reaped));
+            let killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let k = killed.clone();
+            watch_commit_on(
+                Cursor::new(input.to_vec()),
+                move |_pid: u32| {
+                    k.store(true, std::sync::atomic::Ordering::SeqCst);
+                    true
+                },
+                4242,
+                verdict.clone(),
+                reaped_flag,
+            );
+            // bounded wait for the watcher's verdict (it is the thread's last act)
+            let deadline = Instant::now() + Duration::from_millis(5000);
+            loop {
+                if let Some(v) = *verdict.lock().unwrap() {
+                    return (v, killed.load(std::sync::atomic::Ordering::SeqCst));
+                }
+                assert!(Instant::now() < deadline, "the watcher never delivered its verdict");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // end-of-input WITHOUT the commit word, program already reaped: NO kill (F5's whole point)
+        let (v, killed) = run_case(b"", true);
+        assert_eq!((v, killed), (false, false), "a reaped program's pid is never signalled");
+        // end-of-input without the commit word, program still running: the kill fires
+        let (v, killed) = run_case(b"", false);
+        assert_eq!((v, killed), (false, true), "a live uncommitted program is killed");
+        // the commit word: no kill, whatever the reap state
+        let (v, killed) = run_case(b"commit\n", true);
+        assert_eq!((v, killed), (true, false), "a committed run kills nothing");
+        let (v, killed) = run_case(b"commit\n", false);
+        assert_eq!((v, killed), (true, false), "a committed run kills nothing");
     }
 }

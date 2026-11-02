@@ -100,7 +100,12 @@ very run created. Since #209 the spawn is a WAITER (in its own group) whose chil
 program's own group), and the rollback runs: the commit pipe closes UNCOMMITTED first — the end-of-input
 is what makes a LIVE waiter kill its program through `/bin/kill` by ABSOLUTE path (never through `PATH`;
 the std `Child::kill` needs the Child handle, which the waiter's event-driven reaping `wait()` holds) —
-then TERM, a bounded wait (5 s), then KILL to the PROGRAM's group through `/bin/kill` by absolute path;
+then a short bounded grace (2 s) in which the waiter does that kill itself and ends. The grace matters
+most on a refused HANDSHAKE, where the group the rollback would signal is the WAITER's own: a signal
+that lands before the waiter has read the end-of-input kills the waiter (and its commit watcher with
+it) while the program it already spawned keeps running. Only what is still alive past the grace gets
+signalled: TERM, a bounded wait (5 s), then KILL to the group the handshake named (the program's group)
+through `/bin/kill` by absolute path;
 then a bounded reap (3 s) of the WAITER, and the std kill of the waiter as the last resort, so a rollback
 can never block forever on something it could not signal. A helper that cannot be RUN is "unknown", never
 "gone" or "empty": the group waits are skipped and the refusal names the unconfirmed kill.
@@ -124,8 +129,8 @@ can never block forever on something it could not signal. A helper that cannot b
   process of a ticket** (P1B-14).
 - **Evidence privacy is not handled here** (P1B-10): capture is raw, byte-for-byte, secret-shaped text kept
   verbatim. **No evidence reader verb and no Done link** (P1B-09; a missing `exit` file reads as unknown,
-  never success). **No evidence retention/teardown** (P1B-09/P1B-14). **No timeouts or step limits**
-  (P1B-06), **no worker-death record** (P1B-07), **no network allow-list** (G1b/P4a).
+  never success). **No evidence retention/teardown** (P1B-09/P1B-14). **No worker-death record**
+  (P1B-07), **no network allow-list** (G1b/P4a).
 - **Waiter limits.** The waiter is killed by SIGKILL = no record (above). If the harness binary is replaced
   between `start` and the waiter spawn, a different binary runs as the waiter (same user only; `current_exe`).
   A same-user writer could swap the run dir between the waiter's re-check and its file creates (0700 dirs;
@@ -146,7 +151,10 @@ exists:
   in its own group; it creates the files, spawns the program in the program's own group, reports
   `ok <pid> <pid_start_ms>`, reaps the program the moment it dies (an event-driven `wait()`, not a poll —
   a zombie must not outlive the death, `stop`'s proof would read it as alive), drains both pipes (at most
-  2000 ms past the exit for grandchildren that hold them), writes `exit` and ends. Not a daemon: nothing
+  2000 ms past the exit for grandchildren that hold them — the bound holds even when a grandchild keeps a
+  pipe open FOREVER: the copiers publish their progress and never hold a lock across a read, so the
+  record lands with `output_open_after_exit:true` and the waiter ends), writes `exit` and ends. Not a
+  daemon: nothing
   runs when no ticket program runs. The waiter is not in the program's group, so `stop`'s TERM/KILL to the
   group does not reach it and it records the signal.
 - **The exit record.** `exit` is ONE line, compact JSON, fixed key order, newline-terminated, every key

@@ -79,6 +79,11 @@ const KILL_SETTLE_MS: u64 = 2000;
 /// The rollback NEVER waits longer than this on a child it could not signal (the std kill runs first, so
 /// this budget only ever names a child that is somehow still alive after it).
 const REAP_BOUND_MS: u64 = 3000;
+/// How long the rollback lets a LIVE waiter act on the uncommitted end-of-input (kill its program
+/// itself and end) before any signal aimed at a group (#209 fix round 1, F2: on a refused handshake
+/// the signalled group is the WAITER's own, and a TERM that lands first kills the waiter — and its
+/// commit watcher with it — while the program it already spawned keeps running).
+const EOF_GRACE_MS: u64 = 2000;
 
 // ---------------------------------------------------------------- command entry
 
@@ -213,44 +218,53 @@ fn reap_bounded(child: &mut Child, budget_ms: u64) -> Result<(), String> {
 /// Stop what THIS invocation just made (the start rollback ONLY). Since #209 the spawn is a WAITER (the
 /// harness binary in its own group) and `pid` is the PROGRAM's group when the handshake named one — the
 /// waiter is not in that group, survives the signal and records the ending — else the waiter's own group.
-/// The commit pipe closes FIRST: the uncommitted end-of-input is what makes a LIVE waiter std-kill its
-/// program (the only PATH-free way to a program the group signal could not reach), so the close must reach
-/// the waiter before any signal aimed at the waiter itself. Then TERM, a bounded wait, KILL to the group
+/// The commit pipe closes UNCOMMITTED FIRST, and the waiter gets a short bounded grace (EOF_GRACE_MS) to
+/// act on it: the uncommitted end-of-input is what makes a LIVE waiter kill its program (the only
+/// PATH-free way to a program the group signal could not reach), and on a refused handshake `pid` IS the
+/// waiter's own group — a signal that lands before the waiter has read the end-of-input kills the waiter
+/// (and its commit watcher with it) while the program it already spawned keeps running (#209 fix round
+/// 1, F2). Only a waiter still alive past the grace, or a group still holding members (a grandchild the
+/// waiter's pid-only kill cannot reach), gets the signals: TERM, a bounded wait, KILL to the group
 /// through `/bin/kill` by absolute path (a helper that cannot be RUN skips the group waits entirely —
 /// unknown is not empty); then a bounded reap of the WAITER (it ends on its own once its program is dead
 /// and its record is written) and the std kill of the waiter as the LAST resort. Ok(()) only when
 /// everything reachable is provably dead; Err carries the reason.
 fn kill_own_spawn(child: &mut Child, pid: u64) -> Result<(), String> {
     let mut reason = None;
-    match kill_helper(pid, "TERM") {
-        Ran::NotRun(e) => reason = Some(e),
-        Ran::Yes(signalled) => {
-            if signalled && !wait_group_empty(pid, DEFAULT_GRACE_MS) {
-                match kill_helper(pid, "KILL") {
-                    Ran::NotRun(e) => {
-                        reason.get_or_insert(e);
-                    }
-                    Ran::Yes(_) => {
-                        // The same proof rule as stop's check 7: "left nothing running" is claimed only
-                        // when the group is PROVABLY empty, never on a discarded probe answer.
-                        if !wait_group_empty(pid, KILL_SETTLE_MS) {
-                            reason.get_or_insert(format!("the spawned group {pid} is not provably empty after the KILL"));
+    // FIRST: the uncommitted close, then the bounded grace. A healthy waiter kills its program itself
+    // and ends inside the grace; `pid`'s group probe then answers empty and no signal is needed at all.
+    drop(child.stdin.take());
+    let waiter_ended = reap_bounded(child, EOF_GRACE_MS).is_ok();
+    if !waiter_ended || !wait_group_empty(pid, KILL_SETTLE_MS) {
+        match kill_helper(pid, "TERM") {
+            Ran::NotRun(e) => reason = Some(e),
+            Ran::Yes(signalled) => {
+                if signalled && !wait_group_empty(pid, DEFAULT_GRACE_MS) {
+                    match kill_helper(pid, "KILL") {
+                        Ran::NotRun(e) => {
+                            reason.get_or_insert(e);
+                        }
+                        Ran::Yes(_) => {
+                            // The same proof rule as stop's check 7: "left nothing running" is claimed only
+                            // when the group is PROVABLY empty, never on a discarded probe answer.
+                            if !wait_group_empty(pid, KILL_SETTLE_MS) {
+                                reason.get_or_insert(format!("the spawned group {pid} is not provably empty after the KILL"));
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    // The uncommitted close must reach a LIVE waiter; then a bounded reap, and the std kill only as the
-    // last resort on a waiter that would not end.
-    drop(child.stdin.take());
-    if let Err(e) = reap_bounded(child, REAP_BOUND_MS) {
-        reason.get_or_insert(e);
-        if let Err(e) = child.kill() {
-            reason.get_or_insert_with(|| format!("cannot kill the waiter pid {} (std): {}", child.id(), e.kind()));
-        }
+        // A waiter that ended inside the grace is already reaped (reap_bounded answers from the cached
+        // status); the std kill runs only as the last resort on a waiter that would not end.
         if let Err(e) = reap_bounded(child, REAP_BOUND_MS) {
             reason.get_or_insert(e);
+            if let Err(e) = child.kill() {
+                reason.get_or_insert_with(|| format!("cannot kill the waiter pid {} (std): {}", child.id(), e.kind()));
+            }
+            if let Err(e) = reap_bounded(child, REAP_BOUND_MS) {
+                reason.get_or_insert(e);
+            }
         }
     }
     match reason {
