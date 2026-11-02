@@ -1,8 +1,8 @@
-# Config contract (v2)
+# Config contract (v3)
 
 The harness reads one settings file. This page is the contract in plain words. `config/harness.example.yaml` is the public example of it, with placeholders only.
 
-Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 adds the required `lanes.count` key; a config written against v1 is refused until it gains the key (intended, fail closed): the lane count is policy the harness refuses to guess.
+Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 added the required `lanes.count` key; v3 adds the required `friction.inbox` key (ticket 154): the path of the friction inbox file (`docs/friction-inbox.md`). A config written against v2 is refused until it gains the key (intended, fail closed): the inbox is where lessons are captured, and the harness refuses to guess where. The operator's real file is updated in the private overlay the day the change merges.
 
 ## 1. One file, one reader, read-only
 
@@ -17,7 +17,7 @@ The config is one text file. The program only reads it. There is no write, set o
 
 ## 3. Shape
 
-Four sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`. Two levels only: a section line (`name:` with nothing after it), then indented `key: value` lines (two spaces). Whole-line `#` comments and blank lines are allowed. Spaces only.
+Five sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`, `friction`. Two levels only: a section line (`name:` with nothing after it), then indented `key: value` lines (two spaces). Whole-line `#` comments and blank lines are allowed. Spaces only.
 
 ### Keys
 
@@ -39,6 +39,7 @@ shadow.p4a_token_budget
 shadow.d2a_token_budget
 shadow.p7_token_budget
 lanes.count
+friction.inbox
 ```
 
 `repos` has no fixed keys: each key is a repo id (section 5). It may be empty.
@@ -46,6 +47,7 @@ lanes.count
 - `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys.
 - `shadow`: per capability, a ticket or dispatch cap (`p1a_cap`, `p4a_cap`, `d2a_cap`, `p7_cap`) and a token budget (`..._token_budget`).
 - `lanes`: `count`, the number of lanes. The session-name check reads it as the upper bound of a legal lane number (P1B-16); the value is policy, not private: the example ships 4.
+- `friction`: `inbox`, the path of the friction inbox file. It is a path value, not a number: the same shape rules as a `repos` folder (section 5). The real file lives only in the private overlay; `harness friction` (ticket 154) is its reader and writer.
 
 ### The plain-value grammar (closed)
 
@@ -77,17 +79,17 @@ Anything outside this contract is a refusal. The refusal names the section and k
 - The loader does not touch the filesystem for the map. Whether a folder exists or is a git work tree is checked by the ticket intake, not here. Symlink aliasing is intake's problem too.
 - An empty `repos` section is valid. The public example ships it empty.
 
-## 6. Numbers
+## 6. Values
 
-Every budget, shadow and lanes value is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
+`friction.inbox` is the one string value in the file, checked by the path rules of section 5. Every budget, shadow and lanes value is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
 
 ## 7. Public file content
 
-The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. The real values live only in the private file.
+The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. The real values live only in the private file.
 
 ## 8. Who reads it
 
-The library exposes pure lookups: `repo_dir(&RepoId)`, `budget(size)` and `shadow()`. The one command is `harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]`.
+The library exposes pure lookups: `repo_dir(&RepoId)`, `budget(size)`, `shadow()`, `lane_count()` and `friction_inbox()`. The one command over the config itself is `harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]`.
 
 - Exit 0: the config loaded. One stdout line `config ok repos=<n> shadow=ok`; with `--repo` also `repo_id=<id> mapped`; with `--budget` also `budget size=<S> wall_seconds=<n> tokens=<n>`. It never prints a folder.
 - Exit 1: a lookup refusal only. `--repo` names an id that is not in the map. Stdout empty; stderr names the id.

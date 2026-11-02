@@ -2,7 +2,7 @@
 //! and scratch repos under the system temp folder. The config source is set only on the child (`.env`, `.env_remove`); this file never reads one.
 //! Each refusal has a planted failing twin: the same run with one thing changed that a wrong implementation would get wrong.
 #![cfg(unix)]
-use harness::config::{Config, KEYS};
+use harness::config::{Config, INBOX_KEY, KEYS};
 use harness::repo_id::RepoId;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,7 +84,7 @@ fn leaks(o: &Output, needle: &str) -> bool {
 /// A full valid config. `repos` is the body of the `repos` section; `s_tokens` is the value planted on one budget key.
 fn make(repos: &str, s_tokens: &str) -> String {
     format!(
-        "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: {s_tokens}\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n"
+        "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 1\n  s_tokens: {s_tokens}\n  m_wall_seconds: 1\n  m_tokens: 1\n  l_wall_seconds: 1\n  l_tokens: 1\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n"
     )
 }
 
@@ -95,7 +95,7 @@ fn valid() -> String {
 /// A config with distinct planted budget pairs per size.
 fn budgets(s: (u64, u64), m: (u64, u64), l: (u64, u64)) -> String {
     format!(
-        "repos:\n\nbudgets:\n  s_wall_seconds: {}\n  s_tokens: {}\n  m_wall_seconds: {}\n  m_tokens: {}\n  l_wall_seconds: {}\n  l_tokens: {}\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n",
+        "repos:\n\nbudgets:\n  s_wall_seconds: {}\n  s_tokens: {}\n  m_wall_seconds: {}\n  m_tokens: {}\n  l_wall_seconds: {}\n  l_tokens: {}\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n",
         s.0, s.1, m.0, m.1, l.0, l.1
     )
 }
@@ -448,15 +448,17 @@ fn pin(text: &str) -> Result<(), String> {
                 }
             }
             "lanes" if v != "4" => return Err(format!("lanes {k} is not 4")),
+            "friction" if v != "/placeholder/friction-inbox.jsonl" => return Err(format!("friction {k} is not the placeholder")),
             _ => {}
         }
         keys.push(format!("{section}.{k}"));
     }
     keys.sort();
     let mut want: Vec<String> = KEYS.iter().map(|k| k.to_string()).collect();
+    want.push(INBOX_KEY.to_string());
     want.sort();
     if keys != want {
-        return Err("the key set differs from config::KEYS".to_string());
+        return Err("the key set differs from config::KEYS plus INBOX_KEY".to_string());
     }
     Ok(())
 }
@@ -473,9 +475,35 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
         ("shadow token budget 2", text.replace("  p4a_token_budget: 1", "  p4a_token_budget: 2")),
         ("p1a cap 6", text.replace("  p1a_cap: 5", "  p1a_cap: 6")),
         ("lanes count 9", text.replace("  count: 4", "  count: 9")),
+        ("inbox not the placeholder", text.replace("/placeholder/friction-inbox.jsonl", "/real/inbox.jsonl")),
+        ("missing inbox", text.replace("\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl", "")),
     ];
     for (label, t) in &twins {
         assert_ne!(t, &text, "{label}: the twin must differ from the example");
         assert!(pin(t).is_err(), "{label}: the pin should fail");
     }
+}
+
+// ---- AC 11 (config v3): `friction.inbox` is required, fail closed ----
+
+#[test]
+fn config_v3_requires_friction_inbox() {
+    let t = Tmp::new();
+    // A v2 file (every v2 key present, no `friction` section) is refused naming `friction.inbox`.
+    let v2: String = valid().replace("\nfriction:\n  inbox: /synthetic-inbox.jsonl\n", "\n");
+    let o = check(&t.file("v2.yaml", v2), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("friction.inbox"), "must name the key: {}", err(&o));
+    // An empty friction section names the key too.
+    let empty_sec = valid().replace("friction:\n  inbox: /synthetic-inbox.jsonl", "friction:");
+    let o = check(&t.file("empty-sec.yaml", empty_sec), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("friction.inbox"), "{}", err(&o));
+    // A relative inbox path is refused naming the section and key, never the value.
+    let o = check(&t.file("rel.yaml", valid().replace("/synthetic-inbox.jsonl", "relative/inbox.jsonl")), &[]);
+    refused_clean(&o);
+    assert!(err(&o).contains("`friction`") && err(&o).contains("`inbox`"), "{}", err(&o));
+    // Twin: the same file with the key present loads, and the public example (placeholder value) loads as-is.
+    assert_eq!(code(&check(&t.file("v3.yaml", valid()), &[])), 0);
+    assert_eq!(code(&run(&["config", "check", "--config", EXAMPLE], None, None)), 0);
 }
