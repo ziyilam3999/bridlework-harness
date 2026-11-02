@@ -186,10 +186,16 @@ fn resolve_base_dir(flag: &str, arg: &Path) -> Result<PathBuf, Stop> {
 // ---------------------------------------------------------------- shared helpers
 
 /// One leftover found by the walk: its source path and that path's RAW BYTES relative to the workspace root
-/// (raw, because a name need not be UTF-8; the journal stores these bytes hex-encoded).
+/// (raw, because a name need not be UTF-8; the journal stores these bytes hex-encoded), plus the ANCESTOR
+/// CHAIN the walk examined — the root and every real directory between it and the leftover, each with the
+/// dev/ino it had at walk time. The chain is re-checked immediately before the item's rename (review r2, F2 /
+/// RACE-S): an ancestor that is gone, is now a symlink, or is a different directory makes the sweep SKIP the
+/// item (nothing moved for it, no journal line, no event, exit 3 at the end naming the item token) instead of
+/// following a swapped component out of the roots.
 struct Leftover {
     src: PathBuf,
     rel: Vec<u8>,
+    chain: Vec<(PathBuf, u64, u64)>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -378,38 +384,56 @@ fn walk(ws: &Path, roots: &[PathBuf], live: &[PathBuf], max_items: u64) -> Resul
     let mut out: Vec<Leftover> = Vec::new();
     let mut visited = 0usize;
     for root in roots {
-        let mut stack: Vec<(PathBuf, usize)> = vec![(root.clone(), 1)];
-        while let Some((dir, depth)) = stack.pop() {
-            let rd = fs::read_dir(&dir).map_err(|_| err3("a root cannot be walked; nothing was moved"))?;
-            for ent in rd.flatten() {
-                visited += 1;
-                if visited > MAX_VISITED {
-                    return Err(err3("over the entries-visited cap (100000); nothing was moved"));
-                }
-                let p = dir.join(ent.file_name());
-                let meta = fs::symlink_metadata(&p).map_err(|_| err3("an entry in a root cannot be examined; nothing was moved"))?;
-                if live.iter().any(|l| p.starts_with(l)) {
-                    continue; // owned: its contents are owned, skip whole
-                }
-                if live.iter().any(|l| l.starts_with(&p)) && meta.is_dir() {
-                    // an ancestor of a live path entry: descend (never through a symlink)
-                    if depth + 1 > MAX_DEPTH {
-                        return Err(err3("over the walk depth cap (64); nothing was moved"));
-                    }
-                    stack.push((p, depth + 1));
-                    continue;
-                }
-                if out.len() as u64 >= max_items {
-                    return Err(err3("over the --max-items cap; nothing was moved"));
-                }
-                // the relpath is taken against the WORKSPACE ROOT (the event's `from` and the journal's bytes both
-                // use it), never against the walked root: a later multi-root manifest keeps one spelling.
-                let rel = p.strip_prefix(ws).map_err(|_| err3("an entry in a root cannot be named; nothing was moved"))?;
-                out.push(Leftover { rel: rel.as_os_str().as_encoded_bytes().to_vec(), src: p });
-            }
-        }
+        let meta = fs::symlink_metadata(root).map_err(|_| err3("a root cannot be walked; nothing was moved"))?;
+        let chain = vec![(root.clone(), meta.dev(), meta.ino())];
+        walk_dir(ws, root, live, &chain, &mut out, &mut visited, 1, max_items)?;
     }
     Ok(out)
+}
+
+/// One directory of the walk. Recursive (depth is capped at `MAX_DEPTH`, so the stack is bounded); the current
+/// ancestor chain — each directory the walk has descended into, with the dev/ino it had when examined — is
+/// carried down and CLONED into every leftover found below it, so the move phase can re-check it.
+fn walk_dir(
+    ws: &Path,
+    dir: &Path,
+    live: &[PathBuf],
+    chain: &[(PathBuf, u64, u64)],
+    out: &mut Vec<Leftover>,
+    visited: &mut usize,
+    depth: usize,
+    max_items: u64,
+) -> Result<(), Stop> {
+    let rd = fs::read_dir(dir).map_err(|_| err3("a root cannot be walked; nothing was moved"))?;
+    for ent in rd.flatten() {
+        *visited += 1;
+        if *visited > MAX_VISITED {
+            return Err(err3("over the entries-visited cap (100000); nothing was moved"));
+        }
+        let p = dir.join(ent.file_name());
+        let meta = fs::symlink_metadata(&p).map_err(|_| err3("an entry in a root cannot be examined; nothing was moved"))?;
+        if live.iter().any(|l| p.starts_with(l)) {
+            continue; // owned: its contents are owned, skip whole
+        }
+        if live.iter().any(|l| l.starts_with(&p)) && meta.is_dir() {
+            // an ancestor of a live path entry: descend (never through a symlink)
+            if depth + 1 > MAX_DEPTH {
+                return Err(err3("over the walk depth cap (64); nothing was moved"));
+            }
+            let mut sub = chain.to_vec();
+            sub.push((p.clone(), meta.dev(), meta.ino()));
+            walk_dir(ws, &p, live, &sub, out, visited, depth + 1, max_items)?;
+            continue;
+        }
+        if out.len() as u64 >= max_items {
+            return Err(err3("over the --max-items cap; nothing was moved"));
+        }
+        // the relpath is taken against the WORKSPACE ROOT (the event's `from` and the journal's bytes both
+        // use it), never against the walked root: a later multi-root manifest keeps one spelling.
+        let rel = p.strip_prefix(ws).map_err(|_| err3("an entry in a root cannot be named; nothing was moved"))?;
+        out.push(Leftover { rel: rel.as_os_str().as_encoded_bytes().to_vec(), src: p, chain: chain.to_vec() });
+    }
+    Ok(())
 }
 
 /// Mint one fresh batch directory `<shelf>/b-<ts_ms>-<pid>-<seq>` with an EXCLUSIVE create (exists → next seq, never
@@ -528,11 +552,25 @@ pub fn sweep_with_device_probe(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Optio
     if leftovers.is_empty() {
         return Ok(format!("quarantine=done ticket={} moved=0", a.ticket));
     }
-    // The moves. Per item, in order: journal intent (write-ahead), absent check, rename, event.
+    // The moves. Per item, in order: ANCESTOR RE-CHECK, journal intent (write-ahead), absent check, rename,
+    // event. The re-check (review r2, F2 / RACE-S): every ancestor the walk recorded must still be the SAME
+    // real directory — a no-follow stat, same dev, same ino, never a link. An ancestor swapped for a symlink
+    // in the gap between the walk and the move makes the sweep SKIP the item: nothing moved for it, no journal
+    // line, no event, and the run ends exit 3 naming the item token (never a path). A narrow window remains
+    // between this check and the rename itself; it is named under "v1 limits" in docs/quarantine.md.
     let (batch_name, batch) = make_batch(&shelf, a.ts_ms)?;
     let mut moved = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     for (n, lo) in leftovers.iter().enumerate() {
         let item = format!("i-{}", n + 1);
+        let chain_ok = lo.chain.iter().all(|(p, dev, ino)| match fs::symlink_metadata(p) {
+            Ok(m) => !m.file_type().is_symlink() && m.is_dir() && m.dev() == *dev && m.ino() == *ino,
+            Err(_) => false,
+        });
+        if !chain_ok {
+            skipped.push(item);
+            continue; // fail closed for THIS item: nothing moved for it, no journal line, no event
+        }
         let dest = batch.join(&item);
         append_intent(&batch, &item, &lo.rel, "unmanifested")?;
         if fs::symlink_metadata(&dest).is_ok() {
@@ -543,6 +581,12 @@ pub fn sweep_with_device_probe(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Optio
         let to = format!("{}/{}/{}", a.ticket, batch_name, item);
         write_quarantined_event(a, &from, &to, "unmanifested")?;
         moved += 1;
+    }
+    if !skipped.is_empty() {
+        return Err(err3(&format!(
+            "a leftover's parent chain changed mid-run ({}); nothing was moved for it, the rest was moved",
+            skipped.join(", ")
+        )));
     }
     Ok(format!("quarantine=done ticket={} moved={}", a.ticket, moved))
 }
@@ -606,46 +650,90 @@ fn parse_delete(a: &[String]) -> Result<DeleteArgs, Stop> {
     Ok(DeleteArgs { ticket, id: id.to_string(), manifest_dir: PathBuf::from(md), ts_ms })
 }
 
-/// Remove a real directory recursively WITHOUT following any symlink inside it (a link inside is unlinked, its
-/// target untouched). POST-ORDER, two-phase: a directory is pushed back with an `Unlink` frame BEHIND its
-/// children, so it is removed only once every child is gone — the first draft removed the parent while its
-/// children were still queued, so any listed dir with a subdirectory failed ENOTEMPTY, exit 3, wedged on every
-/// re-run (review r1, F1). Iterative, so no recursion depth; bounded by the tree it is given, one listed entry.
-fn remove_tree_no_follow(root: &Path) -> Result<(), Stop> {
-    let io = || err3("a listed folder could not be deleted");
-    enum Frame {
-        Descend(PathBuf),
-        Unlink(PathBuf),
+/// One examined component of the listed path's parent chain: `Absent` (the path is not there — the clean
+/// no-op re-run), or the identity of a REAL directory (dev, ino). A component that IS a link — a swapped
+/// directory or a symlink LOOP — is not a step, it is a refusal: the listed path does not resolve inside a root.
+enum Step {
+    Absent,
+    RealDir(u64, u64),
+}
+
+/// Examine ONE component, relative to the current directory, with a no-follow stat.
+fn step(comp: &std::ffi::OsStr) -> Result<Step, Stop> {
+    match fs::symlink_metadata(comp) {
+        Ok(m) if m.file_type().is_symlink() => Err(err2(
+            "the listed path does not resolve inside a root (a parent component is a symlink); nothing was deleted",
+        )),
+        Ok(m) if !m.is_dir() => Err(err2(
+            "the listed path does not resolve inside a root (a parent component is not a directory); nothing was deleted",
+        )),
+        Ok(m) => Ok(Step::RealDir(m.dev(), m.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Step::Absent),
+        Err(_) => Err(err3("the listed path cannot be examined; nothing was deleted")),
     }
-    let mut stack = vec![Frame::Descend(root.to_path_buf())];
-    while let Some(f) = stack.pop() {
-        match f {
-            Frame::Descend(p) => {
-                let rd = fs::read_dir(&p).map_err(|_| io())?;
-                stack.push(Frame::Unlink(p.clone())); // removed only AFTER the children below it
-                for ent in rd.flatten() {
-                    let c = p.join(ent.file_name());
-                    let m = fs::symlink_metadata(&c).map_err(|_| io())?;
-                    if m.is_dir() {
-                        stack.push(Frame::Descend(c));
-                    } else {
-                        fs::remove_file(&c).map_err(|_| io())?; // a file OR a symlink: the link only, never its target
-                    }
-                }
+}
+
+/// Examine ONE component and ENTER it: a no-follow stat, then a `chdir`, then a verification that the chdir
+/// landed on the SAME directory the stat described (dev/ino of `.`) — a component swapped for a symlink in the
+/// gap between the check and the act is never followed into (the rule of this fix round: act on what was
+/// checked). Entering one component at a time also means no path longer than a single name is ever handed to
+/// the filesystem, so a listed tree deeper than the path limit (PATH_MAX) is still reachable (review r2, F3).
+fn chdir_verified(comp: &std::ffi::OsStr) -> Result<Step, Stop> {
+    match step(comp)? {
+        Step::Absent => Ok(Step::Absent),
+        Step::RealDir(dev, ino) => {
+            std::env::set_current_dir(comp).map_err(|_| err3("the listed path cannot be examined; nothing was deleted"))?;
+            let now = fs::symlink_metadata(".").map_err(|_| err3("the listed path cannot be examined; nothing was deleted"))?;
+            if now.dev() != dev || now.ino() != ino {
+                return Err(err2(
+                    "the listed path does not resolve inside a root (a parent component changed under the walk); nothing was deleted",
+                ));
             }
-            Frame::Unlink(p) => fs::remove_dir(&p).map_err(|_| io())?,
+            Ok(Step::RealDir(dev, ino))
         }
     }
-    Ok(())
+}
+
+/// The delete fence walk (review r2, F1/F3): starting from the re-validated `anchor` (a canonical root),
+/// descend the listed path's intermediate components one at a time — each examined with a no-follow stat and
+/// entered by a chdir verified against the stat — then act on the FINAL component by its relative name alone.
+/// The whole spelled path is never stat'ed or removed as one string: a tree deeper than the filesystem's path
+/// limit could not be examined that way at all (A8). A real directory is removed with `std::fs::remove_dir_all`,
+/// the standard library's openat-based recursive delete — it never follows a symlink inside the tree, unlinks a
+/// swapped-in link as the link, and recurses with no path length limit (review r2, F1: the hand-rolled
+/// stat-then-open walk followed a child swapped for a link between the stat and the `read_dir`, deleting every
+/// file in the link's target OUTSIDE the roots, 3 of 3 trials). A symlink entry is unlinked as the link only
+/// (the `node_modules` rule); an absent path deletes nothing (the clean no-op re-run).
+fn walk_and_delete(anchor: &Path, intermediates: &[std::ffi::OsString], final_name: &std::ffi::OsStr) -> Result<(), Stop> {
+    if let Step::Absent = chdir_verified(anchor.as_os_str())? {
+        return Ok(()); // the root vanished since validation: nothing there, the clean no-op
+    }
+    for comp in intermediates {
+        if let Step::Absent = chdir_verified(comp.as_os_str())? {
+            return Ok(()); // a missing intermediate: the listed path is not there, the clean no-op
+        }
+    }
+    match fs::symlink_metadata(final_name) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // already gone: the clean no-op re-run
+        Err(_) => Err(err3("the listed path cannot be examined; nothing was deleted")),
+        Ok(m) if m.file_type().is_symlink() => {
+            fs::remove_file(final_name).map_err(|_| err3("the listed link could not be removed"))
+        }
+        Ok(m) if m.is_dir() => fs::remove_dir_all(final_name).map_err(|_| err3("a listed folder could not be deleted")),
+        Ok(_) => fs::remove_file(final_name).map_err(|_| err3("the listed file could not be removed")),
+    }
 }
 
 /// The ONE delete path for listed `temp_dir` entries (P1B-14 teardown calls THIS function, never a rebuild):
-/// delete exactly one live manifest entry of class `temp_dir`, named by id. The stored path is re-fenced on its
-/// RESOLVED spelling, never its stored one: any `..`/`.` component is refused, every root is re-validated as the
-/// sweep validates it, and the canonicalized PARENT of the path must equal or lie inside a canonical root (the
-/// final component is never followed); the final component itself is examined with a no-follow stat (a symlink
-/// entry is removed as the link only — the `node_modules` rule); a real directory is removed recursively,
-/// post-order, without following any link inside. Only after the
+/// delete exactly one live manifest entry of class `temp_dir`, named by id. The stored path is re-fenced on the
+/// REAL WORLD, never on its spelling: any `..`/`.` component is refused, every root is re-validated as the
+/// sweep validates it, and the stored spelling must start at a canonical root's spelling; the path is then
+/// walked COMPONENT BY COMPONENT from that root (each intermediate verified a real directory, never a link,
+/// and entered by a chdir verified against its stat), so a swapped component or a symlink LOOP in the parent
+/// chain resolves to nothing and is refused (exit 2). The final component is examined with a no-follow stat
+/// (a symlink entry is removed as the link only — the `node_modules` rule); a real directory is removed with
+/// the standard library's openat-based `remove_dir_all`, which never follows a link inside, unlinks a
+/// swapped-in link as the link, and has no path length limit. Only after the
 /// path is gone is the manifest `remove` line written (a crash between leaves a listed half-deleted thing, never an
 /// orphan; a re-run on an already-absent path just writes the remove).
 pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
@@ -695,30 +783,34 @@ pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
         }
         canon_roots.push(canon);
     }
-    // Third: containment on resolved paths only, and only when something is THERE to delete — an absent path
-    // deletes nothing, so the re-run stays the documented clean no-op (the remove line is written below). The
-    // PARENT of the listed path is canonicalized, so the final component is never followed (a listed link is
-    // unlinked as the link below); the resolved parent must EQUAL or LIE INSIDE a canonical root.
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(err3("the listed path cannot be examined")),
-        Ok(_) => {
-            let parent = path.parent().ok_or_else(|| err2("the listed path has no parent; nothing was deleted"))?;
-            let canon_parent = parent
-                .canonicalize()
-                .map_err(|_| err2("the listed path does not resolve inside a root; nothing was deleted"))?;
-            if !canon_roots.iter().any(|r| canon_parent == *r || canon_parent.starts_with(r)) {
-                return Err(err2("the listed path does not resolve inside a root; nothing was deleted"));
-            }
+    // Third: the fence is a COMPONENT WALK from a re-validated root (review r2, F1/F3), never a stat or a
+    // removal of the whole spelled path as one string. The stored spelling must start at a canonical root's
+    // spelling (a hand-appended line with a foreign spelling is refused, fail closed); every INTERMEDIATE
+    // component is examined and entered ONE AT A TIME — a no-follow stat, then a chdir verified to have landed
+    // on the same directory by dev/ino, so no symlink anywhere in the parent chain (a swapped component, a
+    // symlink LOOP) is ever followed — and the final component is acted on by its RELATIVE name alone, so a
+    // tree deeper than the filesystem's path limit is still deletable. Containment holds by construction: the
+    // walk starts inside a validated root and never leaves it through a link.
+    let Some(anchor) = canon_roots.iter().find(|r| path.starts_with(r.as_path())) else {
+        return Err(err2("the listed path does not resolve inside a root; nothing was deleted"));
+    };
+    let rel = path.strip_prefix(anchor).map_err(|_| err2("the listed path does not resolve inside a root; nothing was deleted"))?;
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(x) => comps.push(x.to_os_string()),
+            _ => return Err(err2("the listed path holds a `..` or `.` component; nothing was deleted")),
         }
     }
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(err3("the listed path cannot be examined")),
-        Ok(m) if m.file_type().is_symlink() => fs::remove_file(&path).map_err(|_| err3("the listed link could not be removed"))?,
-        Ok(m) if m.is_dir() => remove_tree_no_follow(&path)?,
-        Ok(_) => fs::remove_file(&path).map_err(|_| err3("the listed file could not be removed"))?,
-    }
+    let Some((final_name, intermediates)) = comps.split_last() else {
+        return Err(err2("the listed path is a root itself; nothing was deleted"));
+    };
+    // The walk changes the process directory; it is saved and restored (every path used afterwards is
+    // absolute), and the removal itself happens inside the walk, on the relative final name only.
+    let saved_cwd = std::env::current_dir().map_err(|_| err3("the current folder cannot be examined; nothing was deleted"))?;
+    let walked = walk_and_delete(anchor, intermediates, final_name);
+    let _ = std::env::set_current_dir(&saved_cwd);
+    walked?;
     manifest::apply(&md, &a.ticket, &Op::Remove { id: &a.id }, a.ts_ms)
         .map_err(|_| err3("the manifest remove line could not be written"))?;
     Ok(format!("delete=done ticket={} id={}", a.ticket, a.id))

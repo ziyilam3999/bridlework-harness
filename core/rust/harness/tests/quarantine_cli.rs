@@ -818,3 +818,315 @@ fn sweep_into_preexisting_shelf_dir() {
     assert_eq!(batches(&f).len(), 1, "one batch in the pre-existing shelf");
     assert!(batches(&f)[0].join("i-1/one.txt").exists(), "the payload is on the shelf");
 }
+
+
+// ---------------------------------------------------------------- review r2, fix round 2
+
+/// Review r2, F1 (RACE-D): a folder inside a listed temp dir that is swapped for a symlink to an
+/// OUTSIDE folder while the delete is running must never be followed — every outside file survives.
+/// Part (a) is deterministic (a planted link is unlinked as the link); part (b) drives the swap
+/// with a helper thread once one subdir starts emptying, three trials, 3000 files per subdir so
+/// the emptying window is tens of milliseconds. (Measured before the fix: the hand-rolled walk
+/// classified a child with a no-follow stat and opened it LATER by path with `read_dir`, which
+/// follows a swapped-in link — 3 of 3 trials deleted all 50 outside files. `std::fs::remove_dir_all`
+/// recurses by openat and never follows a link; a swapped-in link is unlinked as the link.)
+#[test]
+fn delete_listed_race_swapped_subdir_never_followed() {
+    // (a) deterministic: a planted symlink subdir is unlinked as the link, its target intact
+    let f = fixture();
+    fs::create_dir_all(f.outside.join("ext-a")).unwrap();
+    fs::write(f.outside.join("ext-a/keep.txt"), b"ext-a").unwrap();
+    std::os::unix::fs::symlink(f.outside.join("ext-a"), f.root.join("tmp/planted-link")).unwrap();
+    fs::write(f.root.join("tmp/x.txt"), b"x").unwrap();
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "tmp", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert!(!f.root.join("tmp").exists(), "the listed temp dir is gone");
+    assert_eq!(fs::read(f.outside.join("ext-a/keep.txt")).unwrap(), b"ext-a", "the planted link's target is intact");
+
+    // (b) the driven swap, three trials
+    for trial in 1..=3 {
+        let f = fixture();
+        let (d1, d2) = (f.root.join("tmp/d1"), f.root.join("tmp/d2"));
+        for d in [&d1, &d2] {
+            fs::create_dir_all(d).unwrap();
+            for i in 0..3000 {
+                fs::write(d.join(format!("f{i:04}.txt")), b"x").unwrap();
+            }
+        }
+        let ext = f.outside.join(format!("ext-race-{trial}"));
+        fs::create_dir_all(&ext).unwrap();
+        for i in 0..50 {
+            fs::write(ext.join(format!("keep{i:02}.txt")), b"outside-payload").unwrap();
+        }
+        // the watcher: once ONE subdir starts emptying (count below full), swap the OTHER for a
+        // symlink to the outside folder — exactly the RACE-D shape
+        let w1 = d1.clone();
+        let w2 = d2.clone();
+        let wext = ext.clone();
+        let h = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                let c1 = fs::read_dir(&w1).map(|r| r.count()).unwrap_or(0);
+                let c2 = fs::read_dir(&w2).map(|r| r.count()).unwrap_or(0);
+                let victim = if c1 < 3000 && c2 == 3000 {
+                    Some(w2.clone())
+                } else if c2 < 3000 && c1 == 3000 {
+                    Some(w1.clone())
+                } else {
+                    None
+                };
+                if let Some(v) = victim {
+                    let old = v.with_file_name(format!("{}-old", v.file_name().unwrap().to_string_lossy()));
+                    if fs::rename(&v, &old).is_ok() && std::os::unix::fs::symlink(&wext, &v).is_ok() {
+                        return true;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            false
+        });
+        let o = run(&["quarantine", "delete-listed", "t-1", "--id", "tmp", "--manifest-dir", &s(&f.md)]);
+        let swapped = h.join().unwrap();
+        assert!(swapped, "trial {trial}: the watcher drove the swap (one subdir emptying, the other still full)");
+        let c = code(&o);
+        assert!(c == 0 || c == 3, "trial {trial}: exit 0 or 3, got {c}: {}", err(&o));
+        for i in 0..50 {
+            let p = ext.join(format!("keep{i:02}.txt"));
+            assert!(p.exists(), "trial {trial}: outside file {i} was DELETED through the swapped link");
+            assert_eq!(fs::read(&p).unwrap(), b"outside-payload", "trial {trial}: outside file {i} intact");
+        }
+        if c == 0 {
+            assert!(!f.root.join("tmp").exists(), "trial {trial}: a successful delete removed the whole tree");
+        }
+    }
+}
+
+/// Review r2, F2 (RACE-S): a leftover's ancestor chain (the root and every ancestor below it,
+/// with the dev/ino each had at walk time) is re-checked immediately before the item's rename; an
+/// ancestor swapped for a symlink mid-run makes the sweep SKIP that item — nothing moved for it,
+/// no journal line, no event — and the run ends exit 3 naming the item token. 50 ancestor groups
+/// (each a live entry's parent holding one leftover file `c`) sit among 900 plain root leftovers
+/// so the move batch is long; once the batch directory appears (it is minted only AFTER the
+/// read-only walk), every group is swapped for a symlink to one outside folder holding a file
+/// NAMED `c`. The outside file must never land on the shelf. Three trials.
+#[test]
+fn sweep_ancestor_swap_never_moves_from_outside() {
+    for trial in 1..=3 {
+        let f = fixture();
+        let ext = f.outside.join(format!("ext-s-{trial}"));
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("c"), b"outside-c").unwrap();
+        for i in 0..900 {
+            let d = f.root.join(format!("stray-{i:03}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("one.txt"), b"p").unwrap();
+        }
+        let mut groups: Vec<PathBuf> = Vec::new();
+        for g in 0..50 {
+            let a = f.root.join(format!("a{g:02}"));
+            fs::create_dir_all(&a).unwrap();
+            fs::write(a.join("c"), b"inside-c").unwrap();
+            ok(&[
+                "manifest", "add", "t-1", "--class", "temp_dir", "--id", &format!("live{g:02}"),
+                "--path", &s(&a.join("b")), "--dir", &s(&f.md),
+            ]);
+            groups.push(a);
+        }
+        let wshelf = f.q.join("t-1");
+        let wroot = f.root.clone();
+        let wext = ext.clone();
+        let h = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                let batch_seen = fs::read_dir(&wshelf)
+                    .map(|r| r.flatten().any(|e| e.file_name().to_string_lossy().starts_with("b-")))
+                    .unwrap_or(false);
+                if batch_seen {
+                    // swap every group for a symlink to the outside folder
+                    let mut n = 0;
+                    for g in 0..50 {
+                        let a = wroot.join(format!("a{g:02}"));
+                        let old = wroot.join(format!("a{g:02}-old"));
+                        if fs::rename(&a, &old).is_ok() && std::os::unix::fs::symlink(&wext, &a).is_ok() {
+                            n += 1;
+                        }
+                    }
+                    return Some(n);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            None
+        });
+        let o = sweep(&f, &[]);
+        let swapped = h.join().unwrap();
+        assert_eq!(swapped, Some(50), "trial {trial}: every group was swapped once the batch appeared");
+        let c = code(&o);
+        assert!(c == 0 || c == 3, "trial {trial}: exit 0 or 3, got {c}: {}", err(&o));
+        if c == 3 {
+            assert!(err(&o).contains("parent chain"), "trial {trial}: the refusal names the changed parent chain: {}", err(&o));
+        }
+        // the outside file never moved: still in ext, never on the shelf
+        assert!(ext.join("c").exists(), "trial {trial}: ext/c is gone from outside the roots");
+        assert_eq!(fs::read(ext.join("c")).unwrap(), b"outside-c", "trial {trial}: ext/c intact");
+        let mut outside_on_shelf = 0;
+        for b in batches(&f) {
+            if let Ok(rd) = fs::read_dir(&b) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(false) {
+                        if fs::read(&p).map(|b| b == b"outside-c").unwrap_or(false) {
+                            outside_on_shelf += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(outside_on_shelf, 0, "trial {trial}: a file from OUTSIDE the roots landed on the shelf");
+        // no journal line and no event for a skipped item: journal lines == events, always
+        let mut journal_lines = 0usize;
+        for b in batches(&f) {
+            if let Ok(t) = fs::read_to_string(b.join("journal.jsonl")) {
+                journal_lines += t.lines().count();
+            }
+        }
+        assert_eq!(journal_lines, quarantined_lines(&f).len(), "trial {trial}: one journal line per event, none for a skipped item");
+    }
+}
+
+/// Review r2, F3 (A8): a listed temp dir DEEPER than the filesystem's path limit (PATH_MAX) is
+/// still deleted — the fence walks the components one at a time from the validated root and the
+/// real-directory removal is `std::fs::remove_dir_all`, which recurses by openat with no path
+/// length limit. A symlink to an outside folder planted at the deepest level is unlinked as the
+/// link and the outside folder is untouched. Before the fix: ENAMETOOLONG, exit 3, nothing
+/// deleted, wedged on every re-run. The re-run (the id listed again) is the clean no-op.
+#[test]
+fn delete_listed_deeper_than_path_max() {
+    let f = fixture();
+    let canon_root = f.root.canonicalize().unwrap();
+    let seg = "d".repeat(240);
+    // 15 levels x 241 bytes ~ 3.7 KB: past PATH_MAX on macOS (1024), where the r2 A8 reproduction
+    // was measured, and still under the manifest reader's 4096-byte line cap so the entry can be
+    // LISTED at all (a path past Linux's PATH_MAX of 4096 cannot fit a manifest line: the reader
+    // fails closed there, and no delete is reachable through the manifest for it).
+    let depth = 15;
+    let mut deep = canon_root.clone();
+    for _ in 0..depth {
+        deep.push(&seg);
+    }
+    assert!(deep.as_os_str().len() > 1100, "the fixture path must exceed macOS PATH_MAX");
+    assert!(deep.as_os_str().len() < 3900, "the fixture path must fit a manifest line (4096-byte cap)");
+    // build the deep tree with relative steps (an absolute mkdir would exceed the path limit);
+    // plant an outside symlink at the deepest level (held-out variant: the outside folder survives)
+    fs::create_dir_all(f.outside.join("ext-deep")).unwrap();
+    fs::write(f.outside.join("ext-deep/keep.txt"), b"ext-deep").unwrap();
+    let script = format!(
+        "d={}; i=0; while [ $i -lt {d} ]; do mkdir \"$d\" || exit 1; cd \"$d\" || exit 1; i=$((i+1)); done; echo deep > f.txt; ln -s {} ext-link",
+        seg,
+        f.outside.join("ext-deep").to_str().unwrap(),
+        d = depth
+    );
+    let o = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(&f.root)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "the deep build failed: {}", String::from_utf8_lossy(&o.stderr));
+    append_manifest_line(
+        &f,
+        &format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"deep\",\"class\":\"temp_dir\",\"path\":\"{}\",\"ts_ms\":1731000000125}}",
+            s(&deep)
+        ),
+    );
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "deep", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 0, "a listed tree deeper than PATH_MAX deletes cleanly: {}", err(&o));
+    // gone: walk down depth-1 levels, the deepest name must be absent
+    let check = format!("d={}; i=0; while [ $i -lt {} ]; do cd \"$d\" || exit 1; i=$((i+1)); done; [ ! -e \"$d\" ]", seg, depth - 1);
+    let o = Command::new("/bin/sh").arg("-c").arg(&check).current_dir(&f.root).stdin(Stdio::null()).output().unwrap();
+    assert!(o.status.success(), "the deepest level is gone");
+    assert_eq!(fs::read(f.outside.join("ext-deep/keep.txt")).unwrap(), b"ext-deep", "the outside folder behind the deepest link is untouched");
+    let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f.md)]));
+    assert!(!listed.lines().any(|l| l.starts_with("deep\t")), "the remove line was written: {listed}");
+    // the clean no-op re-run: the id listed again, the path absent, the remove written, exit 0
+    append_manifest_line(
+        &f,
+        &format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"deep\",\"class\":\"temp_dir\",\"path\":\"{}\",\"ts_ms\":1731000000126}}",
+            s(&deep)
+        ),
+    );
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "deep", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 0, "the re-run on the absent deep path is a clean no-op: {}", err(&o));
+    let listed = out(&run(&["manifest", "list", "t-1", "--dir", &s(&f.md)]));
+    assert!(!listed.lines().any(|l| l.starts_with("deep\t")), "the remove line was written again: {listed}");
+}
+
+/// Review r2, F5: delete-listed's ROOT RE-VALIDATION pinned on its own — a root that was real
+/// when the manifest was written but is swapped for a symlink to an OUTSIDE folder afterwards is
+/// refused by the re-validation arm itself (the stderr line names the symlink rule), and nothing
+/// outside the roots is touched. (With the re-validation removed and the raw stored root used as
+/// the walk anchor, the component walk would step THROUGH the swapped root and delete the outside
+/// tree — this is the test that goes RED then.)
+#[test]
+fn delete_root_revalidation_pinned() {
+    let f = fixture();
+    fs::create_dir_all(f.outside.join("tmp")).unwrap();
+    fs::write(f.outside.join("tmp/p.txt"), b"outside-root").unwrap();
+    fs::remove_dir_all(&f.root).unwrap();
+    std::os::unix::fs::symlink(&f.outside, &f.root).unwrap();
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "tmp", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 2, "a root swapped for a symlink is refused: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("symlink"), "the refusal names the root-is-symlink rule itself: {}", err(&o));
+    assert!(f.outside.join("tmp/p.txt").exists(), "nothing behind the swapped root was deleted");
+    assert!(fs::symlink_metadata(&f.root).unwrap().file_type().is_symlink(), "the swapped root link itself is untouched");
+}
+
+/// Review r2, F6: a symlink loop in a listed path's PARENT chain is a parent that IS a link: the
+/// listed path does not resolve inside a root — exit 2, nothing deleted, the loop link itself
+/// untouched. (Before the fix this exited 3 as "the listed path cannot be examined"; the doc now
+/// names a link parent — a loop included — under the exit-2 refusals.)
+#[test]
+fn delete_listed_parent_loop_refused_exit_2() {
+    let f = fixture();
+    std::os::unix::fs::symlink("loop", f.root.join("loop")).unwrap(); // a link that resolves to itself
+    let canon_root = f.root.canonicalize().unwrap();
+    append_manifest_line(
+        &f,
+        &format!(
+            "{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1\",\"id\":\"lp\",\"class\":\"temp_dir\",\"path\":\"{}/loop/x\",\"ts_ms\":1731000000127}}",
+            s(&canon_root)
+        ),
+    );
+    let o = run(&["quarantine", "delete-listed", "t-1", "--id", "lp", "--manifest-dir", &s(&f.md)]);
+    assert_eq!(code(&o), 2, "a symlink loop in the parent chain is a refusal: {}{}", out(&o), err(&o));
+    assert!(err(&o).contains("does not resolve inside a root"), "the refusal names the rule: {}", err(&o));
+    assert!(fs::symlink_metadata(f.root.join("loop")).is_ok(), "the loop link itself is untouched");
+    assert!(f.root.join("tmp/scratch.txt").exists(), "nothing inside the roots was deleted either");
+}
+
+/// Must-not-fire (r2 held-out variant 3): a sweep whose leftovers' ancestors are all REAL and
+/// unchanged moves every one of them — 900 plain root leftovers plus a leftover nested under an
+/// ancestor of a live entry — exit 0, moved=901; the ancestor re-check never refuses a stable
+/// tree, and the ancestor of the live entry stays in place.
+#[test]
+fn sweep_moves_all_when_ancestors_stable() {
+    let f = fixture();
+    for i in 0..900 {
+        let d = f.root.join(format!("stray-{i:03}"));
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("one.txt"), b"p").unwrap();
+    }
+    fs::create_dir_all(f.root.join("a/c")).unwrap();
+    fs::write(f.root.join("a/c/one.txt"), b"nested").unwrap();
+    ok(&["manifest", "add", "t-1", "--class", "temp_dir", "--id", "live-a", "--path", &s(&f.root.join("a/b")), "--dir", &s(&f.md)]);
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 0, "a stable tree sweeps clean: {}", err(&o));
+    assert!(out(&o).contains("moved=901"), "every leftover moved: {}", out(&o));
+    assert!(f.root.join("a").exists(), "the ancestor of the live entry stays");
+    assert!(!f.root.join("a/c").exists(), "the nested leftover moved");
+    for i in 0..900 {
+        assert!(!f.root.join(format!("stray-{i:03}")).exists(), "stray-{i:03} moved");
+    }
+}
