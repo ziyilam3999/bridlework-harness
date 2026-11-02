@@ -9,7 +9,7 @@
 use harness::quarantine::{self, SweepArgs};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1077,12 +1077,12 @@ fn sweep_swap_between_recheck_and_move_never_redirects() {
         fs::rename(&parent, &old).unwrap();
         std::os::unix::fs::symlink(&step_ext, &parent).unwrap();
     };
+    // review r1, F4: the outcome is pinned EXACTLY — the swap lands inside the gap, the move acts on the
+    // verified parent handle, and the run succeeds with precisely one item moved; exit 3 here would be a bug
+    // (the dead "parent chain" arm the review flagged is gone).
     match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
-        Ok(line) => assert!(line.contains("moved=1"), "the inside item moved: {line}"),
-        Err(quarantine::Stop(c, line)) => {
-            assert!(c == 3, "exit 0 or 3, got {c}: {line}");
-            assert!(line.contains("parent chain"), "a refusal names the changed parent chain: {line}");
-        }
+        Ok(line) => assert_eq!(line, "quarantine=done ticket=t-1 moved=1", "the exact success line"),
+        Err(quarantine::Stop(c, line)) => panic!("the in-gap swap must not stop the run: exit {c}: {line}"),
     }
     // the outside file never moved: still at its outside path, original bytes
     assert!(ext.join("c").exists(), "ext-gap/c is gone from outside the roots");
@@ -1122,6 +1122,501 @@ fn sweep_swap_between_recheck_and_move_never_redirects() {
     assert_eq!(journal_lines, quarantined_lines(&f).len(), "one journal line per event");
     // the sweep never changes the process working directory (it must work from a threaded caller)
     assert_eq!(std::env::current_dir().unwrap(), cwd_before, "the working directory is unchanged");
+}
+
+/// The `SweepArgs` of the fixture for an in-process seam run — the same values `sweep(&f, &[])` parses.
+fn seam_args(f: &Fix) -> SweepArgs {
+    SweepArgs {
+        ticket: "t-1".to_string(),
+        manifest_dir: f.md.clone(),
+        workspace_root: f.ws.clone(),
+        quarantine_dir: f.q.clone(),
+        log: f.log.clone(),
+        repo: "r-1".to_string(),
+        role: "executor".to_string(),
+        model: "m-1".to_string(),
+        max_items: 1000,
+        ts_ms: 1731000000123,
+    }
+}
+
+/// One leftover group for the seam tests: `<root>/<name>/c` holding `bytes`, with a live manifest entry
+/// (`<name>/b`) beneath it so the walk DESCENDS into the group and records the ancestor chain. The leftover's
+/// parent is `<name>`; the group itself sits directly under the ticket root.
+fn group(f: &Fix, name: &str, bytes: &[u8]) -> PathBuf {
+    let d = f.root.join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("c"), bytes).unwrap();
+    ok(&[
+        "manifest", "add", "t-1", "--class", "temp_dir", "--id", &format!("live-{name}"),
+        "--path", &s(&d.join("b")), "--dir", &s(&f.md),
+    ]);
+    d
+}
+
+/// The deep variant of `group`: the leftover is `<root>/<name>/deep/c`, so its chain is
+/// `[root, <name>, <name>/deep]` and `<name>` is the leftover's GRANDPARENT (the middle of the chain).
+fn deep_group(f: &Fix, name: &str, bytes: &[u8]) -> PathBuf {
+    let d = f.root.join(name).join("deep");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("c"), bytes).unwrap();
+    ok(&[
+        "manifest", "add", "t-1", "--class", "temp_dir", "--id", &format!("live-{name}"),
+        "--path", &s(&d.join("b")), "--dir", &s(&f.md),
+    ]);
+    d
+}
+
+/// Make a FIFO at `p` with `mkfifo(1)` (present on every unix CI leg and dev box; the crate itself stays
+/// std-only and never makes a FIFO — only this regression test needs one).
+fn mkfifo(p: &Path) {
+    let o = Command::new("mkfifo").arg(p).output().unwrap();
+    assert!(o.status.success(), "mkfifo {:?} failed: {}", p, String::from_utf8_lossy(&o.stderr));
+}
+
+/// Review r1, F1 (#187): the ancestor re-check must open each ancestor as a directory WITHOUT following a
+/// link and WITHOUT blocking. Item 1's seam step swaps the OTHER group's GRANDPARENT (the middle of its
+/// chain) for a FIFO, so the swap lands BEFORE item 2's re-check. A plain `File::open` on a FIFO waits for
+/// a writer; the `O_DIRECTORY | O_NOFOLLOW` open fails AT ONCE (ENOTDIR), item 2 is skipped and the run ends
+/// exit 3 naming the parent chain. There is NO clock in this test: a helper thread retries a non-blocking
+/// write-open of the FIFO until the sweep returns, so a regressed build's read-open is paired (no hang, the
+/// sweep carries on) and the pairing is observable. The fixed build never opens the FIFO at all.
+/// `paired_during_sweep` must be false.
+#[test]
+fn sweep_recheck_fifo_grandparent_fails_fast_and_skips() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let f = fixture();
+    deep_group(&f, "a00", b"inside-a00");
+    deep_group(&f, "a01", b"inside-a01");
+    let args = seam_args(&f);
+    let a00 = f.root.canonicalize().unwrap().join("a00");
+    let a01 = f.root.canonicalize().unwrap().join("a01");
+    let sweep_over = Arc::new(AtomicBool::new(false));
+    let paired_during_sweep = Arc::new(AtomicBool::new(false));
+    let writer: std::cell::RefCell<Option<std::thread::JoinHandle<()>>> = std::cell::RefCell::new(None);
+    let done = std::cell::Cell::new(false);
+    let (over2, paired2) = (sweep_over.clone(), paired_during_sweep.clone());
+    let step = |src: &Path| {
+        if done.get() {
+            return;
+        }
+        done.set(true);
+        // the item's parent is `<group>/deep`, so match by prefix to find which group moves first
+        let victim = if src.starts_with(&a00) { a01.clone() } else { a00.clone() };
+        let aside = victim.with_file_name(format!("{}-moved-aside", victim.file_name().unwrap().to_string_lossy()));
+        fs::rename(&victim, &aside).unwrap();
+        mkfifo(&victim);
+        let (over, paired) = (over2.clone(), paired2.clone());
+        *writer.borrow_mut() = Some(std::thread::spawn(move || {
+            // Non-blocking write-open, retried until the sweep is over. It succeeds only while some reader has
+            // the pipe open — and a plain read-open of a FIFO counts as a reader from the moment it starts to
+            // wait — so a regressed build that opens the swapped-in FIFO is paired here (and carries on)
+            // instead of hanging, and the pairing is recorded. A build that refuses the pipe never opens it:
+            // every attempt fails with ENXIO until the sweep returns.
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NONBLOCK: i32 = if cfg!(target_os = "macos") { 0x4 } else { 0o4000 };
+            loop {
+                if fs::OpenOptions::new().write(true).custom_flags(O_NONBLOCK).open(&victim).is_ok() {
+                    paired.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if over.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        }));
+    };
+    let cwd_before = std::env::current_dir().unwrap();
+    let got = quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step);
+    sweep_over.store(true, Ordering::SeqCst);
+    writer.borrow_mut().take().unwrap().join().unwrap();
+    assert!(
+        !paired_during_sweep.load(Ordering::SeqCst),
+        "the ancestor re-check opened a swapped-in FIFO (a reader paired with the parked writer): it must refuse \
+         the pipe without opening it (review r1, F1)"
+    );
+    match got {
+        Err(quarantine::Stop(3, line)) => assert!(
+            line.contains("parent chain changed mid-run (i-2)"),
+            "the refusal names the skipped item's parent chain: {line}"
+        ),
+        Ok(line) => panic!("a swapped-in FIFO grandparent must skip item 2, got Ok: {line}"),
+        Err(quarantine::Stop(c, line)) => panic!("expected exit 3 naming the parent chain, got {c}: {line}"),
+    }
+    // the moved group's item reached the shelf byte-identical; the skipped group's real file never moved
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let bytes = fs::read(bs[0].join("i-1")).unwrap();
+    assert!(
+        bytes == b"inside-a00" || bytes == b"inside-a01",
+        "the moved item is one of the INSIDE files, byte-identical"
+    );
+    // exactly one group's GRANDPARENT is a FIFO now (the first item's step swapped the other group's), and
+    // that group's real file stayed inside the moved-aside real directory — nothing moved through the pipe's name
+    let mut fifos = 0;
+    for name in ["a00", "a01"] {
+        if fs::symlink_metadata(f.root.join(name)).map(|m| m.file_type().is_fifo()).unwrap_or(false) {
+            fifos += 1;
+            let real = if name == "a00" { &b"inside-a00"[..] } else { &b"inside-a01"[..] };
+            assert_eq!(
+                fs::read(f.root.join(format!("{name}-moved-aside/deep/c"))).unwrap(),
+                real,
+                "the skipped group's real file stayed in the moved-aside real directory"
+            );
+        }
+    }
+    assert_eq!(fifos, 1, "exactly one grandparent was swapped for a FIFO");
+    // journal lines == quarantined events: one for the moved item, none for the skipped one
+    let mut journal_lines = 0usize;
+    for b in &bs {
+        if let Ok(t) = fs::read_to_string(b.join("journal.jsonl")) {
+            journal_lines += t.lines().count();
+        }
+    }
+    assert_eq!(journal_lines, quarantined_lines(&f).len(), "one journal line per event, none for the skipped item");
+    assert_eq!(std::env::current_dir().unwrap(), cwd_before, "the working directory is unchanged");
+}
+
+/// Review r1, F2/F3 (#187): an ancestor replaced by a symlink is SKIPPED even when the link points at the
+/// very directory it replaced (same dev, same ino — the alias would PASS the identity compare if the open
+/// followed the link). Item 1's step swaps item 2's parent for a symlink to the moved-aside real directory.
+/// The `O_NOFOLLOW` open fails (ELOOP) → skip → exit 3, and the real leftover is NOT moved: it stays inside
+/// the moved-aside directory. RED on a build whose open drops `O_NOFOLLOW`: the link opens, the aliased
+/// directory's dev/ino MATCHES the recorded chain and the item moves.
+#[test]
+fn sweep_recheck_same_dir_link_alias_is_skipped_not_moved() {
+    let f = fixture();
+    group(&f, "a00", b"inside-a00");
+    group(&f, "a01", b"inside-a01");
+    let args = seam_args(&f);
+    let a00 = f.root.canonicalize().unwrap().join("a00");
+    let a01 = f.root.canonicalize().unwrap().join("a01");
+    let done = std::cell::Cell::new(false);
+    let step = move |src: &Path| {
+        if done.get() {
+            return;
+        }
+        done.set(true);
+        let parent = src.parent().unwrap().to_path_buf();
+        let victim = if parent == a00 { a01.clone() } else { a00.clone() };
+        let aside = victim.with_file_name(format!("{}-moved-aside", victim.file_name().unwrap().to_string_lossy()));
+        fs::rename(&victim, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &victim).unwrap();
+    };
+    match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
+        Err(quarantine::Stop(3, line)) => assert!(
+            line.contains("parent chain changed mid-run (i-2)"),
+            "the refusal names the skipped item's parent chain: {line}"
+        ),
+        Ok(line) => panic!("a swapped-in link ancestor must skip item 2, got Ok: {line}"),
+        Err(quarantine::Stop(c, line)) => panic!("expected exit 3 naming the parent chain, got {c}: {line}"),
+    }
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let bytes = fs::read(bs[0].join("i-1")).unwrap();
+    assert!(bytes == b"inside-a00" || bytes == b"inside-a01", "the moved item is an INSIDE file");
+    // whichever group was skipped: its parent is now a link to the moved-aside real dir, and the real file
+    // was NOT moved through the alias (it still sits in the moved-aside directory)
+    for name in ["a00", "a01"] {
+        let p = f.root.join(name);
+        if fs::symlink_metadata(&p).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            let aside = f.root.join(format!("{name}-moved-aside"));
+            assert_eq!(
+                fs::read(aside.join("c")).unwrap(),
+                if name == "a00" { &b"inside-a00"[..] } else { &b"inside-a01"[..] },
+                "the skipped item's real file stayed in the moved-aside directory"
+            );
+            // the link target was spelled through the CANONICAL root (/private/var on macOS), so compare
+            // the last component — the moved-aside directory itself — not the full spelling
+            assert_eq!(
+                fs::read_link(&p).unwrap().file_name().unwrap().to_string_lossy(),
+                format!("{name}-moved-aside"),
+                "the link points at the moved-aside real directory"
+            );
+        }
+    }
+    assert!(
+        f.root.join("a00-moved-aside").exists() || f.root.join("a01-moved-aside").exists(),
+        "exactly one group was swapped for a same-directory alias link"
+    );
+    let mut journal_lines = 0usize;
+    for b in &bs {
+        if let Ok(t) = fs::read_to_string(b.join("journal.jsonl")) {
+            journal_lines += t.lines().count();
+        }
+    }
+    assert_eq!(journal_lines, quarantined_lines(&f).len(), "one journal line per event, none for the skipped item");
+}
+
+/// Review r1, F2 (#187): item 1's step swaps item 2's parent for a symlink to an OUTSIDE folder holding a
+/// same-named file with different (outside) bytes — the swap lands BEFORE item 2's re-check. The re-check
+/// must refuse the link and skip the item: exit 3 naming the parent chain, the OUTSIDE file untouched at its
+/// outside path with its original bytes, no outside bytes anywhere on the shelf, journal == events.
+#[test]
+fn sweep_recheck_link_to_outside_folder_never_moves_outside_file() {
+    let f = fixture();
+    let ext = f.outside.join("ext-pre");
+    fs::create_dir_all(&ext).unwrap();
+    fs::write(ext.join("c"), b"outside-c").unwrap();
+    group(&f, "a00", b"inside-a00");
+    group(&f, "a01", b"inside-a01");
+    let args = seam_args(&f);
+    let a00 = f.root.canonicalize().unwrap().join("a00");
+    let a01 = f.root.canonicalize().unwrap().join("a01");
+    let step_ext = ext.clone();
+    let done = std::cell::Cell::new(false);
+    let step = move |src: &Path| {
+        if done.get() {
+            return;
+        }
+        done.set(true);
+        let parent = src.parent().unwrap().to_path_buf();
+        let victim = if parent == a00 { a01.clone() } else { a00.clone() };
+        let aside = victim.with_file_name(format!("{}-moved-aside", victim.file_name().unwrap().to_string_lossy()));
+        fs::rename(&victim, &aside).unwrap();
+        std::os::unix::fs::symlink(&step_ext, &victim).unwrap();
+    };
+    match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
+        Err(quarantine::Stop(3, line)) => assert!(
+            line.contains("parent chain changed mid-run (i-2)"),
+            "the refusal names the skipped item's parent chain: {line}"
+        ),
+        Ok(line) => panic!("a swapped-in link ancestor must skip item 2, got Ok: {line}"),
+        Err(quarantine::Stop(c, line)) => panic!("expected exit 3 naming the parent chain, got {c}: {line}"),
+    }
+    assert!(ext.join("c").exists(), "the outside file is gone from outside the roots");
+    assert_eq!(fs::read(ext.join("c")).unwrap(), b"outside-c", "the outside file is intact");
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let bytes = fs::read(bs[0].join("i-1")).unwrap();
+    assert!(bytes == b"inside-a00" || bytes == b"inside-a01", "the moved item is an INSIDE file");
+    for b in &bs {
+        if let Ok(rd) = fs::read_dir(b) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(false)
+                    && fs::read(&p).map(|x| x == b"outside-c").unwrap_or(false)
+                {
+                    panic!("a file from OUTSIDE the roots landed on the shelf");
+                }
+            }
+        }
+    }
+    let mut journal_lines = 0usize;
+    for b in &bs {
+        if let Ok(t) = fs::read_to_string(b.join("journal.jsonl")) {
+            journal_lines += t.lines().count();
+        }
+    }
+    assert_eq!(journal_lines, quarantined_lines(&f).len(), "one journal line per event, none for the skipped item");
+}
+
+/// Review r1, F2 (#187): the dev/ino compare is the ONLY guard left when the swap lands a DIFFERENT REAL
+/// directory at the parent's name — no link for `O_NOFOLLOW` to refuse, `is_dir` passes, the device is the
+/// same (one filesystem); only the INODE compare can tell the decoy from the recorded parent. Item 1's step
+/// swaps item 2's parent for a real decoy directory (moved in from outside the roots) holding a same-named
+/// file with outside bytes. The compare must fail it: skip, exit 3, the decoy's file stays put, no outside
+/// bytes on the shelf, the real parent's file untouched in the moved-aside directory. RED on the mutant that
+/// drops the dev/ino compare (review r1 m3): the open succeeds on the decoy, the handle-relative rename
+/// carries the DECOY's file — outside bytes — onto the shelf.
+#[test]
+fn sweep_recheck_decoy_real_directory_fails_the_identity_compare() {
+    let f = fixture();
+    let decoy = f.outside.join("decoy");
+    fs::create_dir_all(&decoy).unwrap();
+    fs::write(decoy.join("c"), b"outside-c").unwrap();
+    group(&f, "a00", b"inside-a00");
+    group(&f, "a01", b"inside-a01");
+    let args = seam_args(&f);
+    let a00 = f.root.canonicalize().unwrap().join("a00");
+    let a01 = f.root.canonicalize().unwrap().join("a01");
+    let step_decoy = decoy.clone();
+    let done = std::cell::Cell::new(false);
+    let step = move |src: &Path| {
+        if done.get() {
+            return;
+        }
+        done.set(true);
+        let parent = src.parent().unwrap().to_path_buf();
+        let victim = if parent == a00 { a01.clone() } else { a00.clone() };
+        let aside = victim.with_file_name(format!("{}-moved-aside", victim.file_name().unwrap().to_string_lossy()));
+        fs::rename(&victim, &aside).unwrap();
+        fs::rename(&step_decoy, &victim).unwrap(); // a DIFFERENT REAL directory at the parent's name: same dev, other ino
+    };
+    match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
+        Err(quarantine::Stop(3, line)) => assert!(
+            line.contains("parent chain changed mid-run (i-2)"),
+            "the refusal names the skipped item's parent chain: {line}"
+        ),
+        Ok(line) => panic!("a decoy real directory at the parent's name must fail the identity compare, got Ok: {line}"),
+        Err(quarantine::Stop(c, line)) => panic!("expected exit 3 naming the parent chain, got {c}: {line}"),
+    }
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let bytes = fs::read(bs[0].join("i-1")).unwrap();
+    assert!(bytes == b"inside-a00" || bytes == b"inside-a01", "the moved item is an INSIDE file");
+    // the decoy's file stayed put (in the directory the attack itself moved to the parent's name)
+    let decoy_now = if f.root.join("a01").join("c").exists() { f.root.join("a01") } else { f.root.join("a00") };
+    assert_eq!(fs::read(decoy_now.join("c")).unwrap(), b"outside-c", "the decoy's file was not carried onto the shelf");
+    assert!(!decoy.exists(), "sanity: the decoy directory is the one now sitting at a parent name");
+    // no outside bytes anywhere on the shelf
+    for b in &bs {
+        if let Ok(rd) = fs::read_dir(b) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if fs::symlink_metadata(&p).map(|m| !m.is_dir()).unwrap_or(false)
+                    && fs::read(&p).map(|x| x == b"outside-c").unwrap_or(false)
+                {
+                    panic!("a file from OUTSIDE the roots landed on the shelf");
+                }
+            }
+        }
+    }
+    // the REAL parent's leftover was skipped, not moved: still inside the moved-aside directory
+    let aside_real = decoy_now.with_file_name(format!("{}-moved-aside", decoy_now.file_name().unwrap().to_string_lossy()));
+    let real_bytes = if decoy_now == f.root.join("a01") { &b"inside-a01"[..] } else { &b"inside-a00"[..] };
+    assert_eq!(fs::read(aside_real.join("c")).unwrap(), real_bytes, "the real leftover stayed in the real parent");
+    let mut journal_lines = 0usize;
+    for b in &bs {
+        if let Ok(t) = fs::read_to_string(b.join("journal.jsonl")) {
+            journal_lines += t.lines().count();
+        }
+    }
+    assert_eq!(journal_lines, quarantined_lines(&f).len(), "one journal line per event, none for the skipped item");
+}
+
+/// Must-not-fire twin of the seam tests: with NO swap in the step, three items all move through the seam and
+/// the run is the plain success — the seam itself must not change the outcome.
+#[test]
+fn sweep_seam_plain_run_moves_all_three() {
+    let f = fixture();
+    group(&f, "a00", b"one");
+    group(&f, "a01", b"two");
+    group(&f, "a02", b"three");
+    let args = seam_args(&f);
+    let seen = std::cell::Cell::new(0usize);
+    let step = |_src: &Path| {
+        seen.set(seen.get() + 1);
+    };
+    match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
+        Ok(line) => assert_eq!(line, "quarantine=done ticket=t-1 moved=3", "the exact success line"),
+        Err(quarantine::Stop(c, line)) => panic!("a plain sweep through the seam must succeed, got {c}: {line}"),
+    }
+    assert_eq!(seen.get(), 3, "the step ran once per item, between each re-check and its move");
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let mut payloads = Vec::new();
+    for n in 1..=3 {
+        payloads.push(fs::read(bs[0].join(format!("i-{n}"))).unwrap());
+    }
+    payloads.sort_unstable();
+    assert_eq!(payloads, vec![b"one".to_vec(), b"three".to_vec(), b"two".to_vec()], "all three items moved, byte-identical");
+}
+
+/// Must-not-fire: a swap of an UNRELATED folder under the same ticket root (a live manifest entry's own
+/// directory, outside both items' ancestor chains) must not skip or stop anything — both items still move
+/// and the run succeeds. The re-check opens only the ancestors the walk recorded for each leftover.
+#[test]
+fn sweep_seam_swap_of_unrelated_folder_still_moves_both() {
+    let f = fixture();
+    group(&f, "a00", b"inside-a00");
+    group(&f, "a01", b"inside-a01");
+    let unrel = f.root.join("unrel");
+    fs::create_dir_all(&unrel).unwrap();
+    fs::write(unrel.join("keep.txt"), b"unrelated").unwrap();
+    ok(&[
+        "manifest", "add", "t-1", "--class", "temp_dir", "--id", "live-unrel",
+        "--path", &s(&unrel), "--dir", &s(&f.md),
+    ]);
+    let args = seam_args(&f);
+    let swap_at = f.root.canonicalize().unwrap().join("unrel");
+    let done = std::cell::Cell::new(false);
+    let step = move |_src: &Path| {
+        if done.get() {
+            return;
+        }
+        done.set(true);
+        // an unrelated OWNED folder is swapped mid-run; neither leftover's chain names it
+        let aside = swap_at.with_file_name("unrel-moved-aside");
+        fs::rename(&swap_at, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &swap_at).unwrap();
+    };
+    match quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step) {
+        Ok(line) => assert_eq!(line, "quarantine=done ticket=t-1 moved=2", "both items moved despite the unrelated swap"),
+        Err(quarantine::Stop(c, line)) => panic!("an unrelated swap must not stop the run, got {c}: {line}"),
+    }
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let mut payloads = Vec::new();
+    for n in 1..=2 {
+        payloads.push(fs::read(bs[0].join(format!("i-{n}"))).unwrap());
+    }
+    payloads.sort_unstable();
+    assert_eq!(payloads, vec![b"inside-a00".to_vec(), b"inside-a01".to_vec()], "both items moved, byte-identical");
+}
+
+/// Must-not-fire (mapped refusal, never a hang): the seam's step makes the fresh batch dir read-only (0500)
+/// between item 1's move and item 2's — a plain permission refusal, the reviewer's probe P5 shape. The sweep
+/// must stop with the MAPPED exit-3 refusal "a move failed mid-run" (item 1 stays moved; the write-ahead
+/// journal holds item 2's intent, the event log only item 1's event — the pre-existing crash-recovery
+/// design), not hang, not panic, not skip silently.
+#[test]
+fn sweep_seam_readonly_batch_dir_is_the_mapped_refusal() {
+    let f = fixture();
+    group(&f, "a00", b"inside-a00");
+    group(&f, "a01", b"inside-a01");
+    let args = seam_args(&f);
+    let shelf = f.q.join("t-1");
+    let calls = std::cell::Cell::new(0usize);
+    let step = move |_src: &Path| {
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n != 2 {
+            return; // only between item 1's move and item 2's
+        }
+        let batch = fs::read_dir(&shelf)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.file_name().map(|x| x.to_string_lossy().starts_with("b-")).unwrap_or(false))
+            .expect("the batch dir is minted before the first move");
+        let mut perm = fs::metadata(&batch).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o500);
+        fs::set_permissions(&batch, perm).unwrap();
+    };
+    let outcome = quarantine::sweep_with_step_before_each_move(&args, &|_p: &Path| Some(7u64), &step);
+    // restore write permission first so the fixture's cleanup can remove the batch
+    for b in batches(&f) {
+        let mut perm = fs::metadata(&b).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o700);
+        let _ = fs::set_permissions(&b, perm);
+    }
+    match outcome {
+        Err(quarantine::Stop(3, line)) => assert!(
+            line.contains("a move failed mid-run"),
+            "the refusal is the mapped mid-run move failure: {line}"
+        ),
+        Ok(line) => panic!("a read-only batch dir must fail the move, got Ok: {line}"),
+        Err(quarantine::Stop(c, line)) => panic!("expected exit 3 'a move failed mid-run', got {c}: {line}"),
+    }
+    let bs = batches(&f);
+    assert_eq!(bs.len(), 1, "one batch on the shelf");
+    let bytes = fs::read(bs[0].join("i-1")).unwrap();
+    assert!(bytes == b"inside-a00" || bytes == b"inside-a01", "item 1 stayed moved, byte-identical");
+    // the write-ahead design: item 2's journal intent exists, its event does not
+    let journal_lines = fs::read_to_string(bs[0].join("journal.jsonl")).unwrap().lines().count();
+    assert_eq!(journal_lines, 2, "both intents were journalled before the failed move");
+    assert_eq!(quarantined_lines(&f).len(), 1, "exactly one event: the moved item's");
+    // both groups' real files are accounted for: one on the shelf, one still in its parent
+    let on_shelf = &bytes;
+    let other = if on_shelf == b"inside-a00" { "a01" } else { "a00" };
+    assert_eq!(
+        fs::read(f.root.join(other).join("c")).unwrap(),
+        if other == "a00" { &b"inside-a00"[..] } else { &b"inside-a01"[..] },
+        "the unmoved item stayed in its real parent"
+    );
 }
 
 /// Review r2, F3 (A8): a listed temp dir DEEPER than the filesystem's path limit (PATH_MAX) is

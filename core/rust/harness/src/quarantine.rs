@@ -190,8 +190,9 @@ fn resolve_base_dir(flag: &str, arg: &Path) -> Result<PathBuf, Stop> {
 /// (raw, because a name need not be UTF-8; the journal stores these bytes hex-encoded), plus the ANCESTOR
 /// CHAIN the walk examined — the root and every real directory between it and the leftover, each with the
 /// dev/ino it had at walk time. The chain is re-checked immediately before the item's rename (review r2, F2 /
-/// RACE-S, closed by #187): every ancestor is opened and its handle's stat matched against the recorded
-/// dev/ino, and the immediate parent's handle is HELD into the rename, which is dirfd-relative — an ancestor
+/// RACE-S, closed by #187): every ancestor is opened with O_DIRECTORY|O_NOFOLLOW — a swapped-in link, FIFO
+/// or other non-directory fails the open itself, never followed and never blocked (review r1, F1) — and its
+/// handle's stat matched against the recorded dev/ino, and the immediate parent's handle is HELD into the rename, which is dirfd-relative — an ancestor
 /// that is gone, is now a symlink, or is a different directory makes the sweep SKIP the item (nothing moved
 /// for it, no journal line, no event, exit 3 at the end naming the item token) instead of following a swapped
 /// component out of the roots, and a swap landing after the check can no longer redirect the move.
@@ -465,19 +466,47 @@ fn real_device(p: &Path) -> Option<u64> {
     fs::symlink_metadata(p).ok().map(|m| m.dev())
 }
 
+// `open(2)` directory flags std exposes no constants for (review r1, F1, #187). The spellings differ per
+// platform and are NOT guessable (Darwin's `O_NOFOLLOW` is 0x100; 0x40 — the FreeBSD value — is another
+// flag there and compiles silently, which is exactly how a wrong constant would sneak in), so only the two
+// platforms this crate is built on are listed, each value read from its own `fcntl.h`: Linux from
+// `asm-generic/fcntl.h`, macOS from the SDK `sys/fcntl.h`. Any other platform fails the build here rather
+// than opening without the flags.
+#[cfg(target_os = "linux")]
+const O_DIRECTORY: i32 = 0o200000;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(target_os = "macos")]
+const O_DIRECTORY: i32 = 0x100000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x000100;
+
+/// Open one path as a directory WITHOUT following a link and WITHOUT blocking (review r1, F1, #187):
+/// `O_DIRECTORY` makes a swapped-in FIFO, device node or regular file fail the open AT ONCE (ENOTDIR) — a
+/// plain `File::open` on a FIFO waits for a writer FOREVER and hangs the sweep (and finalize behind it) —
+/// and `O_NOFOLLOW` makes a symlink fail the open itself (ELOOP), so nothing behind a link is ever opened.
+/// Any failure is the caller's fail-closed refusal: skip, never block, never follow.
+fn open_dir_no_follow(p: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().read(true).custom_flags(O_DIRECTORY | O_NOFOLLOW).open(p).ok()
+}
+
 /// Re-check one leftover's ancestor chain immediately before its move (#187): every ancestor the walk recorded
-/// is OPENED, and the handle's own stat (an fstat — no path is re-resolved after the open) must be the SAME
-/// real directory the walk recorded: a directory, same dev, same ino. An ancestor that was swapped for a
-/// symlink opens to a different identity (or not at all), so `None` is fail-closed — the item is skipped.
-/// The LAST ancestor — the leftover's immediate parent — is returned with its HANDLE HELD: the rename then
-/// names the item relative to this verified directory, so no swap landing after the check can redirect the
-/// move (the rule of this fix round: act on what was checked, never on a path looked up again afterwards).
-/// Opening follows a link, but only the exact recorded directory (dev/ino) passes, and the walk never
-/// descended a link, so a match is by construction the real in-roots ancestor.
+/// is opened with `open_dir_no_follow` — a directory, never a link, never a blocking file type — and the
+/// handle's own stat (an fstat — no path is re-resolved after the open) must be the SAME real directory the
+/// walk recorded: a directory, same dev, same ino. An ancestor swapped for a symlink, a FIFO or any other
+/// type fails the OPEN itself; an ancestor swapped for a DIFFERENT real directory (a moved-in decoy: the
+/// open succeeds, `is_dir` passes, the device is the same) fails the dev/ino COMPARE — the compare is the
+/// only guard left in that case, so both checks are load-bearing. Either way `None` is fail-closed: the item
+/// is skipped. The LAST ancestor — the leftover's immediate parent — is returned with its HANDLE HELD: the
+/// rename then names the item relative to this verified directory, so no swap landing after the check can
+/// redirect the move (the rule of this fix round: act on what was checked, never on a path looked up again
+/// afterwards). The walk never descended a link, so a dev/ino match is by construction the real in-roots
+/// ancestor.
 fn verified_parent(chain: &[(PathBuf, u64, u64)]) -> Option<File> {
     let mut held: Option<File> = None;
     for (p, dev, ino) in chain {
-        let f = File::open(p).ok()?;
+        let f = open_dir_no_follow(p)?;
         let m = f.metadata().ok()?;
         if !m.is_dir() || m.dev() != *dev || m.ino() != *ino {
             return None;
@@ -624,15 +653,20 @@ fn sweep_probed(a: &SweepArgs, device_of: &dyn Fn(&Path) -> Option<u64>, step: &
     // The moves. Per item, in order: ANCESTOR RE-CHECK (every recorded ancestor opened and the handle's stat
     // matched against the walk's dev/ino), journal intent (write-ahead), absent check, rename RELATIVE TO THE
     // VERIFIED PARENT HANDLE, event. The re-check (review r2, F2 / RACE-S, window closed by #187): every
-    // ancestor the walk recorded must still be the SAME real directory — same dev, same ino, a directory — and
-    // the immediate parent's HANDLE is held from the check to the rename, which names the item relative to that
+    // ancestor the walk recorded must still be the SAME real directory — same dev, same ino, a directory,
+    // opened with O_DIRECTORY|O_NOFOLLOW so a swapped-in link, FIFO or other type fails the open itself
+    // (never followed, never blocked) — and the immediate parent's HANDLE is held from the check to the rename, which names the item relative to that
     // handle, never by a path re-resolved at rename time. An ancestor swapped for a symlink before the re-check
     // makes the sweep SKIP the item: nothing moved for it, no journal line, no event, and the run ends exit 3
     // naming the item token (never a path). A swap landing between the re-check and the rename can no longer
     // redirect the move: the rename acts on the verified directory itself, so the file behind the swapped-in
     // link — outside the roots — is never touched.
     let (batch_name, batch) = make_batch(&shelf, a.ts_ms)?;
-    let batch_dir = File::open(&batch).map_err(|_| err3("a quarantine batch could not be examined"))?;
+    // The batch directory is opened with the same no-follow, non-blocking directory open as the ancestor
+    // re-check (review r1, F1): between `make_batch` and this open a same-user writer could swap the fresh
+    // batch dir for a symlink or a FIFO; the flags make that fail closed here — the link is never followed,
+    // the pipe never blocks — instead of handing the rename a handle onto something unverified.
+    let batch_dir = open_dir_no_follow(&batch).ok_or_else(|| err3("a quarantine batch could not be examined"))?;
     let mut moved = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for (n, lo) in leftovers.iter().enumerate() {
