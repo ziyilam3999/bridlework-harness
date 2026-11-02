@@ -736,6 +736,9 @@ fn walk_and_delete(anchor: &Path, intermediates: &[std::ffi::OsString], final_na
 /// swapped-in link as the link, and has no path length limit. Only after the
 /// path is gone is the manifest `remove` line written (a crash between leaves a listed half-deleted thing, never an
 /// orphan; a re-run on an already-absent path just writes the remove).
+/// The walk also changes the process working directory while it runs (saved and restored before returning), so this
+/// function is not safe to call while another thread is using the working directory or relative paths — P1B-14
+/// teardown must call it from a single thread only.
 pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
     let md = resolve_base_dir("--manifest-dir", &a.manifest_dir)?;
     let read = manifest::read_manifest(&md, &a.ticket).map_err(|_| err2("the manifest could not be read (missing or unreadable); nothing was deleted"))?;
