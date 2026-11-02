@@ -816,6 +816,20 @@ fn today_utc() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// True when two path strings name one file: the same text, or both exist and canonicalize (symlinks
+/// resolved) to the same file. A record file that does not exist yet only matches its own text, so a
+/// fresh `--record` path is never mistaken for the inbox.
+fn paths_name_one_file(a: &str, b: &str) -> bool {
+    let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
+    if pa == pb {
+        return true;
+    }
+    match (std::fs::canonicalize(pa), std::fs::canonicalize(pb)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 /// `harness friction patterns [--config <file>] [--record <file>]` (ticket 192): the N-threshold listing.
 /// Runs the FULL lint first (any lint failure = the same exit and stderr as `lint`, nothing on stdout); then
 /// prints one line per chain-root pattern row whose count of `repeats` rows is >= N (`friction.pattern_threshold`,
@@ -823,7 +837,8 @@ fn today_utc() -> String {
 /// listed=<k>`. Ids and counts only: a row's text is never printed. Nothing is written except, when `--record`
 /// is given, ONE appended JSONL trial line (`schemas/friction-trial.schema.json`). Being listed creates zero
 /// files under any skill or ticket path. Exit codes as the family: 0 ok; 1 a refusal (the lint leg); 2 a usage
-/// or setup error (and a failed record append, so a half-written trial never reads as a clean run).
+/// or setup error (a failed record append, so a half-written trial never reads as a clean run; and `--record`
+/// naming the inbox itself, because a trial line is not a row).
 pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", m);
@@ -864,6 +879,14 @@ pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    // A trial line is not a row: `--record` naming the inbox itself (or a symlink to it) is refused
+    // before anything is read or written, or the appended record would corrupt the inbox the listing
+    // is about to validate. Exit 2, one line, nothing written.
+    if let Some(path) = record {
+        if paths_name_one_file(path, cfg.friction_inbox()) {
+            return fail("--record must not name the friction inbox");
+        }
+    }
     // The listing reads the inbox, so it runs the same privacy engine and fails closed without a list,
     // exactly like `add`, `lint` and `close-check`.
     let list = match crate::overlay::load() {

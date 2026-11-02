@@ -428,6 +428,82 @@ fn threshold_comes_from_config() {
 
 // ---------------------------------------------------------------- AC 5: a listing writes nothing
 
+/// A strict check of ONE trial-record line against the shape `schemas/friction-trial.schema.json` pins:
+/// exactly the four keys (an extra or missing key fails) and each value's type checked (a number written
+/// as a string fails). Hand-rolled like the crate's own row parser, so the test needs no new dependency;
+/// the planted bad lines below prove every check can fail.
+fn check_trial_line(line: &str) -> Result<(), String> {
+    let body = line.strip_suffix('\n').ok_or("the line must end in a newline")?;
+    let inner = body.strip_prefix('{').and_then(|b| b.strip_suffix('}')).ok_or("the line must be one JSON object")?;
+    // split the top-level members on commas outside every string and outside the one array
+    let mut members: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut in_arr = false;
+    for ch in inner.chars() {
+        match ch {
+            '"' => {
+                in_str = !in_str;
+                cur.push(ch);
+            }
+            '[' if !in_str => {
+                in_arr = true;
+                cur.push(ch);
+            }
+            ']' if !in_str => {
+                in_arr = false;
+                cur.push(ch);
+            }
+            ',' if !in_str && !in_arr => members.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    members.push(cur);
+    let mut got: Vec<String> = Vec::new();
+    for m in &members {
+        let key = m.strip_prefix('"').and_then(|r| r.split_once('"')).map(|(k, _)| k.to_string()).ok_or_else(|| format!("member is not \"key\":value: {m:?}"))?;
+        let val = m.split_once(':').map(|(_, v)| v).ok_or_else(|| format!("member has no value: {m:?}"))?;
+        match key.as_str() {
+            "date" => {
+                let v = val.strip_prefix('"').and_then(|v| v.strip_suffix('"')).ok_or("date must be a string")?;
+                if !friction::date_ok(v) {
+                    return Err(format!("date is not a calendar date: {v:?}"));
+                }
+            }
+            "threshold" | "rows" => {
+                if val.starts_with('"') {
+                    return Err(format!("{key} must be a number, not a string"));
+                }
+                let n: u64 = val.parse().map_err(|_| format!("{key} must be a whole number: {val:?}"))?;
+                if key == "threshold" && n < 1 {
+                    return Err("threshold must be at least 1".to_string());
+                }
+            }
+            "listed" => {
+                let v = val.strip_prefix('[').and_then(|v| v.strip_suffix(']')).ok_or("listed must be an array")?;
+                if !v.is_empty() {
+                    for id in v.split(',') {
+                        let id = id.strip_prefix('"').and_then(|i| i.strip_suffix('"')).ok_or("listed must hold strings")?;
+                        if id.is_empty() || id == "." || id == ".." || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')) {
+                            return Err(format!("listed holds a bad id: {id:?}"));
+                        }
+                    }
+                }
+            }
+            other => return Err(format!("an unexpected key: {other:?}")),
+        }
+        got.push(key);
+    }
+    let mut want = vec!["date", "threshold", "rows", "listed"];
+    got.sort();
+    want.sort_unstable();
+    let got_ref: Vec<&str> = got.iter().map(String::as_str).collect();
+    if got_ref != want {
+        return Err(format!("the key set must be exactly the schema's four: got {got:?}"));
+    }
+    Ok(())
+}
+
 /// No `--record`: the whole scratch tree is byte-identical after the run. With `--record <f>`: exactly one new
 /// file appears (the record), holding exactly one line whose keys are the schema's four.
 #[test]
@@ -462,11 +538,61 @@ fn patterns_creates_no_files() {
     assert!(line.contains("\"threshold\":3"), "the line carries threshold: {line}");
     assert!(line.contains("\"rows\":4"), "the line carries the inbox row count: {line}");
     assert!(line.contains("\"listed\":[\"a\"]"), "the line carries the listed ids: {line}");
-    // the committed schema pins exactly these four keys
+    // F6: the WRITTEN line is validated strictly — exact key set, exact types — against the shape
+    // `schemas/friction-trial.schema.json` pins, not the schema file's own text.
+    check_trial_line(&line).unwrap_or_else(|e| panic!("the written trial line must match the schema: {e}"));
+    // each bad condition is planted in a fixture line of its own; every one must be refused
+    for bad in [
+        // an extra key
+        "{\"date\":\"2026-11-02\",\"threshold\":3,\"rows\":4,\"listed\":[\"a\"],\"note\":\"x\"}\n",
+        // a duplicate key
+        "{\"date\":\"2026-11-02\",\"threshold\":3,\"rows\":4,\"listed\":[\"a\"],\"rows\":4}\n",
+        // a missing key
+        "{\"date\":\"2026-11-02\",\"threshold\":3,\"rows\":4}\n",
+        // threshold written as a string (a type change)
+        "{\"date\":\"2026-11-02\",\"threshold\":\"3\",\"rows\":4,\"listed\":[\"a\"]}\n",
+        // the row count written as a string
+        "{\"date\":\"2026-11-02\",\"threshold\":3,\"rows\":\"4\",\"listed\":[\"a\"]}\n",
+        // a number inside listed
+        "{\"date\":\"2026-11-02\",\"threshold\":3,\"rows\":4,\"listed\":[3]}\n",
+        // a date that is not a calendar date
+        "{\"date\":\"2026-13-45\",\"threshold\":3,\"rows\":4,\"listed\":[\"a\"]}\n",
+    ] {
+        assert!(check_trial_line(bad).is_err(), "this bad trial line must be refused: {bad}");
+    }
+    // the committed schema still names exactly these four keys
     let schema = fs::read_to_string(SCHEMA).expect("the trial schema is committed and utf-8");
     for key in ["date", "threshold", "rows", "listed"] {
         assert!(schema.contains(&format!("\"{key}\"")), "the schema names key {key}");
     }
+}
+
+/// `--record` naming the configured inbox itself (or a symlink to it) is refused: a trial line is not a
+/// row, and appending one would corrupt the inbox the listing is about to validate. The fixture carries
+/// the condition: the record path IS the configured inbox path. Exit 2, one line, nothing written.
+#[test]
+fn refuses_record_pointing_at_the_inbox() {
+    let t = Tmp::new();
+    let cfg = t.config();
+    seed_root(&t, &cfg, "a");
+    for id in ["a-r1", "a-r2", "a-r3"] {
+        seed_repeat(&t, &cfg, id, "a");
+    }
+    let before = fs::read(t.inbox()).unwrap();
+    let o = patterns(&cfg, Some(&t.inbox()));
+    assert_eq!(code(&o), 2, "stderr: {}", err(&o));
+    assert!(out(&o).is_empty(), "stdout must be empty on a refusal: {}", out(&o));
+    assert_eq!(fs::read(t.inbox()).unwrap(), before, "a refused record must not touch the inbox");
+    assert_eq!(err(&o).lines().count(), 1, "exactly one line: {}", err(&o));
+    assert!(err(&o).contains("--record"), "the flag is named: {}", err(&o));
+    // a symlink that resolves to the inbox names the same file: refused too
+    let link = t.0.join("inbox-link.jsonl");
+    std::os::unix::fs::symlink(t.inbox(), &link).unwrap();
+    let o = patterns(&cfg, Some(&link));
+    assert_eq!(code(&o), 2, "stderr: {}", err(&o));
+    assert!(out(&o).is_empty(), "stdout must be empty on a refusal: {}", out(&o));
+    assert_eq!(fs::read(t.inbox()).unwrap(), before, "a refused record must not touch the inbox through the link");
+    assert!(err(&o).contains("--record"), "the flag is named: {}", err(&o));
 }
 
 // ---------------------------------------------------------------- AC 6: privacy
