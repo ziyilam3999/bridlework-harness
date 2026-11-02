@@ -278,6 +278,14 @@ for a pid the run has just proven live AND still the recorded process. An entry 
 whose pid was re-used, is never staged as a timeout — it records `died` (limit from its own entry)
 through the stop's already-gone / pid-reused arms, in every verb.
 
+An entry that check or step signals for a LIMIT is staged first or not signalled at all. The pre-stage
+probes must be CONCLUSIVE: an inconclusive one (a liveness or identity probe that could not run or proved
+nothing) refuses the entry — exit 2, nothing signalled, the entry kept, the cause named in the message —
+because the stop re-probes on its own, and a limit stop whose own later probe succeeds with nothing
+staged would be read as a deliberate stop and remove the entry with NO record. As a second line, a limit
+stop that ever reaches the stopped arm unstaged refuses with `DEATH NOT RECORDED` and keeps the entry
+(instead of the stopped arm reading "nothing staged" as a deliberate stop).
+
 ### The handover file
 
 One file per death, `<manifest-dir>/<ticket>.deaths/<id>.<pid>.<pid_start_ms>.json` — outside the
@@ -295,6 +303,9 @@ checkpoint, recipe(commit_push_then_resume), session_id
 The recipe, stated once: a restart checks out `ws/<ticket>` at `checkpoint` under a NEW session and
 resumes; the old `session_id` is the pointer to what the dead worker knew. NO program name, argv, cwd,
 path, ticket title or any free text is written — nothing that could carry a secret or a private folder.
+`steps` and `hard_limit` name the RUN that found the death, so a `died` found at `step`'s hard line
+carries that run's numbers even though the process was not stopped by the step line (the entry's own
+`limit` field stays the honest one: `none`).
 
 ### Order of writes, and how a failure fails
 
@@ -310,6 +321,10 @@ the driver's next check.
 A path at the final handover name is accepted only if the no-follow metadata says it is a REGULAR file:
 a symlink (even to a valid same-life handover outside the folder), a FIFO, a socket or a directory is
 the planted-name refusal below, is never opened, and cannot hang the verb with the ticket lock held.
+The open itself is non-blocking only (portable no-follow open FLAGS do not exist — the per-platform
+`O_NOFOLLOW` values differ), so a same-user SWAP of the final name between that gate and the open is
+caught one step later: the opened handle must itself be a regular file carrying the gate's own device
+and inode, else the same planted-name refusal — nothing swapped in at the name is ever parsed.
 
 When an existing handover of the same life is REUSED, decision 7 pins only the cause and limit: the
 appended `timed_out` event carries THIS run's `--checkpoint`/`--session` values, so the event and the
@@ -326,6 +341,7 @@ on stderr; the entry is KEPT (not removed), so the death is retried, never lost.
 - `cannot write the handover: <kind>`
 - `event log refused: <why>`
 - `the clock reads before the process was recorded`
+- `a limit stop reached the stopped arm with no staged handover`
 
 The deaths folder is created 0700 when missing, without following links; handover files are 0600. No
 absolute path is ever printed. Exit codes are unchanged: check `0/2/4/5`, step `0/2/4/6`, stop
@@ -352,4 +368,6 @@ Record mode adds ONE stdout line per death this run recorded, after the verb's o
   is an intent record, harmless, and is reused if the entry is later resolved.
 - **Zombie window.** A dead but unreaped program answers the probe and is not recorded until reaped.
 - **Log read cost.** The idempotence lookup reads the whole event log per death (no index); fine at
-  today's sizes.
+  today's sizes. Both record-mode log reads (the pre-flight and the idempotence lookup) go through the
+  same capped, regular-file-proving reader as every other log read (64 MiB cap, a FIFO or directory at
+  the log path refused without being opened).
