@@ -47,10 +47,11 @@
 //! stray scan above does not run in this mode): after steps 1-6 of the clean-state check run unchanged, it
 //! asks one more read-only question — is every commit on `ws/<ticket>` also on the branch's upstream
 //! remote-tracking ref? — answered without any network: the upstream is resolved from the repo's own config
-//! and compared as local refs only, and the exact tracking-ref name rebuilt from that config must EQUAL git's
-//! own `@{upstream}` answer (which applies the remote's fetch refspec and the first `branch.<b>.merge` value);
-//! any disagreement — a non-default fetch refspec, a second merge value, a symref at the tracking ref — is
-//! exit 3, never a pass. `<worktree>/.git` must be a linked-worktree pointer FILE, `--repo` a main
+//! and compared as local refs only, and the exact tracking-ref name rebuilt from that config must EQUAL BOTH
+//! of git's own answers — `@{upstream}` (which applies the remote's fetch refspec and the first
+//! `branch.<b>.merge` value and FOLLOWS a symbolic ref to its target) and the NON-dereferenced
+//! `for-each-ref %(upstream)` name; any disagreement — a non-default fetch refspec, a second merge value, a
+//! symref at the tracking ref — is exit 3, never a pass. `<worktree>/.git` must be a linked-worktree pointer FILE, `--repo` a main
 //! work tree (a real directory whose `.git` is a real directory) of the SAME repository (the canonical git
 //! common dir of the worktree must equal canonical `<repo>/.git`, and `<repo>` must be its own top level),
 //! all by no-follow stat before any git call of this mode reads them; `info/grafts` or a `shallow` file in
@@ -898,8 +899,77 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     if !upstream.starts_with("refs/remotes/") {
         return stop3("the ticket branch's upstream is not a remote-tracking ref");
     }
+    // The NON-dereferenced upstream name, as git itself configured it: `rev-parse --symbolic-full-name`
+    // FOLLOWS a symbolic ref to its target, so when the refspec maps the branch somewhere other than the
+    // default name and that ref is a symref, the answer above is the TARGET (a plain ref) and the symref
+    // would never be seen by any later rule. `%(upstream)` applies the same fetch-refspec mapping as
+    // `@{upstream}` WITHOUT following the ref it names; it must agree with git's dereferenced answer and
+    // (below) with the config rebuild — any difference means a symref or a mapping disagreement: exit 3.
+    let g = pushed_git(
+        tree,
+        &["for-each-ref", "--format=%(upstream)", "--", &branch],
+    );
+    if g.overflow {
+        return stop3("too many paths: a git answer went over the read cap");
+    }
+    if !g.ok {
+        return stop3("a git call in the worktree failed");
+    }
+    let nonderef_text = String::from_utf8_lossy(&g.bytes).into_owned();
+    let mut nonderef_lines = nonderef_text.lines().filter(|l| !l.is_empty());
+    let nonderef = match (nonderef_lines.next(), nonderef_lines.next()) {
+        (Some(l), None) => l.to_string(),
+        _ => return stop3("the ticket branch has no upstream"),
+    };
 
-    // (e) The exact tracking ref is REBUILT from the branch's own config — `branch.ws/<ticket>.remote` +
+    // (e) The non-dereferenced name must be a PLAIN ref: exactly one answer of `<sha> <symref>` with an
+    //     empty symref field. A symbolic ref at the ref git itself configured as the upstream (textual or
+    //     a symlink git reads as one, for example pointing back at `refs/heads/ws/<ticket>` so the
+    //     upstream sha equals the branch tip and every unpushed commit would pass, or — after a refspec
+    //     remap — at the stale default-name leftover) is exit 3. Its object must peel to a commit.
+    let g = pushed_git(
+        tree,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(symref)",
+            "--",
+            &nonderef,
+        ],
+    );
+    if g.overflow {
+        return stop3("too many paths: a git answer went over the read cap");
+    }
+    if !g.ok {
+        return stop3("a git call in the worktree failed");
+    }
+    let line = g
+        .bytes
+        .split(|&b| b == b'\n')
+        .find(|t| !t.is_empty())
+        .map(|t| t.to_vec());
+    let Some(line) = line else {
+        return stop3("the upstream tracking ref cannot be read");
+    };
+    let line = String::from_utf8_lossy(&line).into_owned();
+    let (obj, symref) = match line.split_once(' ') {
+        Some(v) => v,
+        None => return stop3("the upstream tracking ref cannot be read"),
+    };
+    if !symref.is_empty() {
+        return stop3("the upstream tracking ref is a symbolic ref; cannot check");
+    }
+    if !sha40(obj) {
+        return stop3("the upstream tracking ref cannot be read");
+    }
+    let peel = format!("{}^{{commit}}", obj);
+    let upstream_sha =
+        match pushed_git_text(tree, &["rev-parse", "--verify", "--end-of-options", &peel]) {
+            Some(Ok(s)) if sha40(&s) => s,
+            Some(Err(c)) => return c,
+            _ => return stop3("the upstream ref does not point at a commit"),
+        };
+
+    // (f) The exact tracking ref is REBUILT from the branch's own config — `branch.ws/<ticket>.remote` +
     //     `branch.ws/<ticket>.merge`, the same pair `@{upstream}` is built from — because rev-parse follows
     //     a symbolic ref to its TARGET: a symref planted at the tracking ref would otherwise hand the checks
     //     below the target (a plain ref) and pass. `-z --get-regexp` records are `key\nvalue`; the config
@@ -953,57 +1023,13 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     // refspec (which may map `refs/heads/ws/<t>` somewhere other than `refs/remotes/<remote>/ws/<t>`)
     // and uses the FIRST `branch.<b>.merge` value, while the rebuild above is last-wins and refspec-blind
     // — the two can disagree, and a rebuild that lands on a stale or wrong ref can pass commits git says
-    // are unpushed. Any disagreement is exit 3, never a pass (a symref at the tracking ref also fails
-    // here: `@{upstream}` follows it to the target, which is not the rebuilt name).
-    if tracking != upstream {
+    // are unpushed. The NON-dereferenced `%(upstream)` name must agree too: it is what the plain-ref
+    // rule above was asked of, and it is the only one of the three answers that exposes a mapping the
+    // rebuild happens to reproduce while git resolves through something else. Any disagreement between
+    // the three is exit 3, never a pass.
+    if tracking != upstream || nonderef != upstream {
         return stop3("the upstream tracking ref cannot be verified");
     }
-
-    // (f) The tracking ref must be a PLAIN ref: exactly one answer of `<sha> <symref>` with an empty symref
-    //     field. A symbolic ref (textual or a symlink git reads as one, for example pointing back at
-    //     `refs/heads/ws/<ticket>` so the upstream sha equals the branch tip and every unpushed commit
-    //     would pass, or at another remote-tracking ref) is exit 3. Its object must peel to a commit.
-    let g = pushed_git(
-        tree,
-        &[
-            "for-each-ref",
-            "--format=%(objectname) %(symref)",
-            "--",
-            &tracking,
-        ],
-    );
-    if g.overflow {
-        return stop3("too many paths: a git answer went over the read cap");
-    }
-    if !g.ok {
-        return stop3("a git call in the worktree failed");
-    }
-    let line = g
-        .bytes
-        .split(|&b| b == b'\n')
-        .find(|t| !t.is_empty())
-        .map(|t| t.to_vec());
-    let Some(line) = line else {
-        return stop3("the upstream tracking ref cannot be read");
-    };
-    let line = String::from_utf8_lossy(&line).into_owned();
-    let (obj, symref) = match line.split_once(' ') {
-        Some(v) => v,
-        None => return stop3("the upstream tracking ref cannot be read"),
-    };
-    if !symref.is_empty() {
-        return stop3("the upstream tracking ref is a symbolic ref; cannot check");
-    }
-    if !sha40(obj) {
-        return stop3("the upstream tracking ref cannot be read");
-    }
-    let peel = format!("{}^{{commit}}", obj);
-    let upstream_sha =
-        match pushed_git_text(tree, &["rev-parse", "--verify", "--end-of-options", &peel]) {
-            Some(Ok(s)) if sha40(&s) => s,
-            Some(Err(c)) => return c,
-            _ => return stop3("the upstream ref does not point at a commit"),
-        };
 
     // (g) The list: commits reachable from the branch and not from the upstream commit — reachability, not
     //     recency, so a force-moved upstream lists every ticket commit it no longer contains and an upstream
