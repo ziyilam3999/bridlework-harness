@@ -8,6 +8,7 @@ pub mod classes;
 pub mod cli;
 pub mod config;
 pub mod core_layering;
+pub mod death;
 pub mod decode;
 pub mod detect;
 pub mod events;

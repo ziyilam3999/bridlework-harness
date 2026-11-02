@@ -56,6 +56,7 @@
 //! byte-identical); `3` `already-gone` or `pid-reused` (nothing signalled, the entries removed); `4`
 //! signalled but the death could not be confirmed (the entry kept).
 
+use crate::death;
 use crate::manifest::{self, ManifestRead, Target};
 use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
@@ -64,7 +65,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--dir <manifest-dir>] -- <program> [args...] | process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>] | process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>] | process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>]";
+pub const USAGE: &str = "usage: harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--dir <manifest-dir>] -- <program> [args...] | process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]] | process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]] | process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>] [--session <uuid> --checkpoint <sha>]";
 
 /// Default manifest dir, the same default as `harness manifest`.
 const DEFAULT_DIR: &str = ".harness/manifests";
@@ -612,41 +613,74 @@ struct StopArgs {
     pid: Option<u64>,
     grace_ms: u64,
     dir: String,
+    record: Option<RecordArgs>,
 }
 
 /// Parse `process stop`'s command line: the ticket plus exactly one of `--id` / `--pid`, an optional
-/// `--grace-ms`, and the usual `--dir`. Usage errors answer 2 before the lock, so they write nothing.
+/// `--grace-ms`, the usual `--dir`, and the all-or-none record flags (#210). Usage errors — including
+/// any partial or bad record set — answer 2 before the lock, so they write nothing.
 fn parse_stop(a: &[String]) -> Result<StopArgs, String> {
     let mut ticket: Option<String> = None;
     let mut id: Option<String> = None;
     let mut pid: Option<u64> = None;
     let mut grace: Option<u64> = None;
     let mut dir: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut checkpoint: Option<String> = None;
+    let mut repo: Option<String> = None;
+    let mut log: Option<String> = None;
+    let mut root: Option<String> = None;
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         if let Some(name) = arg.strip_prefix("--") {
             let value = it.next().ok_or_else(|| format!("{} needs a value", arg))?;
+            let twice = || format!("{} given twice", arg);
             match name {
                 "id" => {
                     if id.replace(value.clone()).is_some() {
-                        return Err(format!("{} given twice", arg));
+                        return Err(twice());
                     }
                 }
                 "pid" => {
                     let v = num_flag(value, "pid")?;
                     if pid.replace(v).is_some() {
-                        return Err(format!("{} given twice", arg));
+                        return Err(twice());
                     }
                 }
                 "grace-ms" => {
                     let v = num_flag(value, "grace-ms")?;
                     if grace.replace(v).is_some() {
-                        return Err(format!("{} given twice", arg));
+                        return Err(twice());
                     }
                 }
                 "dir" => {
                     if dir.replace(value.clone()).is_some() {
-                        return Err(format!("{} given twice", arg));
+                        return Err(twice());
+                    }
+                }
+                "session" => {
+                    if session.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "checkpoint" => {
+                    if checkpoint.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "repo" => {
+                    if repo.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "log" => {
+                    if log.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "root" => {
+                    if root.replace(value.clone()).is_some() {
+                        return Err(twice());
                     }
                 }
                 _ => return Err(format!("unknown option {}", arg)),
@@ -662,12 +696,29 @@ fn parse_stop(a: &[String]) -> Result<StopArgs, String> {
         (Some(_), Some(_)) => return Err("stop takes exactly one of --id or --pid, not both".to_string()),
         (None, None) => return Err("stop needs exactly one of --id or --pid".to_string()),
     };
+    // Record mode is all-or-none (decision 2): the three required flags come together, the optional
+    // log/root only with them, and the shapes are checked HERE — a partial or bad set is a usage error
+    // that leaves no lock file, no log and no deaths folder behind.
+    let record = match (session, checkpoint, repo) {
+        (None, None, None) => {
+            if log.is_some() || root.is_some() {
+                return Err("--log/--root come with --session, --checkpoint and --repo (record mode) together".to_string());
+            }
+            None
+        }
+        (Some(s), Some(c), Some(r)) => {
+            check_record_shapes(&s, &c, &r)?;
+            Some(RecordArgs { session_id: s, checkpoint: c, repo: r, log, root })
+        }
+        _ => return Err("record mode needs --session, --checkpoint and --repo together".to_string()),
+    };
     Ok(StopArgs {
         ticket,
         id,
         pid,
         grace_ms: grace.unwrap_or(DEFAULT_GRACE_MS),
         dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()),
+        record,
     })
 }
 
@@ -683,21 +734,198 @@ fn remove_stopped(dir: &Path, ticket: &str, id: &str, port_live: bool) -> Result
     Ok(())
 }
 
+// ---------------------------------------------------------------- record mode (#210: the worker death record)
+
+/// The parsed record flags of `check`/`stop` (decision 2): opt-in per call, ALL-OR-NONE — the three
+/// required flags come together or not at all — and shape-checked in the parser with the event table's
+/// own rules, BEFORE the lock, so a partial or bad set writes nothing at all (no lock file either).
+struct RecordArgs {
+    session_id: String,
+    checkpoint: String,
+    repo: String,
+    log: Option<String>,
+    root: Option<String>,
+}
+
+/// Shape-check the record flags (decision 2): a full lowercase uuid, a 40/64 lowercase hex checkpoint, a
+/// plain-token repo — the `timed_out` table's own field rules, restated for the parser.
+fn check_record_shapes(session: &str, checkpoint: &str, repo: &str) -> Result<(), String> {
+    if !death::uuid_ok(session) {
+        return Err("--session must be a full lowercase uuid (8-4-4-4-12 hex; a short id is refused)".to_string());
+    }
+    if !death::sha_ok(checkpoint) {
+        return Err("--checkpoint must be 40 or 64 lowercase hex digits".to_string());
+    }
+    if !crate::events::token_ok(repo) {
+        return Err("--repo must be a plain token (lowercase letters, digits, '-', '_', '.')".to_string());
+    }
+    Ok(())
+}
+
+/// The resolved log/root pair of a record-mode call, following the `events append` defaults:
+/// `.harness/events.jsonl` with root `.` when neither is given, an explicit log's parent as the root
+/// when only the log is given. `log_is_default` drives the create-only-inside-the-root folder rule.
+struct LogRoot {
+    log_is_default: bool,
+    log: PathBuf,
+    root: PathBuf,
+}
+
+fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
+    let log_is_default = log.is_none();
+    let log = PathBuf::from(log.unwrap_or(".harness/events.jsonl"));
+    let root = match root {
+        Some(r) => PathBuf::from(r),
+        None => match log.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        },
+    };
+    LogRoot { log_is_default, log, root }
+}
+
+/// The default log folder is created only after the working folder is proven inside the root (a refusal
+/// leaves no empty folder behind), the same rule `events append` and `step` use. An EXPLICIT log is
+/// never pre-created: a missing parent is the path check's own refusal.
+fn ensure_default_log_folder(lr: &LogRoot) -> Result<(), String> {
+    if !lr.log_is_default {
+        return Ok(());
+    }
+    if let Some(folder) = lr.log.parent() {
+        if !folder.exists() {
+            let inside = match (std::path::Path::new(".").canonicalize(), lr.root.canonicalize()) {
+                (Ok(cwd), Ok(r)) => cwd.starts_with(r),
+                _ => false,
+            };
+            if !inside {
+                return Err("log path refused: the working folder is outside the root".to_string());
+            }
+            if let Err(e) = std::fs::create_dir_all(folder) {
+                return Err(format!("cannot create the default log folder: {}", e.kind()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The record-mode run context: the caller-supplied continuation values (trusted like `--steps` is — a
+/// lying driver is not caught, an honest limit), the log/root the `timed_out` events go to, and the step
+/// context the handover carries (0 outside `step`).
+struct RecordRun<'a> {
+    repo: &'a str,
+    checkpoint: &'a str,
+    session_id: &'a str,
+    lr: &'a LogRoot,
+    steps: u64,
+    hard_limit: u64,
+}
+
+/// The ts_ms of the entry's own add line (the LAST `add` process line of this id — the live one), for
+/// the pure clock rule: a wall clock that reads before it is a detectable backward jump.
+fn add_ts_of(read: &ManifestRead, id: &str) -> u64 {
+    read.lines.iter().rev().find_map(|l| match l {
+        manifest::Line::AddProcess { id: i, ts_ms, .. } if i == id => Some(*ts_ms),
+        _ => None,
+    }).unwrap_or(0)
+}
+
+/// The limit fields the handover carries for an entry: its recorded time limit, or none.
+fn limit_of(read: &ManifestRead, id: &str) -> (death::LimitKind, u64) {
+    match read.live.iter().find(|e| e.id == id).and_then(|e| e.limit.as_ref()) {
+        Some(l) => (death::LimitKind::Time, l.timeout_ms),
+        None => (death::LimitKind::None, 0),
+    }
+}
+
+/// The identity of one process life on the sheet (decision 3's key), for the record step.
+struct Life<'a> {
+    ticket: &'a str,
+    id: &'a str,
+    pid: u64,
+    pid_start_ms: u64,
+}
+
+/// The death half `stage_death` needs beyond the run and the entry: the fresh cause and the limit
+/// fields (decision 1/4). A struct so the stage call stays under the argument cap.
+struct FreshDeath {
+    cause: death::Cause,
+    limit: death::LimitKind,
+    timeout_ms: u64,
+}
+
+/// Stage one death (decision 6 a+b): the clock rule, the log pre-flight, then the handover on disk —
+/// for a timeout, all BEFORE any signal. Answers the staged handover (its cause is the EFFECTIVE one:
+/// an existing handover of the same life wins, decision 7).
+fn stage_death(dir: &Path, read: &ManifestRead, life: &Life<'_>, run: &RecordRun<'_>, fresh: FreshDeath) -> Result<death::Staged, String> {
+    ensure_default_log_folder(run.lr).map_err(|e| format!("event log refused: {e}"))?;
+    let spec = death::DeathSpec {
+        ticket: life.ticket,
+        id: life.id,
+        pid: life.pid,
+        pid_start_ms: life.pid_start_ms,
+        cause: fresh.cause,
+        limit: fresh.limit,
+        timeout_ms: fresh.timeout_ms,
+        steps: run.steps,
+        hard_limit: run.hard_limit,
+        repo: run.repo,
+        checkpoint: run.checkpoint,
+        session_id: run.session_id,
+    };
+    death::stage(dir, &spec, &run.lr.log, &run.lr.root, now_ms(), add_ts_of(read, life.id))
+}
+
+/// Record a death found WITHOUT a signal (already-gone, pid-reused — cause `died`, decision 1): stage
+/// (reusing an existing handover of the same life, whose cause then wins) and commit, BEFORE the caller
+/// removes the entry. Answers the `recorded` stdout line for the caller to print after its own line.
+fn record_unsignalled_death(dir: &Path, read: &ManifestRead, life: &Life<'_>, run: &RecordRun<'_>) -> Result<String, String> {
+    let (limit, timeout_ms) = limit_of(read, life.id);
+    let staged = stage_death(dir, read, life, run, FreshDeath { cause: death::Cause::Died, limit, timeout_ms })?;
+    let spec = death::DeathSpec {
+        ticket: life.ticket,
+        id: life.id,
+        pid: life.pid,
+        pid_start_ms: life.pid_start_ms,
+        cause: staged.cause,
+        limit,
+        timeout_ms,
+        steps: run.steps,
+        hard_limit: run.hard_limit,
+        repo: run.repo,
+        checkpoint: run.checkpoint,
+        session_id: run.session_id,
+    };
+    death::commit(&spec, &staged, &run.lr.log, &run.lr.root, now_ms())?;
+    Ok(format!("recorded\t{}\t{}\t{}", life.id, staged.cause.as_str(), staged.relpath))
+}
+
+/// The record-failure stderr (decision 8): the reason, then the fixed second line. The entry is KEPT
+/// (the caller does not remove it), so the death is retried, never lost.
+fn death_not_recorded(id: &str, reason: &str) {
+    eprintln!("harness: error: {id}: {reason}");
+    eprintln!("harness: DEATH NOT RECORDED");
+}
+
 /// The outcome of stopping ONE live process entry through checks 2-7 (#207: the factored stop body —
 /// `stop`, `check` and `step` all call it under the per-ticket lock the CALLER holds). Every stderr
 /// message prints HERE, byte-identical to the old inline stop; the stdout line is the CALLER's (stop
 /// prints `stopped`, check prints `timed_out`, step prints `stopped`).
 enum StopDone {
-    /// Stopped and removed; carries the pid for the caller's stdout line.
-    Stopped(u64),
+    /// Stopped and removed; carries the pid for the caller's stdout line and, in record mode, the
+    /// `recorded` line for the caller to print AFTER its own (decision 9's order).
+    Stopped { pid: u64, recorded: Option<String> },
     /// already-gone (3): nothing signalled, the entries removed.
-    Gone,
+    Gone { recorded: Option<String> },
     /// pid-reused (3): nothing signalled, the entries removed.
-    Reused,
-    /// signalled, death not confirmed (4): the entry kept so a later stop can retry.
+    Reused { recorded: Option<String> },
+    /// signalled, death not confirmed (4): the entry kept so a later stop can retry (and, in record
+    /// mode, the death is NOT recorded yet — a later run records it, decision 1).
     NotConfirmed,
     /// a refusal (2): nothing signalled; the caller prints the message with `fail`.
     Refused(String),
+    /// the death record could not be written (#210, decision 8): the two stderr lines have already
+    /// printed; the entry is KEPT so a later record-mode run retries. The caller answers 2.
+    DeathNotRecorded,
 }
 
 /// Check 3's already-gone tail (#207 r1 F1, factored so `check`'s liveness-first pass resolves a gone
@@ -713,7 +941,20 @@ fn already_gone(dir: &Path, ticket: &str, id: &str, pid: u64, port_live: bool) -
 /// this ticket, then liveness, identity, leadership, TERM, the KILL gate and the group-and-leader death
 /// proof (the full order is the module header). `read` is the clean manifest the caller read under its own
 /// lock; the `remove` lines write through `dir`. A stop signal goes ONLY when every check passes.
-fn stop_live_entry(dir: &Path, ticket: &str, read: &ManifestRead, id: &str, grace_ms: u64) -> StopDone {
+///
+/// `record` is the record-mode run (#210, decision 6): every REMOVING arm records the death first — the
+/// arms that end without a signal (already-gone, pid-reused) stage and commit `died`; the stopped arm
+/// commits the handover the CALLER staged before the signal (a timeout) and records nothing when there
+/// is none (a deliberate stop). A failed record keeps the entry (`DeathNotRecorded`, the caller answers
+/// 2). The `recorded` stdout line rides the variant so the caller prints it after its own line.
+fn stop_live_entry(
+    dir: &Path,
+    ticket: &str,
+    read: &ManifestRead,
+    id: &str,
+    grace_ms: u64,
+    record: Option<(&RecordRun<'_>, Option<death::Staged>)>,
+) -> StopDone {
     let Some(entry) = read.live.iter().find(|e| e.id == id) else {
         return StopDone::Refused(format!("id {id} is not a live entry of ticket {ticket}"));
     };
@@ -722,13 +963,25 @@ fn stop_live_entry(dir: &Path, ticket: &str, read: &ManifestRead, id: &str, grac
     };
     let (pid, recorded) = (*pid, *recorded);
     let port_live = read.live.iter().any(|e| e.id == format!("{id}.port"));
+    // The record step rides every removing arm below (#210): `recorded_line` is the caller's stdout
+    // line, printed only when the death reached the log.
+    let mut recorded_line: Option<String> = None;
     // Check 3: liveness through the absolute-path helper. Provably no such process -> already-gone (3,
     // entries removed); a helper that cannot run, or an answer that proves nothing -> unknown -> 2, kept.
     match probe_alive_at(Path::new("/bin/kill"), pid) {
         Liveness::Alive => {}
         Liveness::NoSuch => {
+            if let Some((run, _)) = record {
+                match record_unsignalled_death(dir, read, &Life { ticket, id, pid, pid_start_ms: recorded }, run) {
+                    Ok(line) => recorded_line = Some(line),
+                    Err(reason) => {
+                        death_not_recorded(id, &reason);
+                        return StopDone::DeathNotRecorded;
+                    }
+                }
+            }
             return match already_gone(dir, ticket, id, pid, port_live) {
-                Ok(()) => StopDone::Gone,
+                Ok(()) => StopDone::Gone { recorded: recorded_line },
                 Err(e) => StopDone::Refused(e),
             };
         }
@@ -742,10 +995,19 @@ fn stop_live_entry(dir: &Path, ticket: &str, read: &ManifestRead, id: &str, grac
     match probe_identity(pid, recorded) {
         Identity::Same => {}
         Identity::Reused => {
+            if let Some((run, _)) = record {
+                match record_unsignalled_death(dir, read, &Life { ticket, id, pid, pid_start_ms: recorded }, run) {
+                    Ok(line) => recorded_line = Some(line),
+                    Err(reason) => {
+                        death_not_recorded(id, &reason);
+                        return StopDone::DeathNotRecorded;
+                    }
+                }
+            }
             return match remove_stopped(dir, ticket, id, port_live) {
                 Ok(()) => {
                     eprintln!("harness: {id} pid-reused: pid {pid} no longer starts at the time the sheet records; nothing signalled, entries removed");
-                    StopDone::Reused
+                    StopDone::Reused { recorded: recorded_line }
                 }
                 Err(e) => StopDone::Refused(e),
             };
@@ -797,8 +1059,31 @@ fn stop_live_entry(dir: &Path, ticket: &str, read: &ManifestRead, id: &str, grac
     let group_gone = matches!(kill_helper(pid, "0"), Ran::Yes(false));
     let leader_gone = matches!(probe_alive_at(Path::new("/bin/kill"), pid), Liveness::NoSuch);
     if death_proven(group_gone, leader_gone) {
+        // Decision 6c: for a death the caller STAGED before the signal (a timeout), the `timed_out`
+        // event is appended BEFORE the remove lines; a deliberate stop (nothing staged) records nothing.
+        if let Some((run, Some(staged))) = &record {
+            let spec = death::DeathSpec {
+                ticket,
+                id,
+                pid,
+                pid_start_ms: recorded,
+                cause: staged.cause,
+                limit: limit_of(read, id).0,
+                timeout_ms: limit_of(read, id).1,
+                steps: run.steps,
+                hard_limit: run.hard_limit,
+                repo: run.repo,
+                checkpoint: run.checkpoint,
+                session_id: run.session_id,
+            };
+            if let Err(reason) = death::commit(&spec, staged, &run.lr.log, &run.lr.root, now_ms()) {
+                death_not_recorded(id, &reason);
+                return StopDone::DeathNotRecorded;
+            }
+            recorded_line = Some(format!("recorded\t{id}\t{}\t{}", staged.cause.as_str(), staged.relpath));
+        }
         return match remove_stopped(dir, ticket, id, port_live) {
-            Ok(()) => StopDone::Stopped(pid),
+            Ok(()) => StopDone::Stopped { pid, recorded: recorded_line },
             Err(e) => {
                 eprintln!("harness: {id} signalled, death not confirmed: the removal failed: {e}; entry kept so a later stop can retry");
                 StopDone::NotConfirmed
@@ -866,16 +1151,29 @@ fn stop_cmd(a: &[String]) -> i32 {
     if !matches!(target, Target::Process { .. }) {
         return fail(&format!("id {id} is not a live process entry of ticket {}", args.ticket));
     }
+    // Record mode (#210, decision 1): a DELIBERATE stop is not a death and records nothing — the run is
+    // passed only so the ends-without-signal arms (already-gone, pid-reused) record their `died`.
+    let rec_lr = args.record.as_ref().map(|rc| (rc, resolve_log_root(rc.log.as_deref(), rc.root.as_deref())));
+    let rec_run = rec_lr.as_ref().map(|(rc, lr)| (RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 }, None));
     // Checks 2b-7 run in the factored body (#207) under THIS command's lock, so `check` and `step` can
     // stop an entry under a lock they already hold; stop's own behaviour and messages are unchanged.
-    match stop_live_entry(&dir, &args.ticket, &read, &id, args.grace_ms) {
-        StopDone::Stopped(pid) => {
+    match stop_live_entry(&dir, &args.ticket, &read, &id, args.grace_ms, rec_run.as_ref().map(|(r, s)| (r, s.clone()))) {
+        StopDone::Stopped { pid, recorded } => {
             println!("{id}\t{pid}\tstopped");
+            if let Some(line) = recorded {
+                println!("{line}");
+            }
             0
         }
-        StopDone::Gone | StopDone::Reused => 3,
+        StopDone::Gone { recorded } | StopDone::Reused { recorded } => {
+            if let Some(line) = recorded {
+                println!("{line}");
+            }
+            3
+        }
         StopDone::NotConfirmed => 4,
         StopDone::Refused(m) => fail(&m),
+        StopDone::DeathNotRecorded => 2,
     }
 }
 
@@ -923,28 +1221,61 @@ struct CheckArgs {
     ticket: String,
     grace_ms: u64,
     dir: String,
+    record: Option<RecordArgs>,
 }
 
-/// Parse `process check`'s command line: the ticket, an optional `--grace-ms`, the usual `--dir`. Usage
-/// errors answer 2 before the lock, so they write nothing.
+/// Parse `process check`'s command line: the ticket, an optional `--grace-ms`, the usual `--dir`, and
+/// the all-or-none record flags (#210). Usage errors — including any partial or bad record set — answer
+/// 2 before the lock, so they write nothing.
 fn parse_check(a: &[String]) -> Result<CheckArgs, String> {
     let mut ticket: Option<String> = None;
     let mut grace: Option<u64> = None;
     let mut dir: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut checkpoint: Option<String> = None;
+    let mut repo: Option<String> = None;
+    let mut log: Option<String> = None;
+    let mut root: Option<String> = None;
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         if let Some(name) = arg.strip_prefix("--") {
             let value = it.next().ok_or_else(|| format!("{} needs a value", arg))?;
+            let twice = || format!("{} given twice", arg);
             match name {
                 "grace-ms" => {
                     let v = num_flag(value, "grace-ms")?;
                     if grace.replace(v).is_some() {
-                        return Err(format!("{} given twice", arg));
+                        return Err(twice());
                     }
                 }
                 "dir" => {
                     if dir.replace(value.clone()).is_some() {
-                        return Err(format!("{} given twice", arg));
+                        return Err(twice());
+                    }
+                }
+                "session" => {
+                    if session.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "checkpoint" => {
+                    if checkpoint.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "repo" => {
+                    if repo.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "log" => {
+                    if log.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "root" => {
+                    if root.replace(value.clone()).is_some() {
+                        return Err(twice());
                     }
                 }
                 _ => return Err(format!("unknown option {}", arg)),
@@ -954,7 +1285,21 @@ fn parse_check(a: &[String]) -> Result<CheckArgs, String> {
         }
     }
     let ticket = ticket.ok_or_else(|| "a ticket is required".to_string())?;
-    Ok(CheckArgs { ticket, grace_ms: grace.unwrap_or(DEFAULT_GRACE_MS), dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()) })
+    // Record mode is all-or-none (decision 2), shape-checked HERE, before the lock.
+    let record = match (session, checkpoint, repo) {
+        (None, None, None) => {
+            if log.is_some() || root.is_some() {
+                return Err("--log/--root come with --session, --checkpoint and --repo (record mode) together".to_string());
+            }
+            None
+        }
+        (Some(s), Some(c), Some(r)) => {
+            check_record_shapes(&s, &c, &r)?;
+            Some(RecordArgs { session_id: s, checkpoint: c, repo: r, log, root })
+        }
+        _ => return Err("record mode needs --session, --checkpoint and --repo together".to_string()),
+    };
+    Ok(CheckArgs { ticket, grace_ms: grace.unwrap_or(DEFAULT_GRACE_MS), dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()), record })
 }
 
 /// `harness process check <ticket>` (#207): one-shot, NO daemon — whoever drives the ticket runs it before
@@ -991,10 +1336,18 @@ fn check_cmd(a: &[String]) -> i32 {
     if !read.is_clean() {
         return fail(&damage_msg(&read));
     }
+    // Record mode (#210, decision 5): the log/root pair the `timed_out` events go to, resolved once;
+    // the run is built per entry only when a death is actually found, so a no-death run touches no log.
+    let rec = args.record.as_ref().map(|rc| (rc, resolve_log_root(rc.log.as_deref(), rc.root.as_deref())));
     let mut codes: Vec<i32> = Vec::new();
     for e in &read.live {
-        let Target::Process { pid, .. } = &e.target else { continue };
-        let Some(limit) = &e.limit else { continue };
+        let Target::Process { pid, pid_start_ms: recorded } = &e.target else { continue };
+        // Record mode widens the visit to EVERY live process entry (decision 5): an entry with no limit
+        // is probed for liveness only, so a program that vanished is found at the driver's next check.
+        // Legacy mode visits only entries WITH a limit — today's behaviour, byte-identical.
+        if rec.is_none() && e.limit.is_none() {
+            continue;
+        }
         let port_live = read.live.iter().any(|x| x.id == format!("{}.port", e.id));
         // Liveness FIRST (#207 r1 F1): the age of a GONE pid cannot be read either (ps does not know it,
         // /proc/<pid>/stat is gone), and a program that finished on its own is the already-gone path —
@@ -1002,14 +1355,39 @@ fn check_cmd(a: &[String]) -> i32 {
         // proven-LIVE pid, so "cannot read the age" is a refusal about a live process, and a pid that
         // answers the probe but is not ours, or a probe that cannot run, is a fail-closed refusal.
         match probe_alive_at(Path::new("/bin/kill"), *pid) {
-            Liveness::NoSuch => match already_gone(&dir, &args.ticket, &e.id, *pid, port_live) {
-                // stop's already-gone stderr line has already printed, verbatim; resolved.
-                Ok(()) => codes.push(5),
-                Err(m) => {
-                    fail(&m);
-                    codes.push(2);
+            Liveness::NoSuch => {
+                // Record mode: the vanished program is a death (`died`, decision 1), recorded BEFORE the
+                // remove through the same factored body (its already-gone arm carries the record step).
+                // Legacy: exactly today's resolution.
+                if let Some((rc, lr)) = &rec {
+                    let run = RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 };
+                    match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms, Some((&run, None))) {
+                        // stop's already-gone stderr line has already printed, verbatim; resolved.
+                        StopDone::Gone { recorded } | StopDone::Reused { recorded } => {
+                            if let Some(line) = recorded {
+                                println!("{line}");
+                            }
+                            codes.push(5);
+                        }
+                        StopDone::DeathNotRecorded => codes.push(2),
+                        StopDone::NotConfirmed => codes.push(4),
+                        StopDone::Refused(m) => {
+                            fail(&m);
+                            codes.push(2);
+                        }
+                        StopDone::Stopped { .. } => codes.push(5),
+                    }
+                } else {
+                    match already_gone(&dir, &args.ticket, &e.id, *pid, port_live) {
+                        // stop's already-gone stderr line has already printed, verbatim; resolved.
+                        Ok(()) => codes.push(5),
+                        Err(m) => {
+                            fail(&m);
+                            codes.push(2);
+                        }
+                    }
                 }
-            },
+            }
             Liveness::Denied => {
                 fail(&format!(
                     "{}: pid {} answers the liveness probe but is not ours to signal (kill reports no permission); nothing signalled",
@@ -1021,26 +1399,59 @@ fn check_cmd(a: &[String]) -> i32 {
                 fail(&format!("{}: cannot prove pid {} is alive: {}; nothing signalled", e.id, pid, why));
                 codes.push(2);
             }
-            Liveness::Alive => match expiry_decision(*pid, manifest::process_age_ms(*pid), limit.timeout_ms, limit.ts_ms, now_ms()) {
+            Liveness::Alive => {
+                // Probed only in record mode (no limit): alive and unbounded is not a death.
+                let Some(limit) = &e.limit else { continue };
+                match expiry_decision(*pid, manifest::process_age_ms(*pid), limit.timeout_ms, limit.ts_ms, now_ms()) {
                 Expiry::Within => {}
-                Expiry::Expired => match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms) {
-                    StopDone::Stopped(p) => {
-                        println!("{}\t{}\ttimed_out", e.id, p);
-                        codes.push(5);
+                Expiry::Expired => {
+                    // Record mode (decision 6): the handover is on disk BEFORE any signal; a failed
+                    // stage refuses with NOTHING signalled (the entry is kept, so a later run records
+                    // the death — it is never silently lost).
+                    let mut staged = None;
+                    if let Some((rc, lr)) = &rec {
+                        let run = RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 };
+                        match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *recorded }, &run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Time, timeout_ms: limit.timeout_ms }) {
+                            Ok(st) => staged = Some(st),
+                            Err(reason) => {
+                                death_not_recorded(&e.id, &reason);
+                                codes.push(2);
+                                continue;
+                            }
+                        }
                     }
-                    // already-gone / pid-reused: stop's own stderr line has already printed, verbatim; resolved.
-                    StopDone::Gone | StopDone::Reused => codes.push(5),
-                    StopDone::NotConfirmed => codes.push(4),
-                    StopDone::Refused(m) => {
-                        fail(&m);
-                        codes.push(2);
+                    let rec_ref = rec.as_ref().map(|(rc, lr)| {
+                        (RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 }, staged.clone())
+                    });
+                    match stop_live_entry(&dir, &args.ticket, &read, &e.id, args.grace_ms, rec_ref.as_ref().map(|(r, st)| (r, st.clone()))) {
+                        StopDone::Stopped { pid: p, recorded } => {
+                            println!("{}\t{}\ttimed_out", e.id, p);
+                            if let Some(line) = recorded {
+                                println!("{line}");
+                            }
+                            codes.push(5);
+                        }
+                        // already-gone / pid-reused: stop's own stderr line has already printed, verbatim; resolved.
+                        StopDone::Gone { recorded } | StopDone::Reused { recorded } => {
+                            if let Some(line) = recorded {
+                                println!("{line}");
+                            }
+                            codes.push(5);
+                        }
+                        StopDone::NotConfirmed => codes.push(4),
+                        StopDone::Refused(m) => {
+                            fail(&m);
+                            codes.push(2);
+                        }
+                        StopDone::DeathNotRecorded => codes.push(2),
                     }
-                },
+                }
                 Expiry::Refuse(m) => {
                     fail(&format!("{}: {}", e.id, m));
                     codes.push(2);
                 }
-            },
+            }
+            }
         }
     }
     check_fold(&codes)
@@ -1113,6 +1524,9 @@ struct StepArgs {
     dir: String,
     log: Option<String>,
     root: Option<String>,
+    /// The record pair (#210, decision 2): `--session` and `--checkpoint`, all-or-none, shape-checked
+    /// in the parser (step already owns `--repo`/`--log`/`--root`).
+    record: Option<(String, String)>,
 }
 
 /// Parse `process step`'s command line. Every input is validated HERE, before the lock, the manifest read
@@ -1128,12 +1542,24 @@ fn parse_step(a: &[String]) -> Result<StepArgs, String> {
     let mut dir: Option<String> = None;
     let mut log: Option<String> = None;
     let mut root: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut checkpoint: Option<String> = None;
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         if let Some(name) = arg.strip_prefix("--") {
             let value = it.next().ok_or_else(|| format!("{} needs a value", arg))?;
             let twice = || format!("{} given twice", arg);
             match name {
+                "session" => {
+                    if session.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
+                "checkpoint" => {
+                    if checkpoint.replace(value.clone()).is_some() {
+                        return Err(twice());
+                    }
+                }
                 "repo" => {
                     if repo.replace(value.clone()).is_some() {
                         return Err(twice());
@@ -1201,6 +1627,20 @@ fn parse_step(a: &[String]) -> Result<StepArgs, String> {
     if soft >= hard {
         return Err("--soft must be less than --hard".to_string());
     }
+    // The record pair is all-or-none (decision 2), shape-checked HERE, before the lock.
+    let record = match (session, checkpoint) {
+        (None, None) => None,
+        (Some(s), Some(c)) => {
+            if !death::uuid_ok(&s) {
+                return Err("--session must be a full lowercase uuid (8-4-4-4-12 hex; a short id is refused)".to_string());
+            }
+            if !death::sha_ok(&c) {
+                return Err("--checkpoint must be 40 or 64 lowercase hex digits".to_string());
+            }
+            Some((s, c))
+        }
+        _ => return Err("record mode needs --session and --checkpoint together".to_string()),
+    };
     Ok(StepArgs {
         ticket,
         repo,
@@ -1211,6 +1651,7 @@ fn parse_step(a: &[String]) -> Result<StepArgs, String> {
         dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()),
         log,
         root,
+        record,
     })
 }
 
@@ -1270,34 +1711,12 @@ fn step_cmd(a: &[String]) -> i32 {
     if !read.is_clean() {
         return fail(&damage_msg(&read));
     }
-    // The log/root pair follows the `events append` defaults: `.harness/events.jsonl` with root `.` when
-    // neither is given, an explicit log's parent as the root when only the log is given. The default
-    // folder is created only after the working folder is proven inside the root (a refusal leaves no empty
-    // folder behind), the same rule `events append` uses.
-    let log_is_default = args.log.is_none();
-    let log = PathBuf::from(args.log.clone().unwrap_or_else(|| ".harness/events.jsonl".to_string()));
-    let root = match &args.root {
-        Some(r) => PathBuf::from(r),
-        None => match log.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        },
-    };
-    if log_is_default {
-        if let Some(folder) = log.parent() {
-            if !folder.exists() {
-                let inside = match (std::path::Path::new(".").canonicalize(), root.canonicalize()) {
-                    (Ok(cwd), Ok(r)) => cwd.starts_with(r),
-                    _ => false,
-                };
-                if !inside {
-                    return fail("log path refused: the working folder is outside the root");
-                }
-                if let Err(e) = std::fs::create_dir_all(folder) {
-                    return fail(&format!("cannot create the default log folder: {}", e.kind()));
-                }
-            }
-        }
+    // The log/root pair follows the `events append` defaults (the same resolver the record-mode verbs
+    // use, #210); the default folder is created only after the working folder is proven inside the root
+    // (a refusal leaves no empty folder behind), the same rule `events append` uses.
+    let lr = resolve_log_root(args.log.as_deref(), args.root.as_deref());
+    if let Err(e) = ensure_default_log_folder(&lr) {
+        return fail(&e);
     }
     let not_recorded = |e: String| -> i32 {
         eprintln!("harness: error: {}", e);
@@ -1313,8 +1732,8 @@ fn step_cmd(a: &[String]) -> i32 {
                 &args.repo,
                 args.steps,
                 ("soft_limit", args.soft),
-                &root,
-                &log,
+                &lr.root,
+                &lr.log,
             ) {
                 return not_recorded(e);
             }
@@ -1328,12 +1747,38 @@ fn step_cmd(a: &[String]) -> i32 {
                 .filter(|e| matches!(e.target, Target::Process { .. }))
                 .map(|e| e.id.clone())
                 .collect();
+            // Record mode (#210, decision 6): every death's handover is staged BEFORE any signal — and
+            // before the `step_limit_stop` event, which stays the FIRST thing a hard stop writes to the
+            // log. A failed stage answers 2 with `DEATH NOT RECORDED`, nothing signalled, every entry
+            // kept (the record precedes the signal).
+            let mut staged: Vec<(String, death::Staged)> = Vec::new();
+            let rec_run = args.record.as_ref().map(|(session, checkpoint)| RecordRun {
+                repo: &args.repo,
+                checkpoint,
+                session_id: session,
+                lr: &lr,
+                steps: args.steps,
+                hard_limit: args.hard,
+            });
+            if let Some(run) = &rec_run {
+                for e in read.live.iter().filter(|e| matches!(e.target, Target::Process { .. })) {
+                    let Target::Process { pid, pid_start_ms } = &e.target else { continue };
+                    let (_limit_kind, timeout_ms) = limit_of(&read, &e.id);
+                    match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *pid_start_ms }, run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Step, timeout_ms }) {
+                        Ok(st) => staged.push((e.id.clone(), st)),
+                        Err(reason) => {
+                            death_not_recorded(&e.id, &reason);
+                            return 2;
+                        }
+                    }
+                }
+            }
             let ticket = args.ticket.clone();
             let repo = args.repo.clone();
             let steps = args.steps;
             let hard = args.hard;
-            let root = root.clone();
-            let log = log.clone();
+            let root = lr.root.clone();
+            let log = lr.log.clone();
             hard_limit_body(
                 steps,
                 hard,
@@ -1341,16 +1786,28 @@ fn step_cmd(a: &[String]) -> i32 {
                     write_step_event(crate::events::Kind::StepLimitStop, &ticket, &repo, steps, ("hard_limit", hard), &root, &log)
                 },
                 &ids,
-                |id| match stop_live_entry(&dir, &args.ticket, &read, id, args.grace_ms) {
-                    StopDone::Stopped(pid) => {
-                        println!("{id}\t{pid}\tstopped");
-                        0
-                    }
-                    StopDone::Gone | StopDone::Reused => 3,
-                    StopDone::NotConfirmed => 4,
-                    StopDone::Refused(m) => {
-                        fail(&m);
-                        2
+                |id| {
+                    let rec = rec_run.as_ref().map(|run| (run, staged.iter().find(|(i, _)| i == id).map(|(_, st)| st.clone())));
+                    match stop_live_entry(&dir, &args.ticket, &read, id, args.grace_ms, rec) {
+                        StopDone::Stopped { pid, recorded } => {
+                            println!("{id}\t{pid}\tstopped");
+                            if let Some(line) = recorded {
+                                println!("{line}");
+                            }
+                            0
+                        }
+                        StopDone::Gone { recorded } | StopDone::Reused { recorded } => {
+                            if let Some(line) = recorded {
+                                println!("{line}");
+                            }
+                            3
+                        }
+                        StopDone::NotConfirmed => 4,
+                        StopDone::Refused(m) => {
+                            fail(&m);
+                            2
+                        }
+                        StopDone::DeathNotRecorded => 2,
                     }
                 },
             )

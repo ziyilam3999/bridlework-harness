@@ -22,9 +22,9 @@ Code: `core/rust/harness/src/supervisor.rs` (unix only) and the `harness process
 
 ```
 harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--dir <manifest-dir>] -- <program> [args...]
-harness process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>]
-harness process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>]
-harness process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>]
+harness process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]]
+harness process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]]
+harness process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>] [--session <uuid> --checkpoint <sha>]
 ```
 
 `--dir` defaults to `.harness/manifests`, the same default as `harness manifest`. Listing stays
@@ -89,8 +89,9 @@ waits are skipped and the refusal names the unconfirmed kill.
   std file-lock helper, not a record — it holds no data and is safe to delete between commands.
 - **No orphan reaping for stop escapees** (P2) and **no finalize/teardown that calls stop for every live
   process of a ticket** (P1B-14).
-- **No output capture** (stdout, stderr, exit codes, timing, traces: P1B-08), **no worker-death record**
-  (P1B-07 — the `timed_out` event with its continuation recipe), **no network allow-list** (G1b/P4a).
+- **No output capture** (stdout, stderr, exit codes, timing, traces: P1B-08) and **no network allow-list**
+  (G1b/P4a). The worker-death record (the `timed_out` event with its continuation recipe, P1B-07) now
+  EXISTS and has its own section, [Death record](#death-record), below.
 
 ## stop, in order
 
@@ -191,10 +192,12 @@ on another.
 | an expired one was signalled but its death was not confirmed (entry kept) | stop's stderr line verbatim | 4 |
 | refusal: usage, unclean manifest, unreadable age of a LIVE pid (`harness: error: <id>: cannot read the age of pid <pid>: <why>; nothing signalled`), a clock before the limit line (`harness: error: <id>: the clock reads before the recorded limit; nothing signalled`), a pid that is not ours to signal, or a liveness probe that cannot run | — (stderr names it) | 2 |
 
-`timed_out` is NOT written as an event by this ticket: its required continuation recipe
-(`checkpoint`, `handover`, `session_id`, `recipe`) is P1B-07's, and inventing it would be a lie. The
-durable record of a timeout is the manifest (the `limit` line, then the `remove` lines), the stdout line
-and exit 5, which P1B-07 consumes.
+`timed_out` IS written as an event when check runs in RECORD MODE (see [Death record](#death-record),
+#210): with `--session`/`--checkpoint`/`--repo` (and optional `--log`/`--root`) every death check
+resolves — an expired entry stopped, or any visited entry already-gone or pid-reused — leaves a handover
+file and one `timed_out` line, plus one `recorded<TAB>id<TAB>cause<TAB>handover` stdout line per death
+this run recorded. Without the record flags nothing is written beyond today's manifest lines, stdout
+line and exit 5.
 
 ## step
 
@@ -227,7 +230,112 @@ written). The contract for the driver: ONLY exit 0 means "take another step".
   changes WHEN, never WHOM.
 - **Start-to-record crash** (the pre-existing honest limit): a hard crash between the spawn and the
   manifest append leaves a process the sheet does not list, so it carries no limit either.
-- **No `timed_out` event** (P1B-07): exit 5 plus the manifest lines are the record until then.
+- **A driver that never passes the record flags** gets no death record (see [Death record](#death-record)):
+  legacy mode still resolves a gone entry with no `timed_out` line — today's behaviour, kept for
+  compatibility. The P1B-14/15 driver must pass them.
 - **Existing hazard, noted not fixed (Linux):** a wall-clock jump shifts `/proc/stat` `btime`, so stop's
   exact identity check may read a jumped clock as `pid-reused` and remove the entry without a signal — it
   fails toward "not signalled", never toward a stranger.
+
+## Death record
+
+`process check`, `process stop` and `process step` take an OPT-IN record mode (#210, P1B-07):
+`--session <uuid> --checkpoint <sha> --repo <token>` on `check` and `stop` (plus the optional
+`--log <path>`/`--root <dir>` the event log needs, the `events append` defaults when absent), and
+`--session <uuid> --checkpoint <sha>` on `step` (which already owns `--repo`/`--log`/`--root`). The set
+is ALL-OR-NONE and shape-checked in the parser, before the lock: a partial set, an uppercase or short
+uuid, a 39-hex checkpoint or a non-token repo is a usage error (exit 2) that leaves no lock file, no log
+and no deaths folder. With NO record flags every verb is byte-identical to today. The values are trusted
+like `--steps` is: the harness does not prove the checkpoint is a pushed commit or the session real.
+
+Nothing new runs in the background: a death is recorded only when the driver already runs a verb, and
+the same death is recorded ONCE (an existing handover of the same process life is reused, and the event
+is not appended when the log already holds this death's line). Two writers on one ticket serialise on
+the per-ticket lock; the loser finds the entry removed and writes nothing.
+
+### Which ends are recorded, and as what
+
+Every recorded end is the EXISTING `timed_out` event kind; its two `cause` values carry the whole
+distinction (no new kind, no `v` bump):
+
+| Where found | Today's answer | `cause` | Recorded? |
+|---|---|---|---|
+| `check`: expired, stopped by this run | 5, `timed_out` stdout | `timeout` | yes |
+| `step`: hard line, stopped by this run | 6, `stopped` stdout | `timeout` (handover `limit` = `step`) | yes |
+| any verb: provably gone before our signal (`already-gone`) | 3 / 5 | `died` | yes |
+| any verb: `pid-reused` (the recorded process is gone) | 3 / 5 | `died` | yes |
+| `stop`: a deliberate stop by the caller | 0 `stopped` | — | NO (asked-for, not a death) |
+| signalled, death not confirmed | 4 | — | not yet (entry kept; a later run records it) |
+| any refusal | 2 | — | no |
+
+`died` means "ended without a supervisor signal"; whether it exited cleanly is P1B-08's exit record, not
+this ticket's claim. A distinct `step_limit` cause would be a schema change and is NOT done; the
+handover's `limit` field carries that distinction instead.
+
+### The handover file
+
+One file per death, `<manifest-dir>/<ticket>.deaths/<id>.<pid>.<pid_start_ms>.json` — outside the
+roots, so teardown and the quarantine sweep never touch it and it outlives the worktree, like the
+manifest itself; the key `(id, pid, pid_start_ms)` names exactly one process life, so a re-used pid gets
+a different file. The event's `handover` field is that path RELATIVE TO THE MANIFEST DIR. One
+newline-terminated compact JSON line, at most 4096 bytes, fixed key order, every key present:
+
+```
+v(1), ticket, repo, id, pid, pid_start_ms, cause(timeout|died), limit(time|step|none),
+timeout_ms (0 when no time limit), steps, hard_limit (0 when not a step stop), detected_ms (wall),
+checkpoint, recipe(commit_push_then_resume), session_id
+```
+
+The recipe, stated once: a restart checks out `ws/<ticket>` at `checkpoint` under a NEW session and
+resumes; the old `session_id` is the pointer to what the dead worker knew. NO program name, argv, cwd,
+path, ticket title or any free text is written — nothing that could carry a secret or a private folder.
+
+### Order of writes, and how a failure fails
+
+For a death: (a) pre-flight — the event log is read and must be missing or clean, else refuse; (b) the
+handover file is written atomically (an exclusive temp file, `sync_all`, then a hard link that FAILS if
+the name exists — never a replacing rename); (c) the `timed_out` event is appended; (d) only then the
+manifest `remove` lines. For a TIMEOUT, (a) and (b) happen BEFORE any signal, like `step_limit_stop` —
+a hard stop is never silent. A crash between any two steps leaves the entry on the sheet, so the next
+record-mode run finishes the job. Record mode widens `check` to visit EVERY live process entry for
+liveness (an entry with no limit is probed only; gone -> `died`), so a program that vanished is found at
+the driver's next check.
+
+Any record failure answers 2 with `harness: error: <id>: <reason>` then `harness: DEATH NOT RECORDED`
+on stderr; the entry is KEPT (not removed), so the death is retried, never lost. The fixed reasons:
+
+- `deaths folder is a symlink`
+- `deaths folder is not a directory`
+- `deaths folder is owned by another user`
+- `deaths folder is readable by group or others`
+- `handover <relpath> exists and does not match this death`
+- `cannot write the handover: <kind>`
+- `event log refused: <why>`
+- `the clock reads before the process was recorded`
+
+The deaths folder is created 0700 when missing, without following links; handover files are 0600. No
+absolute path is ever printed. Exit codes are unchanged: check `0/2/4/5`, step `0/2/4/6`, stop
+`0/2/3/4` keep their meanings, and "death not recorded" is a refusal (2, top of check's precedence).
+Record mode adds ONE stdout line per death this run recorded, after the verb's own line:
+`recorded<TAB><id><TAB><cause><TAB><handover-relpath>`.
+
+### What the death record does not cover
+
+- **A driver that never passes the record flags.** Legacy mode still removes a gone entry with no
+  record (today's behaviour, kept for compatibility); the P1B-14/15 driver must pass them.
+- **Trusted `--checkpoint` / `--session`.** Shape-checked only; not proven to be a pushed commit of
+  `ws/<ticket>` or the real worker session.
+- **Nobody runs a verb.** No daemon: a death is recorded at the next check/step/stop, not when it
+  happens.
+- **Residual folder swap.** The checks are no-follow and the final link refuses an existing name, but a
+  same-user writer could swap the deaths folder between its check and the temp create (std has no
+  `openat`).
+- **Two manifest dirs or two logs for one ticket.** Each records separately (the existing "two `--dir`s
+  split a ticket" limit).
+- **Orphan reaping** (a process the sheet never listed, or a leaderless group) is P2; **output, exit
+  code and timing** of the ended program are P1B-08.
+- **Leftover intent files.** A timeout whose stop is refused forever leaves a handover with no event; it
+  is an intent record, harmless, and is reused if the entry is later resolved.
+- **Zombie window.** A dead but unreaped program answers the probe and is not recorded until reaped.
+- **Log read cost.** The idempotence lookup reads the whole event log per death (no index); fine at
+  today's sizes.
