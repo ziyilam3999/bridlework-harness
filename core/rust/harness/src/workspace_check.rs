@@ -19,11 +19,15 @@
 //! on the command line (command-line config outranks repo, worktree and global config), every inherited
 //! `GIT_*` name is stripped, ignored paths are listed (`--ignored=matching`), and the same forced reads run
 //! recursively INSIDE every checked-out submodule (the submodule's own config, exclude files and index bits
-//! hide nothing; a submodule that cannot be inspected is exit 3 naming it). Where even that cannot prove the
-//! answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file in the worktree or any
-//! checked-out submodule's git dir, any `filter.*` or `core.attributesFile` config key in any scope (a
-//! clean/smudge/process filter is both a hide and an arbitrary command a "read-only" check must never run),
-//! or a `core.worktree` that redirects elsewhere. Entries git never lists (a FIFO, a socket, a device) are
+//! hide nothing; a submodule that cannot be inspected is exit 3 naming it). User-level config is not the
+//! repo's doing and never changes what the check sees, so it is neither read nor refused: every git call
+//! runs with the system config off and the global config pointed at the null device, and the user
+//! attributes file forced to the null device too — a `filter.lfs.*` block in the user's own global config
+//! (the standard git-lfs install) does not make the check refuse, and no command it names can run. Where
+//! even that cannot prove the answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file
+//! in the worktree or any checked-out submodule's git dir, any `filter.*` or `core.attributesFile` config
+//! key in the repo or worktree scope (a clean/smudge/process filter is both a hide and an arbitrary
+//! command a "read-only" check must never run), or a `core.worktree` that redirects elsewhere. Entries git never lists (a FIFO, a socket, a device) are
 //! caught by a no-follow walk of the tree. Git output is read through a hard 8 MiB cap and stray entries
 //! through a 10,000 cap; the submodule pass and the walk carry their own caps; hitting any is exit 3
 //! ("too many paths"), never a truncated PASS and never an unbounded read (fail closed).
@@ -147,7 +151,10 @@ fn parse_args(a: &[String]) -> Result<(String, String), i32> {
 /// no fsmonitor and no stat levers (command-line config outranks repo, worktree and global config, so
 /// `core.trustctime=false`, `core.checkStat=minimal`, `core.filemode=false`, `core.untrackedCache=true` and
 /// `core.sparseCheckout=true` in the repo cannot relax the comparison), no inherited `GIT_*` name (an
-/// inherited `GIT_DIR`/`GIT_CONFIG_*` cannot redirect or reconfigure it), no stdin, stderr dropped (git's
+/// inherited `GIT_DIR`/`GIT_CONFIG_*` cannot redirect or reconfigure it), and no user-level config at all
+/// (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL` at the null device, `core.attributesFile` forced to the
+/// null device: the system file, the global file, the XDG config and the user attributes file are never
+/// read), no stdin, stderr dropped (git's
 /// own message may name a folder). The stdout read is hard-capped: past `GIT_CAP` the flag `overflow`
 /// is set and the rest is drained and discarded, never buffered.
 struct GitOut {
@@ -169,12 +176,23 @@ fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
         .args(["-c", "core.filemode=true"])
         .args(["-c", "core.untrackedCache=false"])
         .args(["-c", "core.sparseCheckout=false"])
+        .args(["-c", "core.attributesFile=/dev/null"])
         .args(args);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("GIT_") {
             c.env_remove(k);
         }
     }
+    // After the strip: user-level config is neutralised for EVERY git call. Neither the system config file
+    // (`GIT_CONFIG_NOSYSTEM=1`) nor the user's global one (`GIT_CONFIG_GLOBAL` at the null device, which also
+    // covers the XDG config path) is read, and the user attributes file (`core.attributesFile` forced to the
+    // null device, which also covers the XDG default attributes file) is not read either. A key that lives
+    // outside the repo can never run on the checked tree — a configured filter only runs when a path's
+    // attributes name it, and every repo/worktree route to one is refused by the scan below — so this hides
+    // nothing and refuses nothing; it only stops a git-lfs host's user-level `filter.lfs.*` block from
+    // failing every check (the CI-red shape).
+    c.env("GIT_CONFIG_NOSYSTEM", "1");
+    c.env("GIT_CONFIG_GLOBAL", "/dev/null");
     let mut child = match c.stdin(Stdio::null()).stderr(Stdio::null()).stdout(Stdio::piped()).spawn() {
         Ok(ch) => ch,
         Err(_) => return GitOut { ok: false, overflow: false, bytes: Vec::new() },
@@ -221,9 +239,12 @@ fn git_text(tree: &Path, args: &[&str]) -> Option<Result<String, i32>> {
 ///
 /// - `$GIT_DIR/info/attributes` (and the common git dir's copy, which a linked worktree reads): attributes
 ///   can change what status compares, and a `filter=` attribute would run a repo-configured command;
-/// - any `filter.*` or `core.attributesFile` key in ANY config scope (system, global, repo, worktree): a
-///   clean/smudge/process filter is both a hide and an arbitrary command a "read-only" check must never
-///   execute (only the KEY NAME is ever printed, never the value — a value is a command line);
+/// - any `filter.*` or `core.attributesFile` key in the repo or worktree scope: a clean/smudge/process
+///   filter is both a hide and an arbitrary command a "read-only" check must never execute (only the KEY
+///   NAME is ever printed, never the value — a value is a command line). Keys from system or global scope
+///   are simply not seen: those files are neutralised for every git call (see `git_bytes`), because a key
+///   outside the repo can never run on the checked tree unless a repo-scope route names it — and those
+///   routes are exactly what this scan refuses;
 /// - `core.worktree` pointing anywhere but the tree being scanned (git's own plumbing value for an
 ///   absorbed submodule points at that submodule and passes; anything else redirects the work tree).
 fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
@@ -246,18 +267,40 @@ fn refuse_scan(tree: &Path, label: &str) -> Result<(), i32> {
             )));
         }
     }
-    let g = git_bytes(tree, &["config", "-z", "--get-regexp", "^(filter\\.|core\\.attributesFile)"]);
+    let g = git_bytes(tree, &["config", "-z", "--get-regexp", "^filter\\."]);
     if g.overflow {
         return Err(stop3("too many paths: a config answer went over the read cap"));
     }
     if g.ok && !g.bytes.is_empty() {
         // `-z --get-regexp` records are `key\nvalue\0`: the key ends at the newline; only the key is printed.
+        // The read is deliberately unscoped: with the system and global files neutralised for every git call
+        // (see `git_bytes`), an unscoped read resolves exactly the repo and worktree scopes (and anything an
+        // `include.path` in them pulls in), while the check's own `-c` pairs carry no `filter.*` key — so this
+        // fires on every repo/worktree filter key and never on a user-level one (a key that comes from system
+        // or global scope is simply not seen).
         let key = g.bytes.split(|&b| b == b'\n').next().unwrap_or(b"");
         return Err(stop3(&format!(
             "a filter or attributes config key is set ({}) in {}; cannot check (a filter would run a command)",
             String::from_utf8_lossy(key),
             label
         )));
+    }
+    // `core.attributesFile` is read scope-limited (`--local`, then `--worktree`): an unscoped read would see
+    // the check's own forced `-c core.attributesFile=/dev/null` key and refuse on itself. Together the two
+    // scopes cover the repo config file and the `config.worktree` extension file and nothing else.
+    for scope in ["--local", "--worktree"] {
+        let g = git_bytes(tree, &["config", "-z", scope, "--get-regexp", "^core\\.attributesFile$"]);
+        if g.overflow {
+            return Err(stop3("too many paths: a config answer went over the read cap"));
+        }
+        if g.ok && !g.bytes.is_empty() {
+            let key = g.bytes.split(|&b| b == b'\n').next().unwrap_or(b"");
+            return Err(stop3(&format!(
+                "a filter or attributes config key is set ({}) in {}; cannot check (a filter would run a command)",
+                String::from_utf8_lossy(key),
+                label
+            )));
+        }
     }
     let g = git_bytes(tree, &["config", "--get", "core.worktree"]);
     if g.overflow {

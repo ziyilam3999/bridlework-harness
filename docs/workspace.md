@@ -125,13 +125,21 @@ and worktree config alike: no hooks, `core.fsmonitor=false`, `core.trustctime=tr
 forces `--untracked-files=all` and `--ignore-submodules=none` (a repo config `status.showUntrackedFiles=no`
 loses to the flag), and ignored paths are listed (`--ignored=matching`). Every inherited `GIT_*` environment
 name is stripped before each call, so a caller's `GIT_DIR`, `GIT_CONFIG_COUNT` or `GIT_CONFIG_GLOBAL` can neither
-redirect nor reconfigure the check.
+redirect nor reconfigure the check. User-level config is not the repo's doing and never changes what the check
+sees, so it is neither read nor refused: every git call runs with the system config switched off
+(`GIT_CONFIG_NOSYSTEM=1`), the global config pointed at the null device (`GIT_CONFIG_GLOBAL`, which also covers
+the XDG config path), and the user attributes file forced to the null device (`core.attributesFile`, which also
+covers the XDG default attributes file). A filter in the user's own global config — the standard git-lfs
+install writes its `filter.lfs.*` block there — therefore does not make the check refuse, and no command it
+names can ever run on the checked tree: a configured filter only runs when a path's attributes name it, and
+every repo-scope route that could name one is refused below.
 
 Where even that cannot prove the answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file in
 the worktree's git dir or common git dir (or in any checked-out submodule's), or any `filter.*` or
-`core.attributesFile` config key set in ANY scope (system, global, repo, worktree) — a clean/smudge/process
-filter is both a hide and an arbitrary command a "read-only" check must never execute; only the key name is
-printed, never its value — or a `core.worktree` that redirects anywhere but the tree being checked. When one
+`core.attributesFile` config key set in the repo or worktree scope (a key that comes from system or global
+scope is simply not seen, because those files are never read) — a clean/smudge/process filter is both a hide
+and an arbitrary command a "read-only" check must never execute; only the key name is printed, never its
+value — or a `core.worktree` that redirects anywhere but the tree being checked. When one
 path carries two kinds, the stronger wins (order, weakest first: `untracked`, `ignored`, `modified`, `hidden`,
 `submodule`, `missing`).
 
@@ -152,8 +160,9 @@ byte — control characters, space, DEL, any non-UTF-8 byte — prints as `\xNN`
 - `3` — cannot check: usage errors, a missing/torn/corrupt manifest, no live `worktree` entry, a worktree path
   that is missing, is a symlink (no-follow stat) or is not a directory, a folder that is not that worktree's own
   top level, a HEAD that is detached or not `refs/heads/ws/<ticket>`, an in-progress merge/rebase/cherry-pick,
-  an `info/attributes` file or a `filter.*` / `core.attributesFile` config key (any scope), a redirecting
-  `core.worktree`, a submodule that cannot be inspected, a failed git call, or a size cap.
+  an `info/attributes` file or a `filter.*` / `core.attributesFile` config key (repo or worktree scope; keys
+  from system or global scope are never read), a redirecting `core.worktree`, a submodule that cannot be
+  inspected, a failed git call, or a size cap.
 
 **Size caps**: any git output read is capped at 8 MiB and stray entries at 10,000; the submodule pass caps
 inspected submodules at 100 and nesting depth at 8; the tree walk caps visited entries at 200,000. Hitting any
@@ -167,6 +176,17 @@ a git dir.
 **Git version**: the check uses `git status --porcelain=v2 -z --ignored=matching` and
 `git rev-parse --absolute-git-dir`; it assumes git 2.32 or newer (the same floor `--path-format=absolute`
 implies, plus `--ignored=matching`).
+
+**Not in this PR** (known limits of this version of the check, filed as the follow-up ticket
+`clean-state-hardening`, #184): a repo that sets `core.ignorecase=true` on a case-sensitive filesystem, or
+`core.symlinks=false` with a tracked symlink replaced by a regular file, can read clean when it is not (the
+check does not yet force those two settings); a filter configured inside a checked-out submodule's own config
+can still run during git's own submodule status probe (the exit is still 3, but the probe happens before the
+check's refusal scan of that submodule); a stray `d/.git` file or directory at depth (not the worktree's own
+`.git`, not a checked-out gitlink's) is skipped by the walk and invisible to git alike; and several refusal
+and cap rows (`core.worktree` redirect, the submodule refusal scan, walk `.git` skip and cap, submodule count
+and depth caps, `core.trustctime` / `core.checkStat` / `core.untrackedCache` levers) have no test that goes
+RED when their code is removed.
 
 Ignored build output inside the tree (for example `target/`) fails the check on purpose: clean it before
 finalize or list it on the manifest, as described in the P1B-11 plan. Not covered here: unpushed commits

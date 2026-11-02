@@ -188,6 +188,34 @@ fn assert_no_folder(label: &str, o: &Output, t: &Tmp) {
     }
 }
 
+/// The full `workspace check` line for ticket `t1` with HOME pointed at a scratch folder (never the real
+/// HOME), run from an unrelated folder: the caller's user-level git config must be exactly what the test
+/// planted and nothing else.
+fn check_home(t: &Tmp, home: &Path) -> Output {
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .env("HOME", home)
+        .current_dir(&unrelated)
+        .stdin(Stdio::null());
+    c.output().unwrap()
+}
+
+/// A tracked `g.txt` plus a committed `.gitattributes` naming filter `h` for it, committed on the ticket
+/// branch, then a same-size edit with a shifted mtime: git must content-compare `g.txt` on the next status,
+/// so a readable filter driver WOULD run there (the one place a clean filter executes during a status read).
+fn commit_filter_fixture(tree: &Path) {
+    fs::write(tree.join("g.txt"), "one\n").unwrap();
+    fs::write(tree.join(".gitattributes"), "g.txt filter=h\n").unwrap();
+    git(&tree, &["add", "g.txt", ".gitattributes"]);
+    git(&tree, &["commit", "-q", "-m", "filter fixture"]);
+    fs::write(tree.join("g.txt"), "twp\n").unwrap();
+    // Any mtime other than the index-recorded one (with the size unchanged) forces the content compare.
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::options().write(true).open(tree.join("g.txt")).unwrap().set_modified(old).unwrap();
+}
+
 /// The full `workspace check` line for `id`, run from an unrelated folder (never the current folder).
 fn check_id(t: &Tmp, id: &str, md_rel: &str) -> Output {
     let (unrelated, _) = t.both("unrelated");
@@ -1658,4 +1686,86 @@ fn ho16_committed_symlink_and_node_modules_link_stay_clean() {
     let o = check(&t);
     assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
     assert_eq!(out(&o), "workspace=clean ticket=t1\n");
+}
+
+// ------------------------------ fix round 3, F1: user-level (system/global) config is neutralised
+
+#[test]
+fn global_lfs_filter_keys_do_not_refuse_a_clean_workspace() {
+    // must-not-fire (the CI shape): git-lfs's standard block in the USER's global config. A configured
+    // filter only runs when a path's attributes name it, and user-level config is neutralised for every
+    // git call the check makes, so a clean workspace is exit 0 even on a git-lfs host.
+    let t = Tmp::new();
+    let (_, _, _) = mk_ws(&t, false);
+    let (home, _) = t.both("lfs-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n",
+    )
+    .unwrap();
+    let o = check_home(&t, &home);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), "workspace=clean ticket=t1\n");
+}
+
+#[test]
+fn system_scope_filter_keys_do_not_refuse() {
+    // must-not-fire: a filter key in a scratch SYSTEM config file (git honours GIT_CONFIG_SYSTEM for the
+    // system file). HOME is also a scratch folder, never the real one.
+    let t = Tmp::new();
+    let (_, _, _) = mk_ws(&t, false);
+    let (home, _) = t.both("sys-home");
+    fs::create_dir_all(&home).unwrap();
+    let (scfg, _) = t.both("sys-home/system.gitconfig");
+    fs::write(&scfg, "[filter \"x\"]\n\tclean = echo x\n").unwrap();
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .env("HOME", &home)
+        .env("GIT_CONFIG_SYSTEM", &scfg)
+        .current_dir(&unrelated)
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), "workspace=clean ticket=t1\n");
+}
+
+#[test]
+fn global_filter_still_executes_nothing() {
+    // must-fire: a filter in the USER's global config, a committed `.gitattributes` naming it, and a
+    // same-size stray edit to the attributed file (git must content-compare it, so a readable driver
+    // would run): the stray edit is still named, and the filter command never runs (marker absent).
+    // The scratch HOME also carries the XDG default attributes file naming the filter, which the
+    // neutralised user attributes route never reads.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    commit_filter_fixture(&tree);
+    let (home, _) = t.both("gf-home");
+    fs::create_dir_all(home.join(".config/git")).unwrap();
+    let (marker, _) = t.both("gf-marker");
+    fs::write(home.join(".gitconfig"), format!("[filter \"h\"]\n\tclean = touch {}\n", marker.display())).unwrap();
+    fs::write(home.join(".config/git/attributes"), "g.txt filter=h\n").unwrap();
+    let o = check_home(&t, &home);
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray modified g.txt"), "lines: {:?}", out(&o));
+    assert!(!marker.exists(), "a user-level filter command must never run");
+}
+
+#[test]
+fn repo_scope_filter_key_still_refuses() {
+    // must-fire: a filter key in the REPO's own config plus a committed `.gitattributes` (NOT
+    // `info/attributes`, so the filter-key refusal is the only thing that can fire): exit 3, stdout
+    // empty, and the filter command never runs.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    commit_filter_fixture(&tree);
+    let (marker, _) = t.both("rs-marker");
+    git(&tree, &["config", "filter.h.clean", &format!("touch {}", marker.display())]);
+    let o = check(&t);
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "stdout must stay empty on exit 3");
+    assert!(err(&o).contains("filter") || err(&o).contains("attributes"), "stderr names why: {}", err(&o));
+    assert!(!marker.exists(), "the check must never execute a repo-configured command");
 }
