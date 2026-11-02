@@ -28,3 +28,8 @@ lanes:
 # The friction inbox (docs/friction-inbox.md) lives only in the private overlay; this path is a placeholder.
 friction:
   inbox: /placeholder/friction-inbox.jsonl
+
+# The tier the factory designs new fixes at (G8.3, docs/fix-tier.md). A tier, never a brand.
+# T3 is the spec default; an unseeded install refuses to guess (config v4).
+factory:
+  design_tier: T3

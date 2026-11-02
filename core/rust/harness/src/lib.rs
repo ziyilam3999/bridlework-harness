@@ -12,6 +12,7 @@ pub mod decode;
 pub mod detect;
 pub mod events;
 pub mod explain;
+pub mod fix_tier;
 pub mod fixtures;
 pub mod friction;
 pub mod gate_result;
