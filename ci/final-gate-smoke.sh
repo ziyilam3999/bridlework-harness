@@ -216,14 +216,49 @@ if names_ok "$root/.github/workflows"; then ok B2-reported-names; else bad B2-re
 if G -C "$root" rev-parse --verify -q origin/master >/dev/null; then oldbase=origin/master
 elif G -C "$root" rev-parse --verify -q 'HEAD^1' >/dev/null; then oldbase='HEAD^1'
 else oldbase=""; fi
+# ticket 163 changes privacy-gate.yml and privacy-text.yml on purpose, and ONLY these ways: each job declares
+# `environment: privacy-gate`, and privacy-text.yml loses its `release:` trigger. priv_frozen NAME CURRENT-FILE compares the
+# current file with the base copy after dropping those two allowed differences from the base copy, and the one environment line
+# from the current copy (which must carry exactly one); any other change in either file is red. rust-test.yml stays fully frozen.
+priv_frozen() {
+  [ -n "$oldbase" ] || return 1
+  G -C "$root" show "$oldbase:.github/workflows/$1" > "$tmp/priv-old.yml" 2>/dev/null || return 1
+  python3 -I - "$1" "$tmp/priv-old.yml" "$2" <<'PYX'
+import re, sys
+name, oldp, curp = sys.argv[1:4]
+env = "    environment: privacy-gate"
+old = open(oldp, encoding="utf-8").read().split("\n")
+cur = open(curp, encoding="utf-8").read().split("\n")
+if cur.count(env) != 1:
+    sys.exit(1)
+o = [l for l in old if l != env]
+if name == "privacy-text.yml":
+    t = "\n".join(o)
+    t = re.sub(r"^  release:\n    types: \[created, edited, published\]\n", "", t, flags=re.M)
+    o = t.split("\n")
+sys.exit(0 if o == [l for l in cur if l != env] else 1)
+PYX
+}
 if [ -z "$oldbase" ]; then
   echo "skip B2-old-workflows-untouched (no base to compare with)"
-# ticket 163 changes privacy-gate.yml and privacy-text.yml on purpose (they now declare environment: privacy-gate), so only
-# rust-test.yml stays frozen here; the privacy workflows are covered by ci/gate-secret-smoke.sh static.
-elif G -C "$root" diff --quiet "$oldbase" -- .github/workflows/rust-test.yml 2>/dev/null; then
-  ok B2-old-workflows-untouched
 else
-  bad B2-old-workflows-untouched
+  fz=ok
+  G -C "$root" diff --quiet "$oldbase" -- .github/workflows/rust-test.yml 2>/dev/null || fz=bad
+  priv_frozen privacy-gate.yml "$root/.github/workflows/privacy-gate.yml" || fz=bad
+  priv_frozen privacy-text.yml "$root/.github/workflows/privacy-text.yml" || fz=bad
+  $fz B2-old-workflows-untouched
+  # planted twins: one extra line / a lost allowed change in a scratch copy of each privacy workflow must go red
+  for n in privacy-gate.yml privacy-text.yml; do
+    cp "$root/.github/workflows/$n" "$tmp/priv-cur.yml"
+    printf '# x\n' >> "$tmp/priv-cur.yml"
+    if priv_frozen "$n" "$tmp/priv-cur.yml"; then bad "B2-twin-$n-extra-line-detected"; else ok "B2-twin-$n-extra-line-detected"; fi
+    sed -E '/^    environment: privacy-gate$/d' "$root/.github/workflows/$n" > "$tmp/priv-cur.yml"
+    if priv_frozen "$n" "$tmp/priv-cur.yml"; then bad "B2-twin-$n-no-environment-detected"; else ok "B2-twin-$n-no-environment-detected"; fi
+    sed -E 's/^(    environment: privacy-gate)$/\1\n\1/' "$root/.github/workflows/$n" > "$tmp/priv-cur.yml"
+    if priv_frozen "$n" "$tmp/priv-cur.yml"; then bad "B2-twin-$n-two-environment-lines-detected"; else ok "B2-twin-$n-two-environment-lines-detected"; fi
+  done
+  sed -E 's/^(  issues:)$/  release:\n    types: [created, edited, published]\n\1/' "$root/.github/workflows/privacy-text.yml" > "$tmp/priv-cur.yml"
+  if priv_frozen privacy-text.yml "$tmp/priv-cur.yml"; then bad B2-twin-privacy-text-release-trigger-back-detected; else ok B2-twin-privacy-text-release-trigger-back-detected; fi
 fi
 if sh "$here/workflow-lint.sh"; then ok B5-lint-passes-all-workflows; else bad B5-lint-passes-all-workflows; fi
 

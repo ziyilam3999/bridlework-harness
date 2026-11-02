@@ -3,7 +3,8 @@
 # Arms: exfil exfil-master leak failclosed timeout release logcheck static all
 # The driver builds scratch git repos in a temp folder (a base commit plus a PR-shaped head) and RUNS THE WORKFLOW FILE'S OWN
 # `run:` TEXT, step by step, extracted by step name with the step's own `env:` values (review P5). It never holds a copy of the
-# steps. The deny list used is a dummy sentinel list, never the real secret, and nothing here prints it.
+# steps. A step, job or top-level key it does not model (working-directory except the one engine-build literal, shell, defaults,
+# container, ...) makes the run a setup error and the static arm FAIL, never a silent skip (review r1 F1). The deny list used is a dummy sentinel list, never the real secret, and nothing here prints it.
 # Prints "ok <id>" / "FAIL <id>" per check. Exit 0 only if every check of the arm holds, 1 otherwise, 2 on a setup error.
 # GATE_NEXT_WF (optional): path of the workflow file to test instead of .github/workflows/privacy-gate-next.yml.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
@@ -21,6 +22,14 @@ ENGINE = os.path.join(ROOT, "core", "rust", "target", "release", "harness")
 TOKEN = "zzfixturetoken"                       # a denied word of the dummy list (plain word, not a real value)
 SENTINEL = "sentinel-exfil-marker-q9"          # sits on a comment line of the dummy list; the engine ignores it
 LIST = TOKEN + "\n# " + SENTINEL + "\n"
+# Every key that can change what runs, or where, is either modelled by this driver or refused (an unmodelled key is a failure,
+# never a skip). `working-directory` is modelled for ONE literal only (the engine build dir, which the three older workflows
+# keep and the final-gate smoke freezes) and never on a step that holds the secret. `shell`, `continue-on-error`, `timeout-minutes`
+# (step level), `container`, `services`, `defaults`, `strategy`, job `env`, extra top-level keys and quoted/flow keys are refused.
+ALLOWED_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "if", "working-directory"}
+ALLOWED_JOB_KEYS = {"runs-on", "timeout-minutes", "environment", "steps"}
+ALLOWED_TOP_KEYS = {"name", "on", "permissions", "jobs"}
+WD_LITERAL = "core/rust"
 SECRET_WORKFLOWS = ["privacy-gate.yml", "privacy-gate-next.yml", "privacy-text.yml", "privacy-release-text.yml"]
 
 fails = 0
@@ -44,15 +53,20 @@ def check(i, cond):
 
 
 # ------------------------------------------------------------------ workflow file reading (by step name)
-def parse_jobs(path):
+def parse_jobs(path, strict=True):
     """{job id: {"props": {key: value}, "steps": [ {"name","run","env","text"} ]}} for a workflow in the repo layout
     (job ids at 2 spaces, job keys at 4, steps `- ` at 6)."""
     lines = open(path, encoding="utf-8").read().split("\n")
     jobs = {}
+    probs = []
     in_jobs = False
     cur = None
     in_steps = False
     for l in lines:
+        if l and not l[0].isspace() and not l.startswith("#"):
+            tm = re.match(r"^([A-Za-z0-9_-]+):", l)
+            if not tm or tm.group(1) not in ALLOWED_TOP_KEYS:
+                probs.append(tm.group(1) if tm else "?")
         if re.match(r"^jobs:\s*$", l):
             in_jobs = True
             continue
@@ -66,12 +80,21 @@ def parse_jobs(path):
             jobs[cur] = {"props": {}, "blocks": []}
             in_steps = False
             continue
+        if re.match(r"^  \S", l) and not l.lstrip().startswith("#"):
+            probs.append("?")                      # a job id the driver cannot read (quoted, flow, inline)
+            continue
         if cur is None:
             continue
         m = re.match(r"^    ([A-Za-z0-9_-]+):\s*(.*)$", l)
         if m:
             jobs[cur]["props"][m.group(1)] = m.group(2).strip()
             in_steps = m.group(1) == "steps"
+            if m.group(1) not in ALLOWED_JOB_KEYS:
+                probs.append(m.group(1))
+            continue
+        if re.match(r"^    \S", l) and not l.lstrip().startswith("#"):
+            probs.append("?")                      # a job key the driver cannot read (quoted or flow)
+            in_steps = False
             continue
         if in_steps:
             if re.match(r"^      - ", l):
@@ -80,20 +103,43 @@ def parse_jobs(path):
                 jobs[cur]["blocks"][-1].append(l)
     for j in jobs.values():
         j["steps"] = [parse_step(b) for b in j.pop("blocks")]
+        for st in j["steps"]:
+            probs.extend(st["problems"])
+    if strict and probs:
+        # setup error: names the file and the keys only, never a value
+        sys.stderr.write("gate-secret-smoke: refused key(s) in %s: %s\n" % (os.path.basename(path), ",".join(sorted(set(probs)))))
+        sys.exit(2)
+    parse_jobs.last = sorted(set(probs))
     return jobs
+
+
+def key_problems(path):
+    """Sorted key names (never values) in a workflow file that this driver neither models nor allows."""
+    parse_jobs(path, strict=False)
+    return parse_jobs.last
 
 
 def parse_step(block):
     norm = ["        " + block[0][8:]] + block[1:]       # `      - key:` -> `        key:` (keys at 8)
-    st = {"name": None, "run": None, "env": {}, "text": "\n".join(block)}
+    st = {"name": None, "run": None, "env": {}, "text": "\n".join(block), "wd": None, "problems": []}
+    if re.match(r"^      -  ", block[0]):
+        st["problems"].append("?")                  # `-   key:` shifts the step's keys; refuse rather than misread
     i = 0
     while i < len(norm):
         l = norm[i]
         m = re.match(r"^        ([A-Za-z0-9_-]+):\s*(.*)$", l)
         if not m:
+            if l.strip() and not l.lstrip().startswith("#") and len(l) - len(l.lstrip()) <= 8:
+                st["problems"].append("?")          # quoted key, flow mapping or odd indent: not readable, so refused
             i += 1
             continue
         key, val = m.group(1), m.group(2).strip()
+        if key not in ALLOWED_STEP_KEYS:
+            st["problems"].append(key)
+        if key == "working-directory":
+            st["wd"] = val
+            if val != WD_LITERAL or "secrets." in st["text"]:
+                st["problems"].append("working-directory")
         if key == "name":
             st["name"] = val.strip("\"'")
         elif key == "run":
@@ -121,9 +167,9 @@ def parse_step(block):
     return st
 
 
-def find_step(path, name, job=None):
+def find_step(path, name, job=None, strict=True):
     hits = []
-    for jid, j in parse_jobs(path).items():
+    for jid, j in parse_jobs(path, strict).items():
         if job and jid != job:
             continue
         hits += [s for s in j["steps"] if s["name"] == name]
@@ -180,7 +226,8 @@ def run_job(wf, job, steps, cwd, base_env, secret=LIST, timeouts=None):
         for k, v in st["env"].items():
             e[k] = expr(v, secret)
         res["ran"].append(name)
-        rc, out, to = run_bash(st["run"], cwd, e, (timeouts or {}).get(name))
+        step_cwd = os.path.join(cwd, st["wd"]) if st["wd"] else cwd      # the one modelled working-directory (see WD_LITERAL)
+        rc, out, to = run_bash(st["run"], step_cwd, e, (timeouts or {}).get(name))
         res["out"] += out
         if rc != 0:
             res.update(rc=rc, failed=name, timed_out=to)
@@ -332,6 +379,9 @@ def counts(out, key):
 # ------------------------------------------------------------------ exfil
 def exfil_reasons(wf, tmp):
     """[] when the planted exfil got nothing and the base scan really ran; otherwise the list of reasons (never content)."""
+    kp = key_problems(wf)
+    if kp:
+        return ["unmodelled-key:" + "+".join(kp)]
     fx = build(tmp, "exfil")
     r = run_job(wf, job_of(wf), STEPS, fx["base"], fx["env"])
     why = []
@@ -368,6 +418,19 @@ def arm_exfil():
         check("exfil-mutant-checkout-pr-and-run-it-is-caught", bool(exfil_reasons(m1, os.path.join(tmp, "b"))))
         m2 = mutate(NEXT, r'sh "\$base/ci/privacy-gate\.sh"', 'sh ./ci/privacy-gate.sh', os.path.join(tmp, "m2.yml"))
         check("exfil-mutant-script-from-data-dir-is-caught", bool(exfil_reasons(m2, os.path.join(tmp, "c"))))
+        # m3 (review r1 F1): the Scan step runs in the data dir through `working-directory:`, checks the PR out and runs ITS script
+        text = open(NEXT, encoding="utf-8").read()
+        i = text.index("      - name: Scan\n")
+        m3 = os.path.join(tmp, "m3.yml")
+        with open(m3, "w", encoding="utf-8") as f:
+            f.write(text[:i] + "      - name: Scan\n        env:\n          HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}\n"
+                    "        working-directory: ${{ runner.temp }}/gate-data\n        run: |\n"
+                    "          test -d \"$RUNNER_TEMP/gate-data\"\n          git checkout -q -f HEAD\n"
+                    "          sh ./ci/privacy-gate.sh --tree\n          sh ./ci/privacy-gate.sh --range refs/gate/head \"^$GATE_MERGE_BASE\"\n")
+        check("exfil-mutant-working-directory-data-dir-runs-pr-script-is-caught", bool(exfil_reasons(m3, os.path.join(tmp, "d"))))
+        # m4: a step `shell:` key (the driver does not model it, so it must refuse it)
+        m4 = mutate(NEXT, r'^(        run: \|\n          rc=0)$', '        shell: bash -e {0}\n        run: |\n          rc=0', os.path.join(tmp, "m4.yml"))
+        check("exfil-mutant-step-shell-key-is-caught", bool(exfil_reasons(m4, os.path.join(tmp, "e"))))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -407,6 +470,12 @@ def leak_ok(wf, tmp):
         why.append("clean-blocked:" + str(r2["failed"]))
     if not counts(r2["out"], "files") or max(counts(r2["out"], "files")) < 1:
         why.append("clean-scan-did-not-run")
+    # review r1 F5: the tree scan must read the PR HEAD tree, not the base tree. The fixture's head has one more file than the
+    # base, so the printed files= must equal the head tree's file count and differ from the base tree's.
+    head_n = len(G(fc["base"], "ls-tree", "-r", "--name-only", fc["head"]).split("\n"))
+    base_n = len(G(fc["base"], "ls-tree", "-r", "--name-only", "HEAD").split("\n"))
+    if head_n == base_n or counts(r2["out"], "files") != [head_n]:
+        why.append("tree-scan-did-not-read-the-pr-head-tree")
     return why
 
 
@@ -417,7 +486,7 @@ def arm_leak():
         check("leak-blocked-clean-passes-no-token-in-output" + ("" if not why else " (" + ",".join(why) + ")"), not why)
         if os.environ.get("GATE_NEXT_WF"):
             return
-        m = mutate(NEXT, r'^\s*sh "\$base/ci/privacy-gate\.sh" .*$', '  true', os.path.join(tmp, "skip.yml"))
+        m = mutate(NEXT, r'^\s*sh "\$base/ci/privacy-gate\.sh" .*$', '          true', os.path.join(tmp, "skip.yml"))
         check("leak-mutant-skipping-the-scan-is-caught", bool(leak_ok(m, os.path.join(tmp, "m"))))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -582,6 +651,17 @@ def arm_release():
     check("release-missing-file-fails", release_run(None)["rc"] != 0)
     check("release-api-error-object-fails", release_run(json.dumps({"message": "API rate limit exceeded"}))["rc"] != 0)
     check("release-wrong-item-type-fails", release_run(json.dumps([1, 2]))["rc"] != 0)
+    # review r1 F2: the count must be of real releases (an object with an integer id or a string tag_name), not any dict
+    r = release_run(json.dumps([{"message": "Bad credentials"}]))
+    check("release-error-object-wrapped-in-a-list-fails", r["rc"] != 0 and 1 not in counts(r["out"], "releases_scanned"))
+    check("release-list-of-strings-fails", release_run(json.dumps(["a", "b"]))["rc"] != 0)
+    check("release-list-of-numbers-fails", release_run(json.dumps([1.5, 2]))["rc"] != 0)
+    check("release-one-valid-plus-one-bad-item-fails", release_run(json.dumps([{"id": 1, "name": "v1"}, {"message": "Not Found", "documentation_url": "x"}]))["rc"] != 0)
+    check("release-bad-id-type-fails", release_run(json.dumps([{"id": "7"}, {"id": True}]))["rc"] != 0)
+    r = release_run(json.dumps([{"id": 7, "name": "v1", "body": "ok"}, {"tag_name": "v2", "name": "v2"}]))
+    check("release-id-only-and-tag-only-items-count-2", r["rc"] == 0 and counts(r["out"], "releases_scanned") == [2])
+    r = release_run(json.dumps([[], []]))
+    check("release-pages-all-empty-counts-0", r["rc"] == 0 and counts(r["out"], "releases_scanned") == [0])
     check("release-secret-blank-fails-even-with-zero-releases", release_run("[]", secret="")["rc"] != 0)
     r = release_run(None, gh_shim="#!/bin/sh\nexit 1\n", fetch=True)
     check("release-fetch-step-fails-when-gh-fails", r["rc"] != 0 and r["failed"] == "Fetch releases")
@@ -622,7 +702,9 @@ def arm_logcheck():
 
 # ------------------------------------------------------------------ static file facts
 def arm_static():
-    nx = parse_jobs(NEXT)
+    kp = key_problems(NEXT)
+    check("static-keys:%s (every step, job and top-level key is modelled or allowed)%s" % (os.path.basename(NEXT), "" if not kp else " refused: " + ",".join(kp)), not kp)
+    nx = parse_jobs(NEXT, strict=False)
     text = open(NEXT, encoding="utf-8").read()
     check("static-next-triggers-on-pull_request_target-only", re.search(r"^  pull_request_target:", text, re.M) and not re.search(r"^  (pull_request|workflow_run|push|schedule):", text, re.M))
     check("static-next-types-opened-synchronize-reopened", re.search(r"types:\s*\[opened, synchronize, reopened\]", text) is not None)
@@ -635,14 +717,16 @@ def arm_static():
         check("static-next-checkout-depth0-nocreds-no-ref", "fetch-depth: 0" in co and "persist-credentials: false" in co and not re.search(r"^\s*(ref|repository):", co, re.M))
         check("static-next-only-scan-holds-secret", [s["name"] for s in j["steps"] if "secrets." in s["text"]] == ["Scan"])
         check("static-next-environment", j["props"].get("environment") == "privacy-gate")
-        check("static-next-fetch-without-depth-flag", "--depth" not in find_step(NEXT, "Fetch data")["run"])
+        check("static-next-fetch-without-depth-flag", "--depth" not in find_step(NEXT, "Fetch data", strict=False)["run"])
     for wfn in SECRET_WORKFLOWS:
         p = os.path.join(WFDIR, wfn)
         check("static-exists:" + wfn, os.path.isfile(p))
         if not os.path.isfile(p):
             continue
         t = open(p, encoding="utf-8").read()
-        for jid, jj in parse_jobs(p).items():
+        kp = key_problems(p)
+        check("static-keys:%s%s" % (wfn, "" if not kp else " refused: " + ",".join(kp)), not kp)
+        for jid, jj in parse_jobs(p, strict=False).items():
             check("static-environment:%s:%s" % (wfn, jid), jj["props"].get("environment") == "privacy-gate")
             for s in jj["steps"]:
                 check("static-no-expression-in-run:%s:%s" % (wfn, s["name"]), s["run"] is None or "${{" not in s["run"])
