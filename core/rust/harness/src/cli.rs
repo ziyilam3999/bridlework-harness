@@ -528,7 +528,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return crate::friction::friction_cmd(&args[1..], testmode);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start <ticket> ... | workspace create <ticket-file> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";

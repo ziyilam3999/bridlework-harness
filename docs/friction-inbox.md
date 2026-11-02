@@ -59,10 +59,11 @@ signature (the CAUSE a repeat of which files no second row that week) per kind:
 |---|---|---|
 | `replan_required` | yes | `repo`, `ticket`, `reason` |
 | `launch_refused` | yes | `launch_role`, `matched_entry` (`brief_sha256` is left out: it differs per brief while the cause stays the same) |
+| `gate_fail` | yes | `repo`, `ticket`, `gate_id`, `failure_class` (`head_sha` is left out: it changes with every fix push while the cause stays the same; `result` is constant `fail`) |
 | the other twelve kinds | no — zero rows | — |
 
-Gate FAIL and a sweep `blocked` are not event kinds today, so they cannot map yet (deferred follow-ups to
-ticket 193). The mapper is pure: it never opens or writes the inbox — a later weekly sweep files its rows
+A sweep `blocked` is not an event kind today, so it cannot map yet (a deferred follow-up to
+ticket 193); a gate FAIL maps through `gate_fail` (whose writer is a later ticket). The mapper is pure: it never opens or writes the inbox — a later weekly sweep files its rows
 through `harness friction add`, and because the dedup key below IS the row `id`, the duplicate-id rule of
 `add`/`lint` is a second backstop against double-filing.
 
@@ -182,6 +183,31 @@ names back on a refusal has always passed the scan; with no privacy list configu
 Orchestration runs this by hand at the S-1.6 session-removal step until P1b automates removal (154c); a non-zero
 exit blocks removal.
 
+### `harness friction sweep`
+
+```
+harness friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>]
+```
+
+The weekly sweep (ticket 200): it feeds the T-9.3 mapper one week of the event log and files its rows. The
+whole log is read no further than 4 MiB (section 4) and checked by the event reader's own parser: a final
+fragment with no newline is a torn tail, a complete-but-invalid line is corruption, and either refuses the
+whole sweep (exit 1, `the event log has a torn tail at line N; nothing was filed` / `the event log is
+corrupt at line N; nothing was filed`) — one bad line files no rows. The mapped rows whose id ends
+`.<iso-year>-w<ww>` then walk the same door `add` walks: every field of every row through the privacy
+engine, then one exclusive writer lock (section 4) holding the same stored-row checks as `add`, a skip of
+each row whose id is already stored, the cross rules, and only then the appends — all checks before the
+first append, so a refused sweep leaves the inbox byte-identical and never creates a missing one (a sweep
+that would file zero rows does not open it). On success stdout is one `stored id=<id>` per filed row (id
+order), then `sweep week=<week> filed=<n> already=<m>`.
+
+`--log` and `--week` are required and never defaulted: no wall clock runs in this verb, so every run is
+deterministic and any past week can be re-swept. The week grammar is exactly the dedup-key suffix
+(`<iso-year>-w<ww>`, digits only); a bad or absent value is a usage error (2) whose value is never echoed.
+Because the id carries the week and already-stored ids are skipped (not refused), a second run in the same
+week exits 0 with `filed=0` — and the inbox's own duplicate-id refusal stays the second backstop. A missing
+or unreadable log, a log over the cap, or no privacy list configured is a setup error (2), nothing filed.
+
 ## 3. The `lesson:` close-line grammar
 
 - A close-line is a note line whose trimmed form begins `lesson:` (case-sensitive; where it sits in the note does
@@ -213,7 +239,10 @@ exit blocks removal.
   `close-check` only read and take no lock; the lock is advisory, so it protects against other harness writers,
   not against an editor that ignores it. A refused row never creates the inbox file.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
-  than 4 MiB; a close note no further than 1 MiB. Over the bound the verb refuses (1 for a row, 2 for a file).
+  than 4 MiB; a close note no further than 1 MiB; the event log a `sweep` reads no further than 4 MiB (each
+  event line is separately capped at 4 KiB by the event reader's own rules). Over the bound the verb refuses
+  (1 for a row, 2 for a file; a log one byte over the cap is refused with nothing filed, a log exactly at it
+  is accepted).
   `patterns` never writes the inbox at all, and its only output file is the one `--record` line; the listing
   itself cannot loop or grow past its bound (one pass over the already-capped inbox, one line per root).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
@@ -221,8 +250,6 @@ exit blocks removal.
 
 ## 5. Not in slice 1 (where each piece went)
 
-- The weekly sweep that reads the event log, runs the T-9.3 mapper and files its rows through
-  `harness friction add` — a follow-up to ticket 193 (the mapper itself, and `source`, are in this repo).
 - The weekly printout (lessons at 2 `breaks`, open gate tickets with their age, the pattern candidates at N
   repeats) — 154b, in the private companion repo, because its printed list carries lesson text; it calls
   `harness friction patterns --record` (ticket 192) for the pattern half, so the public trial record grows

@@ -40,6 +40,8 @@ pub mod ticket;
 pub mod ticket_gate;
 #[cfg(unix)]
 pub mod workspace;
+#[cfg(unix)]
+pub mod workspace_check;
 
 /// Crate version string printed by `harness --version`.
 pub fn version_line() -> String {
