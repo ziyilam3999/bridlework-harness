@@ -45,8 +45,10 @@
 //! byte-identical); `3` `already-gone` or `pid-reused` (nothing signalled, the entries removed); `4`
 //! signalled but the death could not be confirmed (the entry kept).
 
-use crate::manifest::{self, ManifestRead, Target};
-use std::fs::{File, OpenOptions};
+use crate::evidence::{self, Handshake};
+use crate::manifest::{self, Class, ManifestRead, Target};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -78,6 +80,9 @@ pub fn process_cmd(a: &[String]) -> i32 {
     match sub.as_str() {
         "start" => start_cmd(rest),
         "stop" => stop_cmd(rest),
+        // hidden: the supervisor's own waiter (#209, `evidence.rs`). An implementation verb of `start`,
+        // never typed by a user, so it stays out of USAGE.
+        "waiter" => crate::evidence::waiter_cmd(rest),
         _ => {
             eprintln!("{}", USAGE);
             2
@@ -192,13 +197,16 @@ fn reap_bounded(child: &mut Child, budget_ms: u64) -> Result<(), String> {
     }
 }
 
-/// Stop the process THIS invocation just spawned (the start rollback ONLY). TERM, a bounded wait, then KILL
-/// go to the whole group through `/bin/kill` by absolute path; when that helper cannot be RUN, the group
-/// waits are skipped entirely — unknown is not empty, and waiting on a group nothing signalled is how a
-/// rollback hangs. Whatever happened to the group, std `Child::kill()` — which needs no PATH and cannot fail
-/// to run — ends the DIRECT child BEFORE the bounded reap, so the rollback never waits longer than
-/// REAP_BOUND_MS on a child it could not signal. Ok(()) only when the kill is confirmed; Err carries the
-/// reason (the group signal was not runnable, or the child is not provably dead).
+/// Stop what THIS invocation just made (the start rollback ONLY). Since #209 the spawn is a WAITER (the
+/// harness binary in its own group) and `pid` is the PROGRAM's group when the handshake named one — the
+/// waiter is not in that group, survives the signal and records the ending — else the waiter's own group.
+/// The commit pipe closes FIRST: the uncommitted end-of-input is what makes a LIVE waiter std-kill its
+/// program (the only PATH-free way to a program the group signal could not reach), so the close must reach
+/// the waiter before any signal aimed at the waiter itself. Then TERM, a bounded wait, KILL to the group
+/// through `/bin/kill` by absolute path (a helper that cannot be RUN skips the group waits entirely —
+/// unknown is not empty); then a bounded reap of the WAITER (it ends on its own once its program is dead
+/// and its record is written) and the std kill of the waiter as the LAST resort. Ok(()) only when
+/// everything reachable is provably dead; Err carries the reason.
 fn kill_own_spawn(child: &mut Child, pid: u64) -> Result<(), String> {
     let mut reason = None;
     match kill_helper(pid, "TERM") {
@@ -220,11 +228,17 @@ fn kill_own_spawn(child: &mut Child, pid: u64) -> Result<(), String> {
             }
         }
     }
-    if let Err(e) = child.kill() {
-        reason.get_or_insert_with(|| format!("cannot kill the started pid {} (std): {}", pid, e.kind()));
-    }
+    // The uncommitted close must reach a LIVE waiter; then a bounded reap, and the std kill only as the
+    // last resort on a waiter that would not end.
+    drop(child.stdin.take());
     if let Err(e) = reap_bounded(child, REAP_BOUND_MS) {
         reason.get_or_insert(e);
+        if let Err(e) = child.kill() {
+            reason.get_or_insert_with(|| format!("cannot kill the waiter pid {} (std): {}", child.id(), e.kind()));
+        }
+        if let Err(e) = reap_bounded(child, REAP_BOUND_MS) {
+            reason.get_or_insert(e);
+        }
     }
     match reason {
         Some(r) => Err(r),
@@ -233,8 +247,9 @@ fn kill_own_spawn(child: &mut Child, pid: u64) -> Result<(), String> {
 }
 
 /// Refuse a start AFTER its spawn, running the rollback first: the original reason always leads, and a
-/// rollback that could not confirm its kill appends that fact (exit 2 either way, nothing listed, and
-/// nothing left running that the rollback could reach).
+/// rollback that could not confirm its kill appends that fact (exit 2 either way, nothing left running
+/// that the rollback could reach; the WRITE-AHEAD evidence entries STAY listed since #209 — they record
+/// the failed attempt, and removing them would make the run dir's files unlisted leftovers).
 fn refuse_after_spawn(child: &mut Child, pid: u64, reason: String) -> i32 {
     let tail = match kill_own_spawn(child, pid) {
         Ok(()) => String::new(),
@@ -379,46 +394,137 @@ fn start_cmd(a: &[String]) -> i32 {
             }
         }
     }
-    // Spawn in its OWN process group (group id = its pid), stdin closed, output discarded, PORT in the environment.
-    let mut cmd = Command::new(&args.program);
-    cmd.args(&args.prog_args)
-        .current_dir(&resolved_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    if let Some(p) = args.port {
-        cmd.env("PORT", p.to_string());
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return fail(&format!("cannot start {}: {}", args.program, e.kind())),
+    // Runtime evidence (#209, P1B-08). The layout lives in the manifest root that CONTAINS the resolved
+    // --cwd (the longest such root when roots nest), so nothing ever lands outside a fence the manifest
+    // already enforces, and every captured byte is listed before it exists: the run dir is made, then the
+    // three write-ahead evidence entries, all BEFORE any spawn. Existing evidence dirs are CHECKED, never
+    // trusted (fail closed); every refusal here answers 2 with nothing spawned and nothing appended.
+    let own_uid = match evidence::own_uid() {
+        Ok(u) => u,
+        Err(e) => return fail(&format!("evidence refused: {e}")),
     };
-    let pid = child.id() as u64;
-    // Record: the start time first (identity cannot be read -> nothing recorded, nothing left running), then the
-    // process line, then the port line. Any failure stops the whole group this invocation just made, and a failure
-    // AFTER the process line also removes that line, so the sheet never lists a start that was refused.
-    let start_ms = match manifest::process_start_ms(pid) {
-        Ok(ms) => ms,
+    let evidence_root = match evidence::evidence_root_for(&resolved_cwd, &read.roots) {
+        Some(r) => r,
+        None => return fail(&format!("--cwd {} resolves inside no root of ticket {}", resolved_cwd.display(), args.ticket)),
+    };
+    let (_evidence_dir, proc_dir) = match evidence::ensure_evidence_dirs(&evidence_root, own_uid) {
+        Ok(x) => x,
+        Err(r) => return fail(&format!("evidence refused: {r}")),
+    };
+    let ev_ts = now_ms();
+    let run_dir = match evidence::create_run_dir(&proc_dir, &args.id, ev_ts) {
+        Ok(d) => d,
+        Err(r) => return fail(&format!("evidence refused: {r}")),
+    };
+    // Write-ahead: the three entries (stdout, stderr, exit) go on the sheet BEFORE the spawn, so the
+    // files can never be unlisted orphans; they stay live after a stop (evidence outlives the process,
+    // retention is P1B-09/P1B-14) and the run stamp lets the same --id run again after one.
+    let mut write_ahead: Vec<String> = Vec::new();
+    for stream in ["stdout", "stderr", "exit"] {
+        let ev_id = format!("{}.{}.{}", args.id, ev_ts, stream);
+        match manifest::apply(
+            &dir,
+            &args.ticket,
+            &manifest::Op::AddPath { id: &ev_id, class: Class::Evidence, path: &run_dir.join(stream) },
+            ev_ts,
+        ) {
+            Ok(()) => write_ahead.push(ev_id),
+            Err(e) => return unmake_write_ahead(&dir, &args.ticket, &write_ahead, &run_dir, e.to_string()),
+        }
+    }
+    // The spawn is now a WAITER: this same binary, hidden `process waiter` subcommand, in ITS OWN group,
+    // a commit pipe in (start's stdin write end) and a one-line handshake pipe out. The waiter re-verifies
+    // the run dir, creates the files, spawns the PROGRAM in the program's own group (group id = its pid,
+    // exactly as before, so stop's checks are unchanged), hands back the pid and its OS start time, and
+    // outlives the program just long enough to record its ending.
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
         Err(e) => {
-            return refuse_after_spawn(&mut child, pid, format!("cannot read the start time of the started pid {}: {}", pid, e));
+            let reason = format!("cannot start the evidence waiter: {}", e.kind());
+            return unmake_write_ahead(&dir, &args.ticket, &write_ahead, &run_dir, reason);
         }
     };
+    let mut waiter = match Command::new(exe)
+        .arg("process")
+        .arg("waiter")
+        .arg(&run_dir)
+        .arg(&resolved_cwd)
+        .arg(args.port.unwrap_or(0).to_string())
+        .arg("--")
+        .arg(&args.program)
+        .args(&args.prog_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(w) => w,
+        Err(e) => {
+            let reason = format!("cannot start the evidence waiter: {}", e.kind());
+            return unmake_write_ahead(&dir, &args.ticket, &write_ahead, &run_dir, reason);
+        }
+    };
+    // Handshake: `ok <pid> <start_ms>` (the waiter reads the program's OS start time before any reap
+    // could make the pid unreadable), its own composed refusal, or nothing within the bound.
+    let waiter_pid = waiter.id() as u64;
+    let handshake = evidence::read_handshake(waiter.stdout.take().expect("the waiter's stdout was piped"), evidence::HANDSHAKE_BOUND_MS);
+    let hs = match handshake {
+        Ok(h) => h,
+        Err(m) => return refuse_after_spawn(&mut waiter, waiter_pid, format!("evidence refused: {m}")),
+    };
+    let (pid, start_ms) = match hs {
+        // start records the PROGRAM's pid (not the waiter's): the manifest's process line means what it
+        // has always meant, and `stop` reads that line exactly as before.
+        Handshake::Ok { pid, start_ms } => (pid as u64, start_ms),
+        Handshake::Fail(msg) => {
+            // The waiter refused (spawn failure, hostile run dir, unreadable start time) and ends by
+            // itself; nothing it made is left running. The evidence entries stay listed: they record the
+            // failed attempt (#209 decision 7).
+            if reap_bounded(&mut waiter, REAP_BOUND_MS).is_err() {
+                let _ = waiter.kill();
+                let _ = waiter.wait();
+            }
+            return fail(&msg);
+        }
+    };
+    // Record: the process line, then the port line. Any failure stops everything this invocation just
+    // made, and a failure AFTER the process line also removes that line, so the sheet never lists a
+    // start that was refused; the write-ahead evidence entries stay (decision 7).
     let ts_ms = now_ms();
     if let Err(e) = manifest::apply(&dir, &args.ticket, &manifest::Op::AddProcess { id: &args.id, pid, pid_start_ms: start_ms }, ts_ms) {
-        return refuse_after_spawn(&mut child, pid, e.to_string());
+        return refuse_after_spawn(&mut waiter, pid, e.to_string());
     }
     if let Some(p) = args.port {
         if let Err(e) = manifest::apply(&dir, &args.ticket, &manifest::Op::AddPort { id: &port_id, port: p }, ts_ms) {
             // The process line is already on the sheet: take it back off (best effort — the refusal below
-            // names the original failure either way), then stop the whole group, so a refused start leaves
-            // nothing running and nothing listed.
+            // names the original failure either way), then stop everything, so a refused start leaves
+            // nothing running and nothing listed but the attempt's evidence entries.
             let _ = manifest::apply(&dir, &args.ticket, &manifest::Op::Remove { id: &args.id }, now_ms());
-            return refuse_after_spawn(&mut child, pid, e.to_string());
+            return refuse_after_spawn(&mut waiter, pid, e.to_string());
         }
+    }
+    // Commit handshake: the lines are on the sheet, so the waiter may let its program run to its natural
+    // end. Writing the commit word and closing the pipe is what a waiter that instead sees a bare
+    // end-of-input treats as "kill your program and record committed:false".
+    if let Some(mut commit) = waiter.stdin.take() {
+        let _ = commit.write_all(b"commit\n");
+        let _ = commit.flush();
     }
     println!("{}\t{}\t{}", args.id, pid, start_ms);
     0
+}
+
+/// Undo the write-ahead of a start that never spawned anything (an evidence append or the waiter spawn
+/// itself failed): best effort — remove the entries added so far and the empty run dir, then refuse with
+/// the original reason. Once the WAITER is running the entries are kept instead (decision 7: they record
+/// the attempt), so this runs only on the nothing-ever-started path.
+fn unmake_write_ahead(dir: &Path, ticket: &str, added: &[String], run_dir: &Path, reason: String) -> i32 {
+    for id in added {
+        let _ = manifest::apply(dir, ticket, &manifest::Op::Remove { id }, now_ms());
+    }
+    let _ = fs::remove_dir_all(run_dir);
+    fail(&reason)
 }
 
 

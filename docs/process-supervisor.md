@@ -3,15 +3,18 @@
 The process supervisor starts a ticket's long-running programs — app servers, browser and test
 processes — under **ticket ownership**: a started process and its port are signed out on the ticket's
 [resource manifest](resource-manifest.md) before `start` answers, and a start that cannot record its
-spawn is rolled back, so a refused start leaves nothing running and nothing listed.
+spawn is rolled back, so a refused start leaves nothing running and nothing listed. Every started
+program's **runtime evidence** — stdout, stderr, exit code and timing — is captured into the ticket's
+own root and signed out ahead of the spawn ([runtime evidence](#runtime-evidence-p1b-08) below).
 
 **Stopping a recorded process** is `harness process stop` (#183): it signals a pid only when the sheet
 proves the ticket still owns that exact process, and it answers "stopped" only after the death is proven.
 See ["stop, in order"](#stop-in-order) below.
 
-Code: `core/rust/harness/src/supervisor.rs` (unix only) and the `harness process` command in
-`core/rust/harness/src/cli.rs`. Nothing new in the manifest format: one existing `add` process line and, with
-`--port`, one existing `add` port line — the manifest line IS the durable record, no event kind is added.
+Code: `core/rust/harness/src/supervisor.rs` and `core/rust/harness/src/evidence.rs` (unix only) and the
+`harness process` command in `core/rust/harness/src/cli.rs`. Nothing new in the manifest format: one existing
+`add` process line and, with `--port`, one existing `add` port line, plus three existing `add` evidence lines
+per start — the manifest line IS the durable record, no event kind is added.
 
 ## The command
 
@@ -37,40 +40,66 @@ entries.
    or when `--port` is already bound on 127.0.0.1 (checked with a bind-then-release snapshot). Only `AddrInUse`
    is reported as "already bound": a bind refused for privilege names the error kind instead — ports below 1024
    need privilege for the bind check even on 127.0.0.1 (macOS/BSD give `PermissionDenied`, Linux `EPERM`).
-5. Spawn the program in its OWN process group (group id = its pid), stdin closed, stdout and stderr discarded
-   (capture is P1B-08), and `PORT=<n>` in its environment when `--port` is given.
-6. Read the pid's start time, append the process line, then the port line. If either read or append fails, the
-   whole group this start just made is stopped and **exit 2**; a failure AFTER the process line (the port
-   append) also appends `remove` for that process line, so a refused start leaves nothing running and nothing
-   listed. A rollback that cannot CONFIRM its kill (the kill helper not runnable, the child not provably dead)
-   says so in the refusal message instead of claiming success.
-7. Print `id<TAB>pid<TAB>pid_start_ms`, exit 0.
+5. Make the evidence layout and the write-ahead: the manifest root that contains `--cwd` (the longest such
+   root when roots nest) gets `evidence/` and `evidence/proc/` (real dirs, mode 0700, owned by the running
+   user — an existing dir that is a symlink, not a directory, another user's, or readable by group or others
+   refuses: **exit 2**, nothing spawned, nothing appended, the symlink target untouched), then ONE run dir
+   `evidence/proc/<id>.<ts_ms>/` (created exclusively at 0700; an existing name refuses — retryable, the next
+   millisecond is a new run), then THREE existing-class `evidence` entries (`<id>.<ts_ms>.stdout`,
+   `.stderr`, `.exit`) appended AHEAD of the spawn: the captured files can never be unlisted orphans.
+   They stay live after a stop — evidence outlives the process (retention is P1B-09/P1B-14).
+6. Spawn the WAITER: the harness binary itself, in the hidden `process waiter` subcommand, in ITS OWN process
+   group, with a commit pipe in and a one-line handshake pipe out. The waiter re-verifies the run dir, creates
+   the three files (0600, exclusively — a pre-planted name, a symlink included, is refused and never written
+   through), spawns the PROGRAM in the program's OWN process group (group id = its pid, exactly as before, so
+   `stop`'s checks 5-7 are unchanged), stdin closed, both streams piped to itself, `PORT=<n>` in its
+   environment when `--port` is given, and reports `ok <pid> <pid_start_ms>` — start records the PROGRAM's
+   pid and start time on the process line, exactly what that line has always meant. The waiter's refusal
+   (`fail <message>`, e.g. today's `cannot start <program>: <kind>`), silence past 5000 ms, or garbage each
+   refuse with **exit 2** and the evidence entries stay listed (they record the failed attempt).
+7. Append the process line, then the port line. If either append fails, the whole group this start just made
+   is stopped and **exit 2**; a failure AFTER the process line (the port append) also appends `remove` for
+   that process line, so the sheet never lists a start that was refused — but the attempt's three evidence
+   entries stay listed. A rollback that cannot CONFIRM its kill says so in the refusal message instead of
+   claiming success.
+8. Write the `commit` word to the waiter and close its pipe — the commit handshake: a waiter whose input ends
+   WITHOUT that word kills its program (see [the rollback](#the-rollback)), so a start that refuses or dies
+   after the spawn leaves nothing running unless the waiter died too. Then print `id<TAB>pid<TAB>pid_start_ms`,
+   exit 0.
 
 ## Exit codes
 
 | Case | stdout | exit |
 |---|---|---|
 | started | `id<TAB>pid<TAB>pid_start_ms` | 0 |
-| usage error or any refusal (out-of-range `--port`, bad ticket or id, missing/torn/corrupt manifest, id or port already live, cwd outside every root, port already bound, unreadable start time, refused append) | — (stderr names it) | 2 |
+| usage error or any refusal (out-of-range `--port`, bad ticket or id, missing/torn/corrupt manifest, id or port already live, cwd outside every root, port already bound, `evidence refused:` ... — a symlinked / non-directory / foreign-owned / group-readable evidence dir, `run dir already exists`, `cannot create <rel>: <kind>`, `the waiter did not report the spawn within 5000 ms`, `the waiter reported garbage` — unreadable start time, refused append, `cannot start <program>: <kind>` on a spawn failure) | — (stderr names it; no new message prints an absolute path) | 2 |
 
-There is exactly one nuance inside exit 2: a refusal that happens AFTER the spawn (step 6) has already
-stopped the group that spawn made — such a `2` means "nothing listed and nothing left running", not
-"nothing was ever started". When the rollback itself could not confirm the kill, the message names that
-too, so no refusal is ever read as a success-shaped answer.
+There is exactly one nuance inside exit 2: a refusal that happens AFTER the spawn (steps 6-7) has already
+stopped everything that spawn made — such a `2` means "nothing left running and no process or port entry
+listed", not "nothing was ever started"; the attempt's three evidence entries STAY listed (they record the
+failed attempt). When the rollback itself could not confirm the kill, the message names that too, so no
+refusal is ever read as a success-shaped answer.
 
 ## The rollback
 
-The only signal path in this PR is the start rollback, and it touches only the group the `start` of this
-very run created: TERM, a bounded wait (5 s), then KILL to the group, all through `/bin/kill` by
-ABSOLUTE path (never through `PATH`). Whatever happened to the group, std `Child::kill()` — which needs
-no `PATH` — ends the direct child before a bounded reap (3 s), so a rollback can never block forever on a
-child it could not signal. A helper that cannot be RUN is "unknown", never "gone" or "empty": the group
-waits are skipped and the refusal names the unconfirmed kill.
+The only signal path in this verb is the start rollback, and it touches only what the `start` of this
+very run created. Since #209 the spawn is a WAITER (in its own group) whose child is the program (in the
+program's own group), and the rollback runs: the commit pipe closes UNCOMMITTED first — the end-of-input
+is what makes a LIVE waiter kill its program through `/bin/kill` by ABSOLUTE path (never through `PATH`;
+the std `Child::kill` needs the Child handle, which the waiter's event-driven reaping `wait()` holds) —
+then TERM, a bounded wait (5 s), then KILL to the PROGRAM's group through `/bin/kill` by absolute path;
+then a bounded reap (3 s) of the WAITER, and the std kill of the waiter as the last resort, so a rollback
+can never block forever on something it could not signal. A helper that cannot be RUN is "unknown", never
+"gone" or "empty": the group waits are skipped and the refusal names the unconfirmed kill.
 
 ## What this does not cover
 
-- **Start-to-record window.** A hard crash between spawn and the manifest append leaves a process the sheet does
-  not list; a failed append kills the group, but a hard crash does not. The P2 orphan reaper owns that case.
+- **Start-to-record window (narrowed).** The commit handshake closes most of it: a start that refuses
+  after the spawn, or dies hard after it, no longer leaves a running unlisted program — its waiter sees
+  the uncommitted end-of-input and kills the program. What remains: the waiter ITSELF killed (SIGKILL,
+  host crash) before the record lands — then there is no `exit` file (outcome unknown, never fabricated)
+  and a program whose start died before committing may outlive it unlisted. The P2 orphan reaper owns
+  that case.
 - **Port check is a snapshot, and 127.0.0.1 only.** "Free at start" can change before the child binds; the
   supervisor records the declared port and does not prove the child listens on it. A port already bound on another
   address (for example `0.0.0.0`) but free on 127.0.0.1 passes the check.
@@ -80,8 +109,47 @@ waits are skipped and the refusal names the unconfirmed kill.
   std file-lock helper, not a record — it holds no data and is safe to delete between commands.
 - **No orphan reaping for stop escapees** (P2) and **no finalize/teardown that calls stop for every live
   process of a ticket** (P1B-14).
-- **No output capture** (stdout, stderr, exit codes, timing, traces: P1B-08), **no timeouts or step limits**
+- **Evidence privacy is not handled here** (P1B-10): capture is raw, byte-for-byte, secret-shaped text kept
+  verbatim. **No evidence reader verb and no Done link** (P1B-09; a missing `exit` file reads as unknown,
+  never success). **No evidence retention/teardown** (P1B-09/P1B-14). **No timeouts or step limits**
   (P1B-06), **no worker-death record** (P1B-07), **no network allow-list** (G1b/P4a).
+- **Waiter limits.** The waiter is killed by SIGKILL = no record (above). If the harness binary is replaced
+  between `start` and the waiter spawn, a different binary runs as the waiter (same user only; `current_exe`).
+  A same-user writer could swap the run dir between the waiter's re-check and its file creates (0700 dirs;
+  closing that needs `openat`, not std). Grandchildren that leave the group keep running after the program
+  ends, and their output past the 2000 ms drain window is lost. Each start adds three manifest lines (~250
+  bytes each) against the 1 MiB cap — roughly 1,300 starts of one ticket before the manifest refuses.
+
+## Runtime evidence (P1B-08)
+
+Every started program gets a small private notebook inside the ticket's own root, listed before it
+exists:
+
+- **Layout.** `<root>/evidence/proc/<id>.<ts_ms>/` holding exactly `stdout`, `stderr`, `exit`. `<root>` is
+  the manifest root containing `--cwd` (longest when nested); `<id>` the validated token; `<ts_ms>` the
+  start's wall ms — the run stamp lets the same `--id` run again after a stop. No ticket title or free
+  text ever appears in a path. Dirs 0700, files 0600, files created exclusively.
+- **The waiter.** One helper per started program, the harness binary itself (`process waiter`, hidden),
+  in its own group; it creates the files, spawns the program in the program's own group, reports
+  `ok <pid> <pid_start_ms>`, reaps the program the moment it dies (an event-driven `wait()`, not a poll —
+  a zombie must not outlive the death, `stop`'s proof would read it as alive), drains both pipes (at most
+  2000 ms past the exit for grandchildren that hold them), writes `exit` and ends. Not a daemon: nothing
+  runs when no ticket program runs. The waiter is not in the program's group, so `stop`'s TERM/KILL to the
+  group does not reach it and it records the signal.
+- **The exit record.** `exit` is ONE line, compact JSON, fixed key order, newline-terminated, every key
+  present: `v` (1), `pid`, `committed` (bool), `outcome` (`exited` | `signalled` | `spawn_failed` |
+  `wait_failed`), `code` (-1 when not `exited`), `signal` (0 when not `signalled`), `start_ms`, `end_ms`
+  (wall clock, for humans), `duration_ms` (the waiter's own MONOTONIC span, between its spawn returning
+  and its wait returning, inside one process), `stdout_bytes`, `stderr_bytes` (total seen, past the cap
+  too), `stdout_truncated`, `stderr_truncated`, `stdout_error`, `stderr_error` (`none` or the I/O error
+  kind), `output_open_after_exit`. It is written to a temp name, synced, renamed: a reader sees a whole
+  record or no `exit` file. NO `exit` file means outcome UNKNOWN, never success.
+- **Cap and marker.** Per stream the first 4,194,304 bytes (4 MiB, a constant, no flag) are kept
+  byte-for-byte; then exactly this 46-byte marker once: `\n[harness: output truncated at 4194304 bytes]\n`.
+  The pipe keeps being drained past the cap, so a program that prints forever never blocks on it.
+- **Raw bytes.** Binary and non-UTF-8 output is copied as bytes, never decoded or rewritten.
+- **Write errors.** A failing stream stops being written but keeps being drained, and the error kind
+  lands in `<stream>_error`; if `exit` itself cannot be written, there is no `exit` file (unknown).
 
 ## stop, in order
 

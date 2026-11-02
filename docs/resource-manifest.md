@@ -30,6 +30,13 @@ One operation per line, compact, fixed key order, every key present. Each line c
 
 **Current state** = the roots plus every `add` whose `id` has no later `remove`. "Manifest empty" means no live entries; roots do not count.
 
+**Evidence id convention (#209).** The process supervisor signs out every started program's captures as
+three `evidence` entries per start, ids `<id>.<ts_ms>.stdout`, `<id>.<ts_ms>.stderr` and
+`<id>.<ts_ms>.exit`, whose paths are `<root>/evidence/proc/<id>.<ts_ms>/{stdout,stderr,exit}` — written
+AHEAD of the spawn, so the files are never unlisted orphans. They stay live after a `stop` (evidence
+outlives the process); the run stamp lets the same `--id` start again without colliding. Retention is
+P1B-09/P1B-14.
+
 ## The fence
 
 Init declares the ticket's roots. Every path entry must resolve inside one of them — a path outside, a `..` that escapes, a symlink that points out, or a symlink that does not resolve (its target is missing; it is never treated as a missing path, because the caller's write would follow it) are all refused. The manifest file itself must live outside the roots (`--dir` inside a root is refused), so finalize can remove the roots without removing the record, and the record can still show the empty state afterwards.
