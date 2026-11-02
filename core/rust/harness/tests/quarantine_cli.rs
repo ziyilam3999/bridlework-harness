@@ -1797,3 +1797,275 @@ fn the_doc_v1_limits_names_the_thread_guard() {
     assert!(lower.contains("sticky"), "the bullet states the sticky macOS reading");
     assert!(lower.contains("procfs"), "the bullet names the Linux procfs source of the thread count");
 }
+
+// ---------------------------------------------------------------- #212: reconcile fails closed on a log it cannot read whole
+
+/// A sparse file of exactly `len` bytes: `head` at the start, `last` as the final byte, zeros in between.
+/// Sparse on APFS/ext4, so a 64 MiB fixture costs a few blocks (the same helper as the #211 events tests).
+fn sparse_log(path: &Path, len: u64, head: &[u8], last: u8) {
+    use std::io::{Seek, SeekFrom};
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path).unwrap();
+    f.write_all(head).unwrap();
+    f.seek(SeekFrom::Start(len - 1)).unwrap();
+    f.write_all(&[last]).unwrap();
+    f.set_len(len).unwrap();
+}
+
+/// Setup A: the fixture, one stray planted, one sweep (exit 0, one `quarantined` event, one batch whose journal
+/// intent is now SETTLED), then a second stray `stray-2` planted. The next sweep MUST decide the settled intent
+/// against the event log, so a log it cannot read whole has to stop it before anything is written or moved.
+fn setup_a() -> (Fix, PathBuf) {
+    let f = fixture();
+    plant(&f, "stray-1", "one");
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 0, "the setup sweep: {}", err(&o));
+    assert_eq!(quarantined_lines(&f).len(), 1, "one event after the setup sweep");
+    assert_eq!(batches(&f).len(), 1, "one batch after the setup sweep");
+    let stray2 = plant(&f, "stray-2", "two");
+    (f, stray2)
+}
+
+/// AC 2 (#212): an over-cap log refuses the sweep at reconcile — exit 3, one stderr line naming the read cap,
+/// no log byte echoed, the log byte-for-byte unchanged, no batch added, the stray still in the root.
+#[test]
+fn ac2_212_an_over_cap_log_refuses_reconcile_nothing_moved() {
+    let (f, stray2) = setup_a();
+    let cap = harness::events::LOG_READ_CAP;
+    let real = fs::read(&f.log).unwrap();
+    let mut head = b"MARKER-212-SECRET\n".to_vec();
+    head.extend_from_slice(&real);
+    sparse_log(&f.log, cap + 1, &head, b'\n');
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 3, "an over-cap log is a reconcile refusal: {}{}", out(&o), err(&o));
+    assert_eq!(out(&o), "", "stdout stays empty on a refusal");
+    let e = err(&o);
+    assert_eq!(
+        e,
+        format!(
+            "harness: error: reconcile refused: the event log cannot be read whole (log refused: over the {}-byte read cap; nothing was read as events); nothing was moved\n",
+            cap
+        ),
+        "the exact refusal line, and no log byte is ever echoed"
+    );
+    assert!(!e.contains("MARKER-212-SECRET"), "no log byte is ever echoed: {e}");
+    assert_eq!(fs::metadata(&f.log).unwrap().len(), cap + 1, "the log is byte-for-byte unchanged");
+    assert_eq!(batches(&f).len(), 1, "no batch was added by the refused run");
+    assert!(stray2.join("one.txt").exists(), "stray-2 is still in the root");
+}
+
+/// AC 3 (#212): a symlink at the log path refuses the sweep at reconcile — exit 3 naming the link — and the
+/// link's TARGET is untouched (the old bug appended the duplicate event to the target through the link).
+#[test]
+fn ac3_212_a_symlinked_log_refuses_reconcile_the_target_untouched() {
+    let (f, stray2) = setup_a();
+    let real_len = fs::metadata(&f.log).unwrap().len();
+    let real = f.log.parent().unwrap().join("events-real.jsonl");
+    fs::rename(&f.log, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &f.log).unwrap();
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 3, "a symlinked log is a reconcile refusal: {}{}", out(&o), err(&o));
+    assert_eq!(out(&o), "");
+    let e = err(&o);
+    assert_eq!(
+        e,
+        "harness: error: reconcile refused: the event log cannot be read whole (log refused: the path is a symbolic link); nothing was moved\n",
+        "the exact refusal line"
+    );
+    assert_eq!(fs::metadata(&real).unwrap().len(), real_len, "the link's target is byte-for-byte unchanged");
+    assert!(stray2.join("one.txt").exists(), "stray-2 is still in the root");
+}
+
+/// AC 4 (#212): a DANGLING link at the log path must fail closed, never read as "absent" (an absent log means
+/// no events; a dangling link means the log went somewhere unknown). The refusal actually fires one fence
+/// EARLIER than reconcile: the sweep's log-placement check resolves the log path before reconcile runs, and a
+/// dangling link does not resolve (exit 2, nothing moved) — so the case is pinned at the fence it reaches.
+#[test]
+fn ac4_212_a_dangling_link_at_the_log_path_fails_closed() {
+    let (f, stray2) = setup_a();
+    fs::remove_file(&f.log).unwrap();
+    std::os::unix::fs::symlink(f.log.parent().unwrap().join("no-such-target-212"), &f.log).unwrap();
+    let o = sweep(&f, &[]);
+    assert!(code(&o) != 0, "a dangling link never reads as absent: {}{}", out(&o), err(&o));
+    assert_eq!(code(&o), 2, "the placement fence refuses the unresolvable log path: {}{}", out(&o), err(&o));
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: the event log path does not resolve; nothing was moved\n", "the exact refusal line");
+    assert_eq!(batches(&f).len(), 1, "no batch was added");
+    assert!(stray2.join("one.txt").exists(), "stray-2 is still in the root");
+}
+
+/// AC 5 (#212): a directory at the log path refuses the sweep at reconcile — exit 3 naming the file type —
+/// no batch added, the stray still in the root.
+#[test]
+fn ac5_212_a_directory_at_the_log_path_refuses_reconcile() {
+    let (f, stray2) = setup_a();
+    fs::remove_file(&f.log).unwrap();
+    fs::create_dir(&f.log).unwrap();
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 3, "a directory log is a reconcile refusal: {}{}", out(&o), err(&o));
+    assert_eq!(out(&o), "");
+    let e = err(&o);
+    assert_eq!(
+        e,
+        "harness: error: reconcile refused: the event log cannot be read whole (log refused: not a regular file); nothing was moved\n",
+        "the exact refusal line"
+    );
+    assert_eq!(batches(&f).len(), 1, "no batch was added by the refused run");
+    assert!(stray2.join("one.txt").exists(), "stray-2 is still in the root");
+}
+
+/// AC 5 variant (#212): a FIFO at the log path is refused without ever opening it, so the child comes back.
+/// The 10 s deadline is a hang guard, not a timing assert: nothing here asserts how fast the child is, only
+/// that it returns at all (without the pre-open type check the open of a FIFO blocks until a writer appears).
+#[test]
+fn ac5b_212_a_fifo_at_the_log_path_is_refused_the_child_never_hangs() {
+    use std::time::{Duration, Instant};
+    let (f, _stray2) = setup_a();
+    fs::remove_file(&f.log).unwrap();
+    let mk = Command::new("mkfifo").arg(&f.log).output().unwrap();
+    assert!(mk.status.success(), "mkfifo must exist on unix: {}", String::from_utf8_lossy(&mk.stderr));
+    let args: Vec<String> = vec![
+        "quarantine".into(),
+        "sweep".into(),
+        "t-1".into(),
+        "--manifest-dir".into(),
+        s(&f.md),
+        "--workspace-root".into(),
+        s(&f.ws),
+        "--quarantine-dir".into(),
+        s(&f.q),
+        "--log".into(),
+        s(&f.log),
+        "--repo".into(),
+        "r-1".into(),
+        "--role".into(),
+        "executor".into(),
+        "--model".into(),
+        "m-1".into(),
+    ];
+    let refs: Vec<&str> = args.iter().map(|x| x.as_str()).collect();
+    let mut c = Command::new(BIN);
+    c.args(&refs).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for k in ["HARNESS_RUN_ID", "HARNESS_ROLE", "HARNESS_MODEL", "HARNESS_CONFIG"] {
+        c.env_remove(k);
+    }
+    let mut child = c.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut killed = false;
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(st) => break st,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                killed = true;
+                break child.wait().unwrap();
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert!(!killed, "the sweep blocked on a FIFO log: the log must be refused before it is opened");
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(status.code(), o.status.code());
+    assert_eq!(o.status.code(), Some(3), "a FIFO log is a reconcile refusal");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&o.stderr),
+        "harness: error: reconcile refused: the event log cannot be read whole (log refused: not a regular file); nothing was moved\n",
+        "the exact refusal line"
+    );
+}
+
+/// AC 6 (#212): a corrupt line BEFORE the real events refuses the sweep at reconcile — exit 3 naming the line
+/// number only, never the parse message or any log byte — the log unchanged, the stray still in the root.
+#[test]
+fn ac6_212_a_corrupt_log_refuses_reconcile_named_line_no_leak() {
+    let (f, stray2) = setup_a();
+    let real = fs::read(&f.log).unwrap();
+    let mut bytes = b"MARKER-212-CORRUPT\n".to_vec();
+    bytes.extend_from_slice(&real);
+    fs::write(&f.log, &bytes).unwrap();
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 3, "a corrupt log is a reconcile refusal: {}{}", out(&o), err(&o));
+    assert_eq!(out(&o), "");
+    let e = err(&o);
+    assert_eq!(
+        e,
+        "harness: error: reconcile refused: the event log cannot be read whole (corrupt at line 1); nothing was moved\n",
+        "the exact refusal line — the line number only, never the parse message or any log byte"
+    );
+    assert!(!e.contains("MARKER-212-CORRUPT"), "no log byte is ever echoed: {e}");
+    assert_eq!(fs::metadata(&f.log).unwrap().len(), bytes.len() as u64, "the log is unchanged");
+    assert!(stray2.join("one.txt").exists(), "stray-2 is still in the root");
+}
+
+/// AC 7 (#212): an ABSENT log still means "no events": a crash batch on the shelf with no log at all recovers
+/// exactly as before — exit 0, the log created by the recovered event, one `quarantined` event with the item's `to`.
+#[test]
+fn ac7_212_an_absent_log_still_means_no_events() {
+    let f = fixture();
+    assert!(!f.log.exists(), "no sweep yet, no log file");
+    let shelf = f.q.join("t-1");
+    let crash_batch = shelf.join("b-99-9-77");
+    fs::create_dir_all(crash_batch.join("i-1")).unwrap();
+    fs::write(crash_batch.join("i-1/gone.txt"), b"gone-payload").unwrap();
+    fs::write(
+        crash_batch.join("journal.jsonl"),
+        format!("{{\"item\":\"i-1\",\"src_hex\":\"{}\",\"reason\":\"unmanifested\"}}\n", hex(b"t-1/vanished")),
+    )
+    .unwrap();
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 0, "an absent log is not a refusal: {}{}", out(&o), err(&o));
+    assert!(f.log.exists(), "the log was created by the recovered event");
+    let lines = quarantined_lines(&f);
+    assert_eq!(lines.len(), 1, "exactly the recovered event: {lines:?}");
+    assert!(lines[0].contains("\"to\":\"t-1/b-99-9-77/i-1\""), "the recovered event names the item: {lines:?}");
+}
+
+/// AC 8 (#212): a torn TAIL keeps today's behaviour — every complete line before the fragment is returned, so
+/// the list is complete, the settled intent skips, nothing moves and nothing is appended or truncated.
+#[test]
+fn ac8_212_a_torn_tail_log_keeps_todays_behaviour() {
+    let f = fixture();
+    plant(&f, "stray-1", "one");
+    let o1 = sweep(&f, &[]);
+    assert_eq!(code(&o1), 0, "the setup sweep: {}", err(&o1));
+    let mut fh = fs::OpenOptions::new().append(true).open(&f.log).unwrap();
+    fh.write_all(b"{\"kind\":\"quar").unwrap();
+    drop(fh);
+    let before = fs::metadata(&f.log).unwrap().len();
+    let o2 = sweep(&f, &[]);
+    assert_eq!(code(&o2), 0, "a torn tail is not a refusal: {}{}", out(&o2), err(&o2));
+    assert_eq!(out(&o2), "quarantine=done ticket=t-1 moved=0\n");
+    assert_eq!(fs::metadata(&f.log).unwrap().len(), before, "the log is unchanged by the sweep");
+    // the raw bytes are counted here because `events list` itself refuses a torn-tail log (#211): the sweep's
+    // reader must tolerate the fragment even though the listing verb does not
+    assert_eq!(fs::read(&f.log).unwrap().windows(20).filter(|w| w == b"\"kind\":\"quarantined\"").count(), 1, "no new event");
+}
+
+/// AC 9 (#212): recovery after a refusal is clean — once the log is repaired back to its exact pre-refusal
+/// bytes, the sweep behaves exactly as if the refused run never happened: exit 0, the stray moved, exactly two
+/// events (no duplicate of the first), and exactly two batches (the refused run made none).
+#[test]
+fn ac9_212_recovery_after_a_refusal_is_clean() {
+    let (f, stray2) = setup_a();
+    let original = fs::read(&f.log).unwrap();
+    let first_to = quarantined_lines(&f)
+        .iter()
+        .find_map(|l| l.split("\"to\":\"").nth(1).map(|r| r.split('"').next().unwrap().to_string()))
+        .expect("the setup event carries a to field");
+    // the refused run: the log over the cap
+    let cap = harness::events::LOG_READ_CAP;
+    sparse_log(&f.log, cap + 1, &original, b'\n');
+    let o = sweep(&f, &[]);
+    assert_eq!(code(&o), 3, "the over-cap run refuses: {}{}", out(&o), err(&o));
+    assert_eq!(batches(&f).len(), 1, "the refused run made no batch");
+    // the repair: the log restored to its exact pre-refusal bytes
+    fs::write(&f.log, &original).unwrap();
+    let o2 = sweep(&f, &[]);
+    assert_eq!(code(&o2), 0, "the repaired run proceeds: {}{}", out(&o2), err(&o2));
+    assert_eq!(out(&o2), "quarantine=done ticket=t-1 moved=1\n");
+    let lines = quarantined_lines(&f);
+    assert_eq!(lines.len(), 2, "exactly the setup event and the new one: {lines:?}");
+    assert_eq!(lines.iter().filter(|l| l.contains(&format!("\"to\":\"{first_to}\""))).count(), 1, "no duplicate of the first event");
+    assert!(!stray2.join("one.txt").exists(), "stray-2 was moved by the repaired run");
+    assert_eq!(batches(&f).len(), 2, "exactly the setup batch and the recovery batch — never three");
+}
