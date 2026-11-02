@@ -277,6 +277,17 @@ fn manifest_stop(e: manifest::ManifestError) -> Stop {
 /// fields); 1 the ticket is refused at intake (bad ticket, unknown repo id, repo not found — the same meaning as
 /// `harness ticket intake`); 2 every other refusal or error. Any non-zero exit means "no usable workspace".
 pub fn workspace_cmd(a: &[String]) -> i32 {
+    // P1B-11: the read-only clean-state check is a sibling subcommand, dispatched first so `create` (which
+    // requires its own literal first token) is untouched.
+    if a.first().map(|s| s.as_str()) == Some("check") {
+        #[cfg(unix)]
+        return crate::workspace_check::check_cmd(&a[1..]);
+        #[cfg(not(unix))]
+        {
+            eprintln!("harness: error: workspace check is not available on this platform");
+            return 3;
+        }
+    }
     match create(a) {
         Ok(s) => {
             println!("workspace=created ticket={} repo_id={} base={} branch={}", s.ticket, s.repo_id, s.base, s.branch);
