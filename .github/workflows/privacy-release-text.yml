@@ -1,0 +1,37 @@
+name: privacy-release-text
+
+# Release titles and notes are public text, scanned here on the default branch (ticket 163). Runs on `master` only, from
+# `master`'s own file; it reads release text through the API as data and runs nothing from any tag.
+# Schedule: once a day. A release is therefore scanned up to one day after it is published; workflow_dispatch runs it at once.
+# Not covered: draft releases are not readable with `contents: read`, so drafts are no longer scanned before publish.
+# Not covered: GitHub switches a scheduled workflow off after 60 days with no repository activity; re-enable it by hand.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-text:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: privacy-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build engine
+        run: cargo build --release --locked
+        working-directory: core/rust
+      - name: Fetch releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+      - name: Scan releases
+        env:
+          HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}
+        run: sh ci/privacy-release-text.sh "$RUNNER_TEMP/releases.json"
