@@ -515,7 +515,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return fixtures_cmd(&args[1..]);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | status <ticket-file> | process start|stop <ticket> ... | workspace create <ticket-file> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | status <ticket-file> | process start <ticket> ... | workspace create <ticket-file> ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";

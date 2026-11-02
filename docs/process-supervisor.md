@@ -1,10 +1,13 @@
 # Process supervisor
 
-The process supervisor starts and stops a ticket's long-running programs — app servers, browser and test
+The process supervisor starts a ticket's long-running programs — app servers, browser and test
 processes — under **ticket ownership**: a started process and its port are signed out on the ticket's
-[resource manifest](resource-manifest.md) before `start` answers, and `stop` signals a pid only when the manifest
-of THAT ticket lists it AND the live process at that pid is provably the one that was recorded. Cleanup can never
-reach a process the ticket does not own, and a re-used pid is never signalled.
+[resource manifest](resource-manifest.md) before `start` answers, and a start that cannot record its
+spawn is rolled back, so a refused start leaves nothing running and nothing listed.
+
+**Stopping a recorded process is not part of this PR** (follow-up ticket #183, stop-by-pid): nothing
+here reads, signals or removes a process that a `start` of this run did not create. See
+["Not in this PR"](#not-in-this-pr-stop-by-pid) below.
 
 Code: `core/rust/harness/src/supervisor.rs` (unix only) and the `harness process` command in
 `core/rust/harness/src/cli.rs`. Nothing new in the manifest format: one existing `add` process line and, with
@@ -14,11 +17,12 @@ Code: `core/rust/harness/src/supervisor.rs` (unix only) and the `harness process
 
 ```
 harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--dir <manifest-dir>] -- <program> [args...]
-harness process stop  <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>]
 ```
 
 `--dir` defaults to `.harness/manifests`, the same default as `harness manifest`. Listing stays
 `harness manifest list` (it already prints `id, class, pid, pid_start_ms`); no new list verb exists.
+`process stop` is not a verb: any `stop` invocation is the usage refusal (exit 2), and nothing is
+signalled, written or removed by it.
 
 ## start, in order
 
@@ -34,62 +38,61 @@ harness process stop  <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <
    need privilege for the bind check even on 127.0.0.1 (macOS/BSD give `PermissionDenied`, Linux `EPERM`).
 5. Spawn the program in its OWN process group (group id = its pid), stdin closed, stdout and stderr discarded
    (capture is P1B-08), and `PORT=<n>` in its environment when `--port` is given.
-6. Read the pid's start time, append the process line, then the port line. If either append fails, the whole
-   group it just made is stopped and **exit 2**; a failure AFTER the process line (the port append) also appends
-   `remove` for that process line, so a refused start leaves nothing running and nothing listed.
+6. Read the pid's start time, append the process line, then the port line. If either read or append fails, the
+   whole group this start just made is stopped and **exit 2**; a failure AFTER the process line (the port
+   append) also appends `remove` for that process line, so a refused start leaves nothing running and nothing
+   listed. A rollback that cannot CONFIRM its kill (the kill helper not runnable, the child not provably dead)
+   says so in the refusal message instead of claiming success.
 7. Print `id<TAB>pid<TAB>pid_start_ms`, exit 0.
 
-## stop: ownership first, signal second
-
-`stop` signals only when ALL hold:
-
-- the manifest of THIS ticket reads clean (missing, torn or corrupt: **exit 2**, nothing signalled, the manifest
-  not written);
-- the target is a LIVE `process` entry of THIS ticket — by `--id`, or by `--pid` matched against live entries. A
-  raw pid that is not listed, including a pid listed only on ANOTHER ticket's manifest, is never signalled (**exit 2**);
-- the live process at that pid has the recorded `pid_start_ms` — exact on Linux, within 2000 ms elsewhere
-  (`ps` start times jitter at whole-second precision; the manifest doc's tolerance).
-
-Then TERM goes to the process GROUP (through the system `kill` command with a negative group id, so no crate is
-needed), `stop` waits up to `--grace-ms` (default 5000) for the group to empty, sends KILL to the group if it
-lives, and appends `remove` for the process entry and for `<id>.port` if live.
-
-When the recorded process is provably gone, nothing is signalled and the entries are removed:
+## Exit codes
 
 | Case | stdout | exit |
 |---|---|---|
-| started / stopped | `id<TAB>pid<TAB>pid_start_ms` / `stopped<TAB>id<TAB>pid` | 0 |
-| recorded pid has no process now | `already-gone` | 3 |
-| pid alive but its start time differs (pid re-used) | `pid-reused` | 3 |
-| usage error or any refusal (not on this sheet, torn manifest, refused start) | — (stderr names it) | 2 |
-| the manifest `remove` failed AFTER the signal (the group is dead; the stderr says so) | — (stderr names it) | 2 |
+| started | `id<TAB>pid<TAB>pid_start_ms` | 0 |
+| usage error or any refusal (out-of-range `--port`, bad ticket or id, missing/torn/corrupt manifest, id or port already live, cwd outside every root, port already bound, unreadable start time, refused append) | — (stderr names it) | 2 |
 
-The second exit-2 row is the one case where a `2` does not mean "nothing signalled": `stop` signals the group,
-the group dies, and only then does the `remove` append fail (for example an unwritable manifest mid-run). The
-message names that case, and the stop is safe to repeat — once the write works again, the next stop reports
-`already-gone` (exit 3) and clears the sheet.
+There is exactly one nuance inside exit 2: a refusal that happens AFTER the spawn (step 6) has already
+stopped the group that spawn made — such a `2` means "nothing listed and nothing left running", not
+"nothing was ever started". When the rollback itself could not confirm the kill, the message names that
+too, so no refusal is ever read as a success-shaped answer.
 
-Two stops of one id at once serialise on the supervisor lock: one exits 0, the other finds the id not live and
-exits 2, and the manifest holds exactly one `remove` line. A crash after the signal but before the `remove` is
-safe to repeat: the next stop sees `already-gone` (exit 3) and removes the entries.
+## The rollback
+
+The only signal path in this PR is the start rollback, and it touches only the group the `start` of this
+very run created: TERM, a bounded wait (5 s), then KILL to the group, all through `/bin/kill` by
+ABSOLUTE path (never through `PATH`). Whatever happened to the group, std `Child::kill()` — which needs
+no `PATH` — ends the direct child before a bounded reap (3 s), so a rollback can never block forever on a
+child it could not signal. A helper that cannot be RUN is "unknown", never "gone" or "empty": the group
+waits are skipped and the refusal names the unconfirmed kill.
 
 ## What this does not cover
 
-- **Start-time precision off Linux.** `ps` gives whole seconds; with the 2000 ms tolerance, a pid re-used within
-  about two seconds of the original start can pass the check. Linux (`/proc`) is exact.
-- **Check-to-signal race.** Between the start-time check and the `kill` the process could exit and the pid be
-  re-used. The window is milliseconds; closing it needs pidfds (Linux only, a crate). Documented, not closed.
 - **Start-to-record window.** A hard crash between spawn and the manifest append leaves a process the sheet does
   not list; a failed append kills the group, but a hard crash does not. The P2 orphan reaper owns that case.
-- **Children that leave the group** (a daemon that calls `setsid`) are not stopped; a group whose leader already
-  exited is reported `already-gone` and its remaining members are not signalled (no live leader to prove identity).
 - **Port check is a snapshot, and 127.0.0.1 only.** "Free at start" can change before the child binds; the
   supervisor records the declared port and does not prove the child listens on it. A port already bound on another
   address (for example `0.0.0.0`) but free on 127.0.0.1 passes the check.
-- **The lock file.** A refusal never writes the MANIFEST, but every `start` and `stop` still creates the
-  per-ticket lock file `<manifest-dir>/<ticket>.proc.lock` (step 2 of `start` and step 1 of `stop` take it
-  before anything is read or refused). It is a std file-lock helper, not a record — it holds no data and is safe
-  to delete between commands.
+- **The lock file.** A refusal never writes the MANIFEST. Only a start that gets past the parser and the token
+  checks takes the per-ticket lock file `<manifest-dir>/<ticket>.proc.lock` (step 2 of `start`); a parser or
+  token refusal (bad `--port`, bad ticket or id) exits before the lock, so no lock file is made either. It is a
+  std file-lock helper, not a record — it holds no data and is safe to delete between commands.
 - **No output capture** (stdout, stderr, exit codes, timing, traces: P1B-08), **no timeouts or step limits**
   (P1B-06), **no worker-death record** (P1B-07), **no orphan reaping** (P2), **no network allow-list** (G1b/P4a),
   **no finalize/teardown** (P1B-14).
+
+## Not in this PR: stop-by-pid
+
+Stopping a recorded process was split into its own follow-up ticket (#183, stop-by-pid) after review found
+the round-3 `stop` could answer success without proving the process died. This PR keeps only the start and
+record behaviour that passed review; it never signals or removes a process its own `start` did not create.
+The follow-up must handle at least:
+
+- **a non-leader pid** listed through the public `harness manifest add --class process` verb: a group signal
+  to `-<pid>` hits no group when the pid is not its own group leader, so "stopped" would be a lie while the
+  process lives (r3 finding 1);
+- **`kill` / `ps` not runnable**: signal and probe by absolute path (as the rollback here does), and treat a
+  helper that cannot be run as "unknown" — never as "gone", "empty" or "already dead" — refusing with exit 2
+  and keeping the entry (r3 finding 2, all three sites);
+- **a post-signal liveness check**: answer 0 "stopped" and append the `remove` lines only after the recorded
+  pid is provably dead (`kill -0` failing for the pid itself, not just the group).
