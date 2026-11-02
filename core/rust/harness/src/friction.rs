@@ -34,6 +34,9 @@ pub const LINE_CAP: usize = 16 * 1024;
 const INBOX_CAP: u64 = 4 * 1024 * 1024;
 /// A close note is read no further than this; past it the check fails closed (exit 2).
 const NOTE_CAP: u64 = 1024 * 1024;
+/// The event log a sweep reads no further than; past it the sweep fails closed (exit 2). The same bound as
+/// the inbox: both are append-only stores the friction verb family reads whole (ticket 200).
+const EVENT_LOG_CAP: u64 = 4 * 1024 * 1024;
 
 /// One inbox row. `breaks` is empty or the id of the lesson that broke again (K-1 rule 3). `kind` is empty
 /// (= `friction`), `friction` or `pattern`; `repeats` is empty or the id of the `kind: pattern` row this row
@@ -587,7 +590,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -605,7 +608,8 @@ fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(path))
 }
 
-/// `harness friction add | lint | close-check` (K-1 slice 1; the contract is `docs/friction-inbox.md`).
+/// `harness friction add | lint | patterns | close-check | sweep` (K-1 slice 1 plus tickets 192, 200; the
+/// contract is `docs/friction-inbox.md`).
 /// Exit 0 ok; 1 a refusal (a refused write leaves the inbox byte-identical, stdout empty, stderr naming the field
 /// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error. Nothing is written
 /// before every check has passed: flags, then row rules, then the privacy engine over the new row, then — under
@@ -621,6 +625,7 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
         "lint" => lint_cmd(rest, testmode),
         "patterns" => patterns_cmd(rest, testmode),
         "close-check" => close_check_cmd(rest, testmode),
+        "sweep" => sweep_cmd(rest, testmode),
         _ => {
             eprintln!("{}", FRICTION_USAGE);
             2
@@ -1088,3 +1093,196 @@ fn close_check_cmd(rest: &[String], testmode: bool) -> i32 {
     }
 }
 
+
+// ---------------------------------------------------------------- the weekly sweep (ticket 200)
+
+/// The `--week` grammar: exactly the dedup-key suffix `<iso-year>-w<ww>` (four digits, `-w`, two digits).
+/// Digits only, so nothing a caller could hide in the value can ever be echoed back by the summary line.
+fn week_ok(w: &str) -> bool {
+    let b = w.as_bytes();
+    b.len() == 8
+        && b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[4] == b'-'
+        && b[5] == b'w'
+        && b[6..8].iter().all(|c| c.is_ascii_digit())
+}
+
+/// `harness friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>]` (ticket 200): the
+/// weekly sweep that feeds the T-9.3 mapper (`friction_event`) one week of the event log and files its rows
+/// through the add path's own checks. The whole log is read under the family's 4 MiB cap and checked by the
+/// event reader's own parser (a torn tail or a corrupt line refuses the whole sweep, exit 1, nothing filed);
+/// the mapped rows for the given week then walk the same door `add` walks: every field of every row through
+/// the privacy engine, then ONE `open_locked` critical section — `rows_for_add`, skip each row whose id is
+/// already stored (the id carries the week, so this is what makes a re-run in the same week file nothing,
+/// exit 0), `cross_check` the rest, append. All checks pass before the first append, so a refused sweep
+/// leaves the inbox byte-identical and a crash mid-sweep leaves a prefix the next run completes. A sweep
+/// that would file zero rows never creates a missing inbox. `--log` and `--week` are never defaulted: no
+/// wall clock runs in this verb, so any past week can be re-swept and every run is deterministic. Exit
+/// codes as the family: 0 ok; 1 a refusal; 2 a usage or setup error (a bad `--week`, no config, an
+/// unreadable or oversized log, no privacy list). No path or flag value is ever echoed.
+fn sweep_cmd(rest: &[String], testmode: bool) -> i32 {
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    let refuse = |m: &str| {
+        eprintln!("harness: friction refused: {}", m);
+        eprintln!("harness: ROWS NOT RECORDED");
+        1
+    };
+    let mut log: Option<&str> = None;
+    let mut week: Option<&str> = None;
+    let mut file: Option<&str> = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--log" => {
+                let Some(v) = it.next() else {
+                    return fail("--log is missing its value");
+                };
+                if log.replace(v.as_str()).is_some() {
+                    return fail("--log was given twice");
+                }
+            }
+            "--week" => {
+                let Some(v) = it.next() else {
+                    return fail("--week is missing its value");
+                };
+                if week.replace(v.as_str()).is_some() {
+                    return fail("--week was given twice");
+                }
+            }
+            "--config" => {
+                let Some(v) = it.next() else {
+                    return fail("--config is missing its value");
+                };
+                if file.replace(v.as_str()).is_some() {
+                    return fail("--config was given twice");
+                }
+            }
+            _ => {
+                // A constant message: the argument bytes have passed no privacy scan, so they are never echoed.
+                return fail("an unknown option (sweep takes only --log <file>, --week <iso-year>-w<ww> and --config <file>)");
+            }
+        }
+    }
+    let Some(log_path) = log else {
+        return fail("--log is required (never defaulted: no wall clock runs in this verb)");
+    };
+    let Some(week) = week else {
+        return fail("--week is required (never defaulted: no wall clock runs in this verb)");
+    };
+    // The week is grammar-checked before anything is read and before it can ever be echoed by the summary
+    // line; the refusal names the grammar, never the value.
+    if !week_ok(week) {
+        return fail("--week must be an ISO week <iso-year>-w<ww>: four digits, -w, two digits (the dedup-key suffix)");
+    }
+    let cfg = match config_path(file) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let cfg = match crate::config::Config::load(&cfg) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    // The privacy list loads before anything else is read: with no list configured the sweep fails closed
+    // (2), exactly like `add` — an unscanned row is never filed.
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => return fail("no privacy list configured: an unscanned row is never filed"),
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    // The log, read whole under the family cap (cap+1 bytes, so a log exactly at the cap is accepted and a
+    // log one byte over is refused). A missing or unreadable log is a setup error, not an empty week.
+    let log_path = std::path::Path::new(log_path);
+    let log_bytes = match read_capped(log_path, EVENT_LOG_CAP) {
+        Ok(b) => b,
+        Err(_) => return fail("the event log cannot be read"),
+    };
+    if log_bytes.len() as u64 > EVENT_LOG_CAP {
+        return fail(&format!("the event log is over the {}-byte cap; nothing was filed", EVENT_LOG_CAP));
+    }
+    // The event reader's own parser decides torn vs corrupt: a final fragment with no newline is a torn
+    // tail, a complete-but-invalid line is corruption; both refuse the whole sweep (one bad line files no
+    // rows), and the line number is the parser's, never re-counted here.
+    let log_read = crate::events::parse_log(&log_bytes);
+    if let Some(t) = &log_read.torn_tail {
+        return refuse(&format!("the event log has a torn tail at line {}; nothing was filed", t.line));
+    }
+    if let Some(c) = &log_read.corrupt {
+        return refuse(&format!("the event log is corrupt at line {}; nothing was filed", c.line));
+    }
+    // A clean parse means every line decoded and the file ends with a newline, so the whole read is UTF-8.
+    let text = match String::from_utf8(log_bytes) {
+        Ok(t) => t,
+        Err(_) => return fail("the event log cannot be read"),
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    // The ONE dedup/earliest-ts implementation (the batch helper), not a re-implementation: fail closed on
+    // the whole batch, one row per key, sorted by id.
+    let rows = match crate::friction_event::map_lines(&lines) {
+        Ok(r) => r,
+        Err(e) => return refuse(&e),
+    };
+    // Only this week's rows: the id ends `.<iso-year>-w<ww>`, so the filter is a suffix match on the key.
+    let suffix = format!(".{}", week);
+    let week_rows: Vec<Row> = rows.into_iter().filter(|r| r.id.ends_with(&suffix)).collect();
+    if week_rows.is_empty() {
+        println!("sweep week={} filed=0 already=0", week);
+        return 0;
+    }
+    // Every field of every row the sweep would file, through the same privacy engine as `add`; a hit names
+    // the field and the class only, and the row — the whole batch — is not stored.
+    for row in &week_rows {
+        for (name, value) in row_fields(row) {
+            let hits = crate::scan::scan_text(&ctx, "friction.sweep", value);
+            if !hits.is_empty() {
+                let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
+                return refuse(&format!("field {name} has a privacy hit ({}); the row is not stored", classes.join(", ")));
+            }
+        }
+    }
+    // A row that cannot be encoded is refused BEFORE the inbox is opened, so a refused sweep never creates
+    // the file (the mapper already validated every row, so this is the same backstop `add` keeps).
+    for row in &week_rows {
+        if let Err(e) = encode_row(row) {
+            return refuse(&e);
+        }
+    }
+    let inbox_path = std::path::PathBuf::from(cfg.friction_inbox());
+    // One writer at a time, the same lock as `add`: read, skip, check and append through one descriptor.
+    let mut file = match open_locked(&inbox_path) {
+        Ok(f) => f,
+        Err(m) => return fail(&m),
+    };
+    let mut rows = match rows_for_add(&file, &ctx) {
+        Ok(r) => r,
+        Err((code, m)) => {
+            eprintln!("harness: friction refused: {}", m);
+            eprintln!("harness: ROWS NOT RECORDED");
+            return code;
+        }
+    };
+    // The idempotence step: a row already stored is SKIPPED, not refused (a re-run in the same week exits 0
+    // with filed=0); the inbox's own duplicate-id refusal stays the second backstop.
+    let stored: std::collections::HashSet<&str> = rows.iter().map(|(_, r)| r.id.as_str()).collect();
+    let to_file: Vec<&Row> = week_rows.iter().filter(|r| !stored.contains(r.id.as_str())).collect();
+    let already = week_rows.len() - to_file.len();
+    let first_new = rows.len() + 1;
+    for (i, row) in to_file.iter().enumerate() {
+        rows.push((first_new + i, (*row).clone()));
+    }
+    // All checks before the first append (all-or-nothing against a half-checked inbox): the cross rules over
+    // the stored rows plus every row about to be filed, refusing on any problem a NEW line would carry.
+    if let Some((_, m)) = cross_check(&rows).into_iter().find(|(n, _)| *n >= first_new) {
+        return refuse(&m);
+    }
+    for row in &to_file {
+        if let Err(e) = append_row_to(&mut file, row) {
+            return fail(&e);
+        }
+        println!("stored id={}", row.id);
+    }
+    println!("sweep week={} filed={} already={}", week, to_file.len(), already);
+    0
+}
