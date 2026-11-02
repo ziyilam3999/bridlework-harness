@@ -1085,6 +1085,7 @@ fn cross_check_over_40000_rows_is_linear() {
                     text: s("l"),
                     kind: s(""),
                     repeats: s(""),
+                    source: s(""),
                 },
             )
         })
