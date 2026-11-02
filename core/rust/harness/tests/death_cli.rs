@@ -775,13 +775,16 @@ fn deaths_folder_open_mode_refuses() {
     });
 }
 
-/// AC 10d: the final handover name is a pre-planted symlink to an outside file.
+/// AC 10d (fix r1, F3): the final handover name is a pre-planted symlink to an outside file that is a
+/// VALID same-life handover — the one target for which dropping the final-name check would silently
+/// REUSE a record outside the folder. (An empty or garbage target refuses through the strict decode
+/// anyway, which is why the pre-r1 shape of this test stayed green without the check.)
 #[test]
 fn planted_handover_symlink_refuses() {
     let t = Tmp::new();
     assert_hostile_refusal("d", &t, "exists and does not match this death", |o, d, pid, ms| {
         let target = o.join("outside-d");
-        fs::write(&target, b"").unwrap();
+        fs::write(&target, valid_handover_line("h-d", "a", pid as u64, ms, "died", "none")).unwrap();
         let f = deaths_dir(d, "h-d");
         fs::create_dir_all(&f).unwrap();
         fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).unwrap();
@@ -900,4 +903,400 @@ fn record_carries_nothing_private() {
     let rel = handover_relpath("t-14", "a", pid as u64, start_ms);
     let stripped = ev.replace(&format!("\"handover\":\"{rel}\""), "");
     assert!(!stripped.contains('/'), "a `/` outside the handover value: {ev}");
+}
+
+// ---------------------------------------------------------------- fix r1 helpers
+
+/// A schema-valid handover line for one life (the fixture carrier for the reuse/symlink plants).
+fn valid_handover_line(ticket: &str, id: &str, pid: u64, ms: u64, cause: &str, limit: &str) -> String {
+    format!(
+        "{{\"v\":1,\"ticket\":\"{ticket}\",\"repo\":\"r\",\"id\":\"{id}\",\"pid\":{pid},\"pid_start_ms\":{ms},\"cause\":\"{cause}\",\"limit\":\"{limit}\",\"timeout_ms\":0,\"steps\":0,\"hard_limit\":0,\"detected_ms\":1,\"checkpoint\":\"{CHECKPOINT}\",\"recipe\":\"commit_push_then_resume\",\"session_id\":\"{SESSION}\"}}\n"
+    )
+}
+
+/// Run the binary with a DEADLINE (fix r1, F2): a verb that would block forever on a planted FIFO or
+/// socket is killed at the bound and the test fails, instead of hanging the suite. The bound is on the
+/// WAIT only (25 ms state polls up to `ms`); no wall-clock assert on the verb's own runtime.
+fn run_bounded(args: &[&str], ms: u64) -> Output {
+    let mut c = Command::new(BIN).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    loop {
+        match c.try_wait().unwrap() {
+            Some(_) => return c.wait_with_output().unwrap(),
+            None if Instant::now() >= deadline => {
+                let _ = c.kill();
+                let o = c.wait_with_output().unwrap();
+                panic!("the verb did not answer within {ms} ms: killed; stdout {:?} stderr {:?}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
+/// check + record flags, bounded (for the plants that must refuse, never hang).
+fn check_rec_bounded(ticket: &str, d: &Path, log: &Path, root: &Path) -> Output {
+    let mut v: Vec<String> = vec!["process".into(), "check".into(), ticket.into(), "--dir".into(), d.to_string_lossy().into_owned()];
+    v.extend(record_flags(log, root));
+    let a: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+    run_bounded(&a, 10_000)
+}
+
+// ---------------------------------------------------------------- fix r1 F1: step's cause at the hard line
+
+/// Fix r1 F1: at the step hard line with one GONE entry and one LIVE entry, the gone one is `died`
+/// (limit `none` from its entry) in BOTH the event log and the handover, the live one alone is
+/// `timeout`/`step`; the step_limit_stop line stays first in the log.
+#[test]
+fn step_gone_entry_records_died_live_times_out() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-f1", &r, &d);
+    let mut guard = Guard::default();
+    let (s1, p1, m1) = start("t-f1", "a", &r, &d, None, &["/bin/sh", "-c", "exit 0"]);
+    assert_eq!(code(&s1), 0, "start a: {}", err(&s1));
+    guard.add(p1);
+    assert!(poll(10_000, || !alive(p1)), "the gone fixture never exited");
+    let (s2, p2, m2) = start("t-f1", "b", &r, &d, None, &["sleep", "30"]);
+    assert_eq!(code(&s2), 0, "start b: {}", err(&s2));
+    guard.add(p2);
+    let log = r.join("events.jsonl");
+
+    let st = step_rec("t-f1", &d, &log, &r, 9, 5, 9);
+    assert_eq!(code(&st), 6, "the hard line answers 6: stdout {:?} stderr {:?}", out(&st), err(&st));
+    // stdout, in order: the header, the gone entry's recorded line, then the live entry's pair.
+    assert_eq!(
+        out(&st),
+        format!(
+            "step_limit_stop\t9\t9\nrecorded\ta\tdied\t{}\nb\t{p2}\tstopped\nrecorded\tb\ttimeout\t{}\n",
+            handover_relpath("t-f1", "a", p1 as u64, m1),
+            handover_relpath("t-f1", "b", p2 as u64, m2)
+        ),
+        "stdout names died for the gone entry and timeout for the live one"
+    );
+    // the log: step_limit_stop first, then a's died line, then b's timeout line.
+    let text = fs::read_to_string(&log).unwrap();
+    let all: Vec<&str> = text.lines().collect();
+    assert_eq!(all.len(), 3, "three lines: {text}");
+    assert!(all[0].contains("\"kind\":\"step_limit_stop\""), "the limit event is first: {text}");
+    assert!(all[1].contains(&format!("\"handover\":\"{}\"", handover_relpath("t-f1", "a", p1 as u64, m1))), "line 2 is a's death: {text}");
+    assert_eq!(json_str(all[1], "cause"), "died", "the gone entry is died in the LOG: {text}");
+    assert!(all[2].contains(&format!("\"handover\":\"{}\"", handover_relpath("t-f1", "b", p2 as u64, m2))), "line 3 is b's death: {text}");
+    assert_eq!(json_str(all[2], "cause"), "timeout", "the live entry is timeout in the LOG: {text}");
+    // the handovers carry the same causes, and the gone one its own entry's limit.
+    let ha = fs::read_to_string(handover_path(&d, "t-f1", "a", p1 as u64, m1)).unwrap();
+    assert_eq!(json_str(&ha, "cause"), "died", "the gone entry is died in the HANDOVER: {ha}");
+    assert_eq!(json_str(&ha, "limit"), "none", "the gone entry's limit comes from its entry: {ha}");
+    assert_eq!(json_num(&ha, "timeout_ms"), 0);
+    let hb = fs::read_to_string(handover_path(&d, "t-f1", "b", p2 as u64, m2)).unwrap();
+    assert_eq!(json_str(&hb, "cause"), "timeout");
+    assert_eq!(json_str(&hb, "limit"), "step");
+    // both entries are off the sheet.
+    let l = run(&["manifest", "list", "t-f1", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).lines().any(|x| x.starts_with("a\t") || x.starts_with("b\t")), "an entry survived: {}", out(&l));
+}
+
+/// Fix r1 F1 (the pid-reuse arm): a planted entry whose pid a stranger now holds, at the step hard
+/// line, records `died` keyed on the RECORDED life — never `timeout`/`step` — and the stranger is
+/// never signalled.
+#[test]
+fn step_pid_reused_records_died() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-f1r", &r, &d);
+    let mut guard = Guard::default();
+    let mut own = spawn_own_group("sleep", "60");
+    let pid = own.id();
+    guard.add(pid);
+    let recorded = real_start_ms(pid).saturating_sub(3_600_000);
+    plant_process(&d, "t-f1r", "a", pid, recorded);
+    let log = r.join("events.jsonl");
+
+    let st = step_rec("t-f1r", &d, &log, &r, 9, 5, 9);
+    assert_eq!(code(&st), 6, "a reused pid at the hard line still answers 6: stdout {:?} stderr {:?}", out(&st), err(&st));
+    let rel = handover_relpath("t-f1r", "a", pid as u64, recorded);
+    assert_eq!(out(&st), format!("step_limit_stop\t9\t9\nrecorded\ta\tdied\t{rel}\n"), "stdout carries the died recorded line: {:?}", out(&st));
+    assert!(err(&st).contains("pid-reused"), "the answer names pid-reused: stderr {:?}", err(&st));
+    let lines = timed_out_lines(&log);
+    assert_eq!(lines.len(), 1, "one death line: {}", fs::read_to_string(&log).unwrap());
+    assert_eq!(json_str(&lines[0], "cause"), "died", "the reused pid is died in the LOG, never timeout: {}", lines[0]);
+    let hand = fs::read_to_string(handover_path(&d, "t-f1r", "a", pid as u64, recorded)).unwrap();
+    assert_eq!(json_str(&hand, "cause"), "died", "the reused pid is died in the HANDOVER: {hand}");
+    assert!(alive(pid), "the stranger was signalled");
+    let _ = own.kill();
+    let _ = own.wait();
+}
+
+/// Fix r1 F1 (the sibling hit the search found in `check`): an expired entry whose pid a stranger now
+/// holds records `died` through check too — check's timeout staging is gated on the identity probe,
+/// so the pre-signalled handover never carries a cause the next probe contradicts.
+#[test]
+fn check_pid_reused_expired_records_died() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-f1c", &r, &d);
+    let mut guard = Guard::default();
+    let mut own = spawn_own_group("sleep", "60");
+    let pid = own.id();
+    guard.add(pid);
+    let recorded = real_start_ms(pid).saturating_sub(3_600_000);
+    plant_process(&d, "t-f1c", "a", pid, recorded);
+    {
+        use std::io::Write as _;
+        let line = "{\"v\":1,\"op\":\"limit\",\"ticket\":\"t-f1c\",\"id\":\"a\",\"timeout_ms\":1000,\"ts_ms\":1730000000003}\n";
+        let mut f = fs::OpenOptions::new().append(true).open(d.join("t-f1c.jsonl")).unwrap();
+        f.write_all(line.as_bytes()).unwrap();
+    }
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+
+    let c = check_rec("t-f1c", &d, &log, &r);
+    assert_eq!(code(&c), 5, "the expired reused entry resolves: stdout {:?} stderr {:?}", out(&c), err(&c));
+    let rel = handover_relpath("t-f1c", "a", pid as u64, recorded);
+    assert_eq!(out(&c), format!("recorded\ta\tdied\t{rel}\n"), "stdout carries died, never a timeout line: {:?}", out(&c));
+    assert!(err(&c).contains("pid-reused"), "the answer names pid-reused: stderr {:?}", err(&c));
+    let lines = timed_out_lines(&log);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(json_str(&lines[0], "cause"), "died", "the log says died: {}", lines[0]);
+    let hand = fs::read_to_string(handover_path(&d, "t-f1c", "a", pid as u64, recorded)).unwrap();
+    assert_eq!(json_str(&hand, "cause"), "died", "the handover says died: {hand}");
+    assert!(alive(pid), "the stranger was signalled");
+    let _ = own.kill();
+    let _ = own.wait();
+}
+
+// ---------------------------------------------------------------- fix r1 F2/v3: a non-regular final name never hangs
+
+/// Fix r1 F2: a FIFO planted at the final handover name is refused (2, the mismatch reason, `DEATH NOT
+/// RECORDED`) within the bounded wait — the open is never made, so nothing can block on the pipe with
+/// the per-ticket lock held. The entry is kept and the process alive.
+#[test]
+fn fifo_at_final_name_refuses_without_hanging() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-f2", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid, ms) = start("t-f2", "a", &r, &d, Some(1_000), &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+    let f = deaths_dir(&d, "t-f2");
+    fs::create_dir_all(&f).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).unwrap();
+    let mk = Command::new("mkfifo").arg(f.join(format!("a.{pid}.{ms}.json"))).stdin(Stdio::null()).output().unwrap();
+    assert!(mk.status.success(), "mkfifo: {}", String::from_utf8_lossy(&mk.stderr));
+
+    let c = check_rec_bounded("t-f2", &d, &log, &r);
+    assert_eq!(code(&c), 2, "the FIFO refuses: stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains("exists and does not match this death"), "the refusal is the planted-name reason: stderr {:?}", err(&c));
+    assert!(err(&c).contains("harness: DEATH NOT RECORDED"), "stderr {:?}", err(&c));
+    assert!(!err(&c).contains(&t.0.to_string_lossy().to_string()), "an absolute path leaked: stderr {:?}", err(&c));
+    assert!(alive(pid), "the process was signalled despite the refusal");
+    let l = run(&["manifest", "list", "t-f2", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(out(&l).lines().any(|x| x.starts_with("a\t")), "the entry was removed");
+    if log.exists() {
+        assert!(!fs::read_to_string(&log).unwrap().contains("timed_out"), "a timed_out was written");
+    }
+}
+
+/// Held-out v3: a DIRECTORY planted at the final handover name refuses with the same message class as
+/// the FIFO, within the bounded wait — no hang, no open.
+#[test]
+fn directory_at_final_name_refuses_without_hanging() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-v3", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid, ms) = start("t-v3", "a", &r, &d, Some(1_000), &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+    let f = deaths_dir(&d, "t-v3");
+    fs::create_dir_all(f.join(format!("a.{pid}.{ms}.json"))).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let c = check_rec_bounded("t-v3", &d, &log, &r);
+    assert_eq!(code(&c), 2, "the directory refuses: stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains("exists and does not match this death"), "the same planted-name reason as the FIFO: stderr {:?}", err(&c));
+    assert!(err(&c).contains("harness: DEATH NOT RECORDED"), "stderr {:?}", err(&c));
+    assert!(alive(pid), "the process was signalled despite the refusal");
+    let l = run(&["manifest", "list", "t-v3", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(out(&l).lines().any(|x| x.starts_with("a\t")), "the entry was removed");
+}
+
+// ---------------------------------------------------------------- fix r1 F4: a failed append after the signal
+
+/// Fix r1 F4: the `timed_out` append fails AFTER the pre-flight passed and the signal was sent (the
+/// log file is read-only: readable at pre-flight, unwritable at the append). The verb answers 2 with
+/// `DEATH NOT RECORDED`, the entry is KEPT, the staged handover stays as the intent record, and the
+/// log holds no `timed_out` line.
+#[test]
+fn failed_append_after_signal_keeps_entry() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-f4", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid, ms) = start("t-f4", "a", &r, &d, Some(1_000), &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+    fs::write(&log, b"").unwrap();
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let c = check_rec("t-f4", &d, &log, &r);
+    assert_eq!(code(&c), 2, "the failed append answers 2: stdout {:?} stderr {:?}", out(&c), err(&c));
+    assert!(err(&c).contains("event log refused"), "the refusal names the log: stderr {:?}", err(&c));
+    assert!(err(&c).contains("harness: DEATH NOT RECORDED"), "stderr {:?}", err(&c));
+    let l = run(&["manifest", "list", "t-f4", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(out(&l).lines().any(|x| x.starts_with("a\t")), "the entry was removed after a failed append: the death was silently lost");
+    assert_eq!(fs::read(&log).unwrap(), b"", "the log changed");
+    assert!(handover_path(&d, "t-f4", "a", pid as u64, ms).exists(), "the staged handover is the intent record for the retry");
+    assert!(!timed_out_lines(&log).iter().any(|x| json_str(x, "id") == "a"), "a timed_out was written");
+}
+
+// ---------------------------------------------------------------- fix r1 held-out variants
+
+/// Held-out v1: step at the hard line with TWO gone entries and one live entry: both gone are `died`
+/// (in the log AND their handovers), the live one alone is `timeout`.
+#[test]
+fn held_out_step_two_gone_one_live() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-v1", &r, &d);
+    let mut guard = Guard::default();
+    let mut gone = Vec::new();
+    for id in ["a", "b"] {
+        let (s, pid, ms) = start("t-v1", id, &r, &d, None, &["/bin/sh", "-c", "exit 0"]);
+        assert_eq!(code(&s), 0, "start {id}: {}", err(&s));
+        guard.add(pid);
+        assert!(poll(10_000, || !alive(pid)), "{id} never exited");
+        gone.push((id.to_string(), pid, ms));
+    }
+    let (s3, p3, m3) = start("t-v1", "c", &r, &d, None, &["sleep", "30"]);
+    assert_eq!(code(&s3), 0, "start c: {}", err(&s3));
+    guard.add(p3);
+    let log = r.join("events.jsonl");
+
+    let st = step_rec("t-v1", &d, &log, &r, 9, 5, 9);
+    assert_eq!(code(&st), 6, "stdout {:?} stderr {:?}", out(&st), err(&st));
+    let lines = timed_out_lines(&log);
+    assert_eq!(lines.len(), 3, "one death per entry: {}", fs::read_to_string(&log).unwrap());
+    for (id, pid, ms) in &gone {
+        let ev = lines.iter().find(|l| l.contains(&format!("\"handover\":\"{}\"", handover_relpath("t-v1", id, *pid as u64, *ms)))).unwrap_or_else(|| panic!("no line for {id}: {lines:?}"));
+        assert_eq!(json_str(ev, "cause"), "died", "{id} is not died in the log: {ev}");
+        let hand = fs::read_to_string(handover_path(&d, "t-v1", id, *pid as u64, *ms)).unwrap();
+        assert_eq!(json_str(&hand, "cause"), "died", "{id} is not died in the handover: {hand}");
+        assert_eq!(json_str(&hand, "limit"), "none");
+    }
+    let ev = lines.iter().find(|l| l.contains(&format!("\"handover\":\"{}\"", handover_relpath("t-v1", "c", p3 as u64, m3)))).unwrap();
+    assert_eq!(json_str(ev, "cause"), "timeout", "the live entry is not timeout: {ev}");
+    let hand = fs::read_to_string(handover_path(&d, "t-v1", "c", p3 as u64, m3)).unwrap();
+    assert_eq!(json_str(&hand, "cause"), "timeout");
+    assert_eq!(json_str(&hand, "limit"), "step");
+}
+
+/// Held-out v2: pid reused AND past the step limit, with a live entry beside it: the reused entry is
+/// `died` in the log and its handover, and no `timeout` line for that life exists anywhere.
+#[test]
+fn held_out_step_reused_and_live_died_never_timeout() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-v2", &r, &d);
+    let mut guard = Guard::default();
+    let mut own = spawn_own_group("sleep", "60");
+    let stranger = own.id();
+    guard.add(stranger);
+    let recorded = real_start_ms(stranger).saturating_sub(3_600_000);
+    plant_process(&d, "t-v2", "a", stranger, recorded);
+    let (s2, p2, m2) = start("t-v2", "b", &r, &d, None, &["sleep", "30"]);
+    assert_eq!(code(&s2), 0, "start b: {}", err(&s2));
+    guard.add(p2);
+    let log = r.join("events.jsonl");
+
+    let st = step_rec("t-v2", &d, &log, &r, 9, 5, 9);
+    assert_eq!(code(&st), 6, "stdout {:?} stderr {:?}", out(&st), err(&st));
+    let text = fs::read_to_string(&log).unwrap();
+    let rel_a = handover_relpath("t-v2", "a", stranger as u64, recorded);
+    let line_a = text.lines().find(|l| l.contains(&format!("\"handover\":\"{rel_a}\""))).unwrap_or_else(|| panic!("no death line for a: {text}"));
+    assert_eq!(json_str(line_a, "cause"), "died", "the reused pid past the step limit is died, never timeout: {line_a}");
+    let hand = fs::read_to_string(handover_path(&d, "t-v2", "a", stranger as u64, recorded)).unwrap();
+    assert_eq!(json_str(&hand, "cause"), "died", "the handover says died: {hand}");
+    assert!(!text.contains("\"cause\":\"timeout\"") || !text.contains(&rel_a) || !line_a.contains("timeout"), "a timeout line for the reused life exists: {text}");
+    let hand_b = fs::read_to_string(handover_path(&d, "t-v2", "b", p2 as u64, m2)).unwrap();
+    assert_eq!(json_str(&hand_b, "cause"), "timeout", "the live entry beside it is timeout: {hand_b}");
+    assert!(alive(stranger), "the stranger was signalled");
+    let _ = own.kill();
+    let _ = own.wait();
+}
+
+/// Held-out v4: a regular, valid, same-life handover already in the folder is REUSED: its bytes are
+/// unchanged, its cause wins, exactly one `timed_out` line is appended, rc 5 as before.
+#[test]
+fn held_out_valid_existing_handover_is_reused() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-v4", &r, &d);
+    let mut guard = Guard::default();
+    let (s, pid, ms) = start("t-v4", "a", &r, &d, Some(1_000), &["sleep", "30"]);
+    assert_eq!(code(&s), 0, "start: {}", err(&s));
+    guard.add(pid);
+    wait_past_age(pid, 2);
+    let log = r.join("events.jsonl");
+    let f = deaths_dir(&d, "t-v4");
+    fs::create_dir_all(&f).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o700)).unwrap();
+    let planted = valid_handover_line("t-v4", "a", pid as u64, ms, "timeout", "time");
+    fs::write(handover_path(&d, "t-v4", "a", pid as u64, ms), planted.as_bytes()).unwrap();
+
+    let c = check_rec("t-v4", &d, &log, &r);
+    assert_eq!(code(&c), 5, "the death still resolves to 5: stdout {:?} stderr {:?}", out(&c), err(&c));
+    let rel = handover_relpath("t-v4", "a", pid as u64, ms);
+    assert_eq!(out(&c), format!("a\t{pid}\ttimed_out\nrecorded\ta\ttimeout\t{rel}\n"), "stdout is the verb's line then the recorded line");
+    assert_eq!(fs::read_to_string(handover_path(&d, "t-v4", "a", pid as u64, ms)).unwrap(), planted, "the existing handover was rewritten");
+    let lines = timed_out_lines(&log);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(json_str(&lines[0], "cause"), "timeout", "the reused handover's cause wins: {}", lines[0]);
+    let l = run(&["manifest", "list", "t-v4", "--dir", d.to_str().unwrap()]);
+    assert_eq!(code(&l), 0);
+    assert!(!out(&l).lines().any(|x| x.starts_with("a\t")), "the entry is off the sheet");
+}
+
+/// Held-out v5: check and stop on a gone entry keep today's exact bytes — `died`, the recorded line on
+/// stdout, stop's already-gone stderr line verbatim — with no new line and no changed line.
+#[test]
+fn held_out_gone_entry_check_and_stop_exact_bytes() {
+    let t = Tmp::new();
+    let (r, _o, d) = t.fence();
+    init_manifest("t-v5", &r, &d);
+    let mut guard = Guard::default();
+    let (s1, p1, m1) = start("t-v5", "a", &r, &d, None, &["/bin/sh", "-c", "exit 0"]);
+    assert_eq!(code(&s1), 0, "start a: {}", err(&s1));
+    guard.add(p1);
+    assert!(poll(10_000, || !alive(p1)), "a never exited");
+    let (s2, p2, m2) = start("t-v5", "b", &r, &d, None, &["/bin/sh", "-c", "exit 0"]);
+    assert_eq!(code(&s2), 0, "start b: {}", err(&s2));
+    guard.add(p2);
+    assert!(poll(10_000, || !alive(p2)), "b never exited");
+    let log = r.join("events.jsonl");
+
+    // stop first (it targets one id), then check (it visits every live entry left).
+    let st = stop_rec("t-v5", "b", &d, &log, &r);
+    assert_eq!(code(&st), 3);
+    assert_eq!(out(&st), format!("recorded\tb\tdied\t{}\n", handover_relpath("t-v5", "b", p2 as u64, m2)), "stop stdout is byte-exact");
+    assert_eq!(err(&st), format!("harness: b is already-gone: pid {p2} is provably no such process; nothing signalled, entries removed\n"), "stop stderr is byte-exact");
+
+    let c = check_rec("t-v5", &d, &log, &r);
+    assert_eq!(code(&c), 5);
+    assert_eq!(out(&c), format!("recorded\ta\tdied\t{}\n", handover_relpath("t-v5", "a", p1 as u64, m1)), "check stdout is byte-exact");
+    assert_eq!(err(&c), format!("harness: a is already-gone: pid {p1} is provably no such process; nothing signalled, entries removed\n"), "check stderr is stop's line verbatim, byte-exact");
+
+    let lines = timed_out_lines(&log);
+    assert_eq!(lines.len(), 2);
+    assert!(lines.iter().all(|l| json_str(l, "cause") == "died"), "both are died: {lines:?}");
 }

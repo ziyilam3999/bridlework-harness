@@ -272,6 +272,12 @@ distinction (no new kind, no `v` bump):
 this ticket's claim. A distinct `step_limit` cause would be a schema change and is NOT done; the
 handover's `limit` field carries that distinction instead.
 
+A cause is decided by what the verb OBSERVED about the process before any record was written, never by
+which verb is running: at `check`'s expiry and at `step`'s hard line, a `timeout` handover is staged only
+for a pid the run has just proven live AND still the recorded process. An entry the probe finds gone, or
+whose pid was re-used, is never staged as a timeout — it records `died` (limit from its own entry)
+through the stop's already-gone / pid-reused arms, in every verb.
+
 ### The handover file
 
 One file per death, `<manifest-dir>/<ticket>.deaths/<id>.<pid>.<pid_start_ms>.json` — outside the
@@ -300,6 +306,14 @@ a hard stop is never silent. A crash between any two steps leaves the entry on t
 record-mode run finishes the job. Record mode widens `check` to visit EVERY live process entry for
 liveness (an entry with no limit is probed only; gone -> `died`), so a program that vanished is found at
 the driver's next check.
+
+A path at the final handover name is accepted only if the no-follow metadata says it is a REGULAR file:
+a symlink (even to a valid same-life handover outside the folder), a FIFO, a socket or a directory is
+the planted-name refusal below, is never opened, and cannot hang the verb with the ticket lock held.
+
+When an existing handover of the same life is REUSED, decision 7 pins only the cause and limit: the
+appended `timed_out` event carries THIS run's `--checkpoint`/`--session` values, so the event and the
+reused handover may name different resume points — the handover's are the durable ones.
 
 Any record failure answers 2 with `harness: error: <id>: <reason>` then `harness: DEATH NOT RECORDED`
 on stderr; the entry is KEPT (not removed), so the death is retried, never lost. The fixed reasons:

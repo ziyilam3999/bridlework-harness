@@ -32,6 +32,17 @@ const FOLDER_MODE: u32 = 0o700;
 /// Mode of every handover file.
 const FILE_MODE: u32 = 0o600;
 
+/// Open flags for reading a handover at the final name (fix r1, F2): NO-follow, so a symlinked final
+/// name is never a door out of the folder, and NO-blocking, so a FIFO or socket swapped in at the name
+/// cannot hang the verb with the per-ticket lock held. The values are the platform's own `O_NOFOLLOW`
+/// and `O_NONBLOCK` from `fcntl.h`; neither changes how a REGULAR file opens or reads.
+#[cfg(target_os = "linux")]
+const OPEN_NO_FOLLOW_NO_BLOCK: i32 = 0o4000 | 0o400000;
+#[cfg(target_os = "macos")]
+const OPEN_NO_FOLLOW_NO_BLOCK: i32 = 0x0000_0004 | 0x0040_0000;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const OPEN_NO_FOLLOW_NO_BLOCK: i32 = 0;
+
 /// Why this process ended (decision 1): stopped by a limit (`timeout`), or provably gone before any
 /// supervisor signal (`died` — whether it exited cleanly is P1B-08's claim, not this one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,10 +483,15 @@ fn preflight_log(root: &Path, log: &Path) -> Result<(), String> {
 fn read_existing(final_path: &Path, spec: &DeathSpec<'_>, relpath: &str) -> Result<Option<Handover>, String> {
     let mismatch = || format!("handover {relpath} exists and does not match this death");
     let md = fs::symlink_metadata(final_path).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
-    if md.file_type().is_symlink() {
+    // Fix r1 (F2/F3): a path at the final name is accepted only if the no-follow metadata says it is a
+    // REGULAR file. A symlink — even one pointing at a VALID same-life handover outside the folder — a
+    // FIFO, a socket, a device or a directory is the same planted-name refusal, and none of them is
+    // ever opened: before this gate a FIFO hung the verb on a blocking open for read, with the
+    // per-ticket lock held.
+    if !md.is_file() {
         return Err(mismatch());
     }
-    let mut f = File::open(final_path).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
+    let mut f: File = OpenOptions::new().read(true).custom_flags(OPEN_NO_FOLLOW_NO_BLOCK).open(final_path).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
     let mut buf = Vec::new();
     std::io::Read::take(std::io::Read::by_ref(&mut f), HANDOVER_CAP as u64 + 1).read_to_end(&mut buf).map_err(|e| format!("cannot write the handover: {}", e.kind()))?;
     if buf.len() > HANDOVER_CAP {

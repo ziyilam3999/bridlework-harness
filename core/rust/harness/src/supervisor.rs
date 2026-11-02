@@ -1410,14 +1410,26 @@ fn check_cmd(a: &[String]) -> i32 {
                     // the death — it is never silently lost).
                     let mut staged = None;
                     if let Some((rc, lr)) = &rec {
-                        let run = RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 };
-                        match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *recorded }, &run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Time, timeout_ms: limit.timeout_ms }) {
-                            Ok(st) => staged = Some(st),
-                            Err(reason) => {
-                                death_not_recorded(&e.id, &reason);
-                                codes.push(2);
-                                continue;
+                        // Fix r1 (the F1 class): a `timeout` handover is staged ONLY for a pid this run
+                        // has just identified as the recorded process. A live pid whose number was
+                        // re-used is a `died` the factored stop's own pid-reused arm records; staging
+                        // `timeout` here would put a cause the very next probe contradicts on disk, and
+                        // decision 7 makes that cause permanent. An unreadable identity stages nothing
+                        // either: the stop refuses on it anyway, and a refused stop must not leave a
+                        // mislabelled intent file behind.
+                        match probe_identity(*pid, *recorded) {
+                            Identity::Same => {
+                                let run = RecordRun { repo: &rc.repo, checkpoint: &rc.checkpoint, session_id: &rc.session_id, lr, steps: 0, hard_limit: 0 };
+                                match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *recorded }, &run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Time, timeout_ms: limit.timeout_ms }) {
+                                    Ok(st) => staged = Some(st),
+                                    Err(reason) => {
+                                        death_not_recorded(&e.id, &reason);
+                                        codes.push(2);
+                                        continue;
+                                    }
+                                }
                             }
+                            Identity::Reused | Identity::Unknown(_) => {}
                         }
                     }
                     let rec_ref = rec.as_ref().map(|(rc, lr)| {
@@ -1747,10 +1759,10 @@ fn step_cmd(a: &[String]) -> i32 {
                 .filter(|e| matches!(e.target, Target::Process { .. }))
                 .map(|e| e.id.clone())
                 .collect();
-            // Record mode (#210, decision 6): every death's handover is staged BEFORE any signal — and
-            // before the `step_limit_stop` event, which stays the FIRST thing a hard stop writes to the
-            // log. A failed stage answers 2 with `DEATH NOT RECORDED`, nothing signalled, every entry
-            // kept (the record precedes the signal).
+            // Record mode (#210, decision 6): the handover of every entry THIS RUN IS ABOUT TO SIGNAL
+            // is staged BEFORE any signal — and before the `step_limit_stop` event, which stays the
+            // FIRST thing a hard stop writes to the log. A failed stage answers 2 with `DEATH NOT
+            // RECORDED`, nothing signalled, every entry kept (the record precedes the signal).
             let mut staged: Vec<(String, death::Staged)> = Vec::new();
             let rec_run = args.record.as_ref().map(|(session, checkpoint)| RecordRun {
                 repo: &args.repo,
@@ -1763,6 +1775,21 @@ fn step_cmd(a: &[String]) -> i32 {
             if let Some(run) = &rec_run {
                 for e in read.live.iter().filter(|e| matches!(e.target, Target::Process { .. })) {
                     let Target::Process { pid, pid_start_ms } = &e.target else { continue };
+                    // Fix r1 (F1): a cause is decided by what is OBSERVED about the process BEFORE any
+                    // record is written, never by which verb is running. A `timeout`/`step` handover is
+                    // staged ONLY for an entry this run has just proven LIVE and still the recorded
+                    // process — the one the hard line is about to signal. An entry that is provably
+                    // gone, or whose pid was re-used, is NOT staged here at all: the factored stop's
+                    // already-gone / pid-reused arms stage and commit `died` (limit from the entry) with
+                    // no pre-existing handover to override, exactly as in check and stop. A denied or
+                    // unreadable probe also stages nothing — the stop refuses on it anyway.
+                    match probe_alive_at(Path::new("/bin/kill"), *pid) {
+                        Liveness::Alive => match probe_identity(*pid, *pid_start_ms) {
+                            Identity::Same => {}
+                            Identity::Reused | Identity::Unknown(_) => continue,
+                        },
+                        Liveness::NoSuch | Liveness::Denied | Liveness::Unknown(_) => continue,
+                    }
                     let (_limit_kind, timeout_ms) = limit_of(&read, &e.id);
                     match stage_death(&dir, &read, &Life { ticket: &args.ticket, id: &e.id, pid: *pid, pid_start_ms: *pid_start_ms }, run, FreshDeath { cause: death::Cause::Timeout, limit: death::LimitKind::Step, timeout_ms }) {
                         Ok(st) => staged.push((e.id.clone(), st)),
