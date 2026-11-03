@@ -41,8 +41,8 @@
 //! would answer 4 "death not confirmed" for a process it had just killed (#209's named zombie race).
 //!
 //! Privacy of what a program printed is NOT handled here: capture is raw, byte-for-byte, secret-shaped
-//! text kept verbatim (P1B-10 owns redaction); the reader verb and the Done link are P1B-09;
-//! retention/teardown is P1B-09/P1B-14.
+//! text kept verbatim (P1B-10 owns redaction); the reader verbs and the Done link are P1B-09, below;
+//! retention/teardown is P1B-14.
 
 use crate::manifest;
 use std::fs::{self, File, OpenOptions};
@@ -698,7 +698,617 @@ pub fn waiter_cmd(a: &[String]) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------- #209: unit tests
+// ---------------------------------------------------------------- P1B-09 (#214): the evidence reader
+
+/// The evidence READER (P1B-09, unix only, std only, read-only): `harness evidence show|check` read a
+/// ticket's runtime evidence and turn it into one line per run plus the Done link. A "run" is every
+/// `<id>.<ts>` the ticket's manifest EVER signed out (the FULL append log, so a removed line does not
+/// erase what happened); each run gets exactly one state from the table below; `check` refuses Done
+/// (exit 1) while any run is failed, running, unknown or damaged — unknown is NEVER success — and
+/// allows zero runs (most tickets never start a program; whether one was NEEDED is the gate's
+/// business). Neither verb prints any captured byte and no path: ids are manifest tokens, numbers are
+/// re-printed from parsed integers, never copied text (a tail would echo secret-shaped bytes
+/// unredacted before P1B-10 exists). Neither verb writes, locks, chmods or deletes anything, takes no
+/// supervisor lock, never opens a FIFO (type is checked before any open) and never reads unbounded
+/// (the manifest through its capped reader, `exit` at most 4097 bytes, streams never read at all).
+pub const READER_USAGE: &str = "usage: harness evidence show|check <ticket> --manifest-dir <absolute-dir>";
+
+/// The `exit` record's read cap: a record is ~400 bytes; a bigger file is damaged and the read itself
+/// never takes more than this many bytes plus one (fail closed, never an unbounded read).
+pub const EXIT_RECORD_CAP: u64 = 4096;
+
+/// One parsed `exit` record: the strict inverse of `encode_exit` (same key order, same shapes), with
+/// the value rules the reader adds (`v` is the literal 1, a known outcome, no `committed:true` with
+/// `spawn_failed`, `code` >= -1, `signal` >= 0). Numbers live as integers here, so printers re-print
+/// parsed values, never copied text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitParsed {
+    pub pid: u32,
+    pub committed: bool,
+    pub outcome: String, // exited | signalled | spawn_failed | wait_failed
+    pub code: i32,
+    pub signal: i32,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub duration_ms: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub stdout_error: String,
+    pub stderr_error: String,
+    pub output_open_after_exit: bool,
+}
+
+/// Parse the record EXACTLY as `encode_exit` writes it: one newline-terminated line, compact JSON,
+/// the fixed key order, no spaces, string bodies printable and escape-free. Any deviation — a swapped
+/// key, `v` 2, an unknown outcome, `committed:true` with `spawn_failed`, a second line, a missing
+/// newline, a trailing byte — is `None` (the caller's `malformed`). This is the reader's whole trust
+/// in the record's SHAPE; authorship (a same-uid forgery) is a named limit, not detectable here.
+pub fn parse_exit_record(bytes: &[u8]) -> Option<ExitParsed> {
+    /// A byte cursor that only ever moves forward and answers None the moment the input deviates.
+    struct Cur<'a> {
+        b: &'a [u8],
+        i: usize,
+    }
+    impl<'a> Cur<'a> {
+        fn lit(&mut self, lit: &[u8]) -> Option<()> {
+            if self.b.len() - self.i < lit.len() || &self.b[self.i..self.i + lit.len()] != lit {
+                return None;
+            }
+            self.i += lit.len();
+            Some(())
+        }
+        fn uint(&mut self) -> Option<u64> {
+            let start = self.i;
+            while self.i < self.b.len() && self.b[self.i].is_ascii_digit() {
+                self.i += 1;
+            }
+            if self.i == start || self.i - start > 19 {
+                return None;
+            }
+            std::str::from_utf8(&self.b[start..self.i]).ok()?.parse::<u64>().ok()
+        }
+        fn sint(&mut self) -> Option<i64> {
+            let neg = matches!(self.b.get(self.i), Some(b'-'));
+            if neg {
+                self.i += 1;
+            }
+            let v = self.uint()? as i64;
+            if neg {
+                Some(-v)
+            } else {
+                Some(v)
+            }
+        }
+        fn boolean(&mut self) -> Option<bool> {
+            if self.b.len() - self.i >= 5 && &self.b[self.i..self.i + 5] == b"false" {
+                self.i += 5;
+                return Some(false);
+            }
+            if self.b.len() - self.i >= 4 && &self.b[self.i..self.i + 4] == b"true" {
+                self.i += 4;
+                return Some(true);
+            }
+            None
+        }
+        fn qstring(&mut self) -> Option<String> {
+            let start = self.i;
+            while let Some(&c) = self.b.get(self.i) {
+                if c == b'"' {
+                    let s = std::str::from_utf8(&self.b[start..self.i]).ok()?.to_string();
+                    self.i += 1;
+                    return Some(s);
+                }
+                if c < b' ' || c == b'\\' {
+                    return None; // printable and escape-free, exactly what the encoder can write
+                }
+                self.i += 1;
+            }
+            None
+        }
+    }
+    let mut c = Cur { b: bytes, i: 0 };
+    c.lit(b"{\"v\":1,\"pid\":")?;
+    let pid = u32::try_from(c.uint()?).ok()?;
+    c.lit(b",\"committed\":")?;
+    let committed = c.boolean()?;
+    c.lit(b",\"outcome\":\"")?;
+    let outcome = c.qstring()?;
+    c.lit(b",\"code\":")?;
+    let code = i32::try_from(c.sint()?).ok()?;
+    c.lit(b",\"signal\":")?;
+    let signal = i32::try_from(c.sint()?).ok()?;
+    c.lit(b",\"start_ms\":")?;
+    let start_ms = c.uint()?;
+    c.lit(b",\"end_ms\":")?;
+    let end_ms = c.uint()?;
+    c.lit(b",\"duration_ms\":")?;
+    let duration_ms = c.uint()?;
+    c.lit(b",\"stdout_bytes\":")?;
+    let stdout_bytes = c.uint()?;
+    c.lit(b",\"stderr_bytes\":")?;
+    let stderr_bytes = c.uint()?;
+    c.lit(b",\"stdout_truncated\":")?;
+    let stdout_truncated = c.boolean()?;
+    c.lit(b",\"stderr_truncated\":")?;
+    let stderr_truncated = c.boolean()?;
+    c.lit(b",\"stdout_error\":\"")?;
+    let stdout_error = c.qstring()?;
+    c.lit(b",\"stderr_error\":\"")?;
+    let stderr_error = c.qstring()?;
+    c.lit(b",\"output_open_after_exit\":")?;
+    let output_open_after_exit = c.boolean()?;
+    c.lit(b"}\n")?;
+    if c.i != bytes.len() {
+        return None; // exactly one line, nothing after its newline
+    }
+    if !matches!(outcome.as_str(), "exited" | "signalled" | "spawn_failed" | "wait_failed") {
+        return None;
+    }
+    if committed && outcome == "spawn_failed" {
+        return None; // start never commits a spawn it refused
+    }
+    if code < -1 || signal < 0 {
+        return None;
+    }
+    Some(ExitParsed {
+        pid,
+        committed,
+        outcome,
+        code,
+        signal,
+        start_ms,
+        end_ms,
+        duration_ms,
+        stdout_bytes,
+        stderr_bytes,
+        stdout_truncated,
+        stderr_truncated,
+        stdout_error,
+        stderr_error,
+        output_open_after_exit,
+    })
+}
+
+/// One run's state — the ONE decision table (#214 decision 3). Every run gets exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// `committed:true`, `exited`, `code` 0.
+    Ok,
+    /// `committed:true`, `signalled`, signal 15 or 9 (what a harness stop sends).
+    Stopped,
+    /// A valid record with `committed:false` (start answered 2 for it at the time).
+    Attempt,
+    /// `committed:true` and `exited` non-zero, or `signalled` with any other signal, or `wait_failed`.
+    Failed,
+    /// No `exit` yet, the newest run of its id, and a LIVE `process` entry of that id exists.
+    Running,
+    /// No `exit` otherwise (waiter killed, host crash, files removed) — never success.
+    Unknown,
+    /// The evidence shape itself is broken; `reason` names the token.
+    Damaged,
+}
+
+impl RunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunState::Ok => "ok",
+            RunState::Stopped => "stopped",
+            RunState::Attempt => "attempt",
+            RunState::Failed => "failed",
+            RunState::Running => "running",
+            RunState::Unknown => "unknown",
+            RunState::Damaged => "damaged",
+        }
+    }
+
+    /// The Done rule (#214 decision 4): these states refuse Done.
+    fn blocks_done(self) -> bool {
+        matches!(self, RunState::Failed | RunState::Running | RunState::Unknown | RunState::Damaged)
+    }
+}
+
+/// One run as the printers see it: the id and stamp (tokens/digits, safe to print), the state, the
+/// damaged reason token, and the parsed record when one landed whole.
+#[derive(Debug, Clone)]
+pub struct RunView {
+    pub id: String,
+    pub ts: u64,
+    pub state: RunState,
+    pub reason: Option<&'static str>,
+    pub record: Option<ExitParsed>,
+}
+
+/// The dir decision table as a reason token (`check_evidence_dir`'s rules, token spellings): a
+/// symlink, a non-directory, any group/other mode bit, another owner. A MISSING dir is not damaged —
+/// its runs simply have no files and read `unknown` (#214: a run dir moved out of the root is
+/// unknown, and unknown blocks Done just the same).
+fn dir_reason(m: &fs::Metadata, uid: u32) -> Option<&'static str> {
+    let ft = m.file_type();
+    if ft.is_symlink() {
+        return Some("symlink");
+    }
+    if !ft.is_dir() {
+        return Some("not-dir");
+    }
+    if m.mode() & 0o077 != 0 {
+        return Some("bad-mode");
+    }
+    if m.uid() != uid {
+        return Some("foreign-owner");
+    }
+    None
+}
+
+/// The `exit` file's own table: a symlink (never opened), not a regular file (a FIFO is never opened
+/// either — the type is judged BEFORE any open), another owner, any group/other bit, over the cap.
+fn exit_file_reason(m: &fs::Metadata, uid: u32) -> Option<&'static str> {
+    let ft = m.file_type();
+    if ft.is_symlink() {
+        return Some("symlink");
+    }
+    if !ft.is_file() {
+        return Some("not-regular");
+    }
+    if m.uid() != uid {
+        return Some("foreign-owner");
+    }
+    if m.mode() & 0o077 != 0 {
+        return Some("bad-mode");
+    }
+    if m.size() > EXIT_RECORD_CAP {
+        return Some("over-cap");
+    }
+    None
+}
+
+/// Same file, twice: the no-follow look and the opened handle must name the SAME device and inode, or
+/// the name was `swapped` between the look and the open.
+fn same_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// One manifest `evidence` entry as a run entry: the id must be `<id>.<ts>.<stream>` (stream one of
+/// the three, `<ts>` all digits, `<id>` a plain token — split from the RIGHT, so an id may itself
+/// hold dots) and the stored path exactly `<root>/evidence/proc/<id>.<ts>/<stream>` for one of the
+/// manifest's roots. Anything else is not a run (the caller counts it `other`, never judges it).
+fn run_of_entry(id: &str, path: &str, roots: &[String]) -> Option<(String, u64, PathBuf)> {
+    let mut parts = id.rsplitn(3, '.');
+    let stream = parts.next()?;
+    let ts_text = parts.next()?;
+    let proc_id = parts.next()?;
+    if !matches!(stream, "stdout" | "stderr" | "exit") {
+        return None;
+    }
+    if ts_text.is_empty() || !ts_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ts: u64 = ts_text.parse().ok()?;
+    if !crate::events::token_ok(proc_id) {
+        return None;
+    }
+    let stored = Path::new(path);
+    for r in roots {
+        let dir = Path::new(r.as_str()).join("evidence").join("proc").join(format!("{proc_id}.{ts_text}"));
+        if stored == dir.join(stream) {
+            return Some((proc_id.to_string(), ts, dir));
+        }
+    }
+    None
+}
+
+/// Group the FULL append log into runs (sorted by `<ts>` then `<id>` — the BTreeMap's own order) and
+/// count every other `evidence` entry. A removed entry is still a run: removal does not erase what
+/// happened. The input is bounded by the manifest reader's 1 MiB cap, so both counts are bounded too.
+pub fn collect_runs(read: &manifest::ManifestRead) -> (Vec<(String, u64, PathBuf)>, usize) {
+    let mut runs: std::collections::BTreeMap<(u64, String), PathBuf> = std::collections::BTreeMap::new();
+    let mut other = 0usize;
+    for line in &read.lines {
+        if let manifest::Line::AddPath { id, class: manifest::Class::Evidence, path, .. } = line {
+            match run_of_entry(id, path, &read.roots) {
+                Some((rid, ts, dir)) => {
+                    runs.entry((ts, rid)).or_insert(dir);
+                }
+                None => other += 1,
+            }
+        }
+    }
+    (runs.into_iter().map(|((ts, id), dir)| (id, ts, dir)).collect(), other)
+}
+
+/// The start-time tolerance between the live pid's start and the recorded one, the manifest doc's
+/// ownership rule (same discipline as `supervisor`'s stop): exact on Linux, 2000 ms elsewhere.
+#[cfg(not(target_os = "linux"))]
+const START_TOLERANCE_MS: u64 = 2000;
+
+/// Same discipline as the supervisor's stop: the sheet's entry names the process only while the pid's
+/// start time still matches the recorded one.
+#[cfg(target_os = "linux")]
+fn same_start(read: u64, recorded: u64) -> bool {
+    read == recorded
+}
+#[cfg(not(target_os = "linux"))]
+fn same_start(read: u64, recorded: u64) -> bool {
+    read.abs_diff(recorded) <= START_TOLERANCE_MS
+}
+
+/// The state table for one run (#214 decision 3). `newest_of_id` and `live_process` carry the facts a
+/// no-`exit` run needs: this is the newest run of its id, and a live `process` entry of that id exists
+/// whose pid still IS the process the sheet recorded (start time unchanged; a dead or recycled pid is
+/// no longer it) — then the run is `running`; anything else with no record is `unknown`, never
+/// success, and an unreadable start time reads unknown too (fail closed).
+pub fn classify_run(uid: u32, id: &str, ts: u64, dir: &Path, newest_of_id: bool, live_process: Option<(u64, u64)>) -> RunView {
+    let damaged = |reason: &'static str| RunView {
+        id: id.to_string(),
+        ts,
+        state: RunState::Damaged,
+        reason: Some(reason),
+        record: None,
+    };
+    // The dir chain: `evidence`, `evidence/proc`, the run dir — checked, never trusted; a MISSING
+    // link in the chain means no files, which the no-record rule below reads as unknown.
+    let chain = [dir.parent().and_then(|p| p.parent()), dir.parent(), Some(dir)];
+    for (name, at) in [("evidence", chain[0]), ("evidence/proc", chain[1]), ("run dir", Some(dir))] {
+        let _ = name; // the token spellings below carry the meaning; names kept for the reader of this code
+        match at.map(fs::symlink_metadata) {
+            Some(Ok(m)) => {
+                if let Some(r) = dir_reason(&m, uid) {
+                    return damaged(r);
+                }
+            }
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Some(Err(_)) => return damaged("unreadable"),
+            None => return damaged("not-dir"),
+        }
+    }
+    // The record: a no-follow look FIRST (a symlink or a FIFO is never opened), then the open, then
+    // the opened handle's device and inode against the looked-at one (a swap in between is caught).
+    let exit_path = dir.join("exit");
+    let looked = match fs::symlink_metadata(&exit_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let still_it = live_process.is_some_and(|(pid, recorded)| {
+                manifest::process_start_ms(pid).map(|read| same_start(read, recorded)).unwrap_or(false)
+            });
+            let state = if newest_of_id && still_it { RunState::Running } else { RunState::Unknown };
+            return RunView { id: id.to_string(), ts, state, reason: None, record: None };
+        }
+        Err(_) => return damaged("unreadable"),
+    };
+    if let Some(r) = exit_file_reason(&looked, uid) {
+        return damaged(r);
+    }
+    let mut f = match File::open(&exit_path) {
+        Ok(f) => f,
+        Err(_) => return damaged("unreadable"),
+    };
+    let opened = match f.metadata() {
+        Ok(m) => m,
+        Err(_) => return damaged("unreadable"),
+    };
+    if !same_identity(&looked, &opened) {
+        return damaged("swapped");
+    }
+    // Bounded read: at most the cap plus one byte, so an oversized file is judged, never drained.
+    let mut buf = vec![0u8; EXIT_RECORD_CAP as usize + 1];
+    let mut len = 0usize;
+    loop {
+        match f.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len > EXIT_RECORD_CAP as usize {
+                    return damaged("over-cap");
+                }
+            }
+            Err(_) => return damaged("unreadable"),
+        }
+    }
+    let rec = match parse_exit_record(&buf[..len]) {
+        Some(r) => r,
+        None => return damaged("malformed"),
+    };
+    // A whole record must still have its two streams behind it — missing, a symlink or not regular
+    // is damage; their BYTES are never read (sizes in the printers come from the parsed record).
+    for stream in ["stdout", "stderr"] {
+        match fs::symlink_metadata(dir.join(stream)) {
+            Ok(m) if m.file_type().is_symlink() => return damaged("symlink"),
+            Ok(m) if !m.file_type().is_file() => return damaged("not-regular"),
+            Ok(_) => {}
+            Err(_) => return damaged("missing-stream"),
+        }
+    }
+    let state = if !rec.committed {
+        RunState::Attempt
+    } else {
+        match rec.outcome.as_str() {
+            "exited" if rec.code == 0 => RunState::Ok,
+            "exited" => RunState::Failed,
+            "signalled" if rec.signal == 15 || rec.signal == 9 => RunState::Stopped,
+            "signalled" => RunState::Failed,
+            "wait_failed" => RunState::Failed,
+            _ => return damaged("malformed"), // unreachable: the parser already refused other outcomes
+        }
+    };
+    RunView { id: id.to_string(), ts, state, reason: None, record: Some(rec) }
+}
+
+/// `<ticket> --manifest-dir <absolute-dir>`: the same shape `workspace check` takes — one ticket
+/// (a plain manifest token, refused never rewritten), one required absolute `--manifest-dir` with no
+/// `..` component. An unknown flag, a missing value, a repeat or a second ticket is a usage error.
+fn parse_reader_args(a: &[String]) -> Result<(String, String), String> {
+    let (mut ticket, mut md) = (None, None);
+    let mut it = a.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--manifest-dir" => {
+                let Some(v) = it.next() else { return Err("--manifest-dir is missing its value".to_string()) };
+                if md.replace(v.clone()).is_some() {
+                    return Err("--manifest-dir was given twice".to_string());
+                }
+            }
+            s if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            s => {
+                if ticket.replace(s.to_string()).is_some() {
+                    return Err("more than one ticket given".to_string());
+                }
+            }
+        }
+    }
+    let ticket = ticket.ok_or_else(|| "a ticket is required".to_string())?;
+    let md = md.ok_or_else(|| "--manifest-dir is required".to_string())?;
+    if !crate::events::token_ok(&ticket) {
+        return Err("the ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')".to_string());
+    }
+    let p = Path::new(&md);
+    if !p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("--manifest-dir must be an absolute path with no `..` component".to_string());
+    }
+    Ok((ticket, md))
+}
+
+/// The refused-line detail: the damaged reason token, else the record's own outcome detail; `-` when
+/// there is nothing to name (running and unknown have no record).
+fn refused_detail(v: &RunView) -> String {
+    if let Some(r) = v.reason {
+        return r.to_string();
+    }
+    match &v.record {
+        Some(rec) if rec.outcome == "signalled" => format!("{} {}", rec.outcome, rec.signal),
+        Some(rec) if rec.outcome == "exited" => format!("{} {}", rec.outcome, rec.code),
+        Some(rec) => rec.outcome.clone(),
+        None => "-".to_string(),
+    }
+}
+
+/// `harness evidence show|check <ticket> --manifest-dir <absolute-dir>` (#214). Exit codes — `show`:
+/// 0 read (whatever the states), 2 cannot check; `check`: 0 Done allowed by evidence, 1 Done refused,
+/// 2 cannot check (usage error, a missing/torn/corrupt manifest, an unreadable manifest dir — a
+/// missing manifest is NEVER zero runs; fail closed). "Cannot check" prints nothing on stdout and one
+/// folder-free `harness: error:` line on stderr. The Done link itself is wired by `ticket finalize`
+/// (P1B-15), exactly as `workspace check` is: finalize runs this check and refuses Done unless 0.
+pub fn evidence_cmd(a: &[String]) -> i32 {
+    let check = match a.first().map(|s| s.as_str()) {
+        Some("show") => false,
+        Some("check") => true,
+        _ => {
+            eprintln!("harness: error: evidence takes a verb, show or check: {READER_USAGE}");
+            return 2;
+        }
+    };
+    let (ticket, md) = match parse_reader_args(&a[1..]) {
+        Ok(v) => v,
+        Err(m) => {
+            eprintln!("harness: error: {m}");
+            return 2;
+        }
+    };
+    // The manifest through the existing capped reader only, never written. A missing file is an
+    // error, never an empty state; the reader's own message may name a path, so the line is fixed.
+    let read = match manifest::read_manifest(Path::new(&md), &ticket) {
+        Ok(r) if r.is_clean() => r,
+        _ => {
+            eprintln!("harness: error: the manifest could not be read");
+            return 2;
+        }
+    };
+    let uid = match own_uid() {
+        Ok(u) => u,
+        Err(_) => {
+            eprintln!("harness: error: cannot determine the running user");
+            return 2;
+        }
+    };
+    let (runs, other) = collect_runs(&read);
+    // The two facts a no-record run needs: the newest stamp per id, and the live process ids.
+    let mut newest: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for (id, ts, _) in &runs {
+        let e = newest.entry(id.as_str()).or_insert(0);
+        if *ts > *e {
+            *e = *ts;
+        }
+    }
+    let live: std::collections::HashMap<&str, (u64, u64)> = read
+        .live
+        .iter()
+        .filter(|e| e.class == manifest::Class::Process)
+        .filter_map(|e| match &e.target {
+            manifest::Target::Process { pid, pid_start_ms } => Some((e.id.as_str(), (*pid, *pid_start_ms))),
+            _ => None,
+        })
+        .collect();
+    let views: Vec<RunView> = runs
+        .iter()
+        .map(|(id, ts, dir)| {
+            classify_run(uid, id, *ts, dir, newest.get(id.as_str()) == Some(ts), live.get(id.as_str()).copied())
+        })
+        .collect();
+    let count = |s: RunState| views.iter().filter(|v| v.state == s).count();
+    if !check {
+        for v in &views {
+            match &v.record {
+                Some(r) => println!(
+                    "run\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    v.id,
+                    v.ts,
+                    v.state.as_str(),
+                    v.reason.unwrap_or("-"),
+                    r.outcome,
+                    r.code,
+                    r.signal,
+                    r.committed,
+                    r.duration_ms,
+                    r.stdout_bytes,
+                    r.stderr_bytes,
+                    r.stdout_truncated,
+                    r.stderr_truncated
+                ),
+                None => println!(
+                    "run\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+                    v.id,
+                    v.ts,
+                    v.state.as_str(),
+                    v.reason.unwrap_or("-")
+                ),
+            }
+        }
+        println!(
+            "evidence ticket={} runs={} ok={} stopped={} attempt={} failed={} running={} unknown={} damaged={} other={}",
+            ticket,
+            views.len(),
+            count(RunState::Ok),
+            count(RunState::Stopped),
+            count(RunState::Attempt),
+            count(RunState::Failed),
+            count(RunState::Running),
+            count(RunState::Unknown),
+            count(RunState::Damaged),
+            other
+        );
+        return 0;
+    }
+    let blocking: Vec<&RunView> = views.iter().filter(|v| v.state.blocks_done()).collect();
+    if blocking.is_empty() {
+        println!("evidence=allowed ticket={} runs={}", ticket, views.len());
+        return 0;
+    }
+    for v in &blocking {
+        println!("refused {} {} {} {}", v.id, v.ts, v.state.as_str(), refused_detail(v));
+    }
+    println!("evidence=refused ticket={} blocking={}", ticket, blocking.len());
+    let first = blocking[0];
+    eprintln!(
+        "harness: error: Done refused by evidence: {} run(s) failed, running, unknown or damaged (first: {}.{} {})",
+        blocking.len(),
+        first.id,
+        first.ts,
+        first.state.as_str()
+    );
+    1
+}
+
+// ---------------------------------------------------------------- #209 + #214: unit tests
 
 #[cfg(test)]
 mod tests {
@@ -930,5 +1540,140 @@ mod tests {
         assert_eq!((v, killed), (true, false), "a committed run kills nothing");
         let (v, killed) = run_case(b"commit\n", false);
         assert_eq!((v, killed), (true, false), "a committed run kills nothing");
+    }
+
+    // ------------------------------------------------ #214: the reader's parser and tables
+
+    fn rec() -> ExitRecord {
+        ExitRecord {
+            pid: 4242,
+            committed: true,
+            outcome: "exited",
+            code: 7,
+            signal: 0,
+            start_ms: 1_000,
+            end_ms: 99_999,
+            duration_ms: 1_234,
+            stdout: stat(3, false, ""),
+            stderr: stat(0, true, "timed out"),
+            output_open_after_exit: false,
+        }
+    }
+
+    /// #214 AC 3 (unit half): the reader's parser is the strict inverse of `encode_exit` — the
+    /// encoder's own output parses back, with every value landing as the typed integer/bool it
+    /// encodes (printers re-print parsed values, never copied text). Mutant "read `code` from the
+    /// `signal` key" swaps the values the test compares and turns this red.
+    #[test]
+    fn parser_is_the_inverse_of_the_encoder() {
+        let p = parse_exit_record(encode_exit(&rec()).as_bytes()).expect("the encoder's output parses");
+        assert_eq!(p, ExitParsed {
+            pid: 4242,
+            committed: true,
+            outcome: "exited".to_string(),
+            code: 7,
+            signal: 0,
+            start_ms: 1_000,
+            end_ms: 99_999,
+            duration_ms: 1_234,
+            stdout_bytes: 3,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: true,
+            stdout_error: "none".to_string(),
+            stderr_error: "timed out".to_string(),
+            output_open_after_exit: false,
+        });
+        // a spawn failure is a committed:false record and parses
+        let mut r = rec();
+        r.committed = false;
+        r.outcome = "spawn_failed";
+        r.pid = 0;
+        r.code = -1;
+        let p = parse_exit_record(encode_exit(&r).as_bytes()).expect("a spawn failure parses");
+        assert!(!p.committed && p.outcome == "spawn_failed" && p.code == -1);
+    }
+
+    /// #214 AC 10(d,e) (unit half): the parser refuses every shape deviation — two keys swapped,
+    /// `v` 2, an unknown outcome, `committed:true` with `spawn_failed`, a second line, a missing
+    /// newline, a trailing byte, a negative signal, a non-integer, an escape-shaped string. Each is
+    /// `malformed` at the file level; here the parser half answers None for each.
+    #[test]
+    fn parser_refuses_every_deviation() {
+        let good = encode_exit(&rec());
+        assert!(parse_exit_record(good.as_bytes()).is_some(), "the baseline is good: {good}");
+        let swap_two_keys = good.replacen("\"code\":7,\"signal\":0", "\"signal\":0,\"code\":7", 1);
+        assert!(parse_exit_record(swap_two_keys.as_bytes()).is_none(), "swapped keys are malformed");
+        assert!(parse_exit_record(good.replace("\"v\":1", "\"v\":2").as_bytes()).is_none(), "v 2 is malformed");
+        assert!(
+            parse_exit_record(good.replace("\"exited\"", "\"vanished\"").as_bytes()).is_none(),
+            "an unknown outcome is malformed"
+        );
+        let mut forged = rec();
+        forged.outcome = "spawn_failed";
+        // committed stays true: start never commits a spawn it refused
+        assert!(parse_exit_record(encode_exit(&forged).as_bytes()).is_none(), "committed spawn_failed is malformed");
+        assert!(parse_exit_record(format!("{good}{good}").as_bytes()).is_none(), "two lines are malformed");
+        assert!(parse_exit_record(good.trim_end().as_bytes()).is_none(), "a missing newline is malformed");
+        assert!(parse_exit_record(format!("{good} ").as_bytes()).is_none(), "a trailing byte is malformed");
+        assert!(parse_exit_record(good.replace("\"signal\":0", "\"signal\":-3").as_bytes()).is_none(), "a negative signal is malformed");
+        assert!(parse_exit_record(good.replace("\"pid\":4242", "\"pid\":x").as_bytes()).is_none(), "a non-integer is malformed");
+        assert!(parse_exit_record(good.replace("timed out", "timed\\u0020out").as_bytes()).is_none(), "an escape-shaped string is malformed");
+        assert!(parse_exit_record(b"").is_none(), "an empty file is malformed");
+    }
+
+    /// #214 AC 10 (the owner and swap halves, unit — tests do not run as root): the uid is a
+    /// PARAMETER, so a foreign owner is a fixture, not an act of root; and the identity compare that
+    /// backs `swapped` answers false for two different files and true for one file seen twice.
+    #[test]
+    fn owner_and_identity_tables() {
+        let t = std::env::temp_dir().join(format!("evunit-{}-own", std::process::id()));
+        let _ = fs::remove_dir_all(&t);
+        fs::DirBuilder::new().mode(0o700).create(&t).unwrap();
+        let uid = own_uid().unwrap();
+        // dirs: our own 0700 dir passes, another uid's does not (the parameter IS the fixture)
+        let m = fs::symlink_metadata(&t).unwrap();
+        assert_eq!(dir_reason(&m, uid), None);
+        assert_eq!(dir_reason(&m, uid.wrapping_add(1)), Some("foreign-owner"));
+        // files: the exit table, uid as a parameter again
+        let f = t.join("exit");
+        fs::write(&f, encode_exit(&rec())).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+        let fm = fs::symlink_metadata(&f).unwrap();
+        assert_eq!(exit_file_reason(&fm, uid), None, "our own 0600 record passes");
+        assert_eq!(exit_file_reason(&fm, uid.wrapping_add(1)), Some("foreign-owner"), "another owner is refused");
+        // identity: two different files never match; one file seen twice always does
+        let g = t.join("other");
+        fs::write(&g, b"x").unwrap();
+        let gm = fs::symlink_metadata(&g).unwrap();
+        assert!(!same_identity(&fm, &gm), "two different files are a swap");
+        let fm2 = fs::symlink_metadata(&f).unwrap();
+        assert!(same_identity(&fm, &fm2), "the same file seen twice matches");
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    /// #214 decision 2 (unit): an entry is a run only when BOTH halves hold — the id splits
+    /// `<id>.<ts>.<stream>` from the right (an id may hold dots) and the stored path is exactly
+    /// `<root>/evidence/proc/<id>.<ts>/<stream>`. Everything else is `other`, never judged.
+    #[test]
+    fn run_grouping_takes_only_the_convention() {
+        let root = "/somewhere/r".to_string();
+        let roots = [root];
+        let dir = |name: &str, stream: &str| PathBuf::from(format!("/somewhere/r/evidence/proc/{name}/{stream}"));
+        assert_eq!(
+            run_of_entry("a.123.exit", dir("a.123", "exit").to_str().unwrap(), &roots),
+            Some(("a".to_string(), 123, dir("a.123", "x").parent().unwrap().to_path_buf()))
+        );
+        // an id that itself holds dots still splits from the right
+        assert_eq!(
+            run_of_entry("b.7.45.stdout", dir("b.7.45", "stdout").to_str().unwrap(), &roots),
+            Some(("b.7".to_string(), 45, dir("b.7.45", "x").parent().unwrap().to_path_buf()))
+        );
+        // wrong stream, non-digit stamp, wrong root, wrong path: none of them is a run
+        assert_eq!(run_of_entry("a.123.core", dir("a.123", "core").to_str().unwrap(), &roots), None);
+        assert_eq!(run_of_entry("a.1x3.exit", dir("a.1x3", "exit").to_str().unwrap(), &roots), None);
+        assert_eq!(run_of_entry("a.123.exit", "/elsewhere/evidence/proc/a.123/exit", &roots), None);
+        assert_eq!(run_of_entry("a.123.exit", dir("a.124", "exit").to_str().unwrap(), &roots), None);
     }
 }

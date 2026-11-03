@@ -128,8 +128,9 @@ can never block forever on something it could not signal. A helper that cannot b
 - **No orphan reaping for stop escapees** (P2) and **no finalize/teardown that calls stop for every live
   process of a ticket** (P1B-14).
 - **Evidence privacy is not handled here** (P1B-10): capture is raw, byte-for-byte, secret-shaped text kept
-  verbatim. **No evidence reader verb and no Done link** (P1B-09; a missing `exit` file reads as unknown,
-  never success). **No evidence retention/teardown** (P1B-09/P1B-14). **No worker-death record**
+  verbatim. The evidence READER verbs and the Done link are P1B-09 (`harness evidence show|check`, see
+  [runtime evidence reading](evidence.md); a missing `exit` file reads as unknown, never success).
+  **No evidence retention/teardown** (P1B-14). **No worker-death record**
   (P1B-07), **no network allow-list** (G1b/P4a).
 - **Waiter limits.** The waiter is killed by SIGKILL = no record (above). If the harness binary is replaced
   between `start` and the waiter spawn, a different binary runs as the waiter (same user only; `current_exe`).
