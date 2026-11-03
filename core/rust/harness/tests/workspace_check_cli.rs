@@ -173,6 +173,20 @@ fn stray_lines(o: &Output) -> Vec<String> {
     out(o).lines().filter(|l| l.starts_with("stray ")).map(|l| l.to_string()).collect()
 }
 
+/// The full `workspace check` line for ticket `t1` with ONE extra environment pair set for the
+/// child (run from an unrelated folder, like `check`): the F2/F3/v2/v4 tests steer the child's
+/// TMPDIR this way, never the test process's own.
+fn check_env(t: &Tmp, key: &str, val: &OsStr) -> Output {
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .env(key, val)
+        .current_dir(&unrelated)
+        .stdin(Stdio::null());
+    c.output().unwrap()
+}
+
 /// Neither stdout nor stderr may carry the raw or canonical spelling of the temp folder or of the worktree.
 fn assert_no_folder(label: &str, o: &Output, t: &Tmp) {
     let text = format!("{}{}", out(o), err(o));
@@ -1992,26 +2006,30 @@ fn a_prime_forged_edit_inside_submodule_names_the_submodule() {
 #[test]
 fn a_throwaway_index_is_removed_from_the_temp_folder() {
     // AC 5: the content compare's private temp file is never left behind, whatever the verdict.
-    fn leftovers() -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("harness-wscheck-index-"))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
-    }
+    // The child gets its OWN TMPDIR (a fresh scratch folder), so the listing is this test's alone:
+    // the r1 shape listed the SHARED system temp folder, where every parallel test's in-flight
+    // throwaway index raced the "after" listing (2 of 5 runs red). Asserting the private folder is
+    // EMPTY afterwards also proves the TMPDIR redirection itself is honoured.
     let t = Tmp::new();
     let (_, tree, _) = mk_ws(&t, false);
     fs::write(tree.join("planted.txt"), "stray").unwrap(); // the content read runs on a stray verdict too
-    let before = leftovers();
-    let o = check(&t);
+    let own = t.raw.join("own-tmp");
+    fs::create_dir_all(&own).unwrap();
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .env("TMPDIR", &own)
+        .current_dir(&unrelated)
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
     assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
-    let after = leftovers();
-    for n in after {
-        assert!(before.contains(&n), "a throwaway index file was left behind: {n}");
-    }
+    let leftovers: Vec<String> = std::fs::read_dir(&own)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "the check left files in its TMPDIR: {leftovers:?}");
 }
 
 #[test]
@@ -2295,4 +2313,260 @@ fn n_non_ascii_path_prints_as_xnn() {
     let o = check(&t);
     assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
     assert!(stray_lines(&o).iter().any(|l| l == "stray untracked caf\\xc3\\xa9.txt"), "lines: {:?}", out(&o));
+}
+
+#[test]
+fn f2_check_killed_mid_run_leaves_no_repo_index_lock() {
+    // F2: the check never takes the repo's real index lock, so a check killed mid-run cannot leave
+    // a stale `.git/index.lock` behind — the r1 `read-tree --index-output` shape held that lock
+    // during the content compare, and a SIGKILL there left it behind, blocking every later git
+    // write in the worktree. The fixture watches for the lock from the outside and kills the
+    // check's whole process group the MOMENT it appears; with the fix the lock never appears, the
+    // run finishes on its own, and the repo still works afterwards. Every wait is deadline-bounded.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    // A tree big enough that the content read's index build is a wide window to hit (r1 measured
+    // ~7 MB of index for 100k files; 40k keeps the fixture cost bounded and the window tens of ms).
+    for i in 0..40_000u32 {
+        let dir = tree.join(format!("d{}", i / 1000));
+        if i % 1000 == 0 {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        fs::write(dir.join(format!("f{i}")), format!("content number {i}\n")).unwrap();
+    }
+    git(&tree, &["add", "."]);
+    git(&tree, &["commit", "-q", "-m", "big tree"]);
+    let own = t.raw.join("kill-tmp");
+    fs::create_dir_all(&own).unwrap();
+    let lock = gitdir_of(&tree).join("index.lock");
+    assert!(!lock.exists(), "fixture: no lock before the run");
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .env("TMPDIR", &own)
+        .current_dir(&unrelated)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    use std::os::unix::process::CommandExt;
+    c.process_group(0);
+    let mut child = c.spawn().unwrap();
+    let mut saw_lock = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        if lock.exists() {
+            saw_lock = true;
+            // Kill the whole process group: the harness child AND the git grandchild holding the lock.
+            let pg = format!("-{}", child.id());
+            let _ = Command::new("kill").args(["-9", &pg]).status();
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break; // finished without the repo's real index lock ever appearing
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = child.wait();
+    assert!(!saw_lock, "the check took the repo's real index lock");
+    assert!(!lock.exists(), "a stale index.lock was left behind by a killed check");
+    // the repo still works afterwards: a normal check and a real git write both succeed
+    let o = check(&t);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    fs::write(tree.join("after.txt"), "written after the kill run").unwrap();
+    git(&tree, &["add", "after.txt"]);
+    git(&tree, &["reset", "-q", "HEAD"]);
+}
+
+#[test]
+fn f2_stale_index_lock_present_cannot_change_the_verdict() {
+    // v1 (must-fire): a `<gitdir>/index.lock` someone else left in the repo (the plan's rule: the
+    // check is read-only, so it is unaffected) neither turns a clean tree into a refusal nor gets
+    // touched or removed: same bytes, still present, verdict still exit 0.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let lock = gitdir_of(&tree).join("index.lock");
+    fs::write(&lock, b"someone else's stale lock").unwrap();
+    let o = check(&t);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(fs::read(&lock).unwrap(), b"someone else's stale lock", "the stale lock was modified");
+    assert!(lock.exists(), "the stale lock was removed");
+}
+
+#[test]
+fn f3_tmpdir_on_another_filesystem_still_checks() {
+    // F3/v4: the throwaway index is written in place through `GIT_INDEX_FILE` (its lock file beside
+    // it), so a TMPDIR on ANOTHER filesystem cannot break the check — the r1 `--index-output`
+    // shape renamed the repo's real index.lock across devices and failed EXDEV on every run, clean
+    // tree included. A genuinely different device is used when one is reachable; otherwise the
+    // test notes it and still proves a redirected TMPDIR is honoured (the cross-device rename the
+    // r1 shape made is gone either way). The dirty leg pins that the redirect is no false pass.
+    fn dev_of(p: &Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        p.metadata().ok().map(|m| m.dev())
+    }
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let repo_dev = dev_of(&t.raw).unwrap();
+    let mut chosen: Option<PathBuf> = None;
+    for cand in ["/var/tmp", "/tmp", "/dev/shm", "/private/var/tmp"] {
+        let probe = PathBuf::from(cand).join(format!("wchk-dev-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+        if fs::create_dir(&probe).is_ok() {
+            if dev_of(&probe) != Some(repo_dev) {
+                chosen = Some(probe);
+                break;
+            }
+            let _ = fs::remove_dir(&probe);
+        }
+    }
+    let scratch = match chosen {
+        Some(p) => {
+            println!("note: TMPDIR steered onto a second filesystem ({})", p.display());
+            p
+        }
+        None => {
+            println!("note: no second filesystem reachable; proving the TMPDIR redirection only");
+            let s = t.raw.join("alt-tmp");
+            fs::create_dir_all(&s).unwrap();
+            s
+        }
+    };
+    let o = check_env(&t, "TMPDIR", scratch.as_os_str());
+    assert_eq!(code(&o), 0, "clean with a steered TMPDIR: stdout: {}\nstderr: {}", out(&o), err(&o));
+    fs::write(tree.join("planted.txt"), "stray").unwrap();
+    let o = check_env(&t, "TMPDIR", scratch.as_os_str());
+    assert_eq!(code(&o), 2, "dirty with a steered TMPDIR: stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(stray_lines(&o).iter().any(|l| l == "stray untracked planted.txt"), "lines: {:?}", out(&o));
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn f5_content_read_that_cannot_be_built_fails_closed() {
+    // F5: the content compare's BUILD failure is exit 3, never a pass — the false-pass direction
+    // this ticket exists to close (the r1 swallowing mutant `let _ = content_read(...)` passed
+    // every test). An unwritable TMPDIR makes the throwaway index's lock file impossible to
+    // create, so the read-tree child fails; the check must refuse naming the worktree, with empty
+    // stdout. On a clean tree, so the swallowing mutant answers 0 and goes red here.
+    let t = Tmp::new();
+    let (_, _, _) = mk_ws(&t, false);
+    let ro = t.raw.join("ro-tmp");
+    fs::create_dir_all(&ro).unwrap();
+    let mut perm = fs::metadata(&ro).unwrap().permissions();
+    perm.set_mode(0o555);
+    fs::set_permissions(&ro, perm).unwrap();
+    let o = check_env(&t, "TMPDIR", ro.as_os_str());
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "a refusal prints no stray lines: {}", out(&o));
+    assert!(err(&o).contains("the worktree cannot be inspected"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn v2_nonexistent_tmpdir_cannot_turn_a_dirty_tree_clean() {
+    // v2 (must-fire): a TMPDIR pointing nowhere must fail CLOSED (exit 3, empty stdout), never
+    // turn a dirty workspace into a pass: the throwaway index cannot be built there, and a check
+    // that cannot be run is a refusal.
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    fs::write(tree.join("planted.txt"), "stray").unwrap();
+    let nowhere = t.raw.join("no-such-dir");
+    let o = check_env(&t, "TMPDIR", nowhere.as_os_str());
+    assert_eq!(code(&o), 3, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(out(&o).is_empty(), "a refusal prints no stray lines: {}", out(&o));
+    assert!(err(&o).contains("the worktree cannot be inspected"), "stderr: {}", err(&o));
+}
+
+#[test]
+fn v3_two_checks_at_once_in_one_repo_both_finish() {
+    // v3 (must-fire): two checks run CONCURRENTLY in the same repo must both finish with the same
+    // verdict and leave no lock behind: each child builds its own pid-qualified throwaway index in
+    // its own TMPDIR, and neither ever touches the repo's real index lock. Bounded by a deadline.
+    let t = Tmp::new();
+    let (_, _, _) = mk_ws(&t, false);
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut children = Vec::new();
+    for tag in ["a", "b"] {
+        let mut c = Command::new(BIN);
+        c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+            .env("TMPDIR", t.raw.join(format!("par-tmp-{tag}")))
+            .current_dir(&unrelated)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        fs::create_dir_all(t.raw.join(format!("par-tmp-{tag}"))).unwrap();
+        children.push(c.spawn().unwrap());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    for child in &mut children {
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "a concurrent check did not finish in the deadline");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    for child in children {
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    }
+    let lock = gitdir_of(&t.raw.join("W/t1/tree")).join("index.lock");
+    assert!(!lock.exists(), "a concurrent check left the repo's index.lock behind");
+}
+
+#[test]
+fn v5_clean_tree_passes_while_git_status_runs_beside_it() {
+    // v5 (must-not-fire): the check never needs the repo's index lock, so a user's own
+    // `git status` (which does take it, to refresh the stat cache) running beside the check breaks
+    // neither side. The status loop is bounded (deadline plus an iteration cap).
+    let t = Tmp::new();
+    let (_, tree, _) = mk_ws(&t, false);
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let mut c = Command::new(BIN);
+    c.args(["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap()])
+        .current_dir(&unrelated)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut runs = 0u32;
+    loop {
+        let st = git_try(&tree, &["status", "--porcelain"]);
+        assert!(st.status.success(), "a concurrent git status failed: {}", String::from_utf8_lossy(&st.stderr));
+        runs += 1;
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the check did not finish in the deadline");
+        assert!(runs < 100_000, "the status loop passed its iteration cap");
+    }
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert!(runs > 0, "at least one concurrent status must have run");
+}
+
+#[test]
+fn n1_nested_repo_inside_a_dirty_submodule_is_not_double_named() {
+    // N1: a checked-out repo nested inside a DIRTY submodule is covered by the submodule's own
+    // `stray submodule sub` line — the walk must not ALSO name `sub/inner/.git` untracked (the r1
+    // shape never recorded the nested gitlinks of an already-stray submodule, so the exit was
+    // right but the label was wrong). Exit stays 2 (fail closed) with exactly the one line.
+    let t = Tmp::new();
+    let (_, sub) = mk_sub_ws(&t, "tn1", "Wn1", "Mn1");
+    let (s_raw, _) = t.both("SIN");
+    fs::create_dir_all(&s_raw).unwrap();
+    git(&s_raw, &["init", "-q"]);
+    fs::write(s_raw.join("i.txt"), "i").unwrap();
+    git(&s_raw, &["add", "i.txt"]);
+    git(&s_raw, &["commit", "-q", "-m", "i1"]);
+    git(&sub, &["-c", "protocol.file.allow=always", "submodule", "add", "--name", "inner", s_raw.to_str().unwrap(), "inner"]);
+    fs::write(sub.join("dirty.txt"), "stray").unwrap(); // sub is dirty by its OWN status: the early-return branch
+    let o = check_id(&t, "tn1", "Mn1");
+    assert_eq!(code(&o), 2, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    let lines = stray_lines(&o);
+    assert!(lines.iter().any(|l| l == "stray submodule sub"), "lines: {lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("sub/inner")), "the nested repo is double-named: {lines:?}");
+    assert_no_folder("n1", &o, &t);
 }

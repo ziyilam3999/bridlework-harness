@@ -76,7 +76,10 @@ moves or locks anything in the repo or the manifest (it reads the manifest throu
 and every git call runs under `--no-optional-locks` with fsmonitor forced off, so not even the index's stat
 cache is refreshed. Its one write anywhere is a single private throwaway index file in the system temp folder
 (never inside any repo, holding nothing but paths git itself derived from HEAD) that the content compare
-below builds and removes before the command returns. P1B-15 wires it into `harness ticket finalize`; this command only answers the question.
+below builds and removes before the command returns; git reaches it through `GIT_INDEX_FILE`, so the only
+lock ever taken is `<temp file>.lock` beside it — never the repo's own `index.lock`, whatever `TMPDIR` is set
+to. A check killed by SIGKILL cannot run that removal and leaves one such temp file behind (harmless: it is
+in the temp folder, not in any repo, and holds nothing but paths git itself derived from HEAD). P1B-15 wires it into `harness ticket finalize`; this command only answers the question.
 
 ```
 harness workspace check <ticket> --manifest-dir <absolute-dir>
@@ -212,11 +215,10 @@ semantics, none with a measured hide):
   finalize caller must treat 3 as "not proven" anyway;
 - X: a committed `ident` / `eol` attribute can hide bytes inside a `$Id: ... $` marker — git's own semantics:
   those bytes can never be committed differently, so there is nothing to hide from a commit;
-- Y: `core.precomposeUnicode` is not forced (a fold only merges two spellings the filesystem itself already
-  treats as one file; no measured hide).
+- Y: ticket 155's closed plan lacks its own deferred-follow-ups row; this list is that record.
+- sibling: `core.precomposeUnicode` is not forced (a fold only merges two spellings the filesystem itself
+  already treats as one file; no measured hide).
 
 Ignored build output inside the tree (for example `target/`) fails the check on purpose: clean it before
-finalize or list it on the manifest, as described in the P1B-11 plan. Not covered here: unpushed commits
-(P1B-12), moving leftovers to quarantine (P1B-13), anything in the ticket root outside `tree` (the
-quarantine sweep's ground). No new event kind; P1B-15 records the
+finalize or list it on the manifest, as described in the P1B-11 plan. Unpushed commits (P1B-12) are covered by the separate mode `harness workspace check <ticket> --manifest-dir <dir> --pushed --repo <absolute-dir>`: exit 0 pushed (one `workspace=pushed` line), exit 4 unpushed (one `unpushed <sha> ws/<t>` line per commit plus a `workspace=unpushed ... count=<n>` line), exit 3 cannot check — a missing upstream fails closed, never a pass; the answer reads the LOCAL remote-tracking ref only (no network), so fetch first — but a fetch rule that excludes the branch (a negative refspec) never refreshes the tracking ref, keeping it stale: a stale or forged tracking ref is not detected. Not covered here: moving leftovers to quarantine (P1B-13), anything in the ticket root outside `tree` (the quarantine sweep's ground). No new event kind; P1B-15 records the
 finalize result.

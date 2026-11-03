@@ -66,6 +66,10 @@ pub enum Line {
     AddPath { ticket: String, id: String, class: Class, path: String, ts_ms: u64 },
     AddProcess { ticket: String, id: String, pid: u64, pid_start_ms: u64, ts_ms: u64 },
     AddPort { ticket: String, id: String, port: u64, ts_ms: u64 },
+    /// Written only by `process start --timeout-ms`, right after the process line for that id and before
+    /// its port line (#207). Reader rule: valid only for an id that is a LIVE `process` entry with no
+    /// limit yet; anything else is corruption at that line. A `remove` of the id ends the limit.
+    Limit { ticket: String, id: String, timeout_ms: u64, ts_ms: u64 },
     Remove { ticket: String, id: String, ts_ms: u64 },
 }
 
@@ -73,6 +77,7 @@ const KEYS_ROOT: [&str; 5] = ["v", "op", "ticket", "path", "ts_ms"];
 const KEYS_ADD_PATH: [&str; 7] = ["v", "op", "ticket", "id", "class", "path", "ts_ms"];
 const KEYS_ADD_PROCESS: [&str; 8] = ["v", "op", "ticket", "id", "class", "pid", "pid_start_ms", "ts_ms"];
 const KEYS_ADD_PORT: [&str; 7] = ["v", "op", "ticket", "id", "class", "port", "ts_ms"];
+const KEYS_LIMIT: [&str; 6] = ["v", "op", "ticket", "id", "timeout_ms", "ts_ms"];
 const KEYS_REMOVE: [&str; 5] = ["v", "op", "ticket", "id", "ts_ms"];
 
 /// A path as it may be stored on a line: absolute, and holding no character that would need a JSON escape
@@ -88,6 +93,7 @@ impl Line {
             | Line::AddPath { ticket, .. }
             | Line::AddProcess { ticket, .. }
             | Line::AddPort { ticket, .. }
+            | Line::Limit { ticket, .. }
             | Line::Remove { ticket, .. } => ticket,
         }
     }
@@ -96,6 +102,7 @@ impl Line {
         match self {
             Line::Root { .. } => "root",
             Line::AddPath { .. } | Line::AddProcess { .. } | Line::AddPort { .. } => "add",
+            Line::Limit { .. } => "limit",
             Line::Remove { .. } => "remove",
         }
     }
@@ -107,6 +114,7 @@ impl Line {
             Line::AddPath { class, .. } => format!("add_{}", class.as_str()),
             Line::AddProcess { .. } => "add_process".to_string(),
             Line::AddPort { .. } => "add_port".to_string(),
+            Line::Limit { .. } => "limit".to_string(),
             Line::Remove { .. } => "remove".to_string(),
         }
     }
@@ -118,6 +126,7 @@ impl Line {
             Line::AddPath { .. } => &KEYS_ADD_PATH,
             Line::AddProcess { .. } => &KEYS_ADD_PROCESS,
             Line::AddPort { .. } => &KEYS_ADD_PORT,
+            Line::Limit { .. } => &KEYS_LIMIT,
             Line::Remove { .. } => &KEYS_REMOVE,
         }
     }
@@ -162,6 +171,14 @@ impl Line {
                     return Err("port must be an integer in 1..65535".to_string());
                 }
             }
+            Line::Limit { ticket, id, timeout_ms, .. } => {
+                if !token_ok(ticket) || !token_ok(id) {
+                    return Err("ticket and id must be plain tokens (lowercase letters, digits, '-', '_', '.')".to_string());
+                }
+                if *timeout_ms < 1 {
+                    return Err("timeout_ms must be an integer >= 1 (a 0 ms limit is already expired)".to_string());
+                }
+            }
             Line::Remove { ticket, id, .. } => {
                 if !token_ok(ticket) || !token_ok(id) {
                     return Err("ticket and id must be plain tokens (lowercase letters, digits, '-', '_', '.')".to_string());
@@ -197,6 +214,12 @@ impl Line {
                     SCHEMA_VERSION
                 )
             }
+            Line::Limit { ticket, id, timeout_ms, ts_ms } => {
+                format!(
+                    "{{\"v\":{},\"op\":\"limit\",\"ticket\":\"{ticket}\",\"id\":\"{id}\",\"timeout_ms\":{timeout_ms},\"ts_ms\":{ts_ms}}}\n",
+                    SCHEMA_VERSION
+                )
+            }
             Line::Remove { ticket, id, ts_ms } => {
                 format!("{{\"v\":{},\"op\":\"remove\",\"ticket\":\"{ticket}\",\"id\":\"{id}\",\"ts_ms\":{ts_ms}}}\n", SCHEMA_VERSION)
             }
@@ -228,7 +251,7 @@ impl Line {
         }
         let op = match get("op") {
             None => return Err("op missing".to_string()),
-            Some(Val::Str(s)) if s == "root" || s == "add" || s == "remove" => s.as_str(),
+            Some(Val::Str(s)) if s == "root" || s == "add" || s == "remove" || s == "limit" => s.as_str(),
             Some(Val::Str(s)) => return Err(format!("unknown op {s:?}")),
             Some(_) => return Err("op has the wrong type".to_string()),
         };
@@ -245,6 +268,8 @@ impl Line {
             }
         } else if op == "root" {
             &KEYS_ROOT
+        } else if op == "limit" {
+            &KEYS_LIMIT
         } else {
             &KEYS_REMOVE
         };
@@ -288,6 +313,9 @@ impl Line {
                     _ => unreachable!("class was checked above"),
                 }
             }
+            // The `limit` op must be matched EXPLICITLY before the catch-all: the `_` arm builds a Remove,
+            // so an unmatched new op would silently decode as a remove of its id.
+            "limit" => Line::Limit { ticket, id: text("id")?, timeout_ms: num("timeout_ms")?, ts_ms },
             _ => Line::Remove { ticket, id: text("id")?, ts_ms },
         };
         line.validate().map_err(|e| format!("line refused: {e}"))?;
@@ -394,12 +422,22 @@ pub enum Target {
     Port(u64),
 }
 
-/// One live entry, in add order.
+/// The limit a `limit` line attached to a live process entry (#207): the timeout and the `ts_ms` of the
+/// line that recorded it (a wall clock that reads BEFORE that ts_ms is a detectable backward jump).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitRec {
+    pub timeout_ms: u64,
+    pub ts_ms: u64,
+}
+
+/// One live entry, in add order. `limit` is Some only for a process entry a `limit` line followed; a
+/// `remove` of the id ends it (the entry, limit and all, leaves the live set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub id: String,
     pub class: Class,
     pub target: Target,
+    pub limit: Option<LimitRec>,
 }
 
 /// The current state: the roots plus every `add` whose `id` has no later `remove`. Roots are not entries.
@@ -453,7 +491,7 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                 if st.live.iter().any(|e| matches!(&e.target, Target::Path(p) if p == path)) {
                     return Err((*n, format!("the same path is listed twice live: {path}")));
                 }
-                st.live.push(Entry { id: id.clone(), class: *class, target: Target::Path(path.clone()) });
+                st.live.push(Entry { id: id.clone(), class: *class, target: Target::Path(path.clone()), limit: None });
             }
             Line::AddProcess { ticket: _, id, pid, pid_start_ms, .. } => {
                 if st.roots.is_empty() {
@@ -469,6 +507,7 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                     id: id.clone(),
                     class: Class::Process,
                     target: Target::Process { pid: *pid, pid_start_ms: *pid_start_ms },
+                    limit: None,
                 });
             }
             Line::AddPort { ticket: _, id, port, .. } => {
@@ -481,7 +520,24 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                 if st.live.iter().any(|e| matches!(&e.target, Target::Port(p) if p == port)) {
                     return Err((*n, format!("the same port is listed twice live: {port}")));
                 }
-                st.live.push(Entry { id: id.clone(), class: Class::Port, target: Target::Port(*port) });
+                st.live.push(Entry { id: id.clone(), class: Class::Port, target: Target::Port(*port), limit: None });
+            }
+            Line::Limit { ticket: _, id, timeout_ms, ts_ms } => {
+                if st.roots.is_empty() {
+                    return Err((*n, "limit before init".to_string()));
+                }
+                // The reader rule: a limit line is valid ONLY for an id that is a live PROCESS entry with
+                // no limit yet; anything else was not written by this module's writer, so it is corruption.
+                let Some(pos) = st.live.iter().position(|e| e.id == *id) else {
+                    return Err((*n, format!("limit of an id that is not live: {id}")));
+                };
+                if !matches!(st.live[pos].target, Target::Process { .. }) {
+                    return Err((*n, format!("limit for a non-process entry: {id}")));
+                }
+                if st.live[pos].limit.is_some() {
+                    return Err((*n, format!("a second limit for live id {id}")));
+                }
+                st.live[pos].limit = Some(LimitRec { timeout_ms: *timeout_ms, ts_ms: *ts_ms });
             }
             Line::Remove { ticket: _, id, .. } => {
                 if st.roots.is_empty() {
@@ -711,6 +767,9 @@ pub enum Op<'a> {
     AddPath { id: &'a str, class: Class, path: &'a Path },
     AddProcess { id: &'a str, pid: u64, pid_start_ms: u64 },
     AddPort { id: &'a str, port: u64 },
+    /// Library-only (#207): `harness manifest add` cannot write a limit line; only `process start
+    /// --timeout-ms` does, under the supervisor lock, right after the process line.
+    Limit { id: &'a str, timeout_ms: u64 },
     Remove { id: &'a str },
 }
 
@@ -958,6 +1017,32 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 ts_ms,
             })
         }
+        Op::Limit { id, timeout_ms } => {
+            if !token_ok(id) {
+                return Err(ManifestError::Invalid("id must be a plain token (lowercase letters, digits, '-', '_', '.')".to_string()));
+            }
+            if *timeout_ms < 1 {
+                return Err(ManifestError::Invalid("timeout_ms must be an integer >= 1 (a 0 ms limit is already expired)".to_string()));
+            }
+            let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
+            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            // The writer mirrors the reader rule, so the sheet it wrote can never read back as corrupt.
+            let Some(e) = r.live.iter().find(|e| e.id == *id) else {
+                return Err(ManifestError::Invalid(format!("limit of an id that is not live: {id}")));
+            };
+            if !matches!(e.target, Target::Process { .. }) {
+                return Err(ManifestError::Invalid(format!("limit for a non-process entry: {id}")));
+            }
+            if e.limit.is_some() {
+                return Err(ManifestError::Invalid(format!("a second limit for live id {id}")));
+            }
+            append_locked(&mut f, &Line::Limit {
+                ticket: ticket.to_string(),
+                id: id.to_string(),
+                timeout_ms: *timeout_ms,
+                ts_ms,
+            })
+        }
         Op::Remove { id } => {
             if !token_ok(id) {
                 return Err(ManifestError::Invalid("id must be a plain token (lowercase letters, digits, '-', '_', '.')".to_string()));
@@ -1007,7 +1092,7 @@ pub fn process_start_ms(pid: u64) -> Result<u64, String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| "clock is before the epoch".to_string())?
             .as_millis() as u64;
-        let out = std::process::Command::new("ps")
+        let out = std::process::Command::new("/bin/ps")
             .arg("-o")
             .arg("etime=")
             .arg("-p")
@@ -1040,9 +1125,127 @@ pub fn process_start_ms(pid: u64) -> Result<u64, String> {
     }
 }
 
+
+// ---------------------------------------------------------------- process age (#207)
+
+/// The boot-relative age arithmetic of the Linux age read (#207 r1 F2), factored PURE over the two
+/// numbers so its fail-closed rules are testable: the age is `uptime_ms - starttime_ms`, both
+/// boot-relative. An odd clock reading — a NaN, infinite or negative uptime, a finite reading that does
+/// not fit a u64 millisecond clock, or an uptime BELOW the pid's own starttime (an impossible clock) —
+/// is Err, never a saturated 0 that would read as "brand new, within every limit"; the caller refuses
+/// on Err (fail closed).
+/// Compiled on Linux (the only reader) and under `cfg(test)` everywhere, so the pure table runs on both
+/// CI legs; off-Linux non-test builds carry no dead copy of it.
+#[cfg(any(target_os = "linux", test))]
+fn boot_age_ms(up_s: f64, start_ms: u64) -> Result<u64, String> {
+    if !up_s.is_finite() || up_s < 0.0 {
+        return Err(format!("the uptime reads {up_s}, which is not a usable clock"));
+    }
+    let up_ms = up_s * 1000.0;
+    if up_ms >= u64::MAX as f64 {
+        return Err(format!("the uptime reads {up_s}s, which does not fit a millisecond clock"));
+    }
+    let up_ms = up_ms as u64;
+    if up_ms < start_ms {
+        return Err(format!("the uptime reads {up_ms}ms, before the pid's own start time {start_ms}ms"));
+    }
+    Ok(up_ms - start_ms)
+}
+
+/// The AGE of `pid` in ms, read std-only, for the supervisor's timeout decision (#207). On Linux it is
+/// `/proc/uptime` minus `/proc/<pid>/stat` starttime, both boot-relative, so a wall-clock jump cannot move
+/// it; elsewhere it is the system `ps -o etime=` (whole seconds, wall-based — a forward wall jump can stop
+/// a process early, an honest limit named in docs/process-supervisor.md). The `ps` helper path is a
+/// parameter (the same shape as the supervisor's liveness probe) so the not-runnable case is testable: an
+/// age that cannot be read is Err, and the caller refuses on it, never "not expired".
+pub fn process_age_ms_at(ps: &Path, pid: u64) -> Result<u64, String> {
+    if pid <= 1 {
+        return Err(format!("pid {pid} is not a process whose age can be read"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = ps;
+        let uptime = fs::read_to_string("/proc/uptime").map_err(|_| "cannot read /proc/uptime".to_string())?;
+        let up_s = uptime
+            .split_whitespace()
+            .next()
+            .ok_or("no uptime in /proc/uptime")?
+            .parse::<f64>()
+            .map_err(|_| "uptime is not a number".to_string())?;
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| format!("cannot read /proc/{pid}/stat"))?;
+        let after_paren = stat.rsplit_once(')').map(|(_, r)| r).ok_or("stat has no command field")?;
+        let fields: Vec<&str> = after_paren.split_whitespace().collect();
+        // fields[0] is stat field 3 (state); starttime is field 22, so index 22 - 3 = 19.
+        let ticks: u64 = fields.get(19).ok_or("stat has no starttime field")?.parse().map_err(|_| "starttime is not an integer")?;
+        // CLK_TCK is 100 on every mainstream Linux userspace; both values are boot-relative.
+        let start_ms = ticks * 1000 / 100;
+        boot_age_ms(up_s, start_ms)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new(ps)
+            .arg("-o")
+            .arg("etime=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run ps: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("ps does not know pid {pid}"));
+        }
+        let et = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if et.is_empty() {
+            return Err(format!("ps returned no age for pid {pid}"));
+        }
+        // `etime` prints [[dd-]hh:]mm:ss, sometimes with a fractional second; only whole seconds are knowable.
+        let main = et.split('.').next().unwrap_or(&et);
+        let (days, time) = match main.split_once('-') {
+            Some((d, r)) => (d.trim().parse::<u64>().map_err(|_| format!("cannot parse ps etime {et:?}"))?, r),
+            None => (0, main),
+        };
+        let parts: Vec<u64> = time
+            .split(':')
+            .map(|p| p.trim().parse::<u64>().map_err(|_| format!("cannot parse ps etime {et:?}")))
+            .collect::<Result<_, _>>()?;
+        let secs = match parts.as_slice() {
+            [mm, ss] => days * 86400 + mm * 60 + ss,
+            [hh, mm, ss] => days * 86400 + hh * 3600 + mm * 60 + ss,
+            _ => return Err(format!("cannot parse ps etime {et:?}")),
+        };
+        Ok(secs * 1000)
+    }
+}
+
+/// The age of `pid` through the absolute-path helper (the production call; PATH never decides the age).
+pub fn process_age_ms(pid: u64) -> Result<u64, String> {
+    process_age_ms_at(Path::new("/bin/ps"), pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #207 r1 F2 (pure table): the boot-age arithmetic fails CLOSED on every odd clock — an uptime below
+    /// the pid's own starttime (an impossible clock), nan, either infinity, a negative reading, or a finite
+    /// reading that does not fit a u64 millisecond clock — never a saturated 0 that would read as "brand
+    /// new, within every limit". Normal readings answer uptime minus starttime.
+    #[test]
+    fn boot_age_ms_fails_closed_on_odd_clocks() {
+        assert_eq!(boot_age_ms(12.5, 2_500).unwrap(), 10_000, "a normal reading is uptime minus starttime");
+        assert_eq!(boot_age_ms(2.5, 2_500).unwrap(), 0, "a pid started exactly now is age 0");
+        assert_eq!(boot_age_ms(0.0, 0).unwrap(), 0, "a fresh boot with no pid read yet is age 0");
+        assert!(boot_age_ms(2.4, 2_500).is_err(), "an uptime below the starttime is an impossible clock, never age 0");
+        assert!(boot_age_ms(f64::NAN, 2_500).is_err(), "nan refuses");
+        assert!(boot_age_ms(f64::INFINITY, 2_500).is_err(), "inf refuses");
+        assert!(boot_age_ms(f64::NEG_INFINITY, 2_500).is_err(), "-inf refuses");
+        assert!(boot_age_ms(-1.0, 2_500).is_err(), "a negative uptime refuses");
+        assert!(boot_age_ms(1e300, 2_500).is_err(), "a finite reading that does not fit u64 ms refuses");
+        let why = boot_age_ms(f64::NAN, 2_500).unwrap_err();
+        assert!(why.contains("uptime"), "the refusal names the uptime: {why}");
+    }
 
     /// N-f: a later root whose line is over the cap makes init refuse with `TooLong` and leaves NOTHING on disk (no
     /// manifest dir, no file, no earlier root line). The roots here are synthetic: `write_init` takes roots already
