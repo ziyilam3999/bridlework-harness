@@ -1034,3 +1034,58 @@ fn ac8_211_an_inherited_append_onto_an_over_cap_log_is_refused_and_writes_nothin
     assert!(e.contains("EVENT NOT RECORDED"), "{e}");
     assert_eq!(fs::metadata(&big).unwrap().len(), LOG_READ_CAP + 1, "the over-cap log is left byte-for-byte unchanged");
 }
+
+// ---------------------------------------------------------------- #213: the writer-side cap (an append that would take the log past the read cap is refused)
+
+/// The exact two-line stderr of a writer-side cap refusal, built from the constant (never a hand-typed number).
+fn over_cap_stderr() -> String {
+    format!(
+        "harness: error: log refused: the append would take the log over the {}-byte read cap; nothing was appended\nharness: EVENT NOT RECORDED\n",
+        LOG_READ_CAP
+    )
+}
+
+/// The shared shape of every #213 CLI refusal: exit 2, empty stdout, exactly the two refusal lines on stderr,
+/// no log byte echoed, and the log left byte-for-byte as the fixture made it (full content compare).
+fn assert_over_cap_refusal(o: &Output, big: &Path, before: &[u8]) {
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(out(o), "");
+    assert_eq!(err(o), over_cap_stderr(), "exactly the two refusal lines, nothing else");
+    assert!(!err(o).contains("MARKER-213-SECRET"), "no log byte is ever echoed: {}", err(o));
+    assert_eq!(fs::read(big).unwrap(), before, "the log is byte-for-byte unchanged");
+}
+
+#[test]
+fn ac2_213_an_append_onto_an_at_cap_log_is_refused_and_writes_nothing() {
+    let t = Tmp::new();
+    let big = t.0.join("at.jsonl");
+    // A log of exactly LOG_READ_CAP bytes, ending in a newline so the append reaches the size check: any append,
+    // even one byte, would take it past the cap the reader enforces.
+    sparse(&big, LOG_READ_CAP, b"MARKER-213-SECRET\n", b'\n');
+    let before = fs::read(&big).unwrap();
+    let o = append(&big, "escalation", "1");
+    assert_over_cap_refusal(&o, &big, &before);
+}
+
+#[test]
+fn ac3_213_an_append_one_byte_under_the_cap_is_refused_the_payload_completes_the_crossing() {
+    let t = Tmp::new();
+    let big = t.0.join("under.jsonl");
+    // One byte under the cap is NOT room: the payload itself would carry the log past the cap, so it is refused.
+    sparse(&big, LOG_READ_CAP - 1, b"MARKER-213-SECRET\n", b'\n');
+    let before = fs::read(&big).unwrap();
+    let o = append(&big, "escalation", "1");
+    assert_over_cap_refusal(&o, &big, &before);
+}
+
+#[test]
+fn ac4_213_a_self_issued_append_onto_an_over_cap_log_is_refused_and_writes_nothing() {
+    let t = Tmp::new();
+    let big = t.0.join("over.jsonl");
+    // Already over the cap and no HARNESS_RUN_ID: a self-issue never reads the log, so only the writer-side
+    // check stands between this append and an unreadable log.
+    sparse(&big, LOG_READ_CAP + 1, b"MARKER-213-SECRET\n", b'\n');
+    let before = fs::read(&big).unwrap();
+    let o = append(&big, "escalation", "1");
+    assert_over_cap_refusal(&o, &big, &before);
+}

@@ -11,6 +11,8 @@ pub mod core_layering;
 pub mod death;
 pub mod decode;
 pub mod detect;
+#[cfg(unix)]
+pub mod evidence;
 pub mod events;
 pub mod explain;
 pub mod fix_tier;
