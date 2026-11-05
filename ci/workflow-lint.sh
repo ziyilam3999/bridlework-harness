@@ -21,7 +21,7 @@ ALLOWED_PERMS = {"contents", "issues", "pull-requests"}
 # smoke driver (ci/gate-secret-smoke.sh) models or allows, because a key it does not model (working-directory, shell, defaults,
 # container, services, strategy ...) can move where the secret step runs without any smoke noticing. Keep the sets in step with it.
 SECRET_WORKFLOWS = {"privacy-gate.yml", "privacy-gate-next.yml", "privacy-text.yml", "privacy-release-text.yml"}
-SECRET_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "if", "working-directory"}
+SECRET_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "working-directory"}
 SECRET_JOB_KEYS = {"runs-on", "timeout-minutes", "environment", "steps"}
 SECRET_TOP_KEYS = {"name", "on", "permissions", "jobs"}
 SECRET_WD = "core/rust"        # the engine build dir: allowed as a working-directory only, and never on a step that holds the secret
@@ -197,7 +197,7 @@ def lint_14c(path, cl):
         for line, jid, nm, nline in jobs:
             rep = nm if nm else jid
             at = nline if nm else line
-            if rep == "gate" and name != "privacy-gate.yml":
+            if rep == "gate" and name not in ("privacy-gate.yml", "privacy-gate-next.yml"):
                 bad.append((at, "required-name-gate"))
             if rep == "final-gate" and not fg:
                 bad.append((at, "required-name-final-gate"))
