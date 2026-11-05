@@ -34,8 +34,8 @@ One operation per line, compact, fixed key order, every key present. Each line c
 three `evidence` entries per start, ids `<id>.<ts_ms>.stdout`, `<id>.<ts_ms>.stderr` and
 `<id>.<ts_ms>.exit`, whose paths are `<root>/evidence/proc/<id>.<ts_ms>/{stdout,stderr,exit}` — written
 AHEAD of the spawn, so the files are never unlisted orphans. They stay live after a `stop` (evidence
-outlives the process); the run stamp lets the same `--id` start again without colliding. Retention is
-P1B-09/P1B-14.
+outlives the process); the run stamp lets the same `--id` start again without colliding. The reader
+verbs are `harness evidence show|check` ([evidence reading](evidence.md)); retention is P1B-14.
 
 ## The fence
 
