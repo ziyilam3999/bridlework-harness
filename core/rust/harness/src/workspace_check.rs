@@ -11,15 +11,25 @@
 //! status with the assume-unchanged or skip-worktree bit; a submodule with any change; and a listed inside path
 //! that is gone or no longer the recorded kind (kind `missing`).
 //!
-//! The check never writes, deletes, moves or locks anything: it never touches the manifest (read through the
+//! The check never writes, deletes, moves or locks anything in the repo or the manifest (read through the
 //! existing reader only), and every git call runs under `--no-optional-locks` with fsmonitor off, so not even the
-//! index's stat cache is refreshed. No repo-controlled setting or index flag is trusted when deciding clean:
+//! index's stat cache is refreshed; its ONE write anywhere is a private throwaway index file in the system
+//! temp folder (ticket #184), built from HEAD for a content compare, never inside any repo — not even its
+//! lock: git reaches it through `GIT_INDEX_FILE`, so the only lock ever taken is `<temp file>.lock` next to
+//! the throwaway index itself — and removed
+//! before the check returns. No repo-controlled setting or index flag is trusted when deciding clean:
 //! every git call forces `--no-optional-locks`, `--no-replace-objects` (a replace ref cannot swap what HEAD
 //! looks like), no hooks, fsmonitor/trustctime/checkStat/filemode/untrackedCache/sparseCheckout off-or-default
-//! on the command line (command-line config outranks repo, worktree and global config), every inherited
+//! plus `core.ignorecase=false` (two spellings of one name stay two paths) and `core.symlinks=true` (a
+//! tracked symlink replaced by a regular file stays a type change) on the command line (command-line config
+//! outranks repo, worktree and global config), every inherited
 //! `GIT_*` name is stripped, ignored paths are listed (`--ignored=matching`), and the same forced reads run
 //! recursively INSIDE every checked-out submodule (the submodule's own config, exclude files and index bits
-//! hide nothing; a submodule that cannot be inspected is exit 3 naming it). User-level config is not the
+//! hide nothing; a submodule that cannot be inspected is exit 3 naming it). "Modified" is decided by
+//! CONTENT, not by the stat cache: on top of the status read, every repo checked gets a second
+//! tracked-file read against that throwaway index rebuilt from HEAD with no stat information at all, so
+//! git must hash every tracked file and compare bytes — a same-size edit with the clock forged back into
+//! the index-write second cannot read clean. User-level config is not the
 //! repo's doing and never changes what the check sees, so it is neither read nor refused: every git call
 //! runs with the system config off and the global config pointed at the null device, and the user
 //! attributes file forced to the null device too — a `filter.lfs.*` block in the user's own global config
@@ -92,7 +102,12 @@ const WALK_CAP: usize = 200_000;
 /// The hard cap on unpushed commits listed in one answer: past it the branch cannot be summarized, exit 3.
 const PUSHED_CAP: usize = 1000;
 
-/// The forced status read, identical for the worktree and every checked-out submodule.
+/// The forced status read, identical for the worktree and every checked-out submodule. Submodules are
+/// compared by commit pointer only (`--ignore-submodules=dirty`): git's own dirty-content probe would
+/// spawn the submodule's own status read, which honours the submodule's own config — so a
+/// submodule-local filter could run before this check has refused it. Commit-pointer changes still
+/// show, and every dirty-content shape inside a checked-out submodule is named by the check's own
+/// pass inside it (see `check_submodule`), so nothing is lost.
 const STATUS_ARGS: [&str; 7] = [
     "status",
     "--porcelain=v2",
@@ -100,7 +115,7 @@ const STATUS_ARGS: [&str; 7] = [
     "-z",
     "--untracked-files=all",
     "--ignored=matching",
-    "--ignore-submodules=none",
+    "--ignore-submodules=dirty",
 ];
 
 /// One stray kind. The order is the priority: a path carrying two kinds is reported once, with the stronger.
@@ -217,8 +232,10 @@ fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>), i3
 /// One captured git call: read-only (`--no-optional-locks`, so not even the index stat cache is refreshed),
 /// replace refs off (`--no-replace-objects`, so a `git replace` cannot swap what HEAD looks like), no hooks,
 /// no fsmonitor and no stat levers (command-line config outranks repo, worktree and global config, so
-/// `core.trustctime=false`, `core.checkStat=minimal`, `core.filemode=false`, `core.untrackedCache=true` and
-/// `core.sparseCheckout=true` in the repo cannot relax the comparison), no inherited `GIT_*` name (an
+/// `core.trustctime=false`, `core.checkStat=minimal`, `core.filemode=false`, `core.untrackedCache=true`,
+/// `core.sparseCheckout=true`, `core.ignorecase=true` (two spellings of one name stay two paths) and
+/// `core.symlinks=false` (a tracked symlink replaced by a regular file holding the link text stays a
+/// type change) in the repo cannot relax or fold the comparison), no inherited `GIT_*` name (an
 /// inherited `GIT_DIR`/`GIT_CONFIG_*` cannot redirect or reconfigure it), and no user-level config at all
 /// (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL` at the null device, `core.attributesFile` forced to the
 /// null device: the system file, the global file, the XDG config and the user attributes file are never
@@ -232,6 +249,12 @@ struct GitOut {
 }
 
 fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
+    git_bytes_env(tree, args, None)
+}
+
+/// The same call with one environment pair set AFTER the inherited `GIT_*` strip: the content read
+/// points `GIT_INDEX_FILE` at its private throwaway index, and no inherited value can survive to it.
+fn git_bytes_env(tree: &Path, args: &[&str], extra_env: Option<(&str, &std::ffi::OsStr)>) -> GitOut {
     let mut c = Command::new("git");
     c.arg("--no-optional-locks")
         .arg("--no-replace-objects")
@@ -244,6 +267,8 @@ fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
         .args(["-c", "core.filemode=true"])
         .args(["-c", "core.untrackedCache=false"])
         .args(["-c", "core.sparseCheckout=false"])
+        .args(["-c", "core.ignorecase=false"])
+        .args(["-c", "core.symlinks=true"])
         .args(["-c", "core.attributesFile=/dev/null"])
         .args(args);
     for (k, _) in std::env::vars_os() {
@@ -261,6 +286,9 @@ fn git_bytes(tree: &Path, args: &[&str]) -> GitOut {
     // failing every check (the CI-red shape).
     c.env("GIT_CONFIG_NOSYSTEM", "1");
     c.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    if let Some((k, v)) = extra_env {
+        c.env(k, v);
+    }
     let mut child = match c
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -488,27 +516,100 @@ fn gitlink_state(p: &Path) -> GitlinkState {
         }
         Err(_) => return GitlinkState::Odd,
     }
-    if p.join(".git").exists() {
-        GitlinkState::CheckedOut
-    } else {
-        GitlinkState::Odd
+    match std::fs::symlink_metadata(p.join(".git")) {
+        // A directory (a plain embedded repo) or a regular file (git's `gitdir:` pointer) is a git dir.
+        // A SYMLINK is not: it leads wherever it pleases (outside the checked tree), so it is Odd —
+        // exit 3 naming the submodule, never a pass. No-follow means a dangling `.git` link is Odd
+        // too (an `.exists()` follow would read a dangling link as absent, and a valid one as a repo).
+        Ok(m) if !m.file_type().is_symlink() => GitlinkState::CheckedOut,
+        _ => GitlinkState::Odd,
     }
+}
+
+/// The forged-clock guard (ticket #184, item A): "modified" is decided by CONTENT, never by the stat
+/// cache. Every repo checked (the worktree and each checked-out submodule) gets a second tracked-file
+/// read against a throwaway index rebuilt from HEAD that carries no stat information at all, so git
+/// must hash every tracked file and compare bytes — a same-size edit whose mtime and ctime were forged
+/// back into the index-write second cannot read clean. The throwaway index is ONE private file in the
+/// system temp folder (never inside any repo, holding nothing but paths git itself derived from HEAD);
+/// git reaches it through `GIT_INDEX_FILE`, so the only lock ever taken is `<temp file>.lock` beside it
+/// (never the repo's real index lock, and the lock-to-index rename never crosses a filesystem). It
+/// is built and read with the same forced flags and neutral config (`core.splitIndex=false` too, so no
+/// shared-index file is looked for next to it), is removed on every exit path, and a failure to build
+/// or read it is exit 3 — never a pass. The paths it names are stray `modified` (strongest kind wins,
+/// exactly as for the status read; inside a submodule pass they make the submodule itself stray).
+fn content_read(tree: &Path, label: &str, map: &mut std::collections::BTreeMap<Vec<u8>, Kind>) -> Result<(), i32> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "harness-wscheck-index-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    // The Drop removes the temp file on EVERY exit path below, including a panic.
+    struct TmpIndex(PathBuf);
+    impl Drop for TmpIndex {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _t = TmpIndex(tmp.clone());
+    // F2/F3: the throwaway index is built through `GIT_INDEX_FILE` pointing straight at the temp
+    // file, so git takes ONLY `<tmp>.lock` — in the temp folder, next to the index it is renamed
+    // onto, so that rename can never cross a filesystem either. The r1 shape
+    // (`read-tree --index-output=<tmp>`) held the REPO's real `<gitdir>/index.lock` and renamed it
+    // to the temp path: a parallel `git add` in the repo could fail, a check killed mid-run left a
+    // stale lock behind that blocked every later write, and a temp folder on another filesystem
+    // made even a clean tree exit 3 (the rename failed EXDEV). The build call and the status read
+    // below carry the same env pair, set AFTER the inherited `GIT_*` strip.
+    let build = git_bytes_env(
+        tree,
+        &["-c", "core.splitIndex=false", "read-tree", "HEAD"],
+        Some(("GIT_INDEX_FILE", tmp.as_os_str())),
+    );
+    if !build.ok {
+        return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+    }
+    let read = git_bytes_env(
+        tree,
+        &[
+            "-c",
+            "core.splitIndex=false",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=dirty",
+        ],
+        Some(("GIT_INDEX_FILE", tmp.as_os_str())),
+    );
+    if read.overflow {
+        return Err(stop3(&format!("too many paths: the status answer of {label} went over the read cap")));
+    }
+    if !read.ok {
+        return Err(stop3(&format!("{label} cannot be inspected: a git call inside it failed")));
+    }
+    parse_status(&read.bytes, map);
+    Ok(())
 }
 
 /// The forced reads INSIDE one checked-out submodule at `tree` (worktree-relative `rel`), recursing into
 /// nested submodules. Any hit — a status entry, an untracked or ignored path, a non-`H` ls-files tag, all
-/// read with the same forced flags and neutral config as the superproject — makes the SUBMODULE stray
-/// (`stray submodule <rel>`, the submodule's own path, never a path inside it). The outermost level that
+/// read with the same forced flags and neutral config as the superproject, plus the same content read
+/// against a throwaway stat-free index — makes the SUBMODULE stray (`stray submodule <rel>`, the
+/// submodule's own path, never a path inside it). The outermost level that
 /// can see the change names it, so once a level is dirty its own nested submodules need no separate
 /// verdict; a level that looks clean is exactly where git's own probe may have been blinded by the inner
 /// repo's settings, so the descent continues there. Depth, total count and every git output are capped
-/// (exit 3 past any); a submodule that cannot be inspected is exit 3 naming it.
+/// (exit 3 past any); a submodule that cannot be inspected is exit 3 naming it. Every checked-out level
+/// records its own path in `gitlinks_live`, so the tree walk (which runs after this pass) can skip the
+/// `.git` of each checked-out submodule and only those.
 fn check_submodule(
     tree: &Path,
     rel: &[u8],
     depth: usize,
     visited: &mut usize,
     map: &mut std::collections::BTreeMap<Vec<u8>, Kind>,
+    gitlinks_live: &mut Vec<Vec<u8>>,
 ) -> Result<(), i32> {
     if depth >= SUBMODULE_DEPTH_CAP {
         return Err(stop3(
@@ -519,6 +620,7 @@ fn check_submodule(
     if *visited > SUBMODULE_CAP {
         return Err(stop3("too many paths: over the checked-submodule cap"));
     }
+    gitlinks_live.push(rel.to_vec());
     let label = format!("submodule {}", escape(rel));
     refuse_scan(tree, &label)?;
     let status = git_bytes(tree, &STATUS_ARGS);
@@ -562,6 +664,16 @@ fn check_submodule(
             .unwrap_or(false);
     if dirty {
         insert(map, rel.to_vec(), Kind::Submodule);
+        record_nested_gitlinks(tree, rel, depth, visited, gitlinks_live)?;
+        return Ok(());
+    }
+    // The same content read as the worktree's (item A): a forged-clock edit inside the submodule is
+    // invisible to the status and hidden reads above, so nothing but a content compare can name it.
+    let mut content = std::collections::BTreeMap::new();
+    content_read(tree, &label, &mut content)?;
+    if !content.is_empty() {
+        insert(map, rel.to_vec(), Kind::Submodule);
+        record_nested_gitlinks(tree, rel, depth, visited, gitlinks_live)?;
         return Ok(());
     }
     for sub_rel in gitlinks(tree, &label)? {
@@ -581,23 +693,64 @@ fn check_submodule(
                 let mut child_rel = rel.to_vec();
                 child_rel.push(b'/');
                 child_rel.extend_from_slice(&sub_rel);
-                check_submodule(&child, &child_rel, depth + 1, visited, map)?;
+                check_submodule(&child, &child_rel, depth + 1, visited, map, gitlinks_live)?;
             }
         }
     }
     Ok(())
 }
 
+/// Record, WITHOUT inspecting, the checked-out gitlinks nested inside an already-stray submodule
+/// (r1 N1): the walk skips the `.git` of every recorded path, so a checked-out repo nested inside a
+/// DIRTY submodule is covered by the submodule's own `stray` line instead of being double-named
+/// `stray untracked <sub>/<inner>/.git` next to it. Depth and total count are capped exactly as the
+/// inspecting pass (exit 3 past either); an `Odd` or absent nested folder is left to the walk, which
+/// sees no `.git` in it either way.
+fn record_nested_gitlinks(
+    tree: &Path,
+    rel: &[u8],
+    depth: usize,
+    visited: &mut usize,
+    gitlinks_live: &mut Vec<Vec<u8>>,
+) -> Result<(), i32> {
+    if depth >= SUBMODULE_DEPTH_CAP {
+        return Err(stop3(
+            "too many paths: submodule nesting is over the depth cap",
+        ));
+    }
+    let label = format!("submodule {}", escape(rel));
+    for sub_rel in gitlinks(tree, &label)? {
+        let child = tree.join(std::ffi::OsStr::from_bytes(&sub_rel));
+        if !matches!(gitlink_state(&child), GitlinkState::CheckedOut) {
+            continue;
+        }
+        *visited += 1;
+        if *visited > SUBMODULE_CAP {
+            return Err(stop3("too many paths: over the checked-submodule cap"));
+        }
+        let mut child_rel = rel.to_vec();
+        child_rel.push(b'/');
+        child_rel.extend_from_slice(&sub_rel);
+        gitlinks_live.push(child_rel.clone());
+        record_nested_gitlinks(&child, &child_rel, depth + 1, visited, gitlinks_live)?;
+    }
+    Ok(())
+}
+
 /// A no-follow walk of the tree catching what git never lists: an entry that is not a regular file, a
-/// directory or a symlink (a FIFO, a socket, a device) is `stray untracked <relpath>`. The `.git` entry is
-/// skipped at every level (nothing under it is the worktree's business), symlinks are never followed
-/// (their targets are outside this walk's ground), and the visit count is capped (exit 3 past it or on any
-/// read error — a tree that cannot be walked cannot be proven clean).
+/// directory or a symlink (a FIFO, a socket, a device) is `stray untracked <relpath>`. An entry named
+/// `.git` is skipped ONLY for the worktree itself (rel is empty) and for each checked-out gitlink
+/// recorded in `gitlinks_live` (the paths `check_submodule` inspected); any OTHER entry named `.git` —
+/// a stray file, a stray directory, a planted repo — is `stray untracked <path>` in its own right and
+/// is never descended into. Symlinks are never followed (their targets are outside this walk's
+/// ground), and the visit count is capped (exit 3 past it or on any read error — a tree that cannot be
+/// walked cannot be proven clean).
 fn walk_special(
     dir: &Path,
     rel: &[u8],
     visits: &mut usize,
     map: &mut std::collections::BTreeMap<Vec<u8>, Kind>,
+    gitlinks_live: &[Vec<u8>],
 ) -> Result<(), i32> {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -619,7 +772,20 @@ fn walk_special(
         let name = entry.file_name();
         let name_bytes = name.as_bytes();
         if name_bytes == b".git" {
-            continue;
+            if rel.is_empty() || gitlinks_live.iter().any(|g| g == rel) {
+                continue; // the worktree's own git dir, or a checked-out submodule's
+            }
+            *visits += 1;
+            if *visits > WALK_CAP {
+                return Err(stop3("too many paths: over the tree-walk visit cap"));
+            }
+            let mut stray_rel = rel.to_vec();
+            if !stray_rel.is_empty() {
+                stray_rel.push(b'/');
+            }
+            stray_rel.extend_from_slice(name_bytes);
+            insert(map, stray_rel, Kind::Untracked);
+            continue; // a stray `.git` is named once and never descended into
         }
         *visits += 1;
         if *visits > WALK_CAP {
@@ -642,7 +808,7 @@ fn walk_special(
         if ft.is_symlink() {
             continue; // judged as a path of its own by git and the no-follow stat; never followed
         } else if ft.is_dir() {
-            walk_special(&entry.path(), &child_rel, visits, map)?;
+            walk_special(&entry.path(), &child_rel, visits, map, gitlinks_live)?;
         } else if !ft.is_file() {
             insert(map, child_rel, Kind::Untracked);
         }
@@ -1231,9 +1397,21 @@ pub fn check_cmd(a: &[String]) -> i32 {
     }
     parse_hidden(&hidden.bytes, &mut map);
 
-    // 10. The submodule pass: git's own submodule probe runs the submodule's own status, which honours the
-    //     submodule's own config and index bits — so every CHECKED-OUT gitlink gets the same forced reads
-    //     inside it (recursively), and a hit names the submodule itself.
+    // 9b. The content read (ticket #184, item A): a second tracked-file read against a throwaway index
+    //     rebuilt from HEAD with no stat information at all, so git must hash every tracked file and
+    //     compare bytes — the stat cache (size, mtime, ctime) can never decide "clean" here, and a
+    //     same-size edit with the clock forged back into the index-write second is still named. The
+    //     throwaway index is one private temp file, removed before the check returns.
+    if let Err(code) = content_read(&tree, "the worktree", &mut map) {
+        return code;
+    }
+
+    // 10. The submodule pass: git's own dirty-content probe would run the submodule's own status, which
+    //     honours the submodule's own config and index bits — so the status read above compares submodule
+    //     commit pointers only, and every CHECKED-OUT gitlink gets the same forced reads inside it
+    //     (recursively), and a hit names the submodule itself. Each level records its path so the walk
+    //     below skips exactly those `.git` entries.
+    let mut gitlinks_live: Vec<Vec<u8>> = Vec::new();
     let mut submodules_visited = 0usize;
     let top_gitlinks = match gitlinks(&tree, "the worktree") {
         Ok(v) => v,
@@ -1250,7 +1428,7 @@ pub fn check_cmd(a: &[String]) -> i32 {
                 ));
             }
             GitlinkState::CheckedOut => {
-                if let Err(code) = check_submodule(&p, &rel, 0, &mut submodules_visited, &mut map) {
+                if let Err(code) = check_submodule(&p, &rel, 0, &mut submodules_visited, &mut map, &mut gitlinks_live) {
                     return code;
                 }
             }
@@ -1258,9 +1436,10 @@ pub fn check_cmd(a: &[String]) -> i32 {
     }
 
     // 11. The walk: entries git never lists (a FIFO, a socket, a device) are stray untracked. No-follow,
-    //     `.git` skipped, symlinks never followed, visits capped.
+    //     `.git` skipped only for the worktree and the checked-out gitlinks, symlinks never followed,
+    //     visits capped.
     let mut visits = 0usize;
-    if let Err(code) = walk_special(&tree, b"", &mut visits, &mut map) {
+    if let Err(code) = walk_special(&tree, b"", &mut visits, &mut map, &gitlinks_live) {
         return code;
     }
 
