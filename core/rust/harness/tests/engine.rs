@@ -359,6 +359,10 @@ fn git_modes() {
 fn binary_and_oversize_refused() {
     let d = tmp("bin");
     git(&d, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&d, &["config", k, v]);
+    }
     std::fs::write(d.join("b.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
     git(&d, &["add", "b.bin"]);
     let (rc, out, _) = scan_in(&d, &["--staged"]);
@@ -375,6 +379,10 @@ fn binary_and_oversize_refused() {
 fn invalid_utf8_refused() {
     let d = tmp("utf8");
     git(&d, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&d, &["config", k, v]);
+    }
     std::fs::write(d.join("x.txt"), [b'a', 0xff, 0xfe, b'\n']).unwrap();
     git(&d, &["add", "x.txt"]);
     let (rc, out, _) = scan_in(&d, &["--staged"]);

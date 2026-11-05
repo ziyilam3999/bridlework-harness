@@ -947,6 +947,14 @@ fn delete_listed_race_swapped_subdir_never_followed() {
 /// so the move batch is long; once the batch directory appears (it is minted only AFTER the
 /// read-only walk), every group is swapped for a symlink to one outside folder holding a file
 /// NAMED `c`. The outside file must never land on the shelf. Three trials.
+///
+/// Measured (#187, CI run 41383253550): the one red this shape ever produced was NOT a timing
+/// wobble - a PATH-based rename resolved a group swapped in mid-run and moved the OUTSIDE file
+/// named `c`. That product race is fixed (the sweep moves through the verified parent handle)
+/// and the deterministic twin `sweep_swap_between_recheck_and_move_never_redirects` below carries
+/// the detection. THIS test is the stress check only: its watcher polls the shelf, so the swap may
+/// land outside each item's re-check/move gap and skip every group; a pass here says "no false
+/// red", never "the bug is caught".
 #[test]
 fn sweep_ancestor_swap_never_moves_from_outside() {
     for trial in 1..=3 {

@@ -354,6 +354,10 @@ fn a_folder_that_is_not_a_repo_top_is_refused_without_naming_it() {
     let a_file = t.file("just-a-file.txt", "x");
     let empty_repo = t.dir("empty-repo");
     git(&empty_repo, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&empty_repo, &["config", k, v]);
+    }
     let tf = t.file("tb.json", ticket_for("b"));
     for (label, dir) in [("missing", &missing), ("plain", &plain), ("subfolder", &sub), ("file", &a_file), ("no commit", &empty_repo)] {
         let o = go(&b, &tf, &[("b", dir)]);
