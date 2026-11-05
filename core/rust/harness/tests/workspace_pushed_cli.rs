@@ -86,7 +86,7 @@ fn bare(t: &Tmp, name: &str) -> PathBuf {
     let (d, _) = t.both(name);
     fs::create_dir_all(&d).unwrap();
     git(&d, &["init", "-q", "--bare"]);
-    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0")] {
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
         git(&d, &["config", k, v]);
     }
     d

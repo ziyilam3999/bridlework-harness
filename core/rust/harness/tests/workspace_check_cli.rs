@@ -666,6 +666,10 @@ fn case14_changed_submodule_is_stray() {
     let (s_raw, _) = t.both("S");
     fs::create_dir_all(&s_raw).unwrap();
     git(&s_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s_raw, &["config", k, v]);
+    }
     fs::write(s_raw.join("s.txt"), "s").unwrap();
     git(&s_raw, &["add", "s.txt"]);
     git(&s_raw, &["commit", "-q", "-m", "s1"]);
@@ -856,6 +860,10 @@ fn case19_submodule_dirty_content_is_stray() {
     let (s_raw, _) = t.both("S");
     fs::create_dir_all(&s_raw).unwrap();
     git(&s_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s_raw, &["config", k, v]);
+    }
     fs::write(s_raw.join("s.txt"), "s").unwrap();
     git(&s_raw, &["add", "s.txt"]);
     git(&s_raw, &["commit", "-q", "-m", "s1"]);
@@ -911,6 +919,10 @@ fn case20_nontoplevel_folder_of_another_repo_is_exit_3() {
     let (x, _) = t.both("W/t1/xrepo");
     fs::create_dir_all(x.join("inner")).unwrap();
     git(&x, &["init", "-q", "-b", "ws/t1"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&x, &["config", k, v]);
+    }
     fs::write(x.join("inner/keep.txt"), "x").unwrap();
     git(&x, &["add", "inner/keep.txt"]);
     git(&x, &["commit", "-q", "-m", "x"]);
@@ -1134,6 +1146,10 @@ fn ho7_node_modules_link_and_clean_submodule_stay_clean() {
     let (s_raw, _) = t.both("S");
     fs::create_dir_all(&s_raw).unwrap();
     git(&s_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s_raw, &["config", k, v]);
+    }
     fs::write(s_raw.join("s.txt"), "s").unwrap();
     git(&s_raw, &["add", "s.txt"]);
     git(&s_raw, &["commit", "-q", "-m", "s1"]);
@@ -1194,6 +1210,10 @@ fn mk_sub_ws(t: &Tmp, id: &str, wdir: &str, mdir: &str) -> (PathBuf, PathBuf) {
     let (s_raw, _) = t.both("S");
     fs::create_dir_all(&s_raw).unwrap();
     git(&s_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s_raw, &["config", k, v]);
+    }
     fs::write(s_raw.join("a.txt"), "a").unwrap();
     git(&s_raw, &["add", "a.txt"]);
     git(&s_raw, &["commit", "-q", "-m", "s1"]);
@@ -1642,12 +1662,20 @@ fn ho14_nested_submodule_hidden_bit_is_stray() {
     let (s2_raw, _) = t.both("S2");
     fs::create_dir_all(&s2_raw).unwrap();
     git(&s2_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s2_raw, &["config", k, v]);
+    }
     fs::write(s2_raw.join("inner.txt"), "i").unwrap();
     git(&s2_raw, &["add", "inner.txt"]);
     git(&s2_raw, &["commit", "-q", "-m", "i1"]);
     let (s1_raw, _) = t.both("S1");
     fs::create_dir_all(&s1_raw).unwrap();
     git(&s1_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s1_raw, &["config", k, v]);
+    }
     fs::write(s1_raw.join("a.txt"), "a").unwrap();
     git(&s1_raw, &["add", "a.txt"]);
     git(&s1_raw, &["commit", "-q", "-m", "s1"]);
@@ -2227,6 +2255,10 @@ fn k_over_the_checked_submodule_cap_is_exit_3() {
     let (tpl, _) = t.both("k-tpl");
     fs::create_dir_all(&tpl).unwrap();
     git(&tpl, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&tpl, &["config", k, v]);
+    }
     git(&tpl, &["commit", "-q", "--allow-empty", "-m", "e"]);
     let sha = head(&tpl);
     for i in 0..101u32 {
@@ -2266,6 +2298,10 @@ fn l_over_the_submodule_depth_cap_is_exit_3() {
     for (i, d) in dirs.iter().enumerate().rev() {
         fs::create_dir_all(d).unwrap();
         git(d, &["init", "-q"]);
+        // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            git(d, &["config", k, v]);
+        }
         if !sha.is_empty() {
             git(d, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},l{}", i + 2)]);
         }
@@ -2558,6 +2594,10 @@ fn n1_nested_repo_inside_a_dirty_submodule_is_not_double_named() {
     let (s_raw, _) = t.both("SIN");
     fs::create_dir_all(&s_raw).unwrap();
     git(&s_raw, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&s_raw, &["config", k, v]);
+    }
     fs::write(s_raw.join("i.txt"), "i").unwrap();
     git(&s_raw, &["add", "i.txt"]);
     git(&s_raw, &["commit", "-q", "-m", "i1"]);
