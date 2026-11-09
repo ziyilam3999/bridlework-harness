@@ -49,7 +49,7 @@ factory.design_tier
 
 `repos` has no fixed keys: each key is a repo id (section 5). It may be empty.
 
-- `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys.
+- `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys. `harness ticket gate` reads the wall-time limit of the ticket's size (`budget(size)`, #93): it is the gate's settings source (`--config <file>`, else `HARNESS_CONFIG`), and no source is a refusal, never an unbudgeted run. The token limit stays unread (Deferred).
 - `shadow`: per capability, a ticket or dispatch cap (`p1a_cap`, `p4a_cap`, `d2a_cap`, `p7_cap`) and a token budget (`..._token_budget`).
 - `lanes`: `count`, the number of lanes. The session-name check reads it as the upper bound of a legal lane number (P1B-16); the value is policy, not private: the example ships 4.
 - `friction`: `inbox`, the path of the friction inbox file. It is a path value, not a number: the same shape rules as a `repos` folder (section 5). The real file lives only in the private overlay; `harness friction` (ticket 154) is its reader and writer. The section's second key, `pattern_threshold`, is the contract's one OPTIONAL key (ticket 192): the N a friction pattern chain's repeat count must reach before `harness friction patterns` lists it (`docs/friction-inbox.md`); a positive whole number exactly like every numeric key, absent = 3.
@@ -94,7 +94,7 @@ Anything outside this contract is a refusal. The refusal names the section and k
 The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. `friction.pattern_threshold` ships as its default value, `3`, written out so the one optional key is visible in the public example; omitting the line means the same thing. `factory.design_tier` ships as `T3`, the spec default (G8.3): a default lives in the public example, the same pattern as `lanes.count`. The real values live only in the private file.
 ## 8. Who reads it
 
-The library exposes pure lookups: `repo_dir(&RepoId)`, `budget(size)`, `shadow()`, `lane_count()`, `friction_inbox()` and `design_tier()`. The one command over the config itself is `harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]`.
+The library exposes pure lookups: `repo_dir(&RepoId)`, `budget(size)`, `shadow()`, `lane_count()`, `friction_inbox()` and `design_tier()`. Readers of `budget(size)`: `harness ticket gate` (#93, the wall-time half). The one command over the config itself is `harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]`.
 
 - Exit 0: the config loaded. One stdout line `config ok repos=<n> shadow=ok`; with `--repo` also `repo_id=<id> mapped`; with `--budget` also `budget size=<S> wall_seconds=<n> tokens=<n>`. It never prints a folder.
 - Exit 1: a lookup refusal only. `--repo` names an id that is not in the map. Stdout empty; stderr names the id.

@@ -16,6 +16,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 const MIB: usize = 1024 * 1024;
+
+/// The full v4 settings key set with generous limits (a day for S and M, a week for L), so the wall-time budget never bites a
+/// merged test: `ticket gate` refuses to run without a settings source (ticket 93 part B, fail closed).
+const SETTINGS_V4: &str = "repos:\n\nbudgets:\n  s_wall_seconds: 86400\n  s_tokens: 1000000\n  m_wall_seconds: 86400\n  m_tokens: 1000000\n  l_wall_seconds: 604800\n  l_tokens: 1000000\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl\n\nfactory:\n  design_tier: T3\n";
+
+/// The settings file the real gate run reads: written ONCE into a process-wide temp folder OUTSIDE every fixture root.
+/// Only `Gw::gate` names it (`status` refuses an unknown option, so the shared `args_for`/`run_sub` are not touched).
+fn settings() -> &'static Path {
+    static CFG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("hstatus-{}-cfg", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("settings.yaml");
+        fs::write(&p, SETTINGS_V4).unwrap();
+        p
+    })
+}
 const KEYS: [&str; 8] = ["ticket", "repo_id", "head", "last_gate", "gate_head", "gate_current", "failure_class", "fix_rounds"];
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -696,6 +713,9 @@ impl Gw {
         let mut a = args_for(&self.tf, &self.repo, self.res.to_str().unwrap(), self.caps.to_str().unwrap());
         a.insert(3, self.c0.clone());
         a.insert(3, "--base".to_string());
+        // The gate's settings source (ticket 93), on this vector only: `status` refuses an unknown option, so the shared helpers stay untouched.
+        a.push("--config".to_string());
+        a.push(settings().to_str().unwrap().to_string());
         run_sub("ticket", &self.other, &[vec!["gate".to_string()], a].concat())
     }
 

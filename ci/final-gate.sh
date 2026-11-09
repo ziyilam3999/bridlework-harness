@@ -49,7 +49,40 @@ mkdir "$work/result" || exit 2
 mkdir "$work/caps" || exit 2
 emit_ticket > "$work/ticket.json" || exit 2
 
-out=$("$bin" ticket gate "$work/ticket.json" --repo-map "core=$repo" --base "$base" --result-dir "$work/result" --caps-dir "$work/caps")
+# The gate's settings source (ticket 93): a full v4 settings file written into this run's own fresh temp folder (nothing from
+# the repo under test), with generous limits and fresh caps per CI run, so the wall-time budget never bites here.
+cat > "$work/settings.yaml" <<'CFGEOF' || exit 2
+repos:
+
+budgets:
+  s_wall_seconds: 86400
+  s_tokens: 1000000
+  m_wall_seconds: 86400
+  m_tokens: 1000000
+  l_wall_seconds: 604800
+  l_tokens: 1000000
+
+shadow:
+  p1a_cap: 5
+  p4a_cap: 10
+  d2a_cap: 20
+  p7_cap: 10
+  p1a_token_budget: 1
+  p4a_token_budget: 1
+  d2a_token_budget: 1
+  p7_token_budget: 1
+
+lanes:
+  count: 4
+
+friction:
+  inbox: /placeholder/friction-inbox.jsonl
+
+factory:
+  design_tier: T3
+CFGEOF
+
+out=$("$bin" ticket gate "$work/ticket.json" --repo-map "core=$repo" --config "$work/settings.yaml" --base "$base" --result-dir "$work/result" --caps-dir "$work/caps")
 rc=$?
 printf '%s\n' "$out"
 if [ "$rc" -eq 0 ]; then
