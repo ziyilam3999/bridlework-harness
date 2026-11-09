@@ -65,9 +65,12 @@ fn result_dir_arg_ok(s: &str) -> bool {
     p.is_absolute() && !p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
+/// One option's not-yet-seen value; a type definition so the parse tuple stays under clippy's complexity threshold.
+type Slot<'a> = Option<&'a str>;
+
 fn parse_args(a: &[String]) -> Result<Args, Stop> {
     let mut map = RepoMap::new();
-    let (mut file, mut base, mut dir, mut caps_dir, mut config): (Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>) = (None, None, None, None, None);
+    let (mut file, mut base, mut dir, mut caps_dir, mut config): (Slot, Slot, Slot, Slot, Slot) = (None, None, None, None, None);
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {

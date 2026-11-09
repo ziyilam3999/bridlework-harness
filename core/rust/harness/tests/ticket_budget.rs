@@ -253,7 +253,7 @@ fn now_ms() -> u64 {
 /// `started_ms` read out of a canonical budget line.
 fn started_ms_of(text: &str) -> u64 {
     let i = text.find("\"started_ms\":").expect("a canonical budget line") + "\"started_ms\":".len();
-    text[i..].trim_end_matches(|c: char| c == '}' || c == '\n').parse().expect("digits")
+    text[i..].trim_end_matches(['}', '\n']).parse().expect("digits")
 }
 
 fn ticket_json(repo_id: &str, id: &str, size: &str) -> String {
