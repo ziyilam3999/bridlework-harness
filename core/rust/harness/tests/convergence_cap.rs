@@ -18,6 +18,23 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// The full v4 settings key set with generous limits (a day for S and M, a week for L), so the wall-time budget never bites a
+/// merged test: `ticket gate` refuses to run without a settings source (ticket 93 part B, fail closed).
+const SETTINGS_V4: &str = "repos:\n\nbudgets:\n  s_wall_seconds: 86400\n  s_tokens: 1000000\n  m_wall_seconds: 86400\n  m_tokens: 1000000\n  l_wall_seconds: 604800\n  l_tokens: 1000000\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 1\n  p4a_token_budget: 1\n  d2a_token_budget: 1\n  p7_token_budget: 1\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl\n\nfactory:\n  design_tier: T3\n";
+
+/// The settings file every gate child reads: written ONCE into a process-wide temp folder OUTSIDE every fixture root (so the
+/// whole-root listing test stays green).
+fn settings() -> &'static Path {
+    static CFG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("hconv-{}-cfg", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("settings.yaml");
+        fs::write(&p, SETTINGS_V4).unwrap();
+        p
+    })
+}
+
 struct Tmp(PathBuf);
 
 impl Tmp {
@@ -250,6 +267,8 @@ fn command(cwd: &Path, args: &[String], env: &[(&str, &Path)]) -> Command {
     }
     // The run identity of an escalation (v2): the role and model of the gate run, never defaulted by the harness.
     c.env("HARNESS_ROLE", "executor").env("HARNESS_MODEL", "m-1");
+    // The settings source every gate run now needs (ticket 93): set before the row's own env pairs, so a row may still point a run at its own file.
+    c.env("HARNESS_CONFIG", settings());
     for (k, v) in env {
         c.env(k, v);
     }

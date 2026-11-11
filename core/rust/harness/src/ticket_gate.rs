@@ -8,6 +8,7 @@
 
 use crate::both_ends;
 use crate::caps::{self, Caps, LockError, Record};
+use crate::config::Config;
 use crate::gate_result::{GateResult, Status};
 use crate::gates::{self, Gates};
 use crate::intake::{intake, RepoMap};
@@ -19,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: harness ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
+pub const USAGE: &str = "usage: harness ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] [--config <file>] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
 /// The folded result's gate id.
 pub const GATE_ID: &str = "ticket-gate";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
@@ -42,6 +43,7 @@ struct Args {
     base: String,
     result_dir: PathBuf,
     caps_dir: PathBuf,
+    config: Option<String>,
 }
 
 fn base_ok(s: &str) -> bool {
@@ -63,9 +65,12 @@ fn result_dir_arg_ok(s: &str) -> bool {
     p.is_absolute() && !p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
+/// One option's not-yet-seen value; a type definition so the parse tuple stays under clippy's complexity threshold.
+type Slot<'a> = Option<&'a str>;
+
 fn parse_args(a: &[String]) -> Result<Args, Stop> {
     let mut map = RepoMap::new();
-    let (mut file, mut base, mut dir, mut caps_dir): (Option<&str>, Option<&str>, Option<&str>, Option<&str>) = (None, None, None, None);
+    let (mut file, mut base, mut dir, mut caps_dir, mut config): (Slot, Slot, Slot, Slot, Slot) = (None, None, None, None, None);
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
@@ -77,6 +82,7 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
             "--base" => &mut base,
             "--result-dir" => &mut dir,
             "--caps-dir" => &mut caps_dir,
+            "--config" => &mut config,
             s if s.starts_with("--") => return Err(usage_err("unknown option")),
             _ => {
                 if file.replace(arg.as_str()).is_some() {
@@ -103,7 +109,7 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
     if !result_dir_arg_ok(caps_dir) {
         return Err(usage_err("--caps-dir must be an absolute path with no `..` component"));
     }
-    Ok(Args { ticket_file: file.to_string(), map, base: base.to_string(), result_dir: PathBuf::from(dir), caps_dir: PathBuf::from(caps_dir) })
+    Ok(Args { ticket_file: file.to_string(), map, base: base.to_string(), result_dir: PathBuf::from(dir), caps_dir: PathBuf::from(caps_dir), config: config.map(|c| c.to_string()) })
 }
 
 /// One git call: no hooks, no inherited `GIT_*` name, no stdin, pinned to the canonical root's own `.git`. Same shape as `path_map::changed_paths`.
@@ -256,6 +262,8 @@ struct Outcome {
     cap_reached: bool,
     /// True when this FAIL was the 2nd identical one in a row on a new head, so the next run is refused with `replan-threshold`.
     replan_reached: bool,
+    /// True when a FAIL run ended with the wall-time budget spent, so the next run is refused with `budget_exceeded`.
+    budget_spent_at_end: bool,
 }
 
 /// What a call ended with: a verdict, or a refusal to run at all (the fix-round cap).
@@ -267,6 +275,22 @@ enum Ran {
 fn run(a: &[String]) -> Result<Ran, Stop> {
     // 1. Arguments.
     let args = parse_args(a)?;
+
+    // 1b. The settings source (the wall-time limit lives in it): `--config`, else `HARNESS_CONFIG`, no third source. A non-empty
+    // flag wins even when `HARNESS_CONFIG` is empty; an empty flag or an empty env value is refused and never falls back; no source
+    // at all is exit 2 before anything runs. The whole file loads through the merged strict loader, so a bad file stops the run the
+    // same way. This is the accepted THIRD small copy of the resolver (same as `config check` and `session check-name`); the dedup
+    // belongs to the next command that gains a settings source. No error repeats the settings path or a value from it.
+    let config_path = match args.config.as_deref() {
+        Some("") => return Err(err2("the config source is empty")),
+        Some(f) => f.to_string(),
+        None => match std::env::var_os("HARNESS_CONFIG") {
+            Some(v) if v.is_empty() => return Err(err2("the config source is empty")),
+            Some(v) => v.to_string_lossy().into_owned(),
+            None => return Err(err2("no config configured (pass --config <file> or set HARNESS_CONFIG)")),
+        },
+    };
+    let config = Config::load(Path::new(&config_path)).map_err(err2)?;
 
     // 2. Ticket and repo. The mapped folder is canonicalized ONCE; the one-entry map built from it is what intake verifies.
     let mut bytes = Vec::new();
@@ -321,7 +345,21 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
     };
     // The same-failure streak is read once, here, under the lock; every later update is computed from THIS value and never re-reads the file.
     let streak = caps.read_streak(&ticket.id, &repo_id).map_err(err2)?;
-    if let Err(refusal) = caps::start_check(used, streak.as_ref()) {
+    // The wall-time meter (point B, still under the lock, before any run): ONE clock read, then the strict budget reader. An absent
+    // file means the clock has not started (it starts at this run's point C); a present file is this ticket's pinned start. The size
+    // pinned in the file must match the ticket file's size NOW (editing `S`->`L` in the ticket cannot buy a bigger budget), and a
+    // clock behind the start is exit 2 (fail closed, never "elapsed 0"). Then the merged three-rule order: re-plan > budget > cap.
+    let now = caps::now_ms().map_err(err2)?;
+    let started = caps.read_budget(&ticket.id, &repo_id).map_err(err2)?;
+    let wall_seconds = config.budget(&ticket.size).ok_or_else(|| err2("the ticket's size has no budget in the config"))?.wall_seconds;
+    let mut spent = false;
+    if let Some(b) = &started {
+        if b.size != ticket.size {
+            return Err(err2("the size pinned in the budget file does not match the ticket's size"));
+        }
+        spent = caps::budget_spent(Some(b.started_ms), now, wall_seconds).map_err(err2)?;
+    }
+    if let Err(refusal) = caps::start_check_budget(used, streak.as_ref(), spent) {
         caps.escalate(&refusal, &ticket.id, &repo_id)
             .map_err(|m| Stop(2, format!("harness: ESCALATION NOT RECORDED reason={} ({})", refusal.reason, m)))?;
         return Ok(Ran::Refused { ticket_id: ticket.id, head, reason: refusal.reason });
@@ -359,6 +397,13 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
 
         plan = Some((ids, all, checks));
     }
+
+    // 5a. START the wall-time meter, durably, just before the round is paid: written once at the first paid run and never rewritten
+    // (a PASS does not clear it; the meter is the ticket's lifetime). An existing file is left untouched; a failed write stops the
+    // run with no round paid and nothing run. There is deliberately NO point-B pre-check of the budget temp name, so a planted bad
+    // temp is met here, by the writer, proving the start-before-pay order.
+    let meter = caps::Budget { ticket: ticket.id.clone(), repo_id: repo_id.clone(), size: ticket.size.clone(), started_ms: now };
+    caps.write_budget_once(&meter, &lock).map_err(|_| Stop(2, "harness: budget start not written".to_string()))?;
 
     // 5b. PAY the round (point C), durably, before the first check runs. If the write fails nothing runs. Only a decided PASS refunds it.
     caps.write(&Record { ticket: ticket.id.clone(), repo_id: repo_id.clone(), fix_rounds: used, in_flight: true }, &lock).map_err(err2)?;
@@ -409,7 +454,19 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
     caps.write(&Record { ticket: ticket.id.clone(), repo_id: repo_id.clone(), fix_rounds: fixed, in_flight: false }, &lock).map_err(err2)?;
     write_result(&rdir, &ticket.id, &target, &result)?;
     drop(lock);
-    Ok(Ran::Verdict(Outcome { ticket_id: ticket.id, head, result, failing_gate, cap_reached: fixed >= caps::MAX_FIX_ROUNDS, replan_reached: next.as_ref().map(|s| s.latched()).unwrap_or(false) }))
+    // 9. The wall-time hint (a FAIL run only): a SECOND clock read after the verdict; a read behind the first (or any clock error)
+    // means no hint. The meter's start is the point-B file when one existed, else this run's own point-C start. When the re-plan
+    // hint prints, this one does not (re-plan wins at the next point B, so the budget line would be false). No event: an event
+    // records a refusal, and this run decided a verdict.
+    let replan_reached = next.as_ref().map(|s| s.latched()).unwrap_or(false);
+    let meter_start = started.as_ref().map(|b| b.started_ms).unwrap_or(now);
+    let budget_spent_at_end = result.status == Status::Fail
+        && !replan_reached
+        && match caps::now_ms() {
+            Ok(later) if later >= now => caps::budget_spent(Some(meter_start), later, wall_seconds).unwrap_or(false),
+            _ => false,
+        };
+    Ok(Ran::Verdict(Outcome { ticket_id: ticket.id, head, result, failing_gate, cap_reached: fixed >= caps::MAX_FIX_ROUNDS, replan_reached, budget_spent_at_end }))
 }
 
 /// `harness ticket gate ...` (the arguments after `gate`). Exit 0 only for a written PASS; 1 a FAIL (written) or a ticket refusal; 2 any error.
@@ -433,6 +490,9 @@ pub fn gate_cmd(a: &[String]) -> i32 {
                 }
                 if o.replan_reached {
                     eprintln!("harness: re-plan threshold reached; the next run is refused with replan_required");
+                }
+                if o.budget_spent_at_end {
+                    eprintln!("harness: wall-time budget spent; the next run is refused with budget_exceeded");
                 }
                 1
             }

@@ -109,6 +109,37 @@ new_world() { # [pass|fail]
   git init -q "$O" >/dev/null 2>&1; echo o > "$O/o.txt"; git_q "$O" add -A; git_q "$O" commit -q -m o
   cp "$HOOK_SRC" "$EXT/hook.sh"; link_bin "$EXT/harness"; chmod +x "$EXT/hook.sh"
   printf '%s\n' "$TICKET_JSON" > "$EXT/ticket.json"
+  # The gate's settings source (ticket 93): a full v4 settings file with generous limits, so the budget never bites this smoke.
+  cat > "$EXT/settings.yaml" <<'CFGEOF'
+repos:
+
+budgets:
+  s_wall_seconds: 86400
+  s_tokens: 1000000
+  m_wall_seconds: 86400
+  m_tokens: 1000000
+  l_wall_seconds: 604800
+  l_tokens: 1000000
+
+shadow:
+  p1a_cap: 5
+  p4a_cap: 10
+  d2a_cap: 20
+  p7_cap: 10
+  p1a_token_budget: 1
+  p4a_token_budget: 1
+  d2a_token_budget: 1
+  p7_token_budget: 1
+
+lanes:
+  count: 4
+
+friction:
+  inbox: /placeholder/friction-inbox.jsonl
+
+factory:
+  design_tier: T3
+CFGEOF
   H_BIN=$EXT/harness; H_TICKET=$EXT/ticket.json; H_MAP="demo=$R"; H_RES=$RES; H_CAPS=$CAPS; H_HOOK=$EXT/hook.sh
   HPATH=; HCWD=; HEXTRA=()
 }
@@ -116,7 +147,7 @@ new_world() { # [pass|fail]
 # The real gate writes the result (outside the repo). Optional argument: the exit code the gate should return (default 0).
 gate() {
   local want=${1:-0} rc
-  (cd "$W/home" && "$ENVBIN" -i PATH="$PATH" HOME="$W/home" "$EXT/harness" ticket gate "$EXT/ticket.json" --repo-map "demo=$R" --base "$BASE" --result-dir "$RES" --caps-dir "$CAPS" >/dev/null 2>&1)
+  (cd "$W/home" && "$ENVBIN" -i PATH="$PATH" HOME="$W/home" HARNESS_CONFIG="$EXT/settings.yaml" "$EXT/harness" ticket gate "$EXT/ticket.json" --repo-map "demo=$R" --base "$BASE" --result-dir "$RES" --caps-dir "$CAPS" >/dev/null 2>&1)
   rc=$?
   [ "$rc" -eq "$want" ] || fail "gate run exited $rc, expected $want"
 }
