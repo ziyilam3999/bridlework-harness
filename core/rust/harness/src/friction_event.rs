@@ -137,6 +137,15 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
+/// The one fixed impact table (ticket 3601): the rating an event row carries. The match is exhaustive over the
+/// three mapped kinds' names; no prose is read.
+fn event_impact(kind: Kind) -> &'static str {
+    match kind {
+        Kind::GateFail => "high",
+        _ => "medium",
+    }
+}
+
 // ---------------------------------------------------------------- the mapper
 
 /// Map one event to its inbox row, or to no row: `Ok(None)` for a kind off the closed list, `Ok(Some(row))`
@@ -179,6 +188,10 @@ pub fn map_record(rec: &Record) -> Result<Option<Row>, String> {
         kind: String::new(),
         repeats: String::new(),
         source: SOURCE_EVENT.to_string(),
+        at: format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", (rec.ts_ms % MS_PER_DAY) / 3_600_000, (rec.ts_ms % 3_600_000) / 60_000, (rec.ts_ms % 60_000) / 1000),
+        impact: event_impact(rec.kind).to_string(),
+        why: String::new(),
+        proof: String::new(),
     };
     // The mapper's rows are ordinary rows: a template that somehow broke the row contract is refused here,
     // fail closed, before any verb ever sees it.

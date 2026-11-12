@@ -111,7 +111,7 @@ fn mapped_replan_required_row() {
     assert_eq!(row.ticket, "t-9.3", "an event row never carries the event's own ticket");
     assert_eq!(row.breaks, "");
     assert_eq!(row.kind, "", "an event row is a friction row, the kind default");
-    let want = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\"}";
+    let want = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"medium\"}";
     assert_eq!(encode_row(&row).unwrap(), want);
 }
 
@@ -119,7 +119,7 @@ fn mapped_replan_required_row() {
 fn mapped_launch_refused_row() {
     let line = launch_line(ts(2026, 11, 3), "worker", BRIEF_A, "builder-state-deny");
     let row = mapped(&line);
-    let want = "{\"id\":\"evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\",\"date\":\"2026-11-03\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event launch_refused launch_role=worker matched_entry=builder-state-deny\",\"source\":\"event\"}";
+    let want = "{\"id\":\"evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\",\"date\":\"2026-11-03\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event launch_refused launch_role=worker matched_entry=builder-state-deny\",\"source\":\"event\",\"at\":\"2026-11-03T00:00:00Z\",\"impact\":\"medium\"}";
     assert_eq!(encode_row(&row).unwrap(), want);
     // `brief_sha256` differs per brief while the cause stays the same: the id must not move with it.
     let other = mapped(&launch_line(ts(2026, 11, 4), "worker", BRIEF_B, "builder-state-deny"));
@@ -130,7 +130,7 @@ fn mapped_launch_refused_row() {
 fn mapped_gate_fail_row() {
     let line = gate_fail_line(ts(2026, 11, 2), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A);
     let row = mapped(&line);
-    let want = "{\"id\":\"evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event gate_fail repo=bridlework-harness ticket=199 gate_id=rust-test failure_class=suite-fail\",\"source\":\"event\"}";
+    let want = "{\"id\":\"evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event gate_fail repo=bridlework-harness ticket=199 gate_id=rust-test failure_class=suite-fail\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"high\"}";
     assert_eq!(encode_row(&row).unwrap(), want);
     // `head_sha` moves with every fix push while the cause stays the same: it is in neither the id nor the text.
     assert!(!row.id.contains(HEAD_A), "head_sha is not part of the row id");

@@ -145,10 +145,10 @@ fn fixture_log(t: &Tmp) -> PathBuf {
 }
 
 /// The three W45 rows the plan pins, byte for byte, in id order (each line + newline).
-const R45_GATE: &str = "{\"id\":\"evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event gate_fail repo=bridlework-harness ticket=199 gate_id=rust-test failure_class=suite-fail\",\"source\":\"event\"}";
-const R45_LAUNCH: &str = "{\"id\":\"evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\",\"date\":\"2026-11-03\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event launch_refused launch_role=worker matched_entry=builder-state-deny\",\"source\":\"event\"}";
-const R45_REPLAN: &str = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\"}";
-const R46_REPLAN: &str = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w46\",\"date\":\"2026-11-09\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\"}";
+const R45_GATE: &str = "{\"id\":\"evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event gate_fail repo=bridlework-harness ticket=199 gate_id=rust-test failure_class=suite-fail\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"high\"}";
+const R45_LAUNCH: &str = "{\"id\":\"evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\",\"date\":\"2026-11-03\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event launch_refused launch_role=worker matched_entry=builder-state-deny\",\"source\":\"event\",\"at\":\"2026-11-03T00:00:00Z\",\"impact\":\"medium\"}";
+const R45_REPLAN: &str = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"medium\"}";
+const R46_REPLAN: &str = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w46\",\"date\":\"2026-11-09\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-09T00:00:00Z\",\"impact\":\"medium\"}";
 
 /// `harness friction sweep` over the given log and week, with this scratch config.
 fn sweep(t: &Tmp, log: &Path, week: &str) -> Output {

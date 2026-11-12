@@ -1086,6 +1086,7 @@ fn cross_check_over_40000_rows_is_linear() {
                     kind: s(""),
                     repeats: s(""),
                     source: s(""),
+                    ..Default::default()
                 },
             )
         })
