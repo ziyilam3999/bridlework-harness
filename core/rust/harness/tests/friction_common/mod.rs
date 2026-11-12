@@ -127,7 +127,7 @@ pub fn event(sig: &str, week: &str, date: &str, impact: &str) -> String {
     if !impact.is_empty() {
         extra.push(("impact", impact));
     }
-    format!("{}", row(&format!("{sig}.{week}"), date, "", "event row", &extra)).replace("\"ticket\":\"t-1\"", "\"ticket\":\"t-9.3\"")
+    row(&format!("{sig}.{week}"), date, "", "event row", &extra).replace("\"ticket\":\"t-1\"", "\"ticket\":\"t-9.3\"")
 }
 
 pub fn pattern(id: &str, date: &str, breaks: &str) -> String {
