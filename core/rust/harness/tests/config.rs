@@ -451,6 +451,7 @@ fn pin(text: &str) -> Result<(), String> {
             "friction" => match (k, v) {
                 ("inbox", "/placeholder/friction-inbox.jsonl") => {}
                 ("pattern_threshold", "3") => {}
+                ("triage_top", "3") => {}
                 _ => return Err(format!("friction {k} is not the placeholder or the shipped default 3")),
             },
             "factory" if v != "T3" => return Err(format!("factory {k} is not T3")),
@@ -463,6 +464,8 @@ fn pin(text: &str) -> Result<(), String> {
     want.push(INBOX_KEY.to_string());
     // the contract's one optional key, shipped in the example at its default
     want.push(PATTERN_THRESHOLD_KEY.to_string());
+    // the second optional key (ticket 3601), also shipped at its default
+    want.push(harness::config::TRIAGE_TOP_KEY.to_string());
     want.push(DESIGN_TIER_KEY.to_string());
     want.sort();
     if keys != want {
@@ -487,6 +490,8 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
         ("missing inbox", text.replace("\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl", "")),
         ("pattern_threshold 2", text.replace("  pattern_threshold: 3", "  pattern_threshold: 2")),
         ("missing pattern_threshold", text.replace("  pattern_threshold: 3\n", "")),
+        ("triage_top 2", text.replace("  triage_top: 3", "  triage_top: 2")),
+        ("missing triage_top", text.replace("  triage_top: 3\n", "")),
         ("design tier t1", text.replace("  design_tier: T3", "  design_tier: T1")),
         ("missing design tier", text.replace("\nfactory:\n  design_tier: T3", "")),
     ];

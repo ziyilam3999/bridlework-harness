@@ -45,12 +45,12 @@ impl Tmp {
     }
 
     /// The scratch config: the public example with its placeholder inbox swapped for this scratch inbox
-    /// (and, when given, a `triage_top` line added under `friction`).
+    /// (and, when given, its `triage_top` line replaced by the given line).
     pub fn config_with(&self, extra: &str) -> PathBuf {
         let text = fs::read_to_string(EXAMPLE).unwrap();
         let mut text = text.replace(PLACEHOLDER, self.inbox().to_str().unwrap());
         if !extra.is_empty() {
-            text = text.replace("  pattern_threshold: 3\n", &format!("  pattern_threshold: 3\n{extra}\n"));
+            text = text.replace("  triage_top: 3\n", &format!("{extra}\n"));
         }
         self.file("config.yaml", text)
     }

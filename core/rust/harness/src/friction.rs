@@ -226,13 +226,13 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
 // ---------------------------------------------------------------- strict JSON (the row grammar only)
 
 /// A tiny strict reader for the one shape a row has: `{ "key": "value", ... }`, every value a string.
-struct P<'a> {
-    b: &'a [u8],
-    i: usize,
+pub(crate) struct P<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) i: usize,
 }
 
 impl<'a> P<'a> {
-    fn ws(&mut self) {
+    pub(crate) fn ws(&mut self) {
         while self.i < self.b.len() && (self.b[self.i] == b' ' || self.b[self.i] == b'\t') {
             self.i += 1;
         }
@@ -295,7 +295,7 @@ impl<'a> P<'a> {
 
     /// One JSON object of string values. A duplicate key is refused (the key itself is never echoed: it is
     /// input that has passed no scan).
-    fn object(&mut self) -> Result<Vec<(String, String)>, String> {
+    pub(crate) fn object(&mut self) -> Result<Vec<(String, String)>, String> {
         self.ws();
         if self.i >= self.b.len() || self.b[self.i] != b'{' {
             return Err("expected a JSON object".to_string());
@@ -338,7 +338,7 @@ impl<'a> P<'a> {
 }
 
 /// JSON-escape one string value. The escape set is closed: what `P::string` reads is exactly what this writes.
-fn jstr(s: &str) -> String {
+pub(crate) fn jstr(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -604,7 +604,7 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// there is no stale-steal rule. The returned file is the locked descriptor: the caller reads and appends through it,
 /// and dropping it releases the lock. `Err` is a setup failure (cannot open) or the lock stayed busy past
 /// LOCK_WAIT. Nothing here prints any path.
-fn open_locked(inbox: &Path) -> Result<fs::File, String> {
+pub(crate) fn open_locked(inbox: &Path) -> Result<fs::File, String> {
     let f = fs::OpenOptions::new()
         .read(true)
         .append(true)
@@ -625,7 +625,7 @@ fn open_locked(inbox: &Path) -> Result<fs::File, String> {
     }
 }
 
-fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     let f = fs::File::open(path)?;
     let mut buf = Vec::new();
     f.take(cap + 1).read_to_end(&mut buf)?;
@@ -707,11 +707,11 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--record <file>] [--config <file>] | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <digits> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
-fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, String> {
+pub(crate) fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, String> {
     let path = match file {
         Some(f) => std::ffi::OsString::from(f),
         None => match std::env::var_os("HARNESS_CONFIG") {
@@ -743,6 +743,10 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
         "patterns" => patterns_cmd(rest, testmode),
         "close-check" => close_check_cmd(rest, testmode),
         "sweep" => sweep_cmd(rest, testmode),
+        "rank" => crate::friction_loop::rank_cmd(rest, testmode),
+        "triage" => crate::friction_loop::triage_cmd(rest, testmode),
+        "bind" => crate::friction_loop::bind_cmd(rest, testmode),
+        "page" => crate::friction_loop::page_cmd(rest, testmode),
         _ => {
             eprintln!("{}", FRICTION_USAGE);
             2
@@ -943,7 +947,7 @@ fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
 
 /// Today's UTC date as `YYYY-MM-DD` (std only: days since the epoch to the civil calendar). The trial
 /// record's date, nothing more.
-fn today_utc() -> String {
+pub(crate) fn today_utc() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let z = (secs / 86400) as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -961,7 +965,7 @@ fn today_utc() -> String {
 /// True when two path strings name one file: the same text, or both exist and canonicalize (symlinks
 /// resolved) to the same file. A record file that does not exist yet only matches its own text, so a
 /// fresh `--record` path is never mistaken for the inbox.
-fn paths_name_one_file(a: &str, b: &str) -> bool {
+pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
     let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
     if pa == pb {
         return true;
@@ -970,6 +974,25 @@ fn paths_name_one_file(a: &str, b: &str) -> bool {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => false,
     }
+}
+
+/// The mechanical pattern count (shared by `patterns` and `triage`): the chain roots (`kind: pattern`, empty
+/// `repeats`) whose count of `repeats` rows is at least `threshold`, as (id, count), sorted.
+pub(crate) fn pattern_roots(rows: &[Row], threshold: u64) -> Vec<(String, usize)> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for row in rows {
+        if !row.repeats.is_empty() {
+            *counts.entry(row.repeats.as_str()).or_default() += 1;
+        }
+    }
+    let mut roots: Vec<(String, usize)> = rows
+        .iter()
+        .filter(|r| r.kind == "pattern" && r.repeats.is_empty())
+        .map(|r| (r.id.clone(), counts.get(r.id.as_str()).copied().unwrap_or(0)))
+        .filter(|(_, n)| *n >= threshold as usize)
+        .collect();
+    roots.sort();
+    roots
 }
 
 /// `harness friction patterns [--config <file>] [--record <file>]` (ticket 192): the N-threshold listing.
@@ -1056,20 +1079,8 @@ pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
     // The count is mechanical, never judged (the design rule): every row whose `repeats` names a root adds one
     // to that root's count; a root is a `kind: pattern` row with an empty `repeats`.
     let threshold = cfg.pattern_threshold();
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (_, row) in &inbox.rows {
-        if !row.repeats.is_empty() {
-            *counts.entry(row.repeats.as_str()).or_default() += 1;
-        }
-    }
-    let mut roots: Vec<(String, usize)> = inbox
-        .rows
-        .iter()
-        .filter(|(_, r)| r.kind == "pattern" && r.repeats.is_empty())
-        .map(|(_, r)| (r.id.clone(), counts.get(r.id.as_str()).copied().unwrap_or(0)))
-        .filter(|(_, n)| *n >= threshold as usize)
-        .collect();
-    roots.sort();
+    let plain: Vec<Row> = inbox.rows.iter().map(|(_, r)| r.clone()).collect();
+    let roots = pattern_roots(&plain, threshold);
     // The trial record is appended BEFORE anything is printed, so a failed append is a clean exit 2 with an
     // empty stdout, never a printed listing the record disagrees with.
     if let Some(path) = record {
@@ -1219,7 +1230,7 @@ fn close_check_cmd(rest: &[String], testmode: bool) -> i32 {
 
 /// The `--week` grammar: exactly the dedup-key suffix `<iso-year>-w<ww>` (four digits, `-w`, two digits).
 /// Digits only, so nothing a caller could hide in the value can ever be echoed back by the summary line.
-fn week_ok(w: &str) -> bool {
+pub(crate) fn week_ok(w: &str) -> bool {
     let b = w.as_bytes();
     b.len() == 8
         && b[0..4].iter().all(|c| c.is_ascii_digit())
@@ -1241,7 +1252,7 @@ fn week_ok(w: &str) -> bool {
 /// wall clock runs in this verb, so any past week can be re-swept and every run is deterministic. Exit
 /// codes as the family: 0 ok; 1 a refusal; 2 a usage or setup error (a bad `--week`, no config, an
 /// unreadable or oversized log, no privacy list). No path or flag value is ever echoed.
-fn sweep_cmd(rest: &[String], testmode: bool) -> i32 {
+pub(crate) fn sweep_cmd(rest: &[String], testmode: bool) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", m);
         2

@@ -41,6 +41,12 @@ pub const PATTERN_THRESHOLD_KEY: &str = "friction.pattern_threshold";
 /// The default N when `friction.pattern_threshold` is absent.
 pub const PATTERN_THRESHOLD_DEFAULT: u64 = 3;
 
+/// The second OPTIONAL key (ticket 3601): `friction.triage_top`, the K of the top-K groups `harness friction rank`
+/// lists and `harness friction triage` proposes. Absent means the default, 3 (the spec's "often 1-3").
+pub const TRIAGE_TOP_KEY: &str = "friction.triage_top";
+/// The default K when `friction.triage_top` is absent.
+pub const TRIAGE_TOP_DEFAULT: u64 = 3;
+
 /// The config v4 string key (ticket 190): the tier the factory designs new fixes at (G8.3). One of
 /// `T1`, `T2`, `T3` — a tier, never a brand; `T4` is refused (the design tier is never the top of the
 /// ladder). A refusal over it never carries the value.
@@ -79,6 +85,8 @@ pub struct Config {
     inbox: String,
     /// The optional `friction.pattern_threshold` (default 3 when absent).
     pattern_threshold: u64,
+    /// The optional `friction.triage_top` (default 3 when absent).
+    triage_top: u64,
     /// The `factory.design_tier` tier (v4, ticket 190): the tier the factory designs new fixes at.
     design_tier: Tier,
 }
@@ -150,6 +158,7 @@ impl Config {
         let mut nums: [Option<u64>; 15] = [None; 15];
         let mut inbox: Option<String> = None;
         let mut pattern_threshold: Option<u64> = None;
+        let mut triage_top: Option<u64> = None;
         let mut design_tier: Option<Tier> = None;
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
@@ -228,6 +237,15 @@ impl Config {
                         return Err(refuse(n, &at, "a number must not be quoted"));
                     }
                     pattern_threshold = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
+                } else if key == "triage_top" {
+                    // The second OPTIONAL key (ticket 3601), the same grammar as `pattern_threshold`.
+                    if triage_top.is_some() {
+                        return Err(refuse(n, &at, "duplicate key"));
+                    }
+                    if quoted {
+                        return Err(refuse(n, &at, "a number must not be quoted"));
+                    }
+                    triage_top = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
                 } else if key == "inbox" {
                     if inbox.is_some() {
                         return Err(refuse(n, &at, "duplicate key"));
@@ -290,6 +308,7 @@ impl Config {
             nums: out,
             inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))?,
             pattern_threshold: pattern_threshold.unwrap_or(PATTERN_THRESHOLD_DEFAULT),
+            triage_top: triage_top.unwrap_or(TRIAGE_TOP_DEFAULT),
             design_tier: design_tier.ok_or_else(|| format!("config: missing key `{DESIGN_TIER_KEY}`"))?,
         })    }
 
@@ -344,6 +363,11 @@ impl Config {
     /// (`friction.pattern_threshold`, optional; the default 3 when absent).
     pub fn pattern_threshold(&self) -> u64 {
         self.pattern_threshold
+    }
+
+    /// The configured K for `friction rank` / `friction triage` (`friction.triage_top`, optional; default 3).
+    pub fn triage_top(&self) -> u64 {
+        self.triage_top
     }
 
     /// The configured design tier (`factory.design_tier`, v4): one of T1, T2, T3. Read by the G8.3
@@ -585,6 +609,19 @@ mod tests {
         let e = refused(&valid().replacen("  p7_cap: 10", "  p7_cap: \"5\"", 1));
         assert!(e.contains("p7_cap") && e.contains("quoted"), "{e}");
         Config::parse(&valid().replacen("  s_tokens: 222", "  s_tokens: 5", 1)).unwrap();
+    }
+
+    #[test]
+    fn triage_top_is_optional_defaults_to_three_and_is_shape_checked() {
+        assert_eq!(Config::parse(&valid()).unwrap().triage_top(), 3);
+        let with = |line: &str| valid().replace("  inbox: /synthetic-inbox.jsonl\n", &format!("  inbox: /synthetic-inbox.jsonl\n{line}\n"));
+        assert_eq!(Config::parse(&with("  triage_top: 7")).unwrap().triage_top(), 7);
+        for bad in ["0", "04", "x", "\"2\""] {
+            let e = refused(&with(&format!("  triage_top: {bad}")));
+            assert!(e.contains("`triage_top`"), "{bad}: {e}");
+        }
+        let e = refused(&with("  triage_top: 2\n  triage_top: 3"));
+        assert!(e.contains("duplicate key"), "{e}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 The harness reads one settings file. This page is the contract in plain words. `config/harness.example.yaml` is the public example of it, with placeholders only.
 
-Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 added the required `lanes.count` key; v3 added the required `friction.inbox` key (ticket 154): the path of the friction inbox file (`docs/friction-inbox.md`); v4 adds the required `factory.design_tier` key (ticket 190): the tier the factory designs new fixes at (`docs/fix-tier.md`). A config written against an older version is refused until it gains the key (intended, fail closed): the harness refuses to guess where the inbox is or which tier the factory designs at. Ticket 192 then adds the contract's FIRST OPTIONAL key, `friction.pattern_threshold` (absent = 3): an optional key does not change the version — v4 stays v4 — because an optional key breaks no existing file; a v4 file needs no change. The operator's real file is updated in the private overlay the day a change merges.
+Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE-5c). v2 added the required `lanes.count` key; v3 added the required `friction.inbox` key (ticket 154): the path of the friction inbox file (`docs/friction-inbox.md`); v4 adds the required `factory.design_tier` key (ticket 190): the tier the factory designs new fixes at (`docs/fix-tier.md`). A config written against an older version is refused until it gains the key (intended, fail closed): the harness refuses to guess where the inbox is or which tier the factory designs at. Ticket 192 then adds the contract's FIRST OPTIONAL key, `friction.pattern_threshold` (absent = 3): an optional key does not change the version — v4 stays v4 — because an optional key breaks no existing file; a v4 file needs no change. Ticket 3601 adds the SECOND optional key, `friction.triage_top` (absent = 3), on the same terms. The operator's real file is updated in the private overlay the day a change merges.
 
 ## 1. One file, one reader, read-only
 
@@ -23,8 +23,9 @@ Six sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`, `
 
 Every key below is required, in its section, exactly once. Nothing else is allowed — with ONE exception, named
 here explicitly because it is the first of its kind in this contract: `friction.pattern_threshold` is OPTIONAL
-(ticket 192). It is the only key a file may omit; when present it follows every other rule (its section, exactly
-once, the value grammar below). Absent means the default, 3.
+(ticket 192). With `friction.triage_top` (ticket 3601) these are the only two keys a file may omit; when present
+each follows every other rule (its section, exactly once, the value grammar below). Absent means the default, 3,
+for both.
 
 ```
 budgets.s_wall_seconds
@@ -43,7 +44,8 @@ shadow.d2a_token_budget
 shadow.p7_token_budget
 lanes.count
 friction.inbox
-friction.pattern_threshold   <- OPTIONAL: the one key a file may omit; absent = 3
+friction.pattern_threshold   <- OPTIONAL: a key a file may omit; absent = 3
+friction.triage_top          <- OPTIONAL (ticket 3601): the second key a file may omit; absent = 3
 factory.design_tier
 ```
 
@@ -52,7 +54,7 @@ factory.design_tier
 - `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys.
 - `shadow`: per capability, a ticket or dispatch cap (`p1a_cap`, `p4a_cap`, `d2a_cap`, `p7_cap`) and a token budget (`..._token_budget`).
 - `lanes`: `count`, the number of lanes. The session-name check reads it as the upper bound of a legal lane number (P1B-16); the value is policy, not private: the example ships 4.
-- `friction`: `inbox`, the path of the friction inbox file. It is a path value, not a number: the same shape rules as a `repos` folder (section 5). The real file lives only in the private overlay; `harness friction` (ticket 154) is its reader and writer. The section's second key, `pattern_threshold`, is the contract's one OPTIONAL key (ticket 192): the N a friction pattern chain's repeat count must reach before `harness friction patterns` lists it (`docs/friction-inbox.md`); a positive whole number exactly like every numeric key, absent = 3.
+- `friction`: `inbox`, the path of the friction inbox file. It is a path value, not a number: the same shape rules as a `repos` folder (section 5). The real file lives only in the private overlay; `harness friction` (ticket 154) is its reader and writer. The section's second key, `pattern_threshold`, is the contract's one OPTIONAL key (ticket 192): the N a friction pattern chain's repeat count must reach before `harness friction patterns` lists it (`docs/friction-inbox.md`); a positive whole number exactly like every numeric key, absent = 3. The section's third key, `triage_top`, is the second OPTIONAL key (ticket 3601): the K of the top-K groups `harness friction rank` lists and `harness friction triage` proposes (an explicit `--top` flag wins); same grammar, absent = 3.
 - `factory`: `design_tier`, the tier the factory designs new fixes at (G8.3, `docs/fix-tier.md`). It is one of `T1`, `T2`, `T3` — a tier, never a brand. `T4` is refused: the factory designs at a cheaper tier and escalates on purpose, it never starts at the top. When the model registry exists (P4a) the key may move there; until then this is its home.
 
 ### The plain-value grammar (closed)
@@ -87,11 +89,11 @@ Anything outside this contract is a refusal. The refusal names the section and k
 
 ## 6. Values
 
-`friction.inbox` is a path value, checked by the path rules of section 5. `factory.design_tier` is a tier value: exactly one of `T1`, `T2`, `T3`, unquoted (a quoted tier is refused, like a quoted number). Anything else in the slot — `T4`, a lowercase tier, a model name — is refused naming the section, the key and the line, never the value. Every budget, shadow and lanes value — and the optional `friction.pattern_threshold` — is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
+`friction.inbox` is a path value, checked by the path rules of section 5. `factory.design_tier` is a tier value: exactly one of `T1`, `T2`, `T3`, unquoted (a quoted tier is refused, like a quoted number). Anything else in the slot — `T4`, a lowercase tier, a model name — is refused naming the section, the key and the line, never the value. Every budget, shadow and lanes value — and the optional `friction.pattern_threshold` and `friction.triage_top` — is a positive whole number: digits only, no sign, no leading zero, at most 15 digits. `0` is refused, because a zero budget could be read as "unlimited"; "not seeded" is the safe reading. Refused examples: `0`, `-1`, `1.5`, `007`, a 16-digit number, `abc`, an empty value.
 
 ## 7. Public file content
 
-The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. `friction.pattern_threshold` ships as its default value, `3`, written out so the one optional key is visible in the public example; omitting the line means the same thing. `factory.design_tier` ships as `T3`, the spec default (G8.3): a default lives in the public example, the same pattern as `lanes.count`. The real values live only in the private file.
+The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. `friction.pattern_threshold` ships as its default value, `3`, written out so the optional key is visible in the public example; `friction.triage_top` ships as its default, `3`, on the same terms; omitting the line means the same thing. `factory.design_tier` ships as `T3`, the spec default (G8.3): a default lives in the public example, the same pattern as `lanes.count`. The real values live only in the private file.
 ## 8. Who reads it
 
 The library exposes pure lookups: `repo_dir(&RepoId)`, `budget(size)`, `shadow()`, `lane_count()`, `friction_inbox()` and `design_tier()`. The one command over the config itself is `harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]`.
