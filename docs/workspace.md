@@ -222,3 +222,22 @@ semantics, none with a measured hide):
 Ignored build output inside the tree (for example `target/`) fails the check on purpose: clean it before
 finalize or list it on the manifest, as described in the P1B-11 plan. Unpushed commits (P1B-12) are covered by the separate mode `harness workspace check <ticket> --manifest-dir <dir> --pushed --repo <absolute-dir>`: exit 0 pushed (one `workspace=pushed` line), exit 4 unpushed (one `unpushed <sha> ws/<t>` line per commit plus a `workspace=unpushed ... count=<n>` line), exit 3 cannot check — a missing upstream fails closed, never a pass; the answer reads the LOCAL remote-tracking ref only (no network), so fetch first — but a fetch rule that excludes the branch (a negative refspec) never refreshes the tracking ref, keeping it stale: a stale or forged tracking ref is not detected. Not covered here: moving leftovers to quarantine (P1B-13), anything in the ticket root outside `tree` (the quarantine sweep's ground). No new event kind; P1B-15 records the
 finalize result.
+
+## Teardown (P1B-14)
+
+`harness workspace teardown <ticket> --manifest-dir <abs> --repo-dir <abs> --log <abs> --repo <token> [--grace-ms <n>] [--ts-ms <n>]` walks the ticket's manifest and clears it, in order, using only the existing tools. `--repo-dir` is the ticket repo's main work tree. All options are explicit.
+
+Refused first (exit 2, nothing changed, no event): a ticket or `--repo` that is not a token, a non-absolute or missing `--manifest-dir`/`--repo-dir`, a `--repo-dir` that is a linked work tree, a missing, torn or corrupt manifest, a `--log` that lies inside a manifest root.
+
+1. **Step 4, processes and ports.** Each live `process` entry is stopped by the child verb `harness process stop` (exit 0 or 3 settles it; 2 or 4 is a failure, entry kept). Every process is attempted. A `port` entry still listed afterwards is released only if the same 127.0.0.1 snapshot bind `process start` uses finds it free.
+2. **Step 5, transient files.** Each `temp_dir` entry, in reverse add order, is deleted by the child verb `harness quarantine delete-listed` (one id per call; exit 2 or 3 is a failure). `evidence` entries are released from the manifest; the files and run dirs are kept, and `harness evidence show|check` still read them.
+3. **Step 7, worktree.** `git worktree remove` without `--force`: a tree with uncommitted or untracked work is refused and left intact. An already-absent tree that git no longer lists just gets its manifest `remove`. The branch `ws/<ticket>` stays.
+4. **Step 8, record.** The manifest is re-read and ONE `cleanup_result` (`ticket`, `repo`, `result`, `manifest_left`) is appended. `pass` only when nothing failed and the manifest is empty.
+
+Gates: any step-4 failure skips steps 5 and 7; a step-5 `temp_dir` failure skips step 7. Both go straight to step 8 with `result=fail`.
+
+Exit codes: `0` pass, recorded; `1` fail, recorded; `2` refused at the start, or the event could not be written (the teardown ran but is unrecorded; a re-run is idempotent and records). stdout on 0 and 1 is one line `teardown=<pass|fail> ticket=<t> manifest_left=<n>`. No folder is printed. A re-run on an empty manifest records a fresh `pass`.
+
+Retained: evidence files, the ticket root (it holds the evidence), the branch. A `log` entry has no delete path and stays listed, so it forces `fail`; stderr names how many are left.
+
+Honest limits: teardown does not hold the supervisor lock across steps (the child `process stop` takes it), so a `process start` racing teardown is only caught by the step-8 re-read (`result=fail`), not prevented — P1B-15's finalize owns serialising a ticket. The port release is a snapshot bind. A stop escapee (a child that left the group) is the P2 orphan reaper's.

@@ -127,8 +127,8 @@ can never block forever on something it could not signal. A helper that cannot b
   checks takes the per-ticket lock file `<manifest-dir>/<ticket>.proc.lock` (step 2 of `start`); a parser or
   token refusal (bad `--port`, bad ticket or id) exits before the lock, so no lock file is made either. It is a
   std file-lock helper, not a record — it holds no data and is safe to delete between commands.
-- **No orphan reaping for stop escapees** (P2) and **no finalize/teardown that calls stop for every live
-  process of a ticket** (P1B-14).
+- **No orphan reaping for stop escapees** (P2) and **no finalize that serialises a ticket; teardown calls stop for
+  every live process of a ticket** (see [Teardown](workspace.md#teardown-p1b-14)).
 - **Evidence privacy is not handled here** (P1B-10): capture is raw, byte-for-byte, secret-shaped text kept
   verbatim. The evidence READER verbs and the Done link are P1B-09 (`harness evidence show|check`, see
   [runtime evidence reading](evidence.md); a missing `exit` file reads as unknown, never success).

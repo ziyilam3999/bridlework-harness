@@ -48,6 +48,8 @@ pub mod status;
 pub mod supervisor;
 pub mod ticket;
 #[cfg(unix)]
+pub mod teardown;
+#[cfg(unix)]
 pub mod ticket_gate;
 #[cfg(unix)]
 pub mod workspace;
