@@ -1,6 +1,8 @@
 #!/bin/sh
 # Smoke for the clean-machine install test (ticket 3677). Usage: ci/clean-install-smoke.sh <arm>
-# Arms: static fresh container planted all (all = static, fresh, container, planted)
+# Arms: static fresh container planted twice all (all = static, fresh, container, planted, twice)
+# The `twice` arm (ticket 3678) installs twice into one prefix beside a seeded private overlay (ci/clean-install/twice.sh): the overlay
+# must stay byte-, mode-, inode- and mtime-identical and the second install must change nothing. Plants copy one built base HOME.
 # The driver builds a scratch repo from the worktree's tracked files (index), tags it, builds the engine, then runs #3676's own
 # ci/release-build.sh to make the dist folder and `git archive` for the source. The `fresh` arm and every plant that runs the real
 # install use `env -i` with a fresh HOME plus exactly two non-HARNESS_ variables, CARGO_HOME and RUSTUP_HOME, both outside HOME.
@@ -14,7 +16,7 @@ import hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, tempfile
 
 ROOT = os.path.realpath(sys.argv[1])
 ARM = sys.argv[2] if len(sys.argv) > 2 else ""
-ARMS = ("static", "fresh", "container", "planted", "all")
+ARMS = ("static", "fresh", "container", "planted", "twice", "all")
 MAX_COPY = 5000
 oks = 0
 fails = 0
@@ -53,7 +55,7 @@ def code_only(text):
 
 # ------------------------------------------------------------------ static
 def arm_static():
-    for f in ("ci/clean-install/install.sh", "ci/clean-install/e2e.sh"):
+    for f in ("ci/clean-install/install.sh", "ci/clean-install/e2e.sh", "ci/clean-install/twice.sh"):
         t = code_only(rd(f))
         bad_words = [w for w in ("curl", "wget", "git clone", "gh ") if w in t]
         check("static-no-network-" + os.path.basename(f), not bad_words, "found " + ",".join(bad_words))
@@ -382,8 +384,134 @@ def arm_planted():
     refused("planted-j-cargo-home-unset", e2e(env, "preflight"), "not fresh: CARGO_HOME unset")
 
 
+# ------------------------------------------------------------------ twice (ticket 3678)
+OKLINE = r"^install-twice: ok version=%s overlay_files=3 unchanged core_files=\d+ idempotent$"
+
+
+def twice(env, phase, script=None, dist=None, src=None):
+    args = ["env", "-i"] + ["%s=%s" % kv for kv in env.items()] + [
+        "sh", script or os.path.join(ROOT, "ci/clean-install/twice.sh"), phase, dist or DIST, src or SRC]
+    return run(args)
+
+
+def arm_twice():
+    env = toolchain_env("twice")
+    ov = os.path.join(env["HOME"], "overlay")
+    env["HARNESS_CONFIG"] = os.path.join(ov, "harness.yaml")
+    env["HARNESS_PRIVACY_LIST"] = os.path.join(ov, "privacy-list.txt")
+    r = twice(env, "all")
+    t = out(r)
+    m = re.search(OKLINE % re.escape(VER), t, re.M)
+    check("twice-fresh", r.returncode == 0 and m is not None, "rc=%d\n%s" % (r.returncode, t[-1200:]))
+    if m:
+        print("     " + m.group(0))
+    if shutil.which("docker"):
+        r = run(["sh", os.path.join(ROOT, "ci/clean-install-container.sh"), DIST, SRC, "twice"])
+        t = out(r)
+        if r.returncode == 2 and "docker" in t:
+            raise Setup(t.strip())
+        m = re.search(OKLINE % re.escape(VER), t, re.M)
+        check("twice-container", r.returncode == 0 and m is not None, "rc=%d\n%s" % (r.returncode, t[-1500:]))
+        if m:
+            print("     " + m.group(0))
+    else:
+        raise Setup("docker missing")
+
+    # plants: one built base HOME (seed, first, snap), copied per plant
+    base = toolchain_env("twice-base")
+    for ph in ("seed", "first", "snap"):
+        r = twice(base, ph)
+        if r.returncode != 0:
+            raise Setup("twice base phase %s failed:\n%s" % (ph, out(r)[-800:]))
+    scripts = os.path.join(S, "twice-scripts")
+
+    def plant_env(tag):
+        e = toolchain_env(tag)
+        shutil.copytree(base["HOME"], e["HOME"], symlinks=True, dirs_exist_ok=True)
+        fo = os.path.join(e["HOME"], "work", "first.out")
+        txt = open(fo, encoding="utf-8").read().replace(base["HOME"], e["HOME"])
+        open(fo, "w", encoding="utf-8").write(txt)
+        return e
+
+    def scripts_copy(tag, wrapper=None, edit=None):
+        """Copy ci/clean-install/ to scratch. wrapper: shell text run after the real installer (install.sh becomes a wrapper).
+        edit: (anchor, replacement) text edit of the copied install.sh; the anchor must occur exactly once, else Setup."""
+        d = os.path.join(scripts, tag)
+        shutil.copytree(os.path.join(ROOT, "ci/clean-install"), d)
+        ins = os.path.join(d, "install.sh")
+        if edit:
+            t = open(ins, encoding="utf-8").read()
+            if t.count(edit[0]) != 1:
+                raise Setup("plant %s: anchor occurs %d times" % (tag, t.count(edit[0])))
+            open(ins, "w", encoding="utf-8").write(t.replace(edit[0], edit[1]))
+        if wrapper:
+            os.rename(ins, os.path.join(d, "install-real.sh"))
+            open(ins, "w", encoding="utf-8").write(
+                '#!/bin/sh\nh=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2\n'
+                'sh "$h/install-real.sh" "$@" || exit $?\n' + wrapper)
+        return os.path.join(d, "twice.sh")
+
+    def py(code):
+        return "python3 -I -c '%s'\n" % code
+
+    HEAD = "import os;ov=os.path.join(os.environ[\"HOME\"],\"overlay\");"
+    muts = {
+        "overlay-bytes": ("overlay changed: privacy-list.txt", py(
+            HEAD + "p=os.path.join(ov,\"privacy-list.txt\");b=open(p,\"rb\").read();open(p,\"wb\").write(b[::-1]);"
+            "os.utime(p,ns=(10**18,10**18))")),
+        "overlay-touch": ("overlay changed: harness.yaml", py(
+            HEAD + "p=os.path.join(ov,\"harness.yaml\");os.utime(p,ns=(10**18+10**9,10**18+10**9))")),
+        "overlay-new-file": ("overlay changed", py(HEAD + "open(os.path.join(ov,\"extra\"),\"w\").close()")),
+        "rewrite": ("second install not idempotent: plugins/claude/", py(
+            "import os;p=os.path.join(os.environ[\"HOME\"],\"bridlework\",\"plugins\",\"claude\",\".claude-plugin\",\"plugin.json\");"
+            "b=open(p,\"rb\").read();open(p,\"wb\").write(b);s=os.stat(p);os.utime(p,ns=(s.st_atime_ns,s.st_mtime_ns+10**9))")),
+    }
+    for name, (reason, wrap) in muts.items():
+        i = "twice-planted-" + name
+        e = plant_env("tp-" + name)
+        sc = scripts_copy("tp-" + name, wrapper=wrap)
+        rs = twice(e, "snap", script=sc)
+        r2 = twice(e, "second", script=sc)
+        r3 = twice(e, "check", script=sc)
+        t = out(rs) + out(r2) + out(r3)
+        check(i, rs.returncode == 0 and r2.returncode == 0 and r3.returncode != 0 and reason in out(r3)
+              and "install-twice: ok" not in t, "rc=%d/%d/%d want %r\n%s" % (rs.returncode, r2.returncode, r3.returncode, reason, t[-800:]))
+        shutil.rmtree(e["HOME"], ignore_errors=True)
+
+    # old installer: the base-rev refusal put back by a text edit (anchor kept by the change)
+    anchor = '    die("prefix must be an absolute path")\n'
+    old = anchor + 'if os.path.lexists(prefix) and (not os.path.isdir(prefix) or os.listdir(prefix)):\n    die("prefix exists and is not empty")\n'
+    e = plant_env("tp-old")
+    sc = scripts_copy("tp-old", edit=(anchor, old))
+    twice(e, "snap", script=sc)
+    r = twice(e, "second", script=sc)
+    t = out(r)
+    check("twice-planted-old-installer", r.returncode == 1 and "prefix exists and is not empty" in t and "install-twice: ok" not in t,
+          "rc=%d\n%s" % (r.returncode, t[-800:]))
+    shutil.rmtree(e["HOME"], ignore_errors=True)
+
+    # tampered prefix: the real installer refuses and writes nothing
+    e = plant_env("tp-tamper")
+    twice(e, "snap")
+    tf = os.path.join(e["HOME"], "bridlework", "plugins", "claude", ".claude-plugin", "plugin.json")
+    n0 = os.path.getsize(tf)
+    with open(tf, "ab") as fh:
+        fh.write(b"\n")
+    r = twice(e, "second")
+    t = out(r)
+    check("twice-planted-tampered-prefix", r.returncode == 1 and "prefix holds a different install" in t and os.path.getsize(tf) == n0 + 1
+          and "install-twice: ok" not in t, "rc=%d size=%d want %d\n%s" % (r.returncode, os.path.getsize(tf), n0 + 1, t[-800:]))
+    shutil.rmtree(e["HOME"], ignore_errors=True)
+
+    # a stray HARNESS_ variable at seed
+    e = toolchain_env("tp-stray")
+    e["HARNESS_PRIVACY" + "_OLD_LIST"] = os.path.join(S, "nowhere")
+    r = twice(e, "seed")
+    check("twice-planted-stray-var", r.returncode == 1 and "not fresh" in out(r), "rc=%d\n%s" % (r.returncode, out(r)[-400:]))
+
+
 if ARM not in ARMS:
-    sys.stderr.write("clean-install-smoke: usage: ci/clean-install-smoke.sh <static|fresh|container|planted|all>\n")
+    sys.stderr.write("clean-install-smoke: usage: ci/clean-install-smoke.sh <static|fresh|container|planted|twice|all>\n")
     sys.exit(2)
 rc = 0
 try:
@@ -397,6 +525,8 @@ try:
         arm_container()
     if ARM in ("planted", "all"):
         arm_planted()
+    if ARM in ("twice", "all"):
+        arm_twice()
 except Setup as e:
     sys.stderr.write("clean-install-smoke: setup error: %s\n" % e)
     rc = 2
