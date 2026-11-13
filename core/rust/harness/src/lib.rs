@@ -28,6 +28,7 @@ pub mod intake;
 pub mod manifest;
 pub mod overlay;
 pub mod path_map;
+pub mod plugin;
 pub mod question_class;
 #[cfg(unix)]
 pub mod quarantine;
