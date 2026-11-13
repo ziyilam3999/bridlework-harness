@@ -1,0 +1,48 @@
+{
+  "title": "control registry",
+  "description": "The one control registry file, controls/registry.json: a version and a list of control rows. Each row says what one control guards against, how it is tested, who owns it and when it is removed. The Rust loader in core/rust/harness/src/control.rs is the validator; a test pins this file's required set and enums to the loader's.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "controls"],
+  "properties": {
+    "version": { "const": 1 },
+    "controls": { "type": "array", "items": { "$ref": "#/$defs/row" }, "description": "Row ids are unique across the list." }
+  },
+  "$defs": {
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "class", "enabled", "failure", "test", "retirement_test", "owner"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "description": "Unique across rows." },
+        "kind": { "type": "string", "enum": ["hook"], "description": "Closed list. A later ticket widens it when the first non-hook row lands." },
+        "class": { "type": "string", "enum": ["policy", "crutch", "orchestration"] },
+        "baseline_ref": { "type": "string", "minLength": 1, "description": "Required when the class is orchestration, forbidden otherwise." },
+        "enabled": { "type": "boolean", "description": "The only on/off switch. The hooks.json generator emits enabled rows only." },
+        "failure": { "type": "string", "minLength": 1, "description": "The failure mode the control guards against." },
+        "test": { "type": "string", "minLength": 1, "description": "Repo-relative path of the test that proves the control works. Must exist." },
+        "retirement_test": { "type": "string", "minLength": 1, "description": "The measurable condition under which the control is removed." },
+        "owner": {
+          "type": "string",
+          "enum": ["orchestration_portfolio", "execution_verification", "risk_review", "friction_learning", "knowledge_lessons", "harness_governance"]
+        },
+        "hook": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["script", "manifest", "event", "tools"],
+          "description": "Required when the kind is hook, forbidden otherwise.",
+          "properties": {
+            "script": { "type": "string", "pattern": "^plugins/claude/[a-z0-9._-]+-hook\\.sh$" },
+            "manifest": { "type": "string", "minLength": 1, "description": "Repo-relative path of the hook's manifest; its event and tools must equal this row's." },
+            "event": { "type": "string", "enum": ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "Notification", "PreCompact"] },
+            "tools": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "Joined with a pipe into the hook matcher." }
+          }
+        }
+      },
+      "allOf": [
+        { "if": { "properties": { "class": { "const": "orchestration" } }, "required": ["class"] }, "then": { "required": ["baseline_ref"] }, "else": { "not": { "required": ["baseline_ref"] } } },
+        { "if": { "properties": { "kind": { "const": "hook" } }, "required": ["kind"] }, "then": { "required": ["hook"] }, "else": { "not": { "required": ["hook"] } } }
+      ]
+    }
+  }
+}
