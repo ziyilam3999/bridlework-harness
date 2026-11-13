@@ -1,5 +1,5 @@
 #!/bin/sh
-# Smoke for the release job (ticket 3676). Usage: ci/release-smoke.sh <arm>
+# Smoke for the release job (tickets 3676, 3695). Usage: ci/release-smoke.sh <arm>
 # Arms: static lint planted clean failclosed realbundle all
 # The driver builds scratch git repos in a temp folder and RUNS THE WORKFLOW FILE'S OWN `run:` TEXT, extracted by step name with
 # the step's own `env:` values. The job graph (which job waits for which) is READ FROM .github/workflows/release.yml; the driver
@@ -17,6 +17,10 @@ ARM = sys.argv[2] if len(sys.argv) > 2 else ""
 WF = os.path.join(ROOT, ".github", "workflows", "release.yml")
 LINT = os.path.join(ROOT, "ci", "workflow-lint.sh")
 ENGINE = os.path.join(ROOT, "core", "rust", "target", "release", "harness")
+DEBUG_ENGINE = os.path.join(ROOT, "core", "rust", "target", "debug", "harness")
+# The non-home-path classes the DEBUG engine's scan reports (the fixture generators and their markers are compiled only into
+# debug builds). A release engine must show none of them. Measured after ticket 3695's change.
+FIXTURE_CLASSES = {"credential", "session-link", "synthetic-test"}
 TOKEN = "zzfixturetoken"
 LIST = TOKEN + "\n# sentinel-release-smoke-q9\n"
 TAG = "v0.1.0"
@@ -178,11 +182,44 @@ def git(repo, *a, check_rc=True):
 
 
 def ensure_engine():
-    if not os.path.isfile(ENGINE):
-        r = subprocess.run(["cargo", "build", "--release", "--locked"], cwd=os.path.join(ROOT, "core", "rust"),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if r.returncode != 0 or not os.path.isfile(ENGINE):
-            setup_die("engine build failed")
+    """Always build (incremental, cheap when fresh), so no arm tests a stale engine."""
+    r = subprocess.run(["cargo", "build", "--release", "--locked"], cwd=os.path.join(ROOT, "core", "rust"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0 or not os.path.isfile(ENGINE):
+        setup_die("engine build failed")
+
+
+def ensure_debug_engine():
+    r = subprocess.run(["cargo", "build", "--locked"], cwd=os.path.join(ROOT, "core", "rust"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0 or not os.path.isfile(DEBUG_ENGINE):
+        setup_die("debug engine build failed")
+
+
+def engine_triple(path):
+    """The target named by the binary's own header (the same rule ci/release-build.sh uses); None when unknown."""
+    with open(path, "rb") as fh:
+        h = fh.read(32)
+    if h[:4] == b"\x7fELF" and h[4] == 2 and h[5] == 1:
+        return {0x3E: "x86_64-unknown-linux-gnu", 0xB7: "aarch64-unknown-linux-gnu"}.get(int.from_bytes(h[18:20], "little"))
+    if h[:4] == b"\xcf\xfa\xed\xfe":
+        return {0x01000007: "x86_64-apple-darwin", 0x0100000C: "aarch64-apple-darwin"}.get(int.from_bytes(h[4:8], "little"))
+    return None
+
+
+def engine_tar_name():
+    return "bridlework-harness-engine-0.1.0-%s.tar.gz" % engine_triple(ENGINE)
+
+
+def scan_dist(repo, dist):
+    """Run the workflow's own Scan text over a copy of a dist folder placed at $RUNNER_TEMP/dist; (rc, stdout, stderr, marker)."""
+    s = step(read_wf(WF), "scan", "Scan")
+    tmp = tempfile.mkdtemp(dir=TMP)
+    shutil.copytree(dist, os.path.join(tmp, "dist"), symlinks=True)
+    marker = os.path.join(tmp, "gh-marker")
+    env = base_env({"PATH": stub_bin() + os.pathsep + os.environ.get("PATH", ""), "GH_MARKER": marker, "RUNNER_TEMP": tmp})
+    rc, o, e = run_text(s, repo, env, LIST)
+    return rc, o, e, marker
 
 
 def make_template():
@@ -438,9 +475,9 @@ def arm_static():
     body = [l for l in text.split("\n") if not l.lstrip().startswith("#")]
     check("static-release-yml-never-names-the-engine-binary", not any("target/release" in l for l in body))
     sh = open(os.path.join(ROOT, "ci", "release-build.sh"), encoding="utf-8").read().split("\n")
-    verbs = re.compile(r"\b(cp|mv|install|ln|rsync|copy\w*|add|addfile|dist)\b")
-    check("static-release-build-never-copies-the-engine",
-          not any("target/release" in l and verbs.search(l) for l in sh if not l.lstrip().startswith("#")))
+    reads = [l for l in sh if "target/release/harness" in l and not l.lstrip().startswith("#")]
+    check("static-release-build-packs-the-engine-once", len(reads) == 1 and reads[0].startswith("eng=")
+          and sum(1 for l in sh if "open(eng," in l) == 1)
     check("static-publish-run-has-no-checkout-code", "ci/" not in (step(wf, "publish", "Publish")["run"] or ""))
 
 
@@ -553,12 +590,30 @@ def arm_clean():
     so, se, src = scan["Scan"]
     n = len(md_members(repo))
     check("clean-scan-exit-0", src == 0)
-    check("clean-scan-counts", "artifacts_scanned=3" in se and ("members_scanned=%d" % n) in se)
+    check("clean-scan-counts", "artifacts_scanned=4" in se and ("members_scanned=%d" % (n + 2)) in se)
     check("clean-publish-ran-after-scan", ctx["ran"] == ["scan", "publish"] and ctx["rc"].get("publish") == 0)
     mk = open(ctx["marker"]).read().split("\n") if os.path.exists(ctx["marker"]) else []
     mk = [x for x in mk if x]
-    want = "release create %s --repo %s --verify-tag --title %s --notes-file release-notes.md bridlework-harness-claude-plugin-0.1.0.tar.gz SHA256SUMS" % (TAG, REPO, TAG)
-    check("clean-exactly-one-gh-call-with-two-assets", mk == [want])
+    ename = engine_tar_name()
+    want = "release create %s --repo %s --verify-tag --title %s --notes-file release-notes.md bridlework-harness-claude-plugin-0.1.0.tar.gz %s SHA256SUMS" % (TAG, REPO, TAG, ename)
+    check("clean-exactly-one-gh-call-with-three-assets", mk == [want])
+    if sys.platform.startswith("linux") and os.uname().machine == "x86_64":
+        check("clean-engine-asset-is-linux-x86_64-on-ci", ename == "bridlework-harness-engine-0.1.0-x86_64-unknown-linux-gnu.tar.gz")
+    else:
+        check("clean-engine-asset-is-linux-x86_64-on-ci", engine_triple(ENGINE) is not None and ename in mk[0])
+    rcb, db = build_dist(scratch())
+    lines = [l for l in open(os.path.join(db, "SHA256SUMS")).read().split("\n") if l] if rcb == 0 else []
+    got = dict(reversed(l.split("  ", 1)) for l in lines)
+    plug = "bridlework-harness-claude-plugin-0.1.0.tar.gz"
+    check("clean-sha256sums-three-lines-naming-the-engine",
+          rcb == 0 and len(lines) == 3 and set(got) == {plug, ename, "release-notes.md"}
+          and got.get(ename) == hashlib.sha256(open(os.path.join(db, ename), "rb").read()).hexdigest())
+    # the real release engine inside the dist scans clean and publish starts
+    def put_engine(job, name, ctx):
+        if job == "scan" and name == "Scan":
+            shutil.copy2(ENGINE, os.path.join(ctx["dist"], "harness"))
+    cb = run_graph(WF, scratch(), hook=put_engine)
+    check("clean-binary-in-dist", cb["out"]["scan"]["Scan"][2] == 0 and "publish" in cb["ran"])
     rc1, d1 = build_dist(scratch())
     rc2, d2 = build_dist(scratch())
     same = rc1 == 0 and rc2 == 0 and open(os.path.join(d1, "SHA256SUMS")).read() == open(os.path.join(d2, "SHA256SUMS")).read()
@@ -579,10 +634,20 @@ def arm_realbundle():
     rc2, o2, e2 = run_text(s, repo, env, LIST)
     check("realbundle-scan-exit-0-on-the-on-disk-files", rc2 == 0)
     after = {f: hashlib.sha256(open(os.path.join(dist, f), "rb").read()).hexdigest() for f in os.listdir(dist)} if rc == 0 else {}
-    check("realbundle-scan-did-not-touch-the-files", before == after and len(before) == 3)
+    check("realbundle-scan-did-not-touch-the-files", before == after and len(before) == 4)
     name = "bridlework-harness-claude-plugin-0.1.0.tar.gz"
     sums = dict(reversed(l.split("  ", 1)) for l in open(os.path.join(dist, "SHA256SUMS")).read().split("\n") if l) if rc == 0 else {}
     check("realbundle-tarball-sha256-matches-SHA256SUMS", sums.get(name) == before.get(name) and name in sums)
+    ename = engine_tar_name()
+    edir = ename[:-len(".tar.gz")] + "/"
+    try:
+        with tarfile.open(os.path.join(dist, ename), "r:gz") as et:
+            emembers = sorted(et.getnames())
+            em = et.extractfile(edir + "harness").read()
+    except (OSError, KeyError, tarfile.TarError):
+        emembers, em = [], b""
+    check("realbundle-engine-member-is-the-built-engine",
+          emembers == [edir + "LICENSE", edir + "harness"] and hashlib.sha256(em).hexdigest() == hashlib.sha256(open(ENGINE, "rb").read()).hexdigest())
     with tarfile.open(os.path.join(dist, name), "r:gz") as tf:
         members = sorted(tf.getnames())
     check("realbundle-member-list-equals-git-ls-tree", members == md_members(repo) and len(members) >= 15)
@@ -679,10 +744,37 @@ def arm_failclosed():
     w = read_wf(WF)
     rc, o, e = run_text(step(w, "scan", "Build release"), repo, base_env({"RUNNER_TEMP": tmp, "GITHUB_REF": "refs/tags/" + TAG}), LIST)
     check("failclosed-dist-not-empty-at-build", rc == 1)
-    # binary-in-dist: pins today's reason for the deferral (the engine binary never scans clean)
+    # the debug engine still holds the fixtures: its scan must show the fixture classes (not just a home-path exit 1), and the
+    # release engine in the same slot must show none of them
+    ensure_debug_engine()
     repo, dist = built()
-    shutil.copy2(ENGINE, os.path.join(dist, "harness"))
-    check("failclosed-binary-in-dist", scan_rc(repo, dist) == 1)
+    ename = engine_tar_name()
+    dbg = os.path.join(tempfile.mkdtemp(dir=TMP), "dist")
+    shutil.copytree(dist, dbg)
+    shutil.copy2(DEBUG_ENGINE, os.path.join(dbg, "harness"))
+    rc, o, e, mk = scan_dist(repo, dbg)
+    outl = [l for l in o.split("\n") if l]
+    cls = {l.split(":", 1)[1] for l in outl if re.fullmatch(r"release\.artifact:[a-z0-9-]+", l)}
+    rel = os.path.join(tempfile.mkdtemp(dir=TMP), "dist")
+    shutil.copytree(dist, rel)
+    shutil.copy2(ENGINE, os.path.join(rel, "harness"))
+    rrc, ro, re_, _ = scan_dist(repo, rel)
+    rcls = {l.split(":", 1)[1] for l in ro.split("\n") if ":" in l}
+    check("failclosed-debug-engine-in-dist",
+          rc == 1 and not os.path.exists(mk) and all(re.fullmatch(r"release\.artifact:[a-z0-9-]+", l) for l in outl)
+          and (cls - {"home-path"}) == FIXTURE_CLASSES and rrc == 0 and not (rcls & FIXTURE_CLASSES))
+    # engine of an unknown target
+    repo = scratch()
+    with open(os.path.join(repo, "core", "rust", "target", "release", "harness"), "wb") as fh:
+        fh.write(b"#!/bin/sh\necho not an engine\n")
+    os.chmod(os.path.join(repo, "core", "rust", "target", "release", "harness"), 0o755)
+    rc, o, e, d, _ = step_in(repo, "Build release")
+    check("failclosed-engine-unknown-target", rc == 1 and "not a known target" in e and not os.path.exists(os.path.join(d, "SHA256SUMS")))
+    # the fixtures command is absent from release builds and present in debug builds
+    r = subprocess.run([ENGINE, "fixtures", "names"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    check("failclosed-fixtures-cmd-absent-in-release", r.returncode == 2 and r.stdout == b"")
+    r = subprocess.run([DEBUG_ENGINE, "fixtures", "names"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    check("failclosed-fixtures-cmd-present-in-debug", r.returncode == 0 and r.stdout != b"")
 
     # publish side
     repo, dist = built()
@@ -704,6 +796,14 @@ def arm_failclosed():
     os.remove(os.path.join(d4, "release-notes.md"))
     rc, marker, _ = publish_in(d4)
     check("failclosed-publish-listed-file-missing", rc != 0 and not marker)
+    d5 = os.path.join(tempfile.mkdtemp(dir=TMP), "dist")
+    shutil.copytree(dist, d5)
+    second = "bridlework-harness-engine-0.1.0-second.tar.gz"
+    shutil.copy2(os.path.join(d5, ename), os.path.join(d5, second))
+    with open(os.path.join(d5, "SHA256SUMS"), "a") as fh:
+        fh.write("%s  %s\n" % (hashlib.sha256(open(os.path.join(d5, second), "rb").read()).hexdigest(), second))
+    rc, marker, _ = publish_in(d5)
+    check("failclosed-publish-two-engine-tarballs", rc != 0 and not marker)
 
 
 ARMS = {"static": [arm_static], "lint": [arm_lint], "planted": [arm_planted], "clean": [arm_clean],
