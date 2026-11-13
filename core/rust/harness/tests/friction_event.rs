@@ -244,6 +244,8 @@ fn value_for(kind: Kind, key: &str) -> Field {
         ("quarantined", "reason") => "unmanifested",
         ("human_origin_refused", "target") => "config",
         ("human_origin_refused", "path") => "cfg/harness.conf",
+        ("human_origin_accepted", "target") => "config",
+        ("human_origin_accepted", "path") => "cfg/harness.conf",
         ("question_class", "size") => "S",
         ("question_class", "risk") => "low",
         ("question_class", "rule_hit") => "t2_only",
@@ -291,13 +293,13 @@ fn unmapped_kinds_yield_none() {
         let got = map_line(line).unwrap_or_else(|e| panic!("{}: a valid line must not be refused: {e}", kind.as_str()));
         assert!(got.is_none(), "{} must map to no row through the line door too", kind.as_str());
     }
-    // The closed list covers `Kind::ALL` exactly (15 today): nothing maps by accident, nothing is missed.
+    // The closed list covers `Kind::ALL` exactly (16 today): nothing maps by accident, nothing is missed.
     let mut covered: Vec<&str> = MAPPED.iter().copied().chain(unmapped.iter().copied()).collect();
     covered.sort_unstable();
     let mut all: Vec<&str> = Kind::ALL.iter().map(|k| k.as_str()).collect();
     all.sort_unstable();
     assert_eq!(covered, all, "mapped + unmapped must cover every kind exactly once");
-    assert_eq!(all.len(), 15);
+    assert_eq!(all.len(), 16);
 }
 
 // ---------------------------------------------------------------- AC 5-8: the weekly dedup key

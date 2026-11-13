@@ -46,7 +46,7 @@ pub struct Registry {
 }
 
 #[derive(Debug, Clone)]
-enum V {
+pub(crate) enum V {
     S(String),
     B(bool),
     N(u64),
@@ -202,7 +202,7 @@ impl<'a> P<'a> {
     }
 }
 
-fn parse_doc(text: &str) -> Result<V, String> {
+pub(crate) fn parse_doc(text: &str) -> Result<V, String> {
     let mut p = P { b: text.as_bytes(), i: 0 };
     let v = p.value(0)?;
     p.ws();

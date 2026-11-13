@@ -147,6 +147,9 @@ fn human_signed_write_is_accepted() {
     assert_eq!(o.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(fs::read(&fx.cfg).unwrap(), fs::read(&fx.new).unwrap());
     assert!(!log_text(&fx).contains("human_origin_refused"));
+    let l = log_text(&fx);
+    assert_eq!(l.lines().count(), 1);
+    assert!(l.contains("\"kind\":\"human_origin_accepted\"") && l.contains("\"target\":\"config\""), "log: {l}");
 }
 
 #[test]

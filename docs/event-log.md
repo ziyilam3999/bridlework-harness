@@ -15,7 +15,7 @@ One event per line, compact, fixed key order, every key present. Each line carri
 | Key | Shape |
 |---|---|
 | `v` | the integer `2`; any other value is refused (a `v:1` line names `v` and is never upgraded) |
-| `kind` | one of the fifteen kinds below |
+| `kind` | one of the sixteen kinds below |
 | `ts_ms` | non-negative integer, milliseconds since the epoch, supplied by the caller |
 | `run_id`, `role`, `model` | the run identity: which run wrote the line, in which role, with which model |
 | `ticket`, `repo`, `reason` | a plain token: lowercase letters, digits, `-`, `_`, `.`; not empty, not `.` or `..` |
@@ -24,7 +24,7 @@ One event per line, compact, fixed key order, every key present. Each line carri
 
 ## Kinds
 
-Fifteen kinds today, in two families. Each kind's key set is declared once, in the kind table in `core/rust/harness/src/events.rs`; this doc and `schemas/event.schema.json` mirror that table (a test pins all three together, so a drifted key fails the build).
+Sixteen kinds today, in two families. Each kind's key set is declared once, in the kind table in `core/rust/harness/src/events.rs`; this doc and `schemas/event.schema.json` mirror that table (a test pins all three together, so a drifted key fails the build).
 
 ### The four base kinds (the run-identity envelope)
 
@@ -37,7 +37,7 @@ Fifteen kinds today, in two families. Each kind's key set is declared once, in t
 
 All four have the same key set: `v, kind, ts_ms, run_id, ticket, repo, reason, role, model`. Every key is a plain token except `v`, `kind` and `ts_ms`.
 
-### The eleven P1b kinds (payload kinds)
+### The twelve P1b kinds (payload kinds)
 
 These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`) joins them by editing the ONE shared envelope declaration in the loader when a run issuer exists (the PRE-B follow-up). Most have no writer yet; the writers that exist go through the library record writer — the `events append` CLI flags cannot express a payload and refuse these kinds outright. `session_started` with `source=hook` is written by `harness session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>]` (prints nothing on success; exit 2 and nothing written on any refusal), called by the Claude plugin's SessionStart hook `plugins/claude/session-start-hook.sh` with the id from the hook payload.
 
@@ -52,6 +52,7 @@ These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`)
 | `cleanup_result` | `v, kind, ts_ms, ticket, repo, result, manifest_left` | `ticket`, `repo` token; `result` `pass` or `fail`; `manifest_left` u64 (0 = the manifest's empty state) | the finalize step's cleanup outcome; `result=pass` with `manifest_left` above 0 is refused (a pass that left entries behind is a lie) |
 | `quarantined` | `v, kind, ts_ms, ticket, repo, from, to, reason` | `ticket`, `repo` token; `from`, `to` relpath; `reason` `unmanifested` or `retention` | an item was moved to the quarantine folder, not deleted (the "under the harness root" bound is the writer's rule; the loader checks the relpath shape) |
 | `human_origin_refused` | `v, kind, ts_ms, target, path` | `target` `config`, `permission` or `control_registry`; `path` relpath of the target file, never its content | a config, permission or control-registry write was refused because no human origin was proven; no `ticket`/`repo` (an agent run may be off-ticket) |
+| `human_origin_accepted` | `v, kind, ts_ms, target, path` | `target` `config`, `permission` or `control_registry`; `path` relpath of the target file, never its content | a config, permission or control-registry write carried a valid human-origin approval and was accepted; appended before the file is renamed into place (see `docs/human-origin.md`); written by the `config`, `controls` and `permission` write verbs through `handback::guarded_write` (#3708); no `ticket`/`repo` |
 | `question_class` | `v, kind, ts_ms, size, risk, rule_hit` | `size` `S`, `M`, `L` or `unclassified`; `risk` `low`, `high` or `unclassified`; `rule_hit` `status`, `advisor`, `t2_only` or `fail_closed` | one operator question, classified: its size and risk class and the rule that decided it. Only `size=L` AND `risk=high` consults the T3 advisor (trigger `operator-question`); a status request is `rule_hit=status`, a missing or unknown fact is `rule_hit=fail_closed`, both `unclassified` with no advisor. `docs/question-class.md` is the contract |
 | `gate_fail` | `v, kind, ts_ms, ticket, repo, gate_id, failure_class, head_sha, result` | `ticket`, `repo`, `gate_id`, `failure_class` token; `head_sha` sha (the head the gate judged); `result` `fail` | a ticket gate check FAILED; the cause is `gate_id` + `failure_class` (the halves of the caps' signature — never the message, a line or a head); no writer yet, the gate runner's is a later ticket |
 
@@ -69,7 +70,7 @@ These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`)
 
 ### The version rule
 
-The loader keeps a table of each kind's exact key set and the only `v` it exists at; the four base kinds are at `v` 2 with the PRE-B run-identity envelope (bytes exactly as when that envelope landed), the eleven P1b kinds are at `v` 2 with the plain envelope and no identity fields (v 2 was introduced by PRE-B; the nine joined before any writer existed, and `question_class` and `gate_fail` join on the same precedent — declared before any writer exists). Any other `(v, kind)` pair — a kind at a `v` it never had, a `v` this reader does not know at all — is refused naming `v`, and a `v:1` line is never upgraded. A new kind, or a new key, is an additive change that bumps `v`. A reader that sees a `v` it does not know refuses the line and names the line and `v`; it never guesses.
+The loader keeps a table of each kind's exact key set and the only `v` it exists at; the four base kinds are at `v` 2 with the PRE-B run-identity envelope (bytes exactly as when that envelope landed), the twelve P1b kinds are at `v` 2 with the plain envelope and no identity fields (v 2 was introduced by PRE-B; the nine joined before any writer existed, and `question_class` and `gate_fail` join on the same precedent — declared before any writer exists; `human_origin_accepted` (#3708) joins at `v` 2 together with its writer, an amendment named here and not a general licence: no log held a line of that kind, and every `v` 2 reader refuses an unknown kind by name (`unknown kind`), so no reader can misread one; a bump would only have changed which refusal an older reader prints). Any other `(v, kind)` pair — a kind at a `v` it never had, a `v` this reader does not know at all — is refused naming `v`, and a `v:1` line is never upgraded. A new kind, or a new key, is an additive change that bumps `v`. A reader that sees a `v` it does not know refuses the line and names the line and `v`; it never guesses.
 
 ## Run identity (`run_id`)
 
