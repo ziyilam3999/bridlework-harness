@@ -15,10 +15,11 @@ const PLUGIN_REL: &str = "plugins/claude/.claude-plugin/plugin.json";
 const MAX_BYTES: u64 = 1024 * 1024;
 
 /// The hook-event to CLI-verb table: (control id, harness verb words, literal argv prefix the script must hold).
-pub const CLI_VERBS: [(&str, &str, &str); 3] = [
+pub const CLI_VERBS: [(&str, &str, &str); 4] = [
     ("path-restriction-hook", "harness ticket intake", "[bin_path, \"ticket\", \"intake\""),
     ("gh-text-hook", "harness privacy scan --text", "[bin_path, \"privacy\", \"scan\", \"--text\""),
     ("pre-completion-hook", "harness status", "[bin_path, \"status\""),
+    ("session-start-hook", "harness session record-start", "[bin_path, \"session\", \"record-start\""),
 ];
 
 type Table<'a> = &'a [(&'a str, &'a str, &'a str)];
@@ -228,7 +229,7 @@ mod tests {
         let root = repo();
         check(&root).unwrap();
         let text = std::fs::read_to_string(root.join(HOOKS_REL)).unwrap();
-        assert_eq!(text.matches("\"command\":").count(), 3);
+        assert_eq!(text.matches("\"command\":").count(), CLI_VERBS.len());
         for r in load(&root).rows.iter().filter(|r| r.enabled) {
             let m = format!("\"matcher\": \"{}\"", r.hook.as_ref().unwrap().tools.join("|"));
             assert!(text.contains(&m), "hooks.json holds {}", m);
@@ -241,8 +242,8 @@ mod tests {
         let root = &s.0;
         let reg = load(root);
         let base = hooks_json(root, &reg).unwrap();
-        assert_eq!(base.matches("\"command\":").count(), 3);
-        // a 4th enabled row gives a 4th entry
+        assert_eq!(base.matches("\"command\":").count(), CLI_VERBS.len());
+        // one more enabled row gives one more entry
         std::fs::write(root.join("plugins/claude/extra-hook.sh"), "HARNESS_BIN\n[bin_path, \"extra\"\n").unwrap();
         let reg_text = std::fs::read_to_string(root.join("controls/registry.json")).unwrap();
         let row = r#"{"id":"extra-hook","kind":"hook","class":"policy","enabled":true,"failure":"f","test":"plugins/claude/t.sh","retirement_test":"r","owner":"execution_verification","hook":{"script":"plugins/claude/extra-hook.sh","manifest":"plugins/claude/manifest.json","event":"PreToolUse","tools":["Read"]}}"#;
@@ -250,13 +251,13 @@ mod tests {
         let mut table: Vec<(&str, &str, &str)> = CLI_VERBS.to_vec();
         table.push(("extra-hook", "harness extra", "[bin_path, \"extra\""));
         let four = hooks_json_with(root, &reg4, &table).unwrap();
-        assert_eq!(four.matches("\"command\":").count(), 4);
+        assert_eq!(four.matches("\"command\":").count(), CLI_VERBS.len() + 1);
         std::fs::remove_file(root.join("plugins/claude/extra-hook.sh")).unwrap();
         // one row disabled drops exactly that entry
         let off = Registry::parse(&reg_text.replacen("\"enabled\": true", "\"enabled\": false", 1)).unwrap();
         let t2: Vec<_> = CLI_VERBS[1..].to_vec();
         let two = hooks_json_with(root, &off, &t2).unwrap();
-        assert_eq!(two.matches("\"command\":").count(), 2);
+        assert_eq!(two.matches("\"command\":").count(), CLI_VERBS.len() - 1);
         assert!(!two.contains("path-restriction-hook.sh"));
         // a committed file with one entry deleted, or one extra, is an Err naming the file and a line
         let hp = root.join(HOOKS_REL);

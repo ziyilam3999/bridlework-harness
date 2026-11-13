@@ -1,0 +1,9 @@
+{
+  "hook": "session-start-hook.sh",
+  "event": "SessionStart",
+  "tools": ["startup", "resume", "clear", "compact"],
+  "env": ["HARNESS_BIN", "HARNESS_EVENT_LOG"],
+  "requires": ["python3"],
+  "exit_allow": 0,
+  "exit_refuse": 2
+}
