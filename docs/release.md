@@ -2,6 +2,8 @@
 
 A release is cut by CI when a version tag is pushed. Nothing is built or published from a laptop.
 
+Installing a release: see `docs/install.md`.
+
 ## What is published
 
 The `plugins/claude` bundle at the tag, as one tarball (`bridlework-harness-claude-plugin-X.Y.Z.tar.gz`), the engine as a
