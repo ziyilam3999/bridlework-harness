@@ -51,6 +51,10 @@ All rows are one compact JSON line in an append-only file, taken under an exclus
 `harness session launches` joins rows by `run_id` and prints one line per launch with `state=bound|failed|pending|refused`.
 A corrupt line stops the read (exit 2, the line number named). `launcher::read_launches` is the same join as a function.
 
+A `--sign-off` launch writes `"sign_off":true` as the last field of its `launch` row (a launch without the flag writes the
+row it always wrote). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
+(`false`, a string, a number) is a corrupt line. `harness session sign-off-check` reads the mark; see `docs/signoff.md`.
+
 ## Records path
 
 With `--records`, the path is used as typed, resolved against the harness process cwd; its parent folder must
