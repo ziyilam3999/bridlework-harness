@@ -27,7 +27,7 @@ pub const DEFAULT_RECORDS: &str = ".harness/launch-records.jsonl";
 /// Roles whose launch is always checked against the config's `builder_state` list (S-1.5 part 4).
 const ALWAYS_CHECKED_ROLES: [&str; 1] = ["gov"];
 /// Roles a sign-off may run as (S-1.6); `--sign-off` is refused for any other role.
-const SIGN_OFF_ROLES: [&str; 2] = ["gov", "e-rvw"];
+pub(crate) const SIGN_OFF_ROLES: [&str; 2] = ["gov", "e-rvw"];
 const DEFAULT_START_TIMEOUT_MS: u64 = 30000;
 const DEFAULT_MAP_TIMEOUT_MS: u64 = 10000;
 const MAP_POLL_MS: u64 = 250;
@@ -103,6 +103,7 @@ fn sha256_hex(data: &[u8]) -> String {
 pub(crate) enum J {
     Str(String),
     Num(u64),
+    Bool(bool),
     Other,
     Arr(Vec<J>),
     Obj(Vec<(String, J)>),
@@ -205,7 +206,11 @@ impl P<'_> {
                 for lit in ["true", "false", "null"] {
                     if self.b[self.i..].starts_with(lit.as_bytes()) {
                         self.i += lit.len();
-                        return Ok(J::Other);
+                        return Ok(match lit {
+                            "true" => J::Bool(true),
+                            "false" => J::Bool(false),
+                            _ => J::Other,
+                        });
                     }
                 }
                 Err("unexpected character".into())
@@ -301,9 +306,10 @@ fn append_row(path: &Path, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn launch_row(ts: u64, run: &str, name: &str, role: &str, sha: &str) -> String {
+fn launch_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, sign_off: bool) -> String {
+    let mark = if sign_off { ",\"sign_off\":true" } else { "" };
     format!(
-        "{{\"v\":1,\"kind\":\"launch\",\"ts_ms\":{ts},\"run_id\":{},\"name\":{},\"role\":{},\"brief_sha256\":{},\"owner\":\"orchestration\"}}",
+        "{{\"v\":1,\"kind\":\"launch\",\"ts_ms\":{ts},\"run_id\":{},\"name\":{},\"role\":{},\"brief_sha256\":{},\"owner\":\"orchestration\"{mark}}}",
         jstr(run),
         jstr(name),
         jstr(role),
@@ -335,6 +341,8 @@ pub struct Launch {
     pub session_id: Option<String>,
     /// `bound`, `failed`, `pending` or `refused`.
     pub state: &'static str,
+    /// True only when the `launch` row carries `"sign_off":true` (a `--sign-off` launch, #3704).
+    pub sign_off: bool,
 }
 
 pub(crate) fn uuid_ok(id: &str) -> bool {
@@ -378,6 +386,11 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     return Err(bad("a second launch row for the same run_id"));
                 }
                 let f = |k: &str| row.str(k).map(str::to_string).ok_or_else(|| bad(&format!("no `{k}`")));
+                let sign_off = match row.get("sign_off") {
+                    None => false,
+                    Some(J::Bool(true)) => true,
+                    Some(_) => return Err(bad("`sign_off` is not true")),
+                };
                 out.push(Launch {
                     run_id: run.clone(),
                     name: f("name")?,
@@ -387,6 +400,7 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     short_id: None,
                     session_id: None,
                     state: "pending",
+                    sign_off,
                 });
             }
             "launch_ids" => {
@@ -427,6 +441,7 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     short_id: None,
                     session_id: None,
                     state: "refused",
+                    sign_off: false,
                 });
             }
             _ => return Err(bad("unknown `kind`")),
@@ -711,7 +726,7 @@ pub fn launch_cmd(a: &[String]) -> i32 {
             return 6;
         }
     }
-    if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha)) {
+    if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha, args.sign_off)) {
         eprintln!("launch refused: launch record not written: {e}");
         return 2;
     }
@@ -814,7 +829,7 @@ pub fn launches_cmd(a: &[String]) -> i32 {
         Ok(ls) => {
             for l in ls {
                 println!(
-                    "run_id={} name={} role={} brief_sha256={} ts_ms={} short_id={} session_id={} state={}",
+                    "run_id={} name={} role={} brief_sha256={} ts_ms={} short_id={} session_id={} state={}{}",
                     l.run_id,
                     l.name,
                     l.role,
@@ -822,7 +837,8 @@ pub fn launches_cmd(a: &[String]) -> i32 {
                     l.ts_ms,
                     l.short_id.as_deref().unwrap_or("-"),
                     l.session_id.as_deref().unwrap_or("-"),
-                    l.state
+                    l.state,
+                    if l.sign_off { " sign_off=yes" } else { "" }
                 );
             }
             0
