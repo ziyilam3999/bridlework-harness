@@ -250,10 +250,19 @@ def arm_container():
 
 
 # ------------------------------------------------------------------ planted
+def plugin_tarball_name(d):
+    """Exact plugin tarball name (ci/release-build.sh); refuse when missing, never pick the first *.tar.gz."""
+    name = "bridlework-harness-claude-plugin-%s.tar.gz" % VER
+    if not os.path.isfile(os.path.join(d, name)):
+        print("clean-install-smoke: plugin tarball %s missing in %s" % (name, d), file=sys.stderr)
+        sys.exit(1)
+    return name
+
+
 def repack(dest, mutate, rename=None):
     """Copy DIST to dest with the plugin tarball rebuilt through mutate(members)->members; SHA256SUMS matched."""
     shutil.copytree(DIST, dest)
-    name = [n for n in os.listdir(dest) if n.endswith(".tar.gz")][0]
+    name = plugin_tarball_name(dest)
     p = os.path.join(dest, name)
     members = []
     with tarfile.open(p, "r:gz") as tf:
@@ -285,7 +294,7 @@ def arm_planted():
     # (a) one byte of the tarball flipped
     d = os.path.join(S, "pa")
     shutil.copytree(DIST, d)
-    tarp = os.path.join(d, [n for n in os.listdir(d) if n.endswith(".tar.gz")][0])
+    tarp = os.path.join(d, plugin_tarball_name(d))
     b = bytearray(open(tarp, "rb").read())
     b[len(b) // 2] ^= 0xFF
     open(tarp, "wb").write(bytes(b))
