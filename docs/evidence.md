@@ -77,8 +77,8 @@ unless it exits 0.**
 
 ## Output
 
-Neither verb prints any captured byte, no tail, and no path — captured output is never echoed, not
-even a redacted-free tail (evidence privacy is P1B-10); ids are manifest tokens, and every number in
+`show` and `check` print no captured byte, no tail, and no path — captured output is never echoed by
+them (only `quote` reads a stream, scanned first, see Evidence privacy); ids are manifest tokens, and every number in
 the output is re-printed from the parsed record's integers, never copied text.
 
 `show` (exit 0 read, whatever the states) prints one tab-separated line per run, sorted by `<ts>`
@@ -109,15 +109,40 @@ an unreadable running user: stdout empty and one folder-free `harness: error:` s
 manifest is never zero runs — fail closed (2 is the crate's refusal code; 1 matches `ticket gate`'s
 "Done refused").
 
+## Evidence privacy (P1B-10)
+
+Evidence never leaves private state unscanned. Every renderer builds its whole stdout and stderr text
+and hands it to `evidence::emit_scanned`, the only sanctioned way an evidence byte leaves the process.
+It loads the privacy list, scans both texts with the same engine as `privacy scan --text` and
+`friction add`, and on any hit prints nothing on stdout and one stderr line naming the surface, the hit
+count, the class ids and the line numbers (never a scanned byte). **No list configured means exit 2**
+(`harness: error: no privacy list configured: evidence is never printed unscanned`): unscanned is never
+clean. Later renderers (finalize, status/report cards, briefs) must call `emit_scanned`.
+
+`show` and `check` go through it too: a hit in their rendered text, or no list, exits 2 (never 0, so
+Done is never allowed unscanned). Clean output is byte for byte as before.
+
+`harness evidence quote <ticket> --run <id>.<ts> --stream stdout|stderr [--last <n>] --manifest-dir
+<absolute-dir>` quotes captured lines. The run must be one the ticket's manifest signed out. The stream
+is opened no-follow, must be a regular private file owned by the user (a FIFO or symlink is refused,
+never opened), and only its last 64 KiB are read. Only WHOLE finished lines are quoted (a fragment of a
+secret scans clean): the truncation marker is stripped first, a window that does not start at offset 0
+drops its partial first line, a final run with no newline is dropped, and only then must the rest be
+UTF-8 (never a lossy conversion). A stream cut at capture adds the fixed line
+`[harness: stream was truncated at capture; the cut line is not quoted]`. `--last` defaults to 20, max
+200 (0 or more is a usage error). Exit codes: `0` quoted, `1` a privacy hit (stdout empty), `2` cannot
+quote (usage, unsigned run, bad stream, non-UTF-8, no list). `manifest::Class::exportable()` is false
+for `Evidence`: any future export or publish path must check it.
+
 ## Read-only
 
-Neither verb writes, renames, locks, chmods or deletes anything (the manifest included), takes no
+`show` and `check` write nothing: neither writes, renames, locks, chmods or deletes anything (the manifest included), takes no
 supervisor lock file, never opens a FIFO, and no read is unbounded: the manifest through its capped
-(1 MiB) reader, `exit` at most 4097 bytes, streams only ever looked at, never read.
+(1 MiB) reader, `exit` at most 4097 bytes, streams never read by them.
 
 ## What this does not cover
 
-- Evidence privacy (P1B-10): no redaction; nothing is printed, so nothing leaks here.
+- Redaction: there is none by design. Evidence is scanned and refused, never edited (see Evidence privacy above).
 - Retention and teardown of evidence entries and run dirs (P1B-14, ticket 185), run rotation.
 - Wiring the check into `harness ticket finalize` and any operator override for `unknown` runs (P1B-15).
 - Whether a ticket NEEDED a runtime run (zero runs is allowed).

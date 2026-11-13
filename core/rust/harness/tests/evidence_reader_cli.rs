@@ -46,8 +46,21 @@ impl Drop for Tmp {
     }
 }
 
+/// The synthetic deny list injected as the secret: the reader fails closed without a list (P1B-10), and
+/// every inherited list variable is stripped so the child sees only this one.
+const DENY: &str = "zzdenyzz";
+
+fn base() -> Command {
+    let mut c = Command::new(BIN);
+    c.env_remove("HARNESS_CONFIG")
+        .env_remove("HARNESS_PRIVACY_LIST")
+        .env_remove("HARNESS_PRIVACY_OLD_LIST")
+        .env("HARNESS_PRIVACY_LIST_SECRET", DENY);
+    c
+}
+
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN).args(args).stdin(Stdio::null()).output().unwrap()
+    base().args(args).stdin(Stdio::null()).output().unwrap()
 }
 
 fn code(o: &Output) -> i32 {
@@ -87,7 +100,7 @@ fn hold(ms: u64) {
 /// Run a command that must RETURN within `ms` (a FIFO at the `exit` name would hang a reader that
 /// opens before judging the type): past the bound the child is killed and the assert fires.
 fn run_bounded(args: &[&str], ms: u64) -> Output {
-    let mut child = Command::new(BIN)
+    let mut child = base()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

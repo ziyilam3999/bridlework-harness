@@ -40,9 +40,11 @@
 //! poll period, and a zombie still answers `kill -0` — a window in which `stop`'s post-signal proof
 //! would answer 4 "death not confirmed" for a process it had just killed (#209's named zombie race).
 //!
-//! Privacy of what a program printed is NOT handled here: capture is raw, byte-for-byte, secret-shaped
-//! text kept verbatim (P1B-10 owns redaction); the reader verbs and the Done link are P1B-09, below;
-//! retention/teardown is P1B-14.
+//! Privacy of what a program printed (P1B-10): capture itself stays raw, byte-for-byte, secret-shaped
+//! text kept verbatim, but EVIDENCE never leaves private state unscanned — every renderer builds its
+//! text and hands it to `emit_scanned`, the ONLY sanctioned way an evidence byte leaves the process
+//! (later renderers — finalize, status/report cards, briefs — must call it too). The reader verbs and
+//! the Done link are P1B-09, below; retention/teardown is P1B-14.
 
 use crate::manifest;
 use std::fs::{self, File, OpenOptions};
@@ -706,12 +708,12 @@ pub fn waiter_cmd(a: &[String]) -> i32 {
 /// erase what happened); each run gets exactly one state from the table below; `check` refuses Done
 /// (exit 1) while any run is failed, running, unknown or damaged — unknown is NEVER success — and
 /// allows zero runs (most tickets never start a program; whether one was NEEDED is the gate's
-/// business). Neither verb prints any captured byte and no path: ids are manifest tokens, numbers are
+/// business). `show`/`check` print no captured byte and no path: ids are manifest tokens, numbers are
 /// re-printed from parsed integers, never copied text (a tail would echo secret-shaped bytes
-/// unredacted before P1B-10 exists). Neither verb writes, locks, chmods or deletes anything, takes no
+/// unscanned). Neither verb writes, locks, chmods or deletes anything, takes no
 /// supervisor lock, never opens a FIFO (type is checked before any open) and never reads unbounded
 /// (the manifest through its capped reader, `exit` at most 4097 bytes, streams never read at all).
-pub const READER_USAGE: &str = "usage: harness evidence show|check <ticket> --manifest-dir <absolute-dir>";
+pub const READER_USAGE: &str = "usage: harness evidence show|check <ticket> --manifest-dir <absolute-dir> | evidence quote <ticket> --run <id>.<ts> --stream stdout|stderr [--last <n>] --manifest-dir <absolute-dir>";
 
 /// The `exit` record's read cap: a record is ~400 bytes; a bigger file is damaged and the read itself
 /// never takes more than this many bytes plus one (fail closed, never an unbounded read).
@@ -1158,14 +1160,20 @@ fn parse_reader_args(a: &[String]) -> Result<(String, String), String> {
     }
     let ticket = ticket.ok_or_else(|| "a ticket is required".to_string())?;
     let md = md.ok_or_else(|| "--manifest-dir is required".to_string())?;
-    if !crate::events::token_ok(&ticket) {
+    check_ticket_md(&ticket, &md)?;
+    Ok((ticket, md))
+}
+
+/// The ticket must be a plain token and the manifest dir absolute with no `..` component.
+fn check_ticket_md(ticket: &str, md: &str) -> Result<(), String> {
+    if !crate::events::token_ok(ticket) {
         return Err("the ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')".to_string());
     }
-    let p = Path::new(&md);
+    let p = Path::new(md);
     if !p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return Err("--manifest-dir must be an absolute path with no `..` component".to_string());
     }
-    Ok((ticket, md))
+    Ok(())
 }
 
 /// The refused-line detail: the damaged reason token, else the record's own outcome detail; `-` when
@@ -1182,18 +1190,277 @@ fn refused_detail(v: &RunView) -> String {
     }
 }
 
-/// `harness evidence show|check <ticket> --manifest-dir <absolute-dir>` (#214). Exit codes — `show`:
-/// 0 read (whatever the states), 2 cannot check; `check`: 0 Done allowed by evidence, 1 Done refused,
-/// 2 cannot check (usage error, a missing/torn/corrupt manifest, an unreadable manifest dir — a
-/// missing manifest is NEVER zero runs; fail closed). "Cannot check" prints nothing on stdout and one
-/// folder-free `harness: error:` line on stderr. The Done link itself is wired by `ticket finalize`
+/// Why `emit_scanned` printed nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmitRefused {
+    /// No privacy list is configured (or it could not be loaded): unscanned is never clean.
+    NoList,
+    /// The text has hits: only the count, the class ids and `stream:line` places are kept, never bytes.
+    Hit { count: usize, classes: Vec<&'static str>, places: Vec<String> },
+}
+
+/// THE one sanctioned way an evidence byte leaves the process (P1B-10, G2.4). Every evidence renderer
+/// builds its whole stdout text `out` and stderr text `err` first, then calls this. It loads the privacy
+/// list (none: `NoList`), scans BOTH texts with the same engine `privacy scan --text` and `friction add`
+/// use, and on any hit prints NOTHING and returns `Hit` (the caller prints one line naming the surface,
+/// the count, the classes and the lines — never a scanned byte). A clean scan writes `out` to stdout and
+/// `err` to stderr in one write each. Later renderers (finalize P1B-15, status/report cards, briefs)
+/// must go through this function.
+pub fn emit_scanned(_surface: &str, out: &str, err: &str, testmode: bool) -> Result<(), EmitRefused> {
+    let list = crate::overlay::load().map_err(|_| EmitRefused::NoList)?;
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    let mut hits = crate::scan::scan_text(&ctx, "stdout", out);
+    hits.extend(crate::scan::scan_text(&ctx, "stderr", err));
+    if !hits.is_empty() {
+        let mut classes: Vec<&'static str> = Vec::new();
+        for h in &hits {
+            if !classes.contains(&h.class) {
+                classes.push(h.class);
+            }
+        }
+        let places = hits.iter().map(|h| format!("{}:{}", h.name, h.line)).collect();
+        return Err(EmitRefused::Hit { count: hits.len(), classes, places });
+    }
+    if !out.is_empty() {
+        let mut so = std::io::stdout();
+        let _ = so.write_all(out.as_bytes());
+        let _ = so.flush();
+    }
+    if !err.is_empty() {
+        let mut se = std::io::stderr();
+        let _ = se.write_all(err.as_bytes());
+        let _ = se.flush();
+    }
+    Ok(())
+}
+
+/// Emit through `emit_scanned`; a refusal prints exactly one stderr line (surface, count, classes,
+/// places) and returns `hit_code` for a hit, 2 for no list. A clean emit returns `ok_code`.
+fn emit_or_refuse(surface: &str, out: &str, err: &str, testmode: bool, ok_code: i32, hit_code: i32) -> i32 {
+    match emit_scanned(surface, out, err, testmode) {
+        Ok(()) => ok_code,
+        Err(EmitRefused::NoList) => {
+            eprintln!("harness: error: no privacy list configured: evidence is never printed unscanned");
+            2
+        }
+        Err(EmitRefused::Hit { count, classes, places }) => {
+            eprintln!(
+                "harness: error: {surface}: {count} privacy hit(s) ({}) at {}; nothing printed",
+                classes.join(", "),
+                places.join(", ")
+            );
+            hit_code
+        }
+    }
+}
+
+/// The last-window size `quote` reads from a stream, and the `--last` default and cap.
+pub const QUOTE_WINDOW: u64 = 65_536;
+pub const QUOTE_LAST_DEFAULT: usize = 20;
+pub const QUOTE_LAST_MAX: usize = 200;
+/// The fixed harness line printed after a quote of a stream cut at capture (not evidence).
+pub const QUOTE_TRUNCATED_NOTE: &str = "[harness: stream was truncated at capture; the cut line is not quoted]";
+
+#[cfg(target_os = "linux")]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0;
+
+/// A capture stream's own table (the `exit` file's rules minus the size cap): a symlink, not a regular
+/// file (a FIFO is never opened), another owner, any group/other bit.
+fn stream_file_reason(m: &fs::Metadata, uid: u32) -> Option<&'static str> {
+    let ft = m.file_type();
+    if ft.is_symlink() {
+        return Some("symlink");
+    }
+    if !ft.is_file() {
+        return Some("not-regular");
+    }
+    if m.uid() != uid {
+        return Some("foreign-owner");
+    }
+    if m.mode() & 0o077 != 0 {
+        return Some("bad-mode");
+    }
+    None
+}
+
+/// The whole lines of a stream's last window, and whether the stream was cut at capture.
+struct Tail {
+    lines: Vec<String>,
+    truncated: bool,
+}
+
+/// The cuts that make a window only whole, finished lines (pure; `read_capture_tail` feeds it). `file_len`
+/// is the file's size, `start` the window's file offset, `win` the window's bytes. In order: (a) the
+/// truncation marker, when the file is exactly cap+marker long and ends with it, is stripped (its leading
+/// `\n` would make the cap-cut line look finished); (b) a window not at offset 0 drops everything up to
+/// and including its first `\n`; (c) a final run with no `\n` after it is dropped; (d) only then must
+/// what is left be UTF-8 (never a lossy conversion).
+fn whole_lines(file_len: u64, start: u64, win: &[u8]) -> Result<Tail, String> {
+    let mut b = win;
+    let mut truncated = false;
+    if file_len == STREAM_CAP + TRUNCATION_MARKER.len() as u64 && b.ends_with(TRUNCATION_MARKER) {
+        b = &b[..b.len() - TRUNCATION_MARKER.len()];
+        truncated = true;
+    }
+    if start > 0 {
+        match b.iter().position(|&c| c == b'\n') {
+            Some(i) => b = &b[i + 1..],
+            None => b = &[],
+        }
+    }
+    match b.iter().rposition(|&c| c == b'\n') {
+        Some(i) => b = &b[..=i],
+        None => b = &[],
+    }
+    let text = std::str::from_utf8(b).map_err(|_| "the stream is not valid UTF-8".to_string())?;
+    let lines = text.split_terminator('\n').map(|l| l.to_string()).collect();
+    Ok(Tail { lines, truncated })
+}
+
+/// Read one stream's last window (at most `QUOTE_WINDOW` bytes). PRIVATE on purpose: the only caller
+/// that can emit its bytes is the quote verb, which goes through `emit_scanned`.
+fn read_capture_tail(path: &Path, uid: u32) -> Result<Tail, String> {
+    use std::io::{Seek, SeekFrom};
+    let looked = fs::symlink_metadata(path).map_err(|_| "the stream cannot be read".to_string())?;
+    if let Some(r) = stream_file_reason(&looked, uid) {
+        return Err(format!("the stream is not readable ({r})"));
+    }
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_NOFOLLOW_NONBLOCK)
+        .open(path)
+        .map_err(|_| "the stream cannot be opened".to_string())?;
+    let opened = f.metadata().map_err(|_| "the stream cannot be read".to_string())?;
+    if !same_identity(&looked, &opened) || !opened.file_type().is_file() {
+        return Err("the stream was swapped".to_string());
+    }
+    let len = opened.len();
+    let start = len.saturating_sub(QUOTE_WINDOW);
+    f.seek(SeekFrom::Start(start)).map_err(|_| "the stream cannot be read".to_string())?;
+    let mut win = Vec::new();
+    f.take(len - start).read_to_end(&mut win).map_err(|_| "the stream cannot be read".to_string())?;
+    whole_lines(len, start, &win)
+}
+
+/// `quote <ticket> --run <id>.<ts> --stream stdout|stderr [--last <n>] --manifest-dir <abs>`.
+fn parse_quote_args(a: &[String]) -> Result<(String, String, u64, String, usize, String), String> {
+    let (mut ticket, mut run, mut stream, mut last, mut md) = (None, None, None, None, None);
+    let mut it = a.iter();
+    while let Some(arg) = it.next() {
+        let slot = match arg.as_str() {
+            "--run" => &mut run,
+            "--stream" => &mut stream,
+            "--last" => &mut last,
+            "--manifest-dir" => &mut md,
+            s if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            s => {
+                if ticket.replace(s.to_string()).is_some() {
+                    return Err("more than one ticket given".to_string());
+                }
+                continue;
+            }
+        };
+        let Some(v) = it.next() else { return Err(format!("{arg} is missing its value")) };
+        if slot.replace(v.clone()).is_some() {
+            return Err(format!("{arg} was given twice"));
+        }
+    }
+    let ticket = ticket.ok_or_else(|| "a ticket is required".to_string())?;
+    let md = md.ok_or_else(|| "--manifest-dir is required".to_string())?;
+    check_ticket_md(&ticket, &md)?;
+    let run = run.ok_or_else(|| "--run is required".to_string())?;
+    let (rid, rts) = run.rsplit_once('.').ok_or_else(|| "--run must be <id>.<ts>".to_string())?;
+    if !crate::events::token_ok(rid) || rts.is_empty() || !rts.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("--run must be <id>.<ts> (a plain token, then digits)".to_string());
+    }
+    let ts: u64 = rts.parse().map_err(|_| "--run must be <id>.<ts> (a plain token, then digits)".to_string())?;
+    let stream = stream.ok_or_else(|| "--stream is required".to_string())?;
+    if stream != "stdout" && stream != "stderr" {
+        return Err("--stream must be stdout or stderr".to_string());
+    }
+    let last = match last {
+        None => QUOTE_LAST_DEFAULT,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if (1..=QUOTE_LAST_MAX).contains(&n) => n,
+            _ => return Err(format!("--last must be a number from 1 to {QUOTE_LAST_MAX}")),
+        },
+    };
+    Ok((ticket, rid.to_string(), ts, stream, last, md))
+}
+
+/// `harness evidence quote ...`: the first renderer that quotes a captured line. The run must be one the
+/// ticket's manifest signed out; the dir chain and the stream file pass the reader's type/owner checks;
+/// only whole finished lines of the last 64 KiB are quoted, and they go through `emit_scanned` — a hit
+/// exits 1 with stdout empty, no list or any cannot-quote exits 2.
+fn quote_cmd(a: &[String], testmode: bool) -> i32 {
+    let (ticket, rid, ts, stream, last, md) = match parse_quote_args(a) {
+        Ok(v) => v,
+        Err(m) => {
+            eprintln!("harness: error: {m}");
+            return 2;
+        }
+    };
+    let read = match manifest::read_manifest(Path::new(&md), &ticket) {
+        Ok(r) if r.is_clean() => r,
+        _ => {
+            eprintln!("harness: error: the manifest could not be read");
+            return 2;
+        }
+    };
+    let Ok(uid) = own_uid() else {
+        eprintln!("harness: error: cannot determine the running user");
+        return 2;
+    };
+    let (runs, _other) = collect_runs(&read);
+    let Some((_, _, dir)) = runs.iter().find(|(id, t, _)| *id == rid && *t == ts) else {
+        eprintln!("harness: error: that run is not signed out by the ticket's manifest");
+        return 2;
+    };
+    for at in [dir.parent().and_then(|p| p.parent()), dir.parent(), Some(dir.as_path())] {
+        let ok = at.and_then(|p| fs::symlink_metadata(p).ok()).is_some_and(|m| dir_reason(&m, uid).is_none());
+        if !ok {
+            eprintln!("harness: error: the run folder is missing or not private");
+            return 2;
+        }
+    }
+    let tail = match read_capture_tail(&dir.join(&stream), uid) {
+        Ok(t) => t,
+        Err(m) => {
+            eprintln!("harness: error: {m}");
+            return 2;
+        }
+    };
+    let skip = tail.lines.len().saturating_sub(last);
+    let mut out = String::new();
+    for l in &tail.lines[skip..] {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if tail.truncated {
+        out.push_str(QUOTE_TRUNCATED_NOTE);
+        out.push('\n');
+    }
+    emit_or_refuse("evidence.quote", &out, "", testmode, 0, 1)
+}
+
+/// `harness evidence show|check <ticket> --manifest-dir <absolute-dir>` (#214) and `evidence quote`
+/// (P1B-10). Exit codes — `show`: 0 read (whatever the states), 2 cannot check; `check`: 0 Done allowed by
+/// evidence, 1 Done refused, 2 cannot check (usage error, a missing/torn/corrupt manifest, an unreadable
+/// manifest dir, no privacy list, a privacy hit in the rendered text — a missing manifest is NEVER zero
+/// runs; fail closed). "Cannot check" prints nothing on stdout and one folder-free `harness: error:` line
+/// on stderr. All output goes through `emit_scanned`. The Done link itself is wired by `ticket finalize`
 /// (P1B-15), exactly as `workspace check` is: finalize runs this check and refuses Done unless 0.
-pub fn evidence_cmd(a: &[String]) -> i32 {
+pub fn evidence_cmd(a: &[String], testmode: bool) -> i32 {
     let check = match a.first().map(|s| s.as_str()) {
         Some("show") => false,
         Some("check") => true,
+        Some("quote") => return quote_cmd(&a[1..], testmode),
         _ => {
-            eprintln!("harness: error: evidence takes a verb, show or check: {READER_USAGE}");
+            eprintln!("harness: error: evidence takes a verb, show, check or quote: {READER_USAGE}");
             return 2;
         }
     };
@@ -1245,11 +1512,12 @@ pub fn evidence_cmd(a: &[String]) -> i32 {
         })
         .collect();
     let count = |s: RunState| views.iter().filter(|v| v.state == s).count();
+    let mut out = String::new();
     if !check {
         for v in &views {
             match &v.record {
-                Some(r) => println!(
-                    "run\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                Some(r) => out.push_str(&format!(
+                    "run\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     v.id,
                     v.ts,
                     v.state.as_str(),
@@ -1263,18 +1531,18 @@ pub fn evidence_cmd(a: &[String]) -> i32 {
                     r.stderr_bytes,
                     r.stdout_truncated,
                     r.stderr_truncated
-                ),
-                None => println!(
-                    "run\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+                )),
+                None => out.push_str(&format!(
+                    "run\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-\t-\t-\t-\n",
                     v.id,
                     v.ts,
                     v.state.as_str(),
                     v.reason.unwrap_or("-")
-                ),
+                )),
             }
         }
-        println!(
-            "evidence ticket={} runs={} ok={} stopped={} attempt={} failed={} running={} unknown={} damaged={} other={}",
+        out.push_str(&format!(
+            "evidence ticket={} runs={} ok={} stopped={} attempt={} failed={} running={} unknown={} damaged={} other={}\n",
             ticket,
             views.len(),
             count(RunState::Ok),
@@ -1285,27 +1553,27 @@ pub fn evidence_cmd(a: &[String]) -> i32 {
             count(RunState::Unknown),
             count(RunState::Damaged),
             other
-        );
-        return 0;
+        ));
+        return emit_or_refuse("evidence.show", &out, "", testmode, 0, 2);
     }
     let blocking: Vec<&RunView> = views.iter().filter(|v| v.state.blocks_done()).collect();
     if blocking.is_empty() {
-        println!("evidence=allowed ticket={} runs={}", ticket, views.len());
-        return 0;
+        out.push_str(&format!("evidence=allowed ticket={} runs={}\n", ticket, views.len()));
+        return emit_or_refuse("evidence.check", &out, "", testmode, 0, 2);
     }
     for v in &blocking {
-        println!("refused {} {} {} {}", v.id, v.ts, v.state.as_str(), refused_detail(v));
+        out.push_str(&format!("refused {} {} {} {}\n", v.id, v.ts, v.state.as_str(), refused_detail(v)));
     }
-    println!("evidence=refused ticket={} blocking={}", ticket, blocking.len());
+    out.push_str(&format!("evidence=refused ticket={} blocking={}\n", ticket, blocking.len()));
     let first = blocking[0];
-    eprintln!(
-        "harness: error: Done refused by evidence: {} run(s) failed, running, unknown or damaged (first: {}.{} {})",
+    let err = format!(
+        "harness: error: Done refused by evidence: {} run(s) failed, running, unknown or damaged (first: {}.{} {})\n",
         blocking.len(),
         first.id,
         first.ts,
         first.state.as_str()
     );
-    1
+    emit_or_refuse("evidence.check", &out, &err, testmode, 1, 2)
 }
 
 // ---------------------------------------------------------------- #209 + #214: unit tests
