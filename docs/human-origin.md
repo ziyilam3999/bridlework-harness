@@ -1,6 +1,6 @@
-# Human origin: config writes need a human's signature
+# Human origin: config, permission and control-registry writes need a human's signature
 
-Some files decide what agents may do. The harness writes the config only when the write comes with a human approval. This page is the proof, the setup and the recipe.
+Some files decide what agents may do. The harness writes the config, the permission set and the control registry only when the write comes with a human approval. This page is the proof, the setup and the recipe.
 
 ## The proof
 
@@ -8,8 +8,8 @@ A detached OpenSSH signature (`ssh-keygen -Y sign`, namespace `bridlework-human-
 
 ```
 bridlework-human-origin v1
-target=config
-name=<config file name, last component only>
+target=config|permission|control_registry
+name=<target file name, last component only>
 expires_ms=<n>
 content-follows
 <the exact new content bytes>
@@ -41,13 +41,27 @@ ssh-keygen -Y sign -n bridlework-human-origin -f <your-key> msg      # writes ms
 harness config write --config <config> --from <new-file> --approval msg.sig --expires-ms $EXP
 ```
 
+The same flow covers the other two targets, through the same guarded write (`handback::guarded_write`, the only caller of the check):
+
+```
+harness controls approval-message --registry <controls/registry.json> --from <new-file> --expires-ms $EXP > msg
+ssh-keygen -Y sign -n bridlework-human-origin -f <your-key> msg
+harness controls write --registry <controls/registry.json> --from <new-file> --approval msg.sig --expires-ms $EXP
+
+harness permission approval-message --settings <settings-file> --from <new-file> --expires-ms $EXP > msg
+ssh-keygen -Y sign -n bridlework-human-origin -f <your-key> msg
+harness permission write --settings <settings-file> --from <new-file> --approval msg.sig --expires-ms $EXP
+```
+
+`--registry` and `--settings` are required (no env default). New registry content must pass the strict registry parser; new permission content must be a JSON object whose only key is `permissions`, whose keys are a subset of `allow`, `deny`, `ask`, each an array of distinct non-empty strings. An approval signed for one target is refused on another (the target is inside the signed message).
+
 `--log <file>` and `--root <dir>` choose the event log (default `.harness/events.jsonl`).
 
 ## Exit codes
 
-- 0: written (`config written name=<name>`).
-- 2: usage error, bad new content (it must pass `harness config check` rules), or the refusal could not be logged. Nothing is written.
-- 3: refused. The config is untouched and a `human_origin_refused` event is logged. Stderr: `harness: human_origin_refused target=config reason=<word>`.
+- 0: written (`config written name=<name>`, `controls written name=<name>` or `permission written name=<name>`). An accepted write also logs a `human_origin_accepted` event (`target`, `path`). The line is appended after the new file is staged and before it is renamed into place, so no write lands unlogged. If the rename itself fails the log holds an accepted line with no landed write: the accepted line records that the approval was accepted, and the stdout `written` line confirms the write landed.
+- 2: usage error, bad new content (it must pass the target's own rules: `harness config check` for the config, the registry parser, the permission-shape check), or the refusal could not be logged. Nothing is written.
+- 3: refused. The file is untouched and a `human_origin_refused` event is logged. Stderr: `harness: human_origin_refused target=config|permission|control_registry reason=<word>`.
 
 ## Refusal words
 
@@ -55,4 +69,4 @@ harness config write --config <config> --from <new-file> --approval msg.sig --ex
 
 ## Not covered
 
-An agent editing the config file directly with a shell is not seen by this verb; nor is replacing the `harness` binary. Both are tracked as follow-ups.
+A direct shell edit of `controls/registry.json` or of a permission file is not seen by these verbs (tracked). The live machine-wide managed-settings file is root-owned, so the operator installs it with sudo; the permission verb writes the repo's or overlay's permission set. An agent editing the config file directly with a shell is not seen by this verb; nor is replacing the `harness` binary. Both are tracked as follow-ups.
