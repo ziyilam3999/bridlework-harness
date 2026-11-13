@@ -9,7 +9,8 @@
 //! Exit codes: 0 launched; 1 the name is refused (P1B-16, `--new` mode); 2 usage, validation or the
 //! launch record could not be written (nothing was started); 3 the host failed to start (non-zero,
 //! no short id, E2BIG, timeout); 4 the id could not be mapped and the session was stopped; 5 the id
-//! could not be mapped and the stop FAILED (stop it by hand).
+//! could not be mapped and the stop FAILED (stop it by hand); 6 a signer launch was refused because its
+//! brief names a builder-state entry from the config (a `launch_refused` row is written, nothing started).
 use crate::events::{self, Field, Kind, Record};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -23,6 +24,10 @@ use std::time::{Duration, Instant};
 pub const BRIEF_MAX_BYTES: usize = 102400;
 /// Default records file, relative to the harness process cwd (never `--cwd`).
 pub const DEFAULT_RECORDS: &str = ".harness/launch-records.jsonl";
+/// Roles whose launch is always checked against the config's `builder_state` list (S-1.5 part 4).
+const ALWAYS_CHECKED_ROLES: [&str; 1] = ["gov"];
+/// Roles a sign-off may run as (S-1.6); `--sign-off` is refused for any other role.
+const SIGN_OFF_ROLES: [&str; 2] = ["gov", "e-rvw"];
 const DEFAULT_START_TIMEOUT_MS: u64 = 30000;
 const DEFAULT_MAP_TIMEOUT_MS: u64 = 10000;
 const MAP_POLL_MS: u64 = 250;
@@ -34,7 +39,7 @@ const AGENT_KEY_SHORT: &str = "id";
 const AGENT_KEY_FULL: &str = "sessionId";
 const AGENT_KEY_NAME: &str = "name";
 
-pub const LAUNCH_USAGE: &str = "usage: harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] [--map-timeout-ms <n>] | session launches [--records <file>]";
+pub const LAUNCH_USAGE: &str = "usage: harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--sign-off] [--start-timeout-ms <n>] [--map-timeout-ms <n>] | session launches [--records <file>]";
 
 // ------------------------------------------------------------------------------------ sha256
 
@@ -328,7 +333,7 @@ pub struct Launch {
     pub ts_ms: u64,
     pub short_id: Option<String>,
     pub session_id: Option<String>,
-    /// `bound`, `failed` or `pending`.
+    /// `bound`, `failed`, `pending` or `refused`.
     pub state: &'static str,
 }
 
@@ -386,6 +391,9 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
             }
             "launch_ids" => {
                 let i = find(&mut out).ok_or_else(|| bad("an id row with no launch row before it"))?;
+                if out[i].state == "refused" {
+                    return Err(bad("an id row for a refused launch"));
+                }
                 let sid = row.str("session_id").ok_or_else(|| bad("no `session_id`"))?;
                 if !uuid_ok(sid) {
                     return Err(bad("`session_id` is not a uuid"));
@@ -399,7 +407,27 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
             }
             "launch_failed" => {
                 let i = find(&mut out).ok_or_else(|| bad("a failure row with no launch row before it"))?;
+                if out[i].state == "refused" {
+                    return Err(bad("a failure row for a refused launch"));
+                }
                 out[i].state = "failed";
+            }
+            "launch_refused" => {
+                if find(&mut out).is_some() {
+                    return Err(bad("a second row for the same run_id as a refusal"));
+                }
+                let f = |k: &str| row.str(k).map(str::to_string).ok_or_else(|| bad(&format!("no `{k}`")));
+                row.str("matched_entry").ok_or_else(|| bad("no `matched_entry`"))?;
+                out.push(Launch {
+                    run_id: run.clone(),
+                    name: f("name")?,
+                    role: f("role")?,
+                    brief_sha256: f("brief_sha256")?,
+                    ts_ms: ts,
+                    short_id: None,
+                    session_id: None,
+                    state: "refused",
+                });
             }
             _ => return Err(bad("unknown `kind`")),
         }
@@ -514,13 +542,33 @@ struct Args {
     config: Option<std::ffi::OsString>,
     start_ms: u64,
     map_ms: u64,
+    sign_off: bool,
+}
+
+fn refused_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, entry: &str) -> String {
+    format!(
+        "{{\"v\":1,\"kind\":\"launch_refused\",\"ts_ms\":{ts},\"run_id\":{},\"name\":{},\"role\":{},\"brief_sha256\":{},\"matched_entry\":{}}}",
+        jstr(run),
+        jstr(name),
+        jstr(role),
+        jstr(sha),
+        jstr(entry)
+    )
 }
 
 fn parse_args(a: &[String]) -> Result<Args, String> {
     let (mut name, mut brief, mut cwd, mut host, mut records, mut config, mut start, mut map) =
         (None, None, None, None, None, None, None, None);
+    let mut sign_off = false;
     let mut it = a.iter();
     while let Some(f) = it.next() {
+        if f == "--sign-off" {
+            if sign_off {
+                return Err("--sign-off was given twice".into());
+            }
+            sign_off = true;
+            continue;
+        }
         let slot: &mut Option<String> = match f.as_str() {
             "--name" => &mut name,
             "--brief" => &mut brief,
@@ -551,6 +599,7 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
         config: config.map(std::ffi::OsString::from),
         start_ms: ms(start, DEFAULT_START_TIMEOUT_MS, "--start-timeout-ms")?,
         map_ms: ms(map, DEFAULT_MAP_TIMEOUT_MS, "--map-timeout-ms")?,
+        sign_off,
     })
 }
 
@@ -617,6 +666,10 @@ pub fn launch_cmd(a: &[String]) -> i32 {
         }
     };
     let role = verdict.role;
+    if args.sign_off && !SIGN_OFF_ROLES.contains(&role) {
+        return usage_err("--sign-off needs a gov or e-rvw name");
+    }
+    let checked = args.sign_off || ALWAYS_CHECKED_ROLES.contains(&role);
     // 3. hash and run id
     let sha = sha256_hex(&brief);
     let run = events::new_run_id();
@@ -634,6 +687,30 @@ pub fn launch_cmd(a: &[String]) -> i32 {
             p
         }
     };
+    // 4b. signer check (S-1.5 part 4): after the records folder exists, before the `launch` row
+    if checked {
+        if cfg.builder_state().is_empty() {
+            eprintln!("launch refused: a signer launch needs the config's builder_state list");
+            return 2;
+        }
+        if let Some((entry, _)) = cfg.builder_state().iter().find(|(_, text)| brief_str.contains(text.as_str())) {
+            let shape = Record::build(
+                Kind::LaunchRefused,
+                0,
+                &[("launch_role", Field::Str(role.to_string())), ("brief_sha256", Field::Str(sha.clone())), ("matched_entry", Field::Str(entry.clone()))],
+            );
+            if let Err(e) = shape {
+                eprintln!("launch refused: the signer brief names builder-state entry {entry}; refusal record not written: {e}");
+                return 2;
+            }
+            if let Err(e) = append_row(&records, &refused_row(now_ms(), &run, &args.name, role, &sha, entry)) {
+                eprintln!("launch refused: the signer brief names builder-state entry {entry}; refusal record not written: {e}");
+                return 2;
+            }
+            eprintln!("launch refused: the signer brief names builder-state entry {entry}; nothing started");
+            return 6;
+        }
+    }
     if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha)) {
         eprintln!("launch refused: launch record not written: {e}");
         return 2;
