@@ -1,6 +1,6 @@
 //! `harness ticket finalize` (P1B-15; std only, Unix). The one command that decides whether a ticket may be called Done. It builds nothing:
 //! every check runs as a CHILD of this same binary (the pattern `teardown.rs` uses), its stdout is captured under a fixed cap and never
-//! printed, its stderr is dropped. Order (the first "no" stops, exit 1): gate (via `status`), pushed, clean, sweep, teardown, evidence, then
+//! printed, its stderr is dropped. Order (the first "no" stops, exit 1): gate (via `status`), pushed, clean, sessions (P1B-17: close this ticket's host sessions, then re-read the listing), sweep, teardown, evidence, then
 //! an in-process re-read of the manifest. The sweep runs before teardown (teardown keeps evidence files, so a later sweep would shelve them);
 //! evidence runs after teardown (only teardown stops a live process, and a live process makes evidence refuse). Exit 0 plus the one
 //! `finalize=done` line IS "marked Done" (the `ticket gate` convention). See docs/finalize.md. No folder is ever printed.
@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: harness ticket finalize <ticket-file> --manifest-dir <abs> --repo-dir <abs> --workspace-root <abs> --quarantine-dir <abs> --result-dir <abs> --caps-dir <abs> --log <abs> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>]";
+pub const USAGE: &str = "usage: harness ticket finalize <ticket-file> --manifest-dir <abs> --repo-dir <abs> --workspace-root <abs> --quarantine-dir <abs> --result-dir <abs> --caps-dir <abs> --log <abs> --role <token> --model <token> --host <abs> --config <abs> [--grace-ms <n>] [--ts-ms <n>]";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 /// A child's stdout is read no further than this; more than this is `cannot-check`.
@@ -29,6 +29,8 @@ struct Args {
     log: String,
     role: String,
     model: String,
+    host: String,
+    config: String,
     grace_ms: Option<String>,
     ts_ms: Option<String>,
 }
@@ -48,9 +50,9 @@ fn num_ok(s: &str) -> bool {
 
 fn parse(a: &[String]) -> Result<Args, String> {
     let mut file: Option<String> = None;
-    let mut slots: [Option<String>; 11] = Default::default();
-    const NAMES: [&str; 11] = [
-        "manifest-dir", "repo-dir", "workspace-root", "quarantine-dir", "result-dir", "caps-dir", "log", "role", "model", "grace-ms", "ts-ms",
+    let mut slots: [Option<String>; 13] = Default::default();
+    const NAMES: [&str; 13] = [
+        "manifest-dir", "repo-dir", "workspace-root", "quarantine-dir", "result-dir", "caps-dir", "log", "role", "model", "grace-ms", "ts-ms", "host", "config",
     ];
     let mut i = 0;
     while i < a.len() {
@@ -79,12 +81,17 @@ fn parse(a: &[String]) -> Result<Args, String> {
     let log = take(6)?;
     let role = take(7)?;
     let model = take(8)?;
+    let host = take(11)?;
+    let config = take(12)?;
     let grace = slots[9].take();
     let ts = slots[10].take();
-    for (n, v) in [("manifest-dir", &md), ("repo-dir", &rd), ("workspace-root", &wr), ("quarantine-dir", &qd), ("result-dir", &res), ("caps-dir", &caps), ("log", &log)] {
+    for (n, v) in [("manifest-dir", &md), ("repo-dir", &rd), ("workspace-root", &wr), ("quarantine-dir", &qd), ("result-dir", &res), ("caps-dir", &caps), ("log", &log), ("host", &host), ("config", &config)] {
         if !abs_ok(v) {
             return Err(format!("--{} must be an absolute path with no `.` or `..` component", n));
         }
+    }
+    if !std::fs::metadata(&host).map(|m| m.is_file()).unwrap_or(false) {
+        return Err("--host is not an existing regular file".to_string());
     }
     if !token_ok(&role) || !token_ok(&model) {
         return Err("--role and --model must be plain tokens".to_string());
@@ -96,7 +103,7 @@ fn parse(a: &[String]) -> Result<Args, String> {
             }
         }
     }
-    Ok(Args { ticket_file: file, manifest_dir: md, repo_dir: rd, workspace_root: wr, quarantine_dir: qd, result_dir: res, caps_dir: caps, log, role, model, grace_ms: grace, ts_ms: ts })
+    Ok(Args { ticket_file: file, manifest_dir: md, repo_dir: rd, workspace_root: wr, quarantine_dir: qd, result_dir: res, caps_dir: caps, log, role, model, host, config, grace_ms: grace, ts_ms: ts })
 }
 
 /// One child run of this same binary: no stdin, stderr dropped, stdout captured under the cap.
@@ -128,10 +135,21 @@ enum Why {
 struct Stop {
     check: &'static str,
     why: Why,
+    /// The session a `sessions` failure names, from the failing child's own output.
+    session: Option<String>,
 }
 
 fn stop(check: &'static str, why: Why) -> Stop {
-    Stop { check, why }
+    Stop { check, why, session: None }
+}
+
+/// The `name=` value of the first line starting with `lead`, only when it is itself a valid session name.
+fn session_of(out: &str, lead: &str) -> String {
+    let name = out.lines().find(|l| l.starts_with(lead)).and_then(|l| field(l, "name"));
+    match name {
+        Some(n) if crate::session_name::check(n, u64::MAX, false).is_ok() => n.to_string(),
+        _ => "-".to_string(),
+    }
 }
 
 /// A child's exit code folded to pass / fail / cannot-check: `ok` passes, `no` is the check's own "no", anything else cannot be checked.
@@ -185,6 +203,18 @@ fn run_checks(a: &Args, t: &Ticket, tree: &str) -> Result<String, Stop> {
     // c: nothing unexpected in the work folder.
     let r = child(&sv(&["workspace", "check", id, "--manifest-dir", &a.manifest_dir]));
     fold("clean", r, 0, &[2])?;
+    // c2: close this ticket's host sessions, then re-read the listing (S-1.6, S-1.6.1). Nothing before this step acts.
+    let (host, cfg) = (a.host.as_str(), a.config.as_str());
+    match child(&sv(&["session", "close", "--host", host, "--config", cfg, "--ticket", id])) {
+        Some((0, _)) => {}
+        Some((1, o)) => return Err(Stop { check: "sessions", why: Why::Fail, session: Some(session_of(&o, "close=fail ")) }),
+        _ => return Err(stop("sessions", Why::CannotCheck)),
+    }
+    match child(&sv(&["session", "done-check", "--host", host, "--config", cfg, "--done", id])) {
+        Some((0, _)) => {}
+        Some((1, o)) => return Err(Stop { check: "sessions", why: Why::Fail, session: Some(session_of(&o, "session=open ")) }),
+        _ => return Err(stop("sessions", Why::CannotCheck)),
+    }
     // d: unlisted leftovers go to the shelf; moving any one refuses Done.
     let mut sweep = sv(&["quarantine", "sweep", id, "--manifest-dir", &a.manifest_dir, "--workspace-root", &a.workspace_root, "--quarantine-dir", &a.quarantine_dir]);
     sweep.extend(sv(&["--log", &a.log, "--repo", repo, "--role", &a.role, "--model", &a.model]));
@@ -254,7 +284,10 @@ pub fn finalize_cmd(a: &[String]) -> i32 {
         }
         Err(s) => {
             let why = if s.why == Why::Fail { "fail" } else { "cannot-check" };
-            println!("finalize=refused ticket={} check={} reason={}", ticket.id, s.check, why);
+            match &s.session {
+                Some(n) => println!("finalize=refused ticket={} check={} reason={} session={}", ticket.id, s.check, why, n),
+                None => println!("finalize=refused ticket={} check={} reason={}", ticket.id, s.check, why),
+            }
             eprintln!("harness: finalize refused: check={}", s.check);
             1
         }
