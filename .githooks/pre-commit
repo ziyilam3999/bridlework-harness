@@ -1,7 +1,21 @@
 #!/bin/sh
 # pre-commit privacy gate. Scans the lines being added to the index and refuses the commit
-# when the engine reports a hit or cannot decide (fail closed). No arguments, no switch.
+# when the engine reports a hit or cannot decide (fail closed). It also refuses any staged
+# .ai-workspace/ path, even one force-added past .gitignore. No arguments, no switch.
 top=$(git rev-parse --show-toplevel) || exit 1
+# Private working folder: never committed here, even when force-added past .gitignore.
+# Deletions are allowed (removing a leaked file must commit); a rename is judged as delete plus add.
+# A failing git diff refuses too (fail closed). This check runs before, and without, the engine.
+names=$(git -c core.quotepath=false diff --cached --name-only --no-renames --diff-filter=d) || {
+  echo "pre-commit: could not list staged paths; refusing" >&2
+  exit 1
+}
+bad=$(printf '%s\n' "$names" | grep -E '(^|/)\.ai-workspace(/|$)')
+if [ -n "$bad" ]; then
+  printf '%s\n' "$bad" | sed 's/^/pre-commit: staged private path: /' >&2
+  echo "pre-commit: refused: .ai-workspace/ is never committed in this repo; unstage with: git restore --staged -- <path>" >&2
+  exit 1
+fi
 eng="$top/core/rust/target/release/harness"
 if [ ! -x "$eng" ]; then
   echo "pre-commit: privacy engine missing; build it with: cd core/rust && cargo build --release" >&2
