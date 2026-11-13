@@ -514,6 +514,9 @@ pub fn run(mut args: Vec<String>) -> i32 {
             return 2;
         }
     }
+    if !args.is_empty() && args[0] == "plugin" {
+        return crate::plugin::plugin_cmd(&args[1..]);
+    }
     if !args.is_empty() && args[0] == "status" {
         return crate::status::status_cmd(&args[1..]);
     }
