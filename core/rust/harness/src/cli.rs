@@ -257,7 +257,34 @@ fn events_cmd(a: &[String]) -> i32 {
     }
 }
 
-const CONFIG_USAGE: &str = "usage: harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]";
+const CONFIG_USAGE: &str = "usage: harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]\n       harness config approval-message --config <file> --from <new-file> --expires-ms <n>\n       harness config write --config <file> --from <new-file> [--approval <sig> --expires-ms <n>] [--log <file>] [--root <dir>]";
+/// Parse `--flag value` pairs against `allowed`; each flag at most once.
+pub(crate) fn take_flags(a: &[String], allowed: &[&str]) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut m = std::collections::HashMap::new();
+    let mut it = a.iter();
+    while let Some(flag) = it.next() {
+        let Some(k) = flag.strip_prefix("--").filter(|k| allowed.contains(k)) else { return Err("unknown option".to_string()) };
+        let Some(v) = it.next() else { return Err("an option is missing its value".to_string()) };
+        if m.insert(k.to_string(), v.clone()).is_some() {
+            return Err("an option was given twice".to_string());
+        }
+    }
+    Ok(m)
+}
+
+/// `harness config approval-message` and `harness config write` (the one human-origin write verb), through the shared
+/// `handback::run_verb`. Exit 0 done; 2 usage/bad content/log failure; 3 refused for lack of human origin (the config is untouched).
+#[cfg(unix)]
+fn config_write_cmd(sub: &str, a: &[String]) -> i32 {
+    let spec = crate::handback::Spec {
+        target: crate::human_origin::Target::Config,
+        flag: "config",
+        noun: "config",
+        env: Some("HARNESS_CONFIG"),
+        validate: |t| crate::config::Config::parse(t).map(|_| ()),
+    };
+    crate::handback::run_verb(&spec, sub, a)
+}
 
 /// `harness config check`. Exit 0 the config loaded (stdout: `config ok repos=<n> shadow=ok`, plus `repo_id=<id> mapped` and
 /// `budget size=<S> wall_seconds=<n> tokens=<n>` when asked); 1 `--repo` names an id that is not in the map; 2 everything else
@@ -270,6 +297,10 @@ fn config_cmd(a: &[String]) -> i32 {
         eprintln!("harness: error: {}", m);
         2
     };
+    #[cfg(unix)]
+    if let Some(sub @ ("write" | "approval-message")) = a.first().map(|s| s.as_str()) {
+        return config_write_cmd(sub, &a[1..]);
+    }
     if a.first().map(|s| s.as_str()) != Some("check") {
         eprintln!("{}", CONFIG_USAGE);
         return 2;
@@ -331,7 +362,7 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
-const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new]";
+const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>]";
 
 /// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
 /// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->` for the launcher
@@ -347,6 +378,15 @@ fn session_cmd(a: &[String]) -> i32 {
         eprintln!("harness: error: {}", m);
         2
     };
+    if a.first().map(|s| s.as_str()) == Some("record-start") {
+        return session_record_start(&a[1..]);
+    }
+    #[cfg(unix)]
+    match a.first().map(|s| s.as_str()) {
+        Some("launch") => return crate::launcher::launch_cmd(&a[1..]),
+        Some("launches") => return crate::launcher::launches_cmd(&a[1..]),
+        _ => {}
+    }
     if a.first().map(|s| s.as_str()) != Some("check-name") {
         eprintln!("{}", SESSION_USAGE);
         return 2;
@@ -402,7 +442,56 @@ fn session_cmd(a: &[String]) -> i32 {
     }
 }
 
-const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
+/// `harness session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>]` (P1B-21). Appends ONE
+/// `session_started` event with `source=hook` through the library record writer. Exit 0 recorded (stdout EMPTY: a SessionStart
+/// hook's stdout reaches the model); 2 any refusal (usage, unknown or duplicate flag, bad id shape, relative log, append error),
+/// with nothing written. The root defaults to the log's parent, as `events append` does with an explicit `--log`.
+fn session_record_start(rest: &[String]) -> i32 {
+    use crate::events::{self, Field, Kind, Record};
+    let refuse = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        eprintln!("harness: EVENT NOT RECORDED");
+        2
+    };
+    let o = match take_event_opts(rest, &["session-id", "log", "root", "ts-ms"]) {
+        Ok(o) => o,
+        Err(e) => return refuse(&e),
+    };
+    let Some(id) = o.get("session-id") else { return refuse("--session-id is required") };
+    let Some(log) = o.get("log") else { return refuse("--log is required") };
+    let log = std::path::PathBuf::from(log);
+    if !log.is_absolute() {
+        return refuse("--log must be an absolute path");
+    }
+    let ts_ms = match o.get("ts-ms") {
+        Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => match s.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => return refuse("--ts-ms out of range"),
+        },
+        Some(_) => return refuse("--ts-ms must be a non-negative integer"),
+        None => match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as u64,
+            Err(_) => return refuse("clock is before the epoch"),
+        },
+    };
+    let root = match o.get("root") {
+        Some(r) => std::path::PathBuf::from(r),
+        None => match log.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => return refuse("--log has no parent folder"),
+        },
+    };
+    let rec = match Record::build(Kind::SessionStarted, ts_ms, &[("session_id", Field::Str(id.clone())), ("source", Field::Str("hook".to_string()))]) {
+        Ok(r) => r,
+        Err(e) => return refuse(&e),
+    };
+    match events::append_record(&root, &log, &rec) {
+        Ok(()) => 0,
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>]";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 
@@ -422,6 +511,12 @@ fn ticket_cmd(a: &[String]) -> i32 {
         return crate::ticket_gate::gate_cmd(&a[1..]);
         #[cfg(not(unix))]
         return fail("ticket gate is not available on this platform");
+    }
+    if a.first().map(|s| s.as_str()) == Some("finalize") {
+        #[cfg(unix)]
+        return crate::finalize::finalize_cmd(&a[1..]);
+        #[cfg(not(unix))]
+        return fail("ticket finalize is not available on this platform");
     }
     if a.first().map(|s| s.as_str()) != Some("intake") {
         eprintln!("{}", TICKET_USAGE);
@@ -488,6 +583,14 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "config" {
         return config_cmd(&args[1..]);
     }
+    #[cfg(unix)]
+    if !args.is_empty() && args[0] == "controls" {
+        return crate::handback::controls_cmd(&args[1..]);
+    }
+    #[cfg(unix)]
+    if !args.is_empty() && args[0] == "permission" {
+        return crate::handback::permission_cmd(&args[1..]);
+    }
     if !args.is_empty() && args[0] == "session" {
         return session_cmd(&args[1..]);
     }
@@ -542,7 +645,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return crate::friction::friction_cmd(&args[1..], testmode);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";

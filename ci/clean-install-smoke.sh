@@ -5,6 +5,7 @@
 # ci/release-build.sh to make the dist folder and `git archive` for the source. The `fresh` arm and every plant that runs the real
 # install use `env -i` with a fresh HOME plus exactly two non-HARNESS_ variables, CARGO_HOME and RUSTUP_HOME, both outside HOME.
 # There is no plant switch in install.sh or e2e.sh: plants mutate inputs or run the phases one by one.
+# The smoke checks release-build's own dist_files=N line against the files it listed and the files in dist, never a fixed count.
 # Fixture git identity and every planted value are built at run time; a home path is never typed.
 # Prints "ok <id>" / "FAIL <id>" per check, then "N ok, M failed". Exit 0 only if every check holds, 1 otherwise, 2 on setup error.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
@@ -80,11 +81,40 @@ def arm_static():
     wf = rd(".github/workflows/clean-install.yml")
     check("static-job-named-clean-install", re.search(r"^  clean-install:\s*$", wf, re.M) is not None
           and "final-gate" not in code_only(wf) and not re.search(r"^  gate:", wf, re.M))
+    fx = tempfile.mkdtemp(prefix="dist-count-fixture-")
+    try:
+        names = ["SHA256SUMS", "a.tar.gz", "b.tar.gz", "release-notes.md"]
+        for nm in names:
+            open(os.path.join(fx, nm), "w").close()
+        body = "\n".join(names) + "\n"
+        check("static-dist-count-accepts-true-count", dist_count_ok("dist_files=4\n" + body, fx)[0])
+        check("static-dist-count-refuses-wrong-count", not dist_count_ok("dist_files=3\n" + body, fx)[0])
+        check("static-dist-count-refuses-missing-line", not dist_count_ok(body, fx)[0])
+    finally:
+        shutil.rmtree(fx, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ setup: scratch repo, release dist, source archive
 def run(args, **kw):
     return subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+
+
+def dist_count_ok(stdout, dist):
+    """Cross-check release-build's count line against the names it listed and the files in dist. No count is hard-coded."""
+    lines = [l for l in stdout.split("\n") if l.strip()]
+    if not lines or re.fullmatch(r"dist_files=[1-9][0-9]*", lines[0].strip()) is None:
+        return False, "first line is not a dist_files=N count line"
+    if any(l.startswith("dist_files=") for l in lines[1:]):
+        return False, "more than one dist_files= line"
+    n = int(lines[0].strip().split("=", 1)[1])
+    listed = [l.strip() for l in lines[1:]]
+    try:
+        actual = sorted(os.listdir(dist))
+    except OSError:
+        return False, "dist folder unreadable"
+    if n == len(listed) == len(actual) and listed == actual:
+        return True, ""
+    return False, "count line says %d, listed %d, dist holds %d" % (n, len(listed), len(actual))
 
 
 def setup():
@@ -118,8 +148,12 @@ def setup():
         raise Setup("engine build failed:\n" + r.stdout.decode("utf-8", "replace")[-800:])
     DIST = os.path.join(S, "dist")
     r = run(["sh", "ci/release-build.sh", "refs/tags/v" + VER, DIST], cwd=repo)
-    if r.returncode != 0 or "dist_files=3" not in r.stdout.decode():
-        raise Setup("release-build failed:\n" + r.stdout.decode("utf-8", "replace")[-800:])
+    out = r.stdout.decode("utf-8", "replace")
+    if r.returncode != 0:
+        raise Setup("release-build failed:\n" + out[-800:])
+    ok, why = dist_count_ok(out, DIST)
+    if not ok:
+        raise Setup("release-build dist count mismatch: " + why + "\n" + out[-800:])
     SRC = os.path.join(S, "src.tar.gz")
     r = run(g + ["archive", "--format=tar.gz", "--prefix=bridlework-harness-%s/" % VER, "-o", SRC, "v" + VER])
     if r.returncode != 0:
@@ -216,10 +250,19 @@ def arm_container():
 
 
 # ------------------------------------------------------------------ planted
+def plugin_tarball_name(d):
+    """Exact plugin tarball name (ci/release-build.sh); refuse when missing, never pick the first *.tar.gz."""
+    name = "bridlework-harness-claude-plugin-%s.tar.gz" % VER
+    if not os.path.isfile(os.path.join(d, name)):
+        print("clean-install-smoke: plugin tarball %s missing in %s" % (name, d), file=sys.stderr)
+        sys.exit(1)
+    return name
+
+
 def repack(dest, mutate, rename=None):
     """Copy DIST to dest with the plugin tarball rebuilt through mutate(members)->members; SHA256SUMS matched."""
     shutil.copytree(DIST, dest)
-    name = [n for n in os.listdir(dest) if n.endswith(".tar.gz")][0]
+    name = plugin_tarball_name(dest)
     p = os.path.join(dest, name)
     members = []
     with tarfile.open(p, "r:gz") as tf:
@@ -251,7 +294,7 @@ def arm_planted():
     # (a) one byte of the tarball flipped
     d = os.path.join(S, "pa")
     shutil.copytree(DIST, d)
-    tarp = os.path.join(d, [n for n in os.listdir(d) if n.endswith(".tar.gz")][0])
+    tarp = os.path.join(d, plugin_tarball_name(d))
     b = bytearray(open(tarp, "rb").read())
     b[len(b) // 2] ^= 0xFF
     open(tarp, "wb").write(bytes(b))

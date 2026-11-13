@@ -66,6 +66,7 @@ fn signature(rec: &Record) -> Result<Option<Vec<(&'static str, String)>>, String
         | Kind::CleanupResult
         | Kind::Quarantined
         | Kind::HumanOriginRefused
+        | Kind::HumanOriginAccepted
         | Kind::QuestionClass => None,
     })
 }

@@ -52,7 +52,11 @@ pub const TRIAGE_TOP_DEFAULT: u64 = 3;
 /// ladder). A refusal over it never carries the value.
 pub const DESIGN_TIER_KEY: &str = "factory.design_tier";
 
-const SECTIONS: [&str; 6] = ["repos", "budgets", "shadow", "lanes", "friction", "factory"];
+/// The OPTIONAL section (ticket 3703): builder state a signer brief must not name. `<entry-name>: <text>`.
+const BUILDER_STATE: &str = "builder_state";
+const SECTIONS: [&str; 7] = ["repos", "budgets", "shadow", "lanes", "friction", "factory", BUILDER_STATE];
+/// Sections 0..REQUIRED_SECTIONS must be present; the rest are optional.
+const REQUIRED_SECTIONS: usize = 6;
 const YAML_WORDS: [&str; 11] = ["true", "false", "null", "yes", "no", "on", "off", "y", "n", ".inf", ".nan"];
 
 /// The wall-time and token limit of one ticket size.
@@ -89,6 +93,8 @@ pub struct Config {
     triage_top: u64,
     /// The `factory.design_tier` tier (v4, ticket 190): the tier the factory designs new fixes at.
     design_tier: Tier,
+    /// The optional `builder_state` entries (ticket 3703), file order: (entry name, text). Never printed.
+    builder_state: Vec<(String, String)>,
 }
 
 /// A refusal that names the line, and the section and key when known. Never carries a value.
@@ -152,7 +158,8 @@ impl Config {
         if text.is_empty() {
             return Err("config: file is empty".to_string());
         }
-        let mut seen = [false; 6];
+        let mut seen = [false; 7];
+        let mut builder_state: Vec<(String, String)> = Vec::new();
         let mut section: Option<usize> = None;
         let mut repos: Vec<(RepoId, String)> = Vec::new();
         let mut nums: [Option<u64>; 15] = [None; 15];
@@ -225,6 +232,18 @@ impl Config {
                     return Err(refuse(n, &at, "two repo ids on one folder"));
                 }
                 repos.push((id, val.to_string()));
+            } else if sec == BUILDER_STATE {
+                let at = format!("section `{sec}` key `{}`", shown(key));
+                if key.len() > 64 || !crate::events::token_ok(key) {
+                    return Err(refuse(n, &at, "the entry name must be a token of at most 64 bytes (lowercase letters, digits, `-`, `_`, `.`)"));
+                }
+                if val.is_empty() || val.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+                    return Err(refuse(n, &at, "the entry text must be non-empty with no control character"));
+                }
+                if builder_state.iter().any(|(k, _)| k == key) {
+                    return Err(refuse(n, &at, "duplicate entry name"));
+                }
+                builder_state.push((key.to_string(), val.to_string()));
             } else if sec == "friction" {
                 let at = format!("section `{sec}` key `{}`", shown(key));
                 if key == "pattern_threshold" {
@@ -290,7 +309,7 @@ impl Config {
         // v3: a missing `friction` section is named by its key (a v2 file is refused naming `friction.inbox`), but an
         // earlier missing section is named first, in file order, as before. v4 does the same for `factory`
         // (a v3 file is refused naming `factory.design_tier`).
-        if let Some(i) = seen.iter().position(|s| !s) {
+        if let Some(i) = seen[..REQUIRED_SECTIONS].iter().position(|s| !s) {
             if i == 4 {
                 return Err(format!("config: missing key `{INBOX_KEY}`"));
             }
@@ -310,7 +329,14 @@ impl Config {
             pattern_threshold: pattern_threshold.unwrap_or(PATTERN_THRESHOLD_DEFAULT),
             triage_top: triage_top.unwrap_or(TRIAGE_TOP_DEFAULT),
             design_tier: design_tier.ok_or_else(|| format!("config: missing key `{DESIGN_TIER_KEY}`"))?,
-        })    }
+            builder_state,
+        })
+    }
+
+    /// The `builder_state` entries in file order: (entry name, text). Empty when the section is absent.
+    pub fn builder_state(&self) -> &[(String, String)] {
+        &self.builder_state
+    }
 
     /// Read at most the cap plus one byte, then parse. No search, no default location: the caller names the file. Errors never carry the path.
     pub fn load(path: &Path) -> Result<Config, String> {
@@ -822,5 +848,56 @@ mod tests {
         std::fs::write(&p, "repos:\n  a: /x/\n").unwrap();
         assert!(!Config::load(&p).unwrap_err().contains(secret));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn with_bs(entries: &str) -> String {
+        format!("{}\nbuilder_state:\n{entries}\n", valid())
+    }
+
+    #[test]
+    fn builder_state_two_entries_load_in_file_order() {
+        let c = Config::parse(&with_bs("  zeta: /scratch/one\n  alpha: /scratch/two")).unwrap();
+        let e = c.builder_state();
+        assert_eq!(e.len(), 2);
+        assert_eq!((e[0].0.as_str(), e[0].1.as_str()), ("zeta", "/scratch/one"));
+        assert_eq!((e[1].0.as_str(), e[1].1.as_str()), ("alpha", "/scratch/two"));
+    }
+
+    #[test]
+    fn builder_state_bad_entry_name_is_refused_naming_the_line() {
+        let t = with_bs("  Upper: /scratch/one");
+        let m = refused(&t);
+        assert!(m.contains("line ") && m.contains("builder_state"), "{m}");
+        let long = format!("  {}: /x", "a".repeat(65));
+        assert!(refused(&with_bs(&long)).contains("builder_state"));
+    }
+
+    #[test]
+    fn builder_state_duplicate_entry_name_is_refused() {
+        let m = refused(&with_bs("  one: /scratch/a\n  one: /scratch/b"));
+        assert!(m.contains("duplicate entry name"), "{m}");
+    }
+
+    #[test]
+    fn builder_state_empty_value_is_refused() {
+        assert!(refused(&with_bs("  one:")).contains("non-empty"));
+    }
+
+    #[test]
+    fn builder_state_refusal_never_carries_the_entry_text() {
+        let secret = "/synthetic-secret-0xB2";
+        for t in [with_bs(&format!("  one: {secret}\n  one: {secret}")), with_bs(&format!("  One: {secret}")), with_bs(&format!("  one: {secret}: x"))] {
+            assert!(!leaks(&refused(&t), secret));
+        }
+    }
+
+    #[test]
+    fn builder_state_absent_section_loads_with_zero_entries() {
+        assert!(Config::parse(&valid()).unwrap().builder_state().is_empty());
+    }
+
+    #[test]
+    fn builder_state_duplicate_section_is_refused() {
+        assert!(refused(&format!("{}\nbuilder_state:\n  a: /x\nbuilder_state:\n  b: /y\n", valid())).contains("duplicate section"));
     }
 }

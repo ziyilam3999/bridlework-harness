@@ -218,6 +218,20 @@
       }
     },
     {
+      "title": "human_origin_accepted",
+      "description": "A config, permission or control-registry write carried a valid human-origin approval and was accepted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "target", "path"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "human_origin_accepted" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "target": { "enum": ["config", "permission", "control_registry"], "description": "The class of write accepted." },
+        "path": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Relative path of the target file under the harness root, never its content." }
+      }
+    },
+    {
       "title": "question_class",
       "description": "One operator question, classified: its size and risk class and the rule that decided it (docs/question-class.md). Only size=L AND risk=high consults the T3 advisor; the event never names a model brand.",
       "type": "object",

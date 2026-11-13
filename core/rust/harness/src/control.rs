@@ -46,7 +46,7 @@ pub struct Registry {
 }
 
 #[derive(Debug, Clone)]
-enum V {
+pub(crate) enum V {
     S(String),
     B(bool),
     N(u64),
@@ -202,7 +202,7 @@ impl<'a> P<'a> {
     }
 }
 
-fn parse_doc(text: &str) -> Result<V, String> {
+pub(crate) fn parse_doc(text: &str) -> Result<V, String> {
     let mut p = P { b: text.as_bytes(), i: 0 };
     let v = p.value(0)?;
     p.ws();
@@ -637,7 +637,7 @@ mod tests {
     fn the_committed_registry_has_one_row_per_plugin_hook() {
         let repo = repo();
         let reg = Registry::load(&repo).expect("the committed registry loads");
-        assert_eq!(reg.rows.len(), 3, "one row per hook: {:?}", reg.ids());
+        assert_eq!(reg.rows.len(), crate::plugin::CLI_VERBS.len(), "one row per hook: {:?}", reg.ids());
         if let Err(e) = check_hooks(&repo, &reg) {
             panic!("registry check failed: {}", e);
         }

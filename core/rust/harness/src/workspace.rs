@@ -145,7 +145,7 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
 
 /// One git call: no hooks, no inherited `GIT_*` name (so an inherited `GIT_DIR` cannot redirect it), no stdin, and
 /// stderr dropped (git's own message may name a folder). The `tree_prep.rs` git-call rule.
-fn git(repo: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Option<String> {
     let mut c = Command::new("git");
     c.arg("-C").arg(repo).args(["-c", "core.hooksPath=/dev/null"]).args(args);
     for (k, _) in std::env::vars_os() {
@@ -162,12 +162,17 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
 
 /// The repo the ticket names, resolved once the `tree_prep.rs` way: canonical, the top level of its work tree, and
 /// a MAIN work tree (git dir == common dir), so a workspace is never made from another ticket's workspace.
-struct Repo {
-    top: PathBuf,
-    common: PathBuf,
+pub(crate) struct Repo {
+    pub(crate) top: PathBuf,
+    #[allow(dead_code)]
+    pub(crate) common: PathBuf,
 }
 
-fn resolve_main_work_tree(path: &Path) -> Result<Repo, Stop> {
+pub(crate) fn resolve_main_work_tree(path: &Path) -> Result<Repo, String> {
+    resolve_main_work_tree_stop(path).map_err(|Stop(_, l)| l)
+}
+
+fn resolve_main_work_tree_stop(path: &Path) -> Result<Repo, Stop> {
     let canon = path.canonicalize().map_err(|_| err2("the mapped repo folder is unreadable"))?;
     let out = git(&canon, &["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"])
         .ok_or_else(|| err2("the mapped repo folder is not a readable git work tree"))?;
@@ -288,6 +293,9 @@ pub fn workspace_cmd(a: &[String]) -> i32 {
             return 3;
         }
     }
+    if a.first().map(|s| s.as_str()) == Some("teardown") {
+        return crate::teardown::teardown_cmd(&a[1..]);
+    }
     match create(a) {
         Ok(s) => {
             println!("workspace=created ticket={} repo_id={} base={} branch={}", s.ticket, s.repo_id, s.base, s.branch);
@@ -325,7 +333,7 @@ fn create(a: &[String]) -> Result<Success, Stop> {
         .map
         .lookup(&accepted.repo_id)
         .ok_or_else(|| err2("the repo map no longer lists the ticket's repo"))?;
-    let repo = resolve_main_work_tree(dir)?;
+    let repo = resolve_main_work_tree_stop(dir)?;
     let base = resolve_base(&repo, &args.base)?;
     let branch = format!("ws/{}", ticket.id);
 

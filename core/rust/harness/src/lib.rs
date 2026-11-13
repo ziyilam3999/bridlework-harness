@@ -25,9 +25,16 @@ pub mod friction_loop;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;
+#[cfg(unix)]
+pub mod handback;
+#[cfg(unix)]
+pub mod human_origin;
 pub mod intake;
+#[cfg(unix)]
+pub mod launcher;
 pub mod manifest;
 pub mod overlay;
+pub mod permission;
 pub mod path_map;
 pub mod plugin;
 pub mod question_class;
@@ -43,6 +50,10 @@ pub mod status;
 #[cfg(unix)]
 pub mod supervisor;
 pub mod ticket;
+#[cfg(unix)]
+pub mod finalize;
+#[cfg(unix)]
+pub mod teardown;
 #[cfg(unix)]
 pub mod ticket_gate;
 #[cfg(unix)]
