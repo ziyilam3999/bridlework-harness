@@ -39,7 +39,7 @@ All four have the same key set: `v, kind, ts_ms, run_id, ticket, repo, reason, r
 
 ### The twelve P1b kinds (payload kinds)
 
-These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`) joins them by editing the ONE shared envelope declaration in the loader when a run issuer exists (the PRE-B follow-up). Most have no writer yet; the writers that exist go through the library record writer — the `events append` CLI flags cannot express a payload and refuse these kinds outright.
+These carry no run-identity fields yet: the identity (`run_id`, `role`, `model`) joins them by editing the ONE shared envelope declaration in the loader when a run issuer exists (the PRE-B follow-up). Most have no writer yet; the writers that exist go through the library record writer — the `events append` CLI flags cannot express a payload and refuse these kinds outright. `session_started` with `source=hook` is written by `harness session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>]` (prints nothing on success; exit 2 and nothing written on any refusal), called by the Claude plugin's SessionStart hook `plugins/claude/session-start-hook.sh` with the id from the hook payload.
 
 | Kind | Keys (canonical order) | Field shapes after `v`, `kind`, `ts_ms` | Meaning |
 |---|---|---|---|

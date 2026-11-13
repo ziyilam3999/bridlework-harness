@@ -48,6 +48,22 @@
         "event": "PreToolUse",
         "tools": ["TaskUpdate"]
       }
+    },
+    {
+      "id": "session-start-hook",
+      "kind": "hook",
+      "class": "crutch",
+      "enabled": true,
+      "failure": "An interactive session starts and the event log never learns its id.",
+      "test": "plugins/claude/session-start-smoke.sh",
+      "retirement_test": "Retire when the host hands the session id to the engine directly and the smoke shows no case only this hook covers.",
+      "owner": "execution_verification",
+      "hook": {
+        "script": "plugins/claude/session-start-hook.sh",
+        "manifest": "plugins/claude/session-start-manifest.json",
+        "event": "SessionStart",
+        "tools": ["startup", "resume", "clear", "compact"]
+      }
     }
   ]
 }

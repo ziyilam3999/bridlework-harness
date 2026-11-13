@@ -362,7 +362,7 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
-const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>]";
+const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>]";
 
 /// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
 /// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->` for the launcher
@@ -378,6 +378,9 @@ fn session_cmd(a: &[String]) -> i32 {
         eprintln!("harness: error: {}", m);
         2
     };
+    if a.first().map(|s| s.as_str()) == Some("record-start") {
+        return session_record_start(&a[1..]);
+    }
     #[cfg(unix)]
     match a.first().map(|s| s.as_str()) {
         Some("launch") => return crate::launcher::launch_cmd(&a[1..]),
@@ -439,7 +442,56 @@ fn session_cmd(a: &[String]) -> i32 {
     }
 }
 
-const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
+/// `harness session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>]` (P1B-21). Appends ONE
+/// `session_started` event with `source=hook` through the library record writer. Exit 0 recorded (stdout EMPTY: a SessionStart
+/// hook's stdout reaches the model); 2 any refusal (usage, unknown or duplicate flag, bad id shape, relative log, append error),
+/// with nothing written. The root defaults to the log's parent, as `events append` does with an explicit `--log`.
+fn session_record_start(rest: &[String]) -> i32 {
+    use crate::events::{self, Field, Kind, Record};
+    let refuse = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        eprintln!("harness: EVENT NOT RECORDED");
+        2
+    };
+    let o = match take_event_opts(rest, &["session-id", "log", "root", "ts-ms"]) {
+        Ok(o) => o,
+        Err(e) => return refuse(&e),
+    };
+    let Some(id) = o.get("session-id") else { return refuse("--session-id is required") };
+    let Some(log) = o.get("log") else { return refuse("--log is required") };
+    let log = std::path::PathBuf::from(log);
+    if !log.is_absolute() {
+        return refuse("--log must be an absolute path");
+    }
+    let ts_ms = match o.get("ts-ms") {
+        Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => match s.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => return refuse("--ts-ms out of range"),
+        },
+        Some(_) => return refuse("--ts-ms must be a non-negative integer"),
+        None => match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as u64,
+            Err(_) => return refuse("clock is before the epoch"),
+        },
+    };
+    let root = match o.get("root") {
+        Some(r) => std::path::PathBuf::from(r),
+        None => match log.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => return refuse("--log has no parent folder"),
+        },
+    };
+    let rec = match Record::build(Kind::SessionStarted, ts_ms, &[("session_id", Field::Str(id.clone())), ("source", Field::Str("hook".to_string()))]) {
+        Ok(r) => r,
+        Err(e) => return refuse(&e),
+    };
+    match events::append_record(&root, &log, &rec) {
+        Ok(()) => 0,
+        Err(e) => refuse(&e.to_string()),
+    }
+}
+
+const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>]";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 
@@ -459,6 +511,12 @@ fn ticket_cmd(a: &[String]) -> i32 {
         return crate::ticket_gate::gate_cmd(&a[1..]);
         #[cfg(not(unix))]
         return fail("ticket gate is not available on this platform");
+    }
+    if a.first().map(|s| s.as_str()) == Some("finalize") {
+        #[cfg(unix)]
+        return crate::finalize::finalize_cmd(&a[1..]);
+        #[cfg(not(unix))]
+        return fail("ticket finalize is not available on this platform");
     }
     if a.first().map(|s| s.as_str()) != Some("intake") {
         eprintln!("{}", TICKET_USAGE);
@@ -587,7 +645,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return crate::friction::friction_cmd(&args[1..], testmode);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";
