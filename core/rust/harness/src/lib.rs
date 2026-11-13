@@ -28,6 +28,8 @@ pub mod gitio;
 #[cfg(unix)]
 pub mod human_origin;
 pub mod intake;
+#[cfg(unix)]
+pub mod launcher;
 pub mod manifest;
 pub mod overlay;
 pub mod path_map;

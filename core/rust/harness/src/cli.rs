@@ -462,7 +462,7 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
-const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new]";
+const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>]";
 
 /// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
 /// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->` for the launcher
@@ -478,6 +478,12 @@ fn session_cmd(a: &[String]) -> i32 {
         eprintln!("harness: error: {}", m);
         2
     };
+    #[cfg(unix)]
+    match a.first().map(|s| s.as_str()) {
+        Some("launch") => return crate::launcher::launch_cmd(&a[1..]),
+        Some("launches") => return crate::launcher::launches_cmd(&a[1..]),
+        _ => {}
+    }
     if a.first().map(|s| s.as_str()) != Some("check-name") {
         eprintln!("{}", SESSION_USAGE);
         return 2;

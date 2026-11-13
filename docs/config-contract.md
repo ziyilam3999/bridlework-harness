@@ -17,7 +17,7 @@ The config is one text file. The program reads it. The ONLY write verb is `harne
 
 ## 3. Shape
 
-Six sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`, `friction`, `factory`. Two levels only: a section line (`name:` with nothing after it), then indented `key: value` lines (two spaces). Whole-line `#` comments and blank lines are allowed. Spaces only.
+Six required sections, in this order of meaning: `repos`, `budgets`, `shadow`, `lanes`, `friction`, `factory`, plus one OPTIONAL seventh, `builder_state` (ticket 3703). Two levels only: a section line (`name:` with nothing after it), then indented `key: value` lines (two spaces). Whole-line `#` comments and blank lines are allowed. Spaces only.
 
 ### Keys
 
@@ -50,6 +50,8 @@ factory.design_tier
 ```
 
 `repos` has no fixed keys: each key is a repo id (section 5). It may be empty.
+
+`builder_state` (OPTIONAL section, ticket 3703; the version stays v4, like ticket 192) has no fixed keys either: each line is `  <entry-name>: <text>`. The entry name must be a token (lowercase letters, digits, `-`, `_`, `.`) of at most 64 bytes; it is the `matched_entry` of a `launch_refused` row. The text is a plain value (the grammar below), non-empty, with no control character. A duplicate entry name is refused. A missing section loads as zero entries; the library exposes it as `builder_state()` (file order). A signer launch (`docs/launcher.md`, step 3b) with zero entries is refused, so the section is needed wherever signers launch. Refusals name the line, section and key, never the text.
 
 - `budgets`: per ticket size S, M, L (`s_`, `m_`, `l_`), a wall-time limit in seconds and a token limit. Flat keys.
 - `shadow`: per capability, a ticket or dispatch cap (`p1a_cap`, `p4a_cap`, `d2a_cap`, `p7_cap`) and a token budget (`..._token_budget`).
@@ -93,7 +95,7 @@ Anything outside this contract is a refusal. The refusal names the section and k
 
 ## 7. Public file content
 
-The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. `friction.pattern_threshold` ships as its default value, `3`, written out so the optional key is visible in the public example; `friction.triage_top` ships as its default, `3`, on the same terms; omitting the line means the same thing. `factory.design_tier` ships as `T3`, the spec default (G8.3): a default lives in the public example, the same pattern as `lanes.count`. The real values live only in the private file.
+The example holds no repo entries, no folder and no name. Every budget value and every shadow token-budget value is the placeholder `1`: an unseeded install stops, it does not overspend. The four shadow caps are policy numbers, not private: `p1a_cap` 5 tickets, `p4a_cap` 10 dispatches, `d2a_cap` 20 tickets, `p7_cap` 10 tickets. `lanes.count` is policy too and ships as 4. `friction.inbox` ships as the placeholder path `/placeholder/friction-inbox.jsonl`: no inbox of this repo, only of the overlay. `friction.pattern_threshold` ships as its default value, `3`, written out so the optional key is visible in the public example; `friction.triage_top` ships as its default, `3`, on the same terms; omitting the line means the same thing. `factory.design_tier` ships as `T3`, the spec default (G8.3): a default lives in the public example, the same pattern as `lanes.count`. The real values live only in the private file. `builder_state` is never shipped in the public example (entries are private paths, and a placeholder could falsely refuse a real brief that quotes it): it lives only in the private overlay.
 ## 8. Who reads it
 
 The library exposes pure lookups: `repo_dir(&RepoId)`, `budget(size)`, `shadow()`, `lane_count()`, `friction_inbox()` and `design_tier()`. The one command over the config itself is `harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]`.
