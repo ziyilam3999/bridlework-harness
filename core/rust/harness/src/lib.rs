@@ -7,6 +7,7 @@ pub mod caps;
 pub mod classes;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod core_layering;
 pub mod death;
 pub mod decode;
