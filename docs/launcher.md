@@ -4,7 +4,7 @@ Starts a named background session from the harness, with a launch record written
 
 ```
 harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path>
-    [--records <file>] [--config <file>] [--start-timeout-ms <n>] [--map-timeout-ms <n>]
+    [--records <file>] [--config <file>] [--sign-off] [--start-timeout-ms <n>] [--map-timeout-ms <n>]
 harness session launches [--records <file>]
 ```
 
@@ -15,7 +15,15 @@ harness session launches [--records <file>]
    free of NUL bytes, not start with `-`, and be at most 102400 bytes. The bytes are never trimmed.
 2. Name check: the P1B-16 predicate in `--new` mode, with the lane bound from the config (`--config`, else
    `HARNESS_CONFIG`). The record's `role` is that verdict's role.
+   `--sign-off` is a value-less flag (given twice is exit 2). It marks the launch as a sign-off and is allowed for
+   `gov` and `e-rvw` names only (any other role: exit 2, `--sign-off needs a gov or e-rvw name`). A sign-off launch
+   MUST pass it; an ordinary review must not (a routine `e-rvw` brief may name the builder's work).
 3. sha256 of the exact brief bytes, and a fresh run id.
+3b. Signer check, after the records path is resolved (the default `.harness/` folder is created first) and before
+   the `launch` row. It runs for every `gov` launch and for any launch given `--sign-off`; a plain `e-rvw` launch is
+   not checked. With no `builder_state` entries in the config: exit 2, nothing written or started (fail closed).
+   Otherwise the FIRST entry (file order) whose text is a byte substring of the brief refuses the launch: one
+   `launch_refused` row, no `launch` row, nothing started, exit 6. stderr and the row name the entry, never its text.
 4. Write the `launch` row first. Any failure exits 2 with `launch refused: launch record not written: <cause>`
    and the host is never run.
 5. Start `<host> --bg -n <name> <brief>`: the brief is ONE argv element, byte-identical to the file, run from the
@@ -36,10 +44,11 @@ is a JSON array of objects with `id` (short id), `sessionId` (full uuid) and `na
 All rows are one compact JSON line in an append-only file, taken under an exclusive lock; a torn tail refuses the write.
 
 - `{"v":1,"kind":"launch","ts_ms":..,"run_id":..,"name":..,"role":..,"brief_sha256":..,"owner":"orchestration"}`
+- `{"v":1,"kind":"launch_refused","ts_ms":..,"run_id":..,"name":..,"role":..,"brief_sha256":..,"matched_entry":..}` (a signer brief named builder state; `matched_entry` is the entry NAME, never its text; the row stands alone)
 - `{"v":1,"kind":"launch_ids","ts_ms":..,"run_id":..,"short_id":..,"session_id":..}`
 - `{"v":1,"kind":"launch_failed","ts_ms":..,"run_id":..,"stage":"start|map","reason":..}` (best effort)
 
-`harness session launches` joins rows by `run_id` and prints one line per launch with `state=bound|failed|pending`.
+`harness session launches` joins rows by `run_id` and prints one line per launch with `state=bound|failed|pending|refused`.
 A corrupt line stops the read (exit 2, the line number named). `launcher::read_launches` is the same join as a function.
 
 ## Records path
@@ -59,6 +68,7 @@ host's working directory); `.harness/` is created when missing.
 | 3 | the host failed to start: non-zero exit, no short id, spawn error (for example E2BIG), or timeout |
 | 4 | the id could not be mapped; the session was stopped (`<host> stop <short-id>` exited 0) |
 | 5 | the id could not be mapped and the stop failed; stderr names the short id, stop it by hand |
+| 6 | a signer launch was refused: its brief names a `builder_state` entry (a `launch_refused` row is written, nothing started) |
 
 ## Brief cap
 

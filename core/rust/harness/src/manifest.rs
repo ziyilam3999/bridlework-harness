@@ -69,8 +69,26 @@ pub enum Line {
     /// Written only by `process start --timeout-ms`, right after the process line for that id and before
     /// its port line (#207). Reader rule: valid only for an id that is a LIVE `process` entry with no
     /// limit yet; anything else is corruption at that line. A `remove` of the id ends the limit.
-    Limit { ticket: String, id: String, timeout_ms: u64, ts_ms: u64 },
-    Remove { ticket: String, id: String, ts_ms: u64 },
+    Limit {
+        ticket: String,
+        id: String,
+        timeout_ms: u64,
+        ts_ms: u64,
+    },
+    /// Written only by `process start --worker` (#3706), right after the process (and limit) line for that id.
+    /// Reader rule: valid only for an id that is a LIVE `process` entry with no session yet. A `remove` of
+    /// the id closes the session.
+    Session {
+        ticket: String,
+        id: String,
+        session_id: String,
+        ts_ms: u64,
+    },
+    Remove {
+        ticket: String,
+        id: String,
+        ts_ms: u64,
+    },
 }
 
 const KEYS_ROOT: [&str; 5] = ["v", "op", "ticket", "path", "ts_ms"];
@@ -78,6 +96,7 @@ const KEYS_ADD_PATH: [&str; 7] = ["v", "op", "ticket", "id", "class", "path", "t
 const KEYS_ADD_PROCESS: [&str; 8] = ["v", "op", "ticket", "id", "class", "pid", "pid_start_ms", "ts_ms"];
 const KEYS_ADD_PORT: [&str; 7] = ["v", "op", "ticket", "id", "class", "port", "ts_ms"];
 const KEYS_LIMIT: [&str; 6] = ["v", "op", "ticket", "id", "timeout_ms", "ts_ms"];
+const KEYS_SESSION: [&str; 6] = ["v", "op", "ticket", "id", "session_id", "ts_ms"];
 const KEYS_REMOVE: [&str; 5] = ["v", "op", "ticket", "id", "ts_ms"];
 
 /// A path as it may be stored on a line: absolute, and holding no character that would need a JSON escape
@@ -94,6 +113,7 @@ impl Line {
             | Line::AddProcess { ticket, .. }
             | Line::AddPort { ticket, .. }
             | Line::Limit { ticket, .. }
+            | Line::Session { ticket, .. }
             | Line::Remove { ticket, .. } => ticket,
         }
     }
@@ -103,6 +123,7 @@ impl Line {
             Line::Root { .. } => "root",
             Line::AddPath { .. } | Line::AddProcess { .. } | Line::AddPort { .. } => "add",
             Line::Limit { .. } => "limit",
+            Line::Session { .. } => "session",
             Line::Remove { .. } => "remove",
         }
     }
@@ -115,6 +136,7 @@ impl Line {
             Line::AddProcess { .. } => "add_process".to_string(),
             Line::AddPort { .. } => "add_port".to_string(),
             Line::Limit { .. } => "limit".to_string(),
+            Line::Session { .. } => "session".to_string(),
             Line::Remove { .. } => "remove".to_string(),
         }
     }
@@ -127,6 +149,7 @@ impl Line {
             Line::AddProcess { .. } => &KEYS_ADD_PROCESS,
             Line::AddPort { .. } => &KEYS_ADD_PORT,
             Line::Limit { .. } => &KEYS_LIMIT,
+            Line::Session { .. } => &KEYS_SESSION,
             Line::Remove { .. } => &KEYS_REMOVE,
         }
     }
@@ -179,6 +202,19 @@ impl Line {
                     return Err("timeout_ms must be an integer >= 1 (a 0 ms limit is already expired)".to_string());
                 }
             }
+            Line::Session {
+                ticket,
+                id,
+                session_id,
+                ..
+            } => {
+                if !token_ok(ticket) || !token_ok(id) {
+                    return Err("ticket and id must be plain tokens (lowercase letters, digits, '-', '_', '.')".to_string());
+                }
+                if !crate::death::uuid_ok(session_id) {
+                    return Err("session_id must be a lowercase uuid (8-4-4-4-12 hex)".to_string());
+                }
+            }
             Line::Remove { ticket, id, .. } => {
                 if !token_ok(ticket) || !token_ok(id) {
                     return Err("ticket and id must be plain tokens (lowercase letters, digits, '-', '_', '.')".to_string());
@@ -220,6 +256,17 @@ impl Line {
                     SCHEMA_VERSION
                 )
             }
+            Line::Session {
+                ticket,
+                id,
+                session_id,
+                ts_ms,
+            } => {
+                format!(
+                    "{{\"v\":{},\"op\":\"session\",\"ticket\":\"{ticket}\",\"id\":\"{id}\",\"session_id\":\"{session_id}\",\"ts_ms\":{ts_ms}}}\n",
+                    SCHEMA_VERSION
+                )
+            }
             Line::Remove { ticket, id, ts_ms } => {
                 format!("{{\"v\":{},\"op\":\"remove\",\"ticket\":\"{ticket}\",\"id\":\"{id}\",\"ts_ms\":{ts_ms}}}\n", SCHEMA_VERSION)
             }
@@ -251,7 +298,11 @@ impl Line {
         }
         let op = match get("op") {
             None => return Err("op missing".to_string()),
-            Some(Val::Str(s)) if s == "root" || s == "add" || s == "remove" || s == "limit" => s.as_str(),
+            Some(Val::Str(s))
+                if s == "root" || s == "add" || s == "remove" || s == "limit" || s == "session" =>
+            {
+                s.as_str()
+            }
             Some(Val::Str(s)) => return Err(format!("unknown op {s:?}")),
             Some(_) => return Err("op has the wrong type".to_string()),
         };
@@ -270,6 +321,8 @@ impl Line {
             &KEYS_ROOT
         } else if op == "limit" {
             &KEYS_LIMIT
+        } else if op == "session" {
+            &KEYS_SESSION
         } else {
             &KEYS_REMOVE
         };
@@ -315,8 +368,23 @@ impl Line {
             }
             // The `limit` op must be matched EXPLICITLY before the catch-all: the `_` arm builds a Remove,
             // so an unmatched new op would silently decode as a remove of its id.
-            "limit" => Line::Limit { ticket, id: text("id")?, timeout_ms: num("timeout_ms")?, ts_ms },
-            _ => Line::Remove { ticket, id: text("id")?, ts_ms },
+            "limit" => Line::Limit {
+                ticket,
+                id: text("id")?,
+                timeout_ms: num("timeout_ms")?,
+                ts_ms,
+            },
+            "session" => Line::Session {
+                ticket,
+                id: text("id")?,
+                session_id: text("session_id")?,
+                ts_ms,
+            },
+            _ => Line::Remove {
+                ticket,
+                id: text("id")?,
+                ts_ms,
+            },
         };
         line.validate().map_err(|e| format!("line refused: {e}"))?;
         Ok(line)
@@ -438,6 +506,8 @@ pub struct Entry {
     pub class: Class,
     pub target: Target,
     pub limit: Option<LimitRec>,
+    /// Some only for a process entry a `session` line followed (#3706): the worker session id the supervisor minted.
+    pub session: Option<String>,
 }
 
 /// The current state: the roots plus every `add` whose `id` has no later `remove`. Roots are not entries.
@@ -491,7 +561,13 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                 if st.live.iter().any(|e| matches!(&e.target, Target::Path(p) if p == path)) {
                     return Err((*n, format!("the same path is listed twice live: {path}")));
                 }
-                st.live.push(Entry { id: id.clone(), class: *class, target: Target::Path(path.clone()), limit: None });
+                st.live.push(Entry {
+                    id: id.clone(),
+                    class: *class,
+                    target: Target::Path(path.clone()),
+                    limit: None,
+                    session: None,
+                });
             }
             Line::AddProcess { ticket: _, id, pid, pid_start_ms, .. } => {
                 if st.roots.is_empty() {
@@ -508,6 +584,7 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                     class: Class::Process,
                     target: Target::Process { pid: *pid, pid_start_ms: *pid_start_ms },
                     limit: None,
+                    session: None,
                 });
             }
             Line::AddPort { ticket: _, id, port, .. } => {
@@ -520,7 +597,13 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                 if st.live.iter().any(|e| matches!(&e.target, Target::Port(p) if p == port)) {
                     return Err((*n, format!("the same port is listed twice live: {port}")));
                 }
-                st.live.push(Entry { id: id.clone(), class: Class::Port, target: Target::Port(*port), limit: None });
+                st.live.push(Entry {
+                    id: id.clone(),
+                    class: Class::Port,
+                    target: Target::Port(*port),
+                    limit: None,
+                    session: None,
+                });
             }
             Line::Limit { ticket: _, id, timeout_ms, ts_ms } => {
                 if st.roots.is_empty() {
@@ -538,6 +621,26 @@ fn build_state(numbered: &[(usize, Line)]) -> Result<State, (usize, String)> {
                     return Err((*n, format!("a second limit for live id {id}")));
                 }
                 st.live[pos].limit = Some(LimitRec { timeout_ms: *timeout_ms, ts_ms: *ts_ms });
+            }
+            Line::Session {
+                ticket: _,
+                id,
+                session_id,
+                ..
+            } => {
+                if st.roots.is_empty() {
+                    return Err((*n, "session before init".to_string()));
+                }
+                let Some(pos) = st.live.iter().position(|e| e.id == *id) else {
+                    return Err((*n, format!("session of an id that is not live: {id}")));
+                };
+                if !matches!(st.live[pos].target, Target::Process { .. }) {
+                    return Err((*n, format!("session for a non-process entry: {id}")));
+                }
+                if st.live[pos].session.is_some() {
+                    return Err((*n, format!("a second session for live id {id}")));
+                }
+                st.live[pos].session = Some(session_id.clone());
             }
             Line::Remove { ticket: _, id, .. } => {
                 if st.roots.is_empty() {
@@ -769,8 +872,18 @@ pub enum Op<'a> {
     AddPort { id: &'a str, port: u64 },
     /// Library-only (#207): `harness manifest add` cannot write a limit line; only `process start
     /// --timeout-ms` does, under the supervisor lock, right after the process line.
-    Limit { id: &'a str, timeout_ms: u64 },
-    Remove { id: &'a str },
+    Limit {
+        id: &'a str,
+        timeout_ms: u64,
+    },
+    /// Library-only (#3706): only `process start --worker` writes a session line, under the supervisor lock.
+    Session {
+        id: &'a str,
+        session_id: &'a str,
+    },
+    Remove {
+        id: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1043,6 +1156,45 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 ts_ms,
             })
         }
+        Op::Session { id, session_id } => {
+            if !token_ok(id) {
+                return Err(ManifestError::Invalid(
+                    "id must be a plain token (lowercase letters, digits, '-', '_', '.')"
+                        .to_string(),
+                ));
+            }
+            if !crate::death::uuid_ok(session_id) {
+                return Err(ManifestError::Invalid(
+                    "session_id must be a lowercase uuid (8-4-4-4-12 hex)".to_string(),
+                ));
+            }
+            let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
+            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let Some(e) = r.live.iter().find(|e| e.id == *id) else {
+                return Err(ManifestError::Invalid(format!(
+                    "session of an id that is not live: {id}"
+                )));
+            };
+            if !matches!(e.target, Target::Process { .. }) {
+                return Err(ManifestError::Invalid(format!(
+                    "session for a non-process entry: {id}"
+                )));
+            }
+            if e.session.is_some() {
+                return Err(ManifestError::Invalid(format!(
+                    "a second session for live id {id}"
+                )));
+            }
+            append_locked(
+                &mut f,
+                &Line::Session {
+                    ticket: ticket.to_string(),
+                    id: id.to_string(),
+                    session_id: session_id.to_string(),
+                    ts_ms,
+                },
+            )
+        }
         Op::Remove { id } => {
             if !token_ok(id) {
                 return Err(ManifestError::Invalid("id must be a plain token (lowercase letters, digits, '-', '_', '.')".to_string()));
@@ -1264,6 +1416,116 @@ mod tests {
         write_init(&dir, "t-1", &[PathBuf::from("/short-a"), PathBuf::from("/short-b"), PathBuf::from("/short-c")], 1).unwrap();
         let text = fs::read_to_string(manifest_file(&dir, "t-1")).unwrap();
         assert_eq!(text.lines().count(), 3);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    const SID: &str = "0b9f1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4";
+
+    /// #3706 AC7: a `session` line round-trips; a missing key, an extra key and a short id are refused by the
+    /// strict loader, each naming the problem.
+    #[test]
+    fn session_line_is_strict() {
+        let line = Line::Session {
+            ticket: "t-1".into(),
+            id: "w".into(),
+            session_id: SID.into(),
+            ts_ms: 5,
+        };
+        let text = line.encode().unwrap();
+        assert_eq!(Line::decode(text.trim_end()).unwrap(), line);
+        let missing = "{\"v\":1,\"op\":\"session\",\"ticket\":\"t-1\",\"id\":\"w\",\"ts_ms\":5}".to_string();
+        assert!(Line::decode(&missing)
+            .unwrap_err()
+            .contains("session_id missing"));
+        let extra = format!("{{\"v\":1,\"op\":\"session\",\"ticket\":\"t-1\",\"id\":\"w\",\"session_id\":\"{SID}\",\"ts_ms\":5,\"x\":1}}");
+        assert!(Line::decode(&extra).unwrap_err().contains("unexpected key"));
+        let short = "{\"v\":1,\"op\":\"session\",\"ticket\":\"t-1\",\"id\":\"w\",\"session_id\":\"abc\",\"ts_ms\":5}".to_string();
+        assert!(Line::decode(&short).unwrap_err().contains("session_id"));
+        let upper = text.replace(SID, &SID.to_uppercase());
+        assert!(Line::decode(upper.trim_end()).is_err());
+    }
+
+    /// #3706 AC7: the writer mirrors the reader rule — a session for an id that is not a live process entry (or a
+    /// second session, or a bad uuid) is refused and the file is byte-identical; a live process entry accepts one.
+    #[test]
+    fn session_write_needs_a_live_process_entry() {
+        let base = std::env::temp_dir().join(format!("manifest-session-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("man");
+        write_init(&dir, "t-1", &[PathBuf::from("/short-a")], 1).unwrap();
+        let file = manifest_file(&dir, "t-1");
+        let before = fs::read(&file).unwrap();
+        let err = apply(
+            &dir,
+            "t-1",
+            &Op::Session {
+                id: "ghost",
+                session_id: SID,
+            },
+            2,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid(_)), "{err}");
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            before,
+            "a refused session changed the file"
+        );
+        let add = Line::AddProcess {
+            ticket: "t-1".into(),
+            id: "w".into(),
+            pid: 4242,
+            pid_start_ms: 7,
+            ts_ms: 2,
+        }
+        .encode()
+        .unwrap();
+        let mut bytes = before.clone();
+        bytes.extend_from_slice(add.as_bytes());
+        fs::write(&file, &bytes).unwrap();
+        assert!(apply(
+            &dir,
+            "t-1",
+            &Op::Session {
+                id: "w",
+                session_id: "abc"
+            },
+            3
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            bytes,
+            "a short id changed the file"
+        );
+        apply(
+            &dir,
+            "t-1",
+            &Op::Session {
+                id: "w",
+                session_id: SID,
+            },
+            3,
+        )
+        .unwrap();
+        let after = fs::read(&file).unwrap();
+        assert!(apply(
+            &dir,
+            "t-1",
+            &Op::Session {
+                id: "w",
+                session_id: SID
+            },
+            4
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            after,
+            "a second session changed the file"
+        );
+        let r = read_manifest(&dir, "t-1").unwrap();
+        assert_eq!(r.live[0].session.as_deref(), Some(SID));
         let _ = fs::remove_dir_all(&base);
     }
 }
