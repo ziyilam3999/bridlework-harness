@@ -61,4 +61,10 @@ jobs:
             echo "publish: expected exactly one plugin tarball" >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md "$1" SHA256SUMS
+          plugin="$1"
+          set -- bridlework-harness-engine-*.tar.gz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "publish: expected exactly one engine tarball" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md "$plugin" "$1" SHA256SUMS

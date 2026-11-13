@@ -17,6 +17,7 @@ pub mod evidence;
 pub mod events;
 pub mod explain;
 pub mod fix_tier;
+#[cfg(debug_assertions)]
 pub mod fixtures;
 pub mod friction;
 pub mod friction_event;

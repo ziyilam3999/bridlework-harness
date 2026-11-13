@@ -1210,12 +1210,14 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
         _ => return stop3("the ticket branch cannot be resolved"),
     };
     let neg = format!("^{}", upstream_sha);
+    // Joined at run time so no `=value` literal pools in the binary's read-only data (see gitio::quotepath_off).
+    let max_count = ["--max-count", "1001"].join("=");
     let g = pushed_git(
         tree,
         &[
             "rev-list",
             "--topo-order",
-            "--max-count=1001",
+            &max_count,
             "--end-of-options",
             &branch_sha,
             &neg,

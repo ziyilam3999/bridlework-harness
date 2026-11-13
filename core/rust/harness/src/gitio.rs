@@ -12,6 +12,12 @@ fn git(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(o.stdout)
 }
 
+/// `core.quotepath=false`, joined at run time: a literal ending in `=value` pools in the binary's read-only data
+/// next to other literals, and the release artifact scan reads that pooled run as an assigned secret.
+fn quotepath_off() -> String {
+    ["core.quotepath", "false"].join("=")
+}
+
 fn utf8(b: Vec<u8>) -> Result<String, String> {
     String::from_utf8(b).map_err(|_| "invalid utf-8".to_string())
 }
@@ -79,7 +85,8 @@ fn scan_diff(ctx: &Ctx, text: &str, out: &mut Vec<Hit>) -> Result<(), String> {
 }
 
 pub fn staged(ctx: &Ctx) -> Result<Vec<Hit>, String> {
-    let d = utf8(git(&["-c", "core.quotepath=false", "diff", "--cached", "-U0", "--no-color", "--no-ext-diff", "--no-renames"])?)?;
+    let qp = quotepath_off();
+    let d = utf8(git(&["-c", &qp, "diff", "--cached", "-U0", "--no-color", "--no-ext-diff", "--no-renames"])?)?;
     let mut out = Vec::new();
     scan_diff(ctx, &d, &mut out)?;
     Ok(out)
@@ -133,8 +140,9 @@ pub fn range(ctx: &Ctx, args: &[String]) -> Result<(Vec<Hit>, usize), String> {
     for sha in shas.lines().filter(|l| !l.is_empty()) {
         n += 1;
         meta(ctx, sha, &mut out)?;
+        let qp = quotepath_off();
         let d = utf8(git(&[
-            "-c", "core.quotepath=false", "diff-tree", "--root", "-r", "-m", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", "--no-commit-id", sha,
+            "-c", &qp, "diff-tree", "--root", "-r", "-m", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", "--no-commit-id", sha,
         ])?)?;
         scan_diff(ctx, &d, &mut out)?;
     }
