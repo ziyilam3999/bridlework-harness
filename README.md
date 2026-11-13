@@ -20,6 +20,7 @@ Install the new version next to the old one and switch; rollback is the reverse 
 - `core/rust/` : Rust workspace. The `harness` crate holds the scan engine
   (std only, no external crates).
 - `.githooks/` : the pre-push hook and the `.githooks/pre-commit` hook; both call the engine.
+  The pre-commit hook also refuses any staged `.ai-workspace/` path.
 - `ci/` : entry scripts and lints that CI runs.
 - `.github/workflows/` : the workflows that call those scripts.
 - `dashboard/` : the dashboard (placeholder).
