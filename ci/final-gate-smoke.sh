@@ -251,6 +251,9 @@ rust_frozen() {
   G -C "$root" show "$oldbase:.github/workflows/rust-test.yml" > "$tmp/rust-old.yml" 2>/dev/null || return 1
   cmp -s "$tmp/rust-old.yml" "$1" && return 0
   { cat "$tmp/rust-old.yml"; printf '      - name: Clippy\n        run: sh ci/rust-clippy.sh\n'; } > "$tmp/rust-want.yml"
+  cmp -s "$tmp/rust-want.yml" "$1" && return 0
+  # ticket 3676 sanctions one more difference: exactly the two Release smoke lines appended after the last step.
+  { cat "$tmp/rust-old.yml"; printf '      - name: Release smoke\n        run: sh ci/release-smoke.sh all\n'; } > "$tmp/rust-want.yml"
   cmp -s "$tmp/rust-want.yml" "$1"
 }
 if [ -z "$oldbase" ]; then
