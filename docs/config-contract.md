@@ -6,7 +6,7 @@ Status: contract plus its strict reader (PRE-5b) and `harness config check` (PRE
 
 ## 1. One file, one reader, read-only
 
-The config is one text file. The program only reads it. There is no write, set or install verb: the installer never writes the real file.
+The config is one text file. The program reads it. The ONLY write verb is `harness config write`, which refuses unless the write carries a human-origin approval (`docs/human-origin.md`); there is no set or install verb, and the installer never writes the real file.
 
 ## 2. Where it lives
 

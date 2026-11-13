@@ -419,7 +419,7 @@ pub fn folder_verdict(is_symlink: bool, is_dir: bool, owner_uid: u32, mode: u32,
 /// `getuid`; this is the same std-only route the crate's other ownership checks could use, and a temp
 /// dir we cannot write into is itself a refusal-shaped answer). Never trusted for anything but the
 /// owner comparison.
-fn my_uid() -> Result<u32, String> {
+pub(crate) fn my_uid() -> Result<u32, String> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
