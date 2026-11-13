@@ -1061,13 +1061,13 @@ fn check_record_shapes(session: &str, checkpoint: &str, repo: &str) -> Result<()
 /// The resolved log/root pair of a record-mode call, following the `events append` defaults:
 /// `.harness/events.jsonl` with root `.` when neither is given, an explicit log's parent as the root
 /// when only the log is given. `log_is_default` drives the create-only-inside-the-root folder rule.
-struct LogRoot {
-    log_is_default: bool,
-    log: PathBuf,
-    root: PathBuf,
+pub(crate) struct LogRoot {
+    pub(crate) log_is_default: bool,
+    pub(crate) log: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
-fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
+pub(crate) fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
     let log_is_default = log.is_none();
     let log = PathBuf::from(log.unwrap_or(".harness/events.jsonl"));
     let root = match root {
@@ -1083,7 +1083,7 @@ fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
 /// The default log folder is created only after the working folder is proven inside the root (a refusal
 /// leaves no empty folder behind), the same rule `events append` and `step` use. An EXPLICIT log is
 /// never pre-created: a missing parent is the path check's own refusal.
-fn ensure_default_log_folder(lr: &LogRoot) -> Result<(), String> {
+pub(crate) fn ensure_default_log_folder(lr: &LogRoot) -> Result<(), String> {
     if !lr.log_is_default {
         return Ok(());
     }
