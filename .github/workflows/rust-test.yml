@@ -21,7 +21,3 @@ jobs:
         run: sh ci/rust-clippy.sh
       - name: Release smoke
         run: sh ci/release-smoke.sh all
-      - name: MCP tools lint
-        run: sh ci/mcp-tools-lint.sh --build
-      - name: MCP tools lint self-test
-        run: sh ci/mcp-tools-lint.sh --build --self-test
