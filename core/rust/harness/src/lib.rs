@@ -25,6 +25,8 @@ pub mod gate_result;
 pub mod gates;
 pub mod gitio;
 pub mod intake;
+#[cfg(unix)]
+pub mod launcher;
 pub mod manifest;
 pub mod overlay;
 pub mod path_map;
