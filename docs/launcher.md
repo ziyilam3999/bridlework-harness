@@ -81,3 +81,7 @@ closed: exit 3 with a `launch_failed` row (`stage=start`), nothing runs.
 When `--start-timeout-ms` expires the launcher sends SIGKILL to the host's process group, reaps the child, appends
 `launch_failed` (`stage=start`, `reason=timeout`) and exits 3. Killing the host does not prove no session was
 started, so stderr always names the session: check `<host> agents` and stop it by hand.
+
+## Closing a ticket's sessions
+
+`harness session done-check` and `harness session close` (P1B-17) read the same host listing and remove a finished ticket's sessions; see `docs/session-close.md`.

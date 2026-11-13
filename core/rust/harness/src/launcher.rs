@@ -100,7 +100,7 @@ fn sha256_hex(data: &[u8]) -> String {
 // ------------------------------------------------------------------------------------ mini JSON
 
 #[derive(Debug, Clone, PartialEq)]
-enum J {
+pub(crate) enum J {
     Str(String),
     Num(u64),
     Other,
@@ -109,13 +109,13 @@ enum J {
 }
 
 impl J {
-    fn get(&self, key: &str) -> Option<&J> {
+    pub(crate) fn get(&self, key: &str) -> Option<&J> {
         match self {
             J::Obj(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
-    fn str(&self, key: &str) -> Option<&str> {
+    pub(crate) fn str(&self, key: &str) -> Option<&str> {
         match self.get(key) {
             Some(J::Str(s)) => Some(s),
             _ => None,
@@ -252,7 +252,7 @@ impl P<'_> {
     }
 }
 
-fn parse_json(bytes: &[u8]) -> Result<J, String> {
+pub(crate) fn parse_json(bytes: &[u8]) -> Result<J, String> {
     let mut p = P { b: bytes, i: 0 };
     let v = p.value(0)?;
     p.ws();
@@ -337,7 +337,7 @@ pub struct Launch {
     pub state: &'static str,
 }
 
-fn uuid_ok(id: &str) -> bool {
+pub(crate) fn uuid_ok(id: &str) -> bool {
     Record::build(Kind::SessionStarted, 0, &[("session_id", Field::Str(id.to_string())), ("source", Field::Str("launch".into()))])
         .is_ok()
 }
@@ -437,17 +437,17 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
 
 // ------------------------------------------------------------------------------------ host calls
 
-enum RunErr {
+pub(crate) enum RunErr {
     Spawn(String),
     Timeout,
 }
 
-struct HostOut {
-    ok: bool,
-    stdout: Vec<u8>,
+pub(crate) struct HostOut {
+    pub(crate) ok: bool,
+    pub(crate) stdout: Vec<u8>,
 }
 
-fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) {
     for k in ["/bin/kill", "/usr/bin/kill"] {
         if Path::new(k).is_file() {
             let _ = Command::new(k).args(["-KILL", "--", &format!("-{pid}")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
@@ -457,7 +457,7 @@ fn kill_group(pid: u32) {
 }
 
 /// Run the host with a bounded wait, in its own process group. On the bound: SIGKILL the group, kill and reap the child.
-fn run_host(host: &Path, args: &[&std::ffi::OsStr], cwd: Option<&Path>, timeout_ms: u64) -> Result<HostOut, RunErr> {
+pub(crate) fn run_host(host: &Path, args: &[&std::ffi::OsStr], cwd: Option<&Path>, timeout_ms: u64) -> Result<HostOut, RunErr> {
     let mut c = Command::new(host);
     c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
     if let Some(d) = cwd {

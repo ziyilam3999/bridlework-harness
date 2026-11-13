@@ -12,10 +12,12 @@ pub mod core_layering;
 pub mod death;
 pub mod decode;
 pub mod detect;
+pub mod events;
 #[cfg(unix)]
 pub mod evidence;
-pub mod events;
 pub mod explain;
+#[cfg(unix)]
+pub mod finalize;
 pub mod fix_tier;
 #[cfg(debug_assertions)]
 pub mod fixtures;
@@ -34,25 +36,25 @@ pub mod manifest;
 pub mod overlay;
 pub mod path_map;
 pub mod plugin;
-pub mod question_class;
 #[cfg(unix)]
 pub mod quarantine;
+pub mod question_class;
 pub mod repo_id;
 pub mod runner;
-#[cfg(unix)]
-pub mod tree_prep;
 pub mod scan;
+#[cfg(unix)]
+pub mod session_close;
 pub mod session_name;
 pub mod status;
 #[cfg(unix)]
 pub mod supervisor;
-pub mod ticket;
-#[cfg(unix)]
-pub mod finalize;
 #[cfg(unix)]
 pub mod teardown;
+pub mod ticket;
 #[cfg(unix)]
 pub mod ticket_gate;
+#[cfg(unix)]
+pub mod tree_prep;
 #[cfg(unix)]
 pub mod workspace;
 #[cfg(unix)]

@@ -107,9 +107,56 @@ struct Fx {
     shelf: PathBuf,
     tf: PathBuf,
     base: String,
+    host: PathBuf,
+    cfg: PathBuf,
+    sdir: PathBuf,
 }
 
 const T: &str = "t1";
+const EXAMPLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../config/harness.example.yaml"
+);
+
+/// A stub host (P1B-17): `agents` prints the listing file, `stop <id>` logs and marks the entry done, `rm <id>` logs and deletes it.
+/// `STUB_AGENTS_EXIT`, `STUB_AGENTS_RAW`, `STUB_STOP_EXIT`, `STUB_RM_EXIT` force failures; `STUB_RM_NOOP` makes `rm` exit 0 and keep the entry.
+const STUB: &str = r#"#!/bin/sh
+d="$STUB_DIR"
+case "$1" in
+  agents)
+    if [ -n "$STUB_AGENTS_EXIT" ]; then exit "$STUB_AGENTS_EXIT"; fi
+    if [ -n "$STUB_AGENTS_RAW" ]; then echo "$STUB_AGENTS_RAW"; exit 0; fi
+    printf '['; paste -sd, "$d/list"; printf ']\n' ;;
+  stop)
+    echo "stop $2" >> "$d/calls"
+    if [ -n "$STUB_STOP_EXIT" ]; then exit "$STUB_STOP_EXIT"; fi
+    sed "/\"id\":\"$2\"/s/\"state\":\"[a-z]*\"/\"state\":\"done\"/" "$d/list" > "$d/list.n"; mv "$d/list.n" "$d/list" ;;
+  rm)
+    echo "rm $2" >> "$d/calls"
+    if [ -n "$STUB_RM_EXIT" ]; then exit "$STUB_RM_EXIT"; fi
+    if [ -z "$STUB_RM_NOOP" ]; then grep -v "\"id\":\"$2\"" "$d/list" > "$d/list.n"; mv "$d/list.n" "$d/list"; fi
+    echo "removed $2" ;;
+esac
+exit 0
+"#;
+
+/// A session name built at run time: `exec-L<lane>-t<ticket>-r1-M-son-med`.
+fn sname(lane: u32, ticket: &str) -> String {
+    [
+        "exec".to_string(),
+        format!("L{lane}"),
+        format!("t{ticket}"),
+        "r1".into(),
+        "M".into(),
+        "son".into(),
+        "med".into(),
+    ]
+    .join("-")
+}
+
+fn ent(id: &str, name: &str, state: &str) -> String {
+    format!("{{\"id\":\"{id}\",\"name\":\"{name}\",\"state\":\"{state}\"}}")
+}
 
 impl Fx {
     /// create → commit a change on `ws/t1` in the tree → push to the bare remote. The gate has not run yet.
@@ -142,7 +189,18 @@ impl Fx {
         fs::write(&tf, ticket_json()).unwrap();
         let repo = repo.canonicalize().unwrap();
         let base = git(&repo, &["rev-parse", "HEAD"]);
+        let sdir = t.p.join("S");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(sdir.join("list"), "").unwrap();
+        fs::write(sdir.join("calls"), "").unwrap();
+        let host = t.p.join("host.sh");
+        put(&host, STUB, true);
+        let cfg = t.p.join("config.yaml");
+        fs::copy(EXAMPLE, &cfg).unwrap();
         let fx = Fx {
+            host,
+            cfg,
+            sdir,
             log: logd.join("events.jsonl"),
             ws: ws.canonicalize().unwrap(),
             md: md.canonicalize().unwrap(),
@@ -201,10 +259,53 @@ impl Fx {
     }
 
     fn finalize_with(&self, drop_flag: Option<&str>, log: &Path, md: &str) -> Output {
+        self.finalize_x(drop_flag, log, md, self.host.to_str().unwrap(), &[])
+    }
+
+    /// Set the stub host's listing, one entry per line.
+    fn sessions(&self, entries: &[String]) {
+        fs::write(
+            self.sdir.join("list"),
+            entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+        )
+        .unwrap();
+    }
+    fn calls(&self) -> String {
+        fs::read_to_string(self.sdir.join("calls")).unwrap()
+    }
+    fn listing(&self) -> String {
+        fs::read_to_string(self.sdir.join("list")).unwrap()
+    }
+    fn done_check(&self, id: &str) -> Output {
+        let mut c = Command::new(BIN);
+        c.args([
+            "session",
+            "done-check",
+            "--host",
+            self.host.to_str().unwrap(),
+            "--config",
+            self.cfg.to_str().unwrap(),
+            "--done",
+            id,
+        ])
+        .stdin(Stdio::null())
+        .env("STUB_DIR", &self.sdir);
+        c.output().unwrap()
+    }
+
+    fn finalize_x(
+        &self,
+        drop_flag: Option<&str>,
+        log: &Path,
+        md: &str,
+        host: &str,
+        envs: &[(&str, &str)],
+    ) -> Output {
         let (ws, shelf, res, caps, repo) = (self.ws.to_str().unwrap(), self.shelf.to_str().unwrap(), self.res.to_str().unwrap(), self.caps.to_str().unwrap(), self.repo.to_str().unwrap());
         let mut v: Vec<(&str, &str)> = vec![
             ("--manifest-dir", md), ("--repo-dir", repo), ("--workspace-root", ws), ("--quarantine-dir", shelf), ("--result-dir", res),
             ("--caps-dir", caps), ("--log", log.to_str().unwrap()), ("--role", "executor"), ("--model", "m1"), ("--grace-ms", "3000"),
+            ("--host", host), ("--config", self.cfg.to_str().unwrap()),
         ];
         v.retain(|(k, _)| Some(*k) != drop_flag);
         let mut a: Vec<&str> = vec!["ticket", "finalize", self.tf.to_str().unwrap()];
@@ -212,11 +313,34 @@ impl Fx {
             a.push(k);
             a.push(x);
         }
-        run(&a)
+        let mut c = Command::new(BIN);
+        c.args(&a).stdin(Stdio::null()).env("STUB_DIR", &self.sdir);
+        for k in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            c.env_remove(k);
+        }
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.output().unwrap()
     }
 
     fn finalize(&self) -> Output {
         self.finalize_with(None, &self.log, self.md.to_str().unwrap())
+    }
+
+    fn finalize_env(&self, envs: &[(&str, &str)]) -> Output {
+        self.finalize_x(
+            None,
+            &self.log,
+            self.md.to_str().unwrap(),
+            self.host.to_str().unwrap(),
+            envs,
+        )
     }
 
     fn list(&self) -> Vec<String> {
@@ -489,4 +613,112 @@ fn finalize_prints_no_folder() {
     std::thread::sleep(Duration::from_millis(1500));
     let o = fx.finalize();
     assert!(fx.leak_free(&o), "{} {}", out(&o), err(&o));
+}
+
+fn sessions_refused(reason: &str, session: &str) -> String {
+    format!("finalize=refused ticket=t1 check=sessions reason={reason} session={session}")
+}
+
+/// P1B-17: the ticket's sessions are stopped and removed; another ticket's session is untouched; the re-check passes.
+#[test]
+fn finalize_closes_ticket_sessions_live_ticket_untouched() {
+    let fx = Fx::new();
+    fx.gate_pass();
+    let (n1, n2) = (sname(1, "t1"), sname(2, "t2"));
+    fx.sessions(&[ent("a1", &n1, "working"), ent("b2", &n2, "working")]);
+    let o = fx.finalize();
+    assert_eq!(code(&o), 0, "stdout {} stderr {}", out(&o), err(&o));
+    assert!(
+        out(&o).starts_with("finalize=done ticket=t1 "),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(fx.calls(), "stop a1\nrm a1\n");
+    let l = fx.listing();
+    assert!(l.contains("\"id\":\"b2\"") && !l.contains("a1"), "{l}");
+    let d = fx.done_check("t1");
+    assert_eq!(code(&d), 0);
+    assert!(out(&d).contains("done-check=pass open=0"), "{}", out(&d));
+}
+
+/// P1B-17: a failing `rm` refuses Done before sweep and teardown; after the fault clears a re-run is Done.
+#[test]
+fn finalize_session_rm_failure_refused_and_rerunnable() {
+    let fx = Fx::new();
+    fx.gate_pass();
+    let n1 = sname(1, "t1");
+    fx.sessions(&[ent("a1", &n1, "working")]);
+    let o = fx.finalize_env(&[("STUB_RM_EXIT", "1")]);
+    assert_eq!(code(&o), 1, "stdout {} stderr {}", out(&o), err(&o));
+    assert_eq!(out(&o).trim_end(), sessions_refused("fail", &n1));
+    untouched(&fx);
+    let o = fx.finalize();
+    assert_eq!(code(&o), 0, "re-run: {} {}", out(&o), err(&o));
+}
+
+/// P1B-17: a listing that cannot be read is `cannot-check` and `rm` is never called.
+#[test]
+fn finalize_unreadable_listing_cannot_check() {
+    let fx = Fx::new();
+    fx.gate_pass();
+    let n1 = sname(1, "t1");
+    fx.sessions(&[ent("a1", &n1, "working")]);
+    for envs in [
+        vec![("STUB_AGENTS_EXIT", "1")],
+        vec![("STUB_AGENTS_RAW", "{}")],
+        vec![("STUB_AGENTS_RAW", "[{\"id\":\"-x\",\"name\":\"n\"}]")],
+    ] {
+        let o = fx.finalize_env(&envs);
+        assert_eq!(code(&o), 1, "{:?}: {} {}", envs, out(&o), err(&o));
+        assert_eq!(out(&o).trim_end(), refused("sessions", "cannot-check"));
+    }
+    assert_eq!(fx.calls(), "");
+    untouched(&fx);
+}
+
+/// P1B-17: usage errors on the host flags exit 2 before any host call.
+#[test]
+fn finalize_host_usage_refused() {
+    let fx = Fx::new();
+    fx.gate_pass();
+    fx.sessions(&[ent("a1", &sname(1, "t1"), "working")]);
+    let md = fx.md.to_str().unwrap().to_string();
+    let dir = fx.t.p.to_str().unwrap().to_string();
+    let cases: Vec<Output> = vec![
+        fx.finalize_with(Some("--host"), &fx.log, &md),
+        fx.finalize_with(Some("--config"), &fx.log, &md),
+        fx.finalize_x(None, &fx.log, &md, "host.sh", &[]),
+        fx.finalize_x(None, &fx.log, &md, &dir, &[]),
+    ];
+    for (i, o) in cases.iter().enumerate() {
+        assert_eq!(code(o), 2, "case {i}: {} {}", out(o), err(o));
+        assert!(out(o).is_empty(), "case {i}: {}", out(o));
+    }
+    assert_eq!(fx.calls(), "");
+    untouched(&fx);
+}
+
+/// P1B-17: a stale gate refuses Done before any host call.
+#[test]
+fn finalize_failed_gate_no_host_call() {
+    let fx = Fx::new();
+    fx.sessions(&[ent("a1", &sname(1, "t1"), "working")]);
+    let o = fx.finalize();
+    assert_eq!(code(&o), 1, "{} {}", out(&o), err(&o));
+    assert_eq!(out(&o).trim_end(), refused("gate", "fail"));
+    assert_eq!(fx.calls(), "");
+}
+
+/// P1B-17 (S-1.6.1): `rm` reported success but the session is still listed: Done is refused.
+#[test]
+fn finalize_rm_reported_but_still_listed_fails() {
+    let fx = Fx::new();
+    fx.gate_pass();
+    let n1 = sname(1, "t1");
+    fx.sessions(&[ent("a1", &n1, "working")]);
+    let o = fx.finalize_env(&[("STUB_RM_NOOP", "1")]);
+    assert_eq!(code(&o), 1, "stdout {} stderr {}", out(&o), err(&o));
+    assert_eq!(out(&o).trim_end(), sessions_refused("fail", &n1));
+    assert!(fx.cleanup_lines().is_empty(), "{:?}", fx.cleanup_lines());
+    untouched(&fx);
 }
