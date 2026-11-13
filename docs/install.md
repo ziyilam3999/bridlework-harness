@@ -17,7 +17,7 @@ Check that the tools the guide uses are present.
 
 <!-- step: prereqs -->
 ```sh
-command -v curl sha256sum tar git bash python3
+for t in curl sha256sum tar git bash python3; do command -v "$t"; done
 ```
 Expected: exit 0; six lines, one per tool, each containing `curl`, `sha256sum`, `tar`, `git`, `bash`, `python3` (one line each).
 
