@@ -421,19 +421,15 @@ fn start_cmd(a: &[String]) -> i32 {
         if read.live.iter().any(|e| matches!(&e.target, Target::Port(n) if *n == p)) {
             return fail(&format!("port {} is already live in ticket {}", p, args.ticket));
         }
-        // Only AddrInUse means "taken": the bind can also fail for reasons of privilege (an unprivileged bind on
-        // 127.0.0.1 below 1024 is EACCES on macOS/BSD and EPERM on Linux), which is not a claim on the port —
-        // so the refusal names the error kind instead of a false "already bound".
-        match TcpListener::bind(("127.0.0.1", p as u16)) {
-            Ok(l) => drop(l),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+        match port_bind_check(p as u16) {
+            Ok(()) => {}
+            Err(PortCheckError::Taken) => {
                 return fail(&format!("port {} is already bound on 127.0.0.1", p));
             }
-            Err(e) => {
+            Err(PortCheckError::Unknown(kind)) => {
                 return fail(&format!(
                     "cannot check port {} on 127.0.0.1: {} (ports below 1024 need privilege for the bind check)",
-                    p,
-                    e.kind()
+                    p, kind
                 ));
             }
         }
@@ -1329,6 +1325,27 @@ fn stop_live_entry(
         "harness: {id} signalled, death not confirmed: pid {pid} or its group still answers the liveness probe, or the probe could not run; entry kept so a later stop can retry"
     );
     StopDone::NotConfirmed
+}
+
+/// Why a port could not be shown free: `Taken` (the bind got AddrInUse) or `Unknown` (any other error kind).
+pub(crate) enum PortCheckError {
+    Taken,
+    Unknown(std::io::ErrorKind),
+}
+
+/// The ONE 127.0.0.1 snapshot bind (used by `process start` and by teardown's port release). Only AddrInUse means
+/// "taken": the bind can also fail for reasons of privilege (an unprivileged bind on 127.0.0.1 below 1024 is EACCES
+/// on macOS/BSD and EPERM on Linux), which is not a claim on the port — so the error kind is carried, not a false
+/// "already bound". The listener is dropped at once: a snapshot, not a hold.
+pub(crate) fn port_bind_check(p: u16) -> Result<(), PortCheckError> {
+    match TcpListener::bind(("127.0.0.1", p)) {
+        Ok(l) => {
+            drop(l);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(PortCheckError::Taken),
+        Err(e) => Err(PortCheckError::Unknown(e.kind())),
+    }
 }
 
 /// `harness process stop` (#183). Every refusal answers 2 with NOTHING signalled and the manifest
