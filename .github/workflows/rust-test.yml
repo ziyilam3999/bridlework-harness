@@ -19,3 +19,5 @@ jobs:
         run: sh ci/rust-test.sh
       - name: Clippy
         run: sh ci/rust-clippy.sh
+      - name: Release smoke
+        run: sh ci/release-smoke.sh all

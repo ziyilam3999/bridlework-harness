@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: privacy-gate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build engine
+        run: cargo build --release --locked
+        working-directory: core/rust
+      - name: Build release
+        run: sh ci/release-build.sh "$GITHUB_REF" "$RUNNER_TEMP/dist"
+      - name: Scan
+        env:
+          HARNESS_PRIVACY_LIST_SECRET: ${{ secrets.PRIVACY_LIST }}
+        run: sh ci/privacy-release-artifacts.sh "$RUNNER_TEMP/dist"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+  publish:
+    needs: scan
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: release-dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release-dist
+          sha256sum -c SHA256SUMS
+          listed=$(sed 's/^[0-9a-f]*  //' SHA256SUMS | sort)
+          have=$(ls -A | grep -vx SHA256SUMS | sort)
+          if [ "$listed" != "$have" ]; then
+            echo "publish: file set differs from SHA256SUMS" >&2
+            exit 1
+          fi
+          set -- bridlework-harness-claude-plugin-*.tar.gz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "publish: expected exactly one plugin tarball" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md "$1" SHA256SUMS
