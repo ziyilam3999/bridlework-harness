@@ -118,7 +118,7 @@ supervisor lock file, never opens a FIFO, and no read is unbounded: the manifest
 ## What this does not cover
 
 - Evidence privacy (P1B-10): no redaction; nothing is printed, so nothing leaks here.
-- Retention and teardown of evidence entries and run dirs (P1B-14, ticket 185), run rotation.
+- Retention of evidence run dirs and run rotation; teardown releases the entries but keeps the files (see [Teardown](workspace.md#teardown-p1b-14)).
 - Wiring the check into `harness ticket finalize` and any operator override for `unknown` runs (P1B-15).
 - Whether a ticket NEEDED a runtime run (zero runs is allowed).
 - Distinguishing a harness stop from an external TERM/KILL, or a timeout stop from a normal stop: a
