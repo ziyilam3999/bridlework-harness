@@ -1,8 +1,9 @@
 #!/bin/sh
 # Release build. Usage: ci/release-build.sh <github-ref> <dist-dir>
 # Packs the tracked plugins/claude bundle at HEAD into a reproducible tarball and writes release-notes.md and SHA256SUMS.
-# It builds NO shipped binary: the engine at core/rust/target/release/harness is the scanner and plugin checker only (never published).
-# Exit 0 clean, 1 on any refusal (fail closed). Prints only dist_files=3 and the file names.
+# It also packs the engine at core/rust/target/release/harness (the same binary that ran the scan and the plugin check) into a
+# reproducible tarball named from the engine's own header (ELF or Mach-O), never from the host.
+# Exit 0 clean, 1 on any refusal (fail closed). Prints only dist_files=4 and the file names.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
 root="$here/.."
 eng="$root/core/rust/target/release/harness"
@@ -21,6 +22,7 @@ import gzip, io, json, os, re, subprocess, sys, tarfile
 
 root, eng, ref, dist = sys.argv[1:5]
 MAX_FILES = 2000
+MAX_ENGINE = 64 * 1024 * 1024
 
 
 def die(msg):
@@ -54,6 +56,31 @@ head = git("rev-parse", "HEAD").strip()
 tagc = subprocess.run(["git", "-C", root, "rev-parse", "-q", "--verify", ref + "^{commit}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 if tagc.returncode != 0 or tagc.stdout.decode().strip() != head:
     die("tag does not name the checked-out commit")
+
+
+def target_of(path):
+    """Name the target from the binary's own header; refuse anything unknown."""
+    with open(path, "rb") as fh:
+        h = fh.read(32)
+    if h[:4] == b"\x7fELF" and len(h) >= 20 and h[4] == 2 and h[5] == 1:
+        mach = int.from_bytes(h[18:20], "little")
+        if mach == 0x3E:
+            return "x86_64-unknown-linux-gnu"
+        if mach == 0xB7:
+            return "aarch64-unknown-linux-gnu"
+    if h[:4] == b"\xcf\xfa\xed\xfe":
+        cpu = int.from_bytes(h[4:8], "little")
+        if cpu == 0x01000007:
+            return "x86_64-apple-darwin"
+        if cpu == 0x0100000C:
+            return "aarch64-apple-darwin"
+    die("engine is not a known target")
+
+
+size = os.path.getsize(eng)
+if size > MAX_ENGINE:
+    die("engine is over the size bound")
+triple = target_of(eng)
 if subprocess.run([eng, "plugin", "check", "--repo", root], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
     die("plugin check failed")
 if os.path.lexists(dist) and (not os.path.isdir(dist) or os.listdir(dist)):
@@ -90,21 +117,40 @@ with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as tf:
 with open(os.path.join(dist, name), "wb") as fh:
     with gzip.GzipFile(filename="", mode="wb", fileobj=fh, mtime=ctime, compresslevel=9) as gz:
         gz.write(raw.getvalue())
+ename = "bridlework-harness-engine-%s-%s.tar.gz" % (ver, triple)
+edir = "bridlework-harness-engine-%s-%s/" % (ver, triple)
+edata = open(eng, "rb").read()
+if len(edata) > MAX_ENGINE:
+    die("engine is over the size bound")
+license_blob = git("cat-file", "blob", "HEAD:LICENSE", raw=True)
+eraw = io.BytesIO()
+with tarfile.open(fileobj=eraw, mode="w", format=tarfile.GNU_FORMAT) as tf:
+    for mname, mdata, mmode in ((edir + "harness", edata, 0o755), (edir + "LICENSE", license_blob, 0o644)):
+        ti = tarfile.TarInfo(mname)
+        ti.size = len(mdata)
+        ti.mtime = ctime
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        ti.mode = mmode
+        ti.type = tarfile.REGTYPE
+        tf.addfile(ti, io.BytesIO(mdata))
+with open(os.path.join(dist, ename), "wb") as fh:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=fh, mtime=ctime, compresslevel=9) as gz:
+        gz.write(eraw.getvalue())
 notes = (
     "# bridlework-harness v%s\n\n"
-    "Asset: %s (the plugins/claude bundle at this tag).\n\n"
-    "The harness engine is not shipped yet: build it from source at this tag (cargo build --release --locked in core/rust), then set HARNESS_BIN to the built binary.\n\n"
-    "See docs/release.md.\n" % (ver, name)
+    "Assets: %s (the plugins/claude bundle at this tag) and %s (the harness engine, built from this tag).\n\n"
+    "See docs/release.md.\n" % (ver, name, ename)
 )
 with open(os.path.join(dist, "release-notes.md"), "w", encoding="utf-8", newline="\n") as fh:
     fh.write(notes)
 import hashlib
 sums = ""
-for fn in sorted([name, "release-notes.md"]):
+for fn in sorted([name, ename, "release-notes.md"]):
     sums += "%s  %s\n" % (hashlib.sha256(open(os.path.join(dist, fn), "rb").read()).hexdigest(), fn)
 with open(os.path.join(dist, "SHA256SUMS"), "w", encoding="utf-8", newline="\n") as fh:
     fh.write(sums)
-print("dist_files=3")
+print("dist_files=4")
 for fn in sorted(os.listdir(dist)):
     print(fn)
 PY

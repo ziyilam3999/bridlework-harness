@@ -1,3 +1,4 @@
+#![cfg(debug_assertions)]
 //! The fixture corpus against the engine, with the synthetic list text injected (no real list is read).
 use harness::detect::classes_for_line;
 use harness::fixtures;

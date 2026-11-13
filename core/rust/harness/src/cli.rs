@@ -70,7 +70,8 @@ fn run_scan(args: &[String], testmode: bool, surface: &str) -> Result<Outcome, S
 }
 
 /// `harness fixtures names | list | near-miss | line <name> | marker <name> | class <name> | extra <name>`:
-/// prints synthetic test material for drivers. It reads nothing.
+/// prints synthetic test material for drivers. It reads nothing. Debug builds only.
+#[cfg(debug_assertions)]
 fn fixtures_cmd(a: &[String]) -> i32 {
     use crate::fixtures;
     let cases = fixtures::cases();
@@ -529,7 +530,13 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return crate::evidence::evidence_cmd(&args[1..]);
     }
     if !args.is_empty() && args[0] == "fixtures" {
+        #[cfg(debug_assertions)]
         return fixtures_cmd(&args[1..]);
+        #[cfg(not(debug_assertions))]
+        {
+            eprintln!("harness: fixtures are not built into release binaries");
+            return 2;
+        }
     }
     if !args.is_empty() && args[0] == "friction" {
         return crate::friction::friction_cmd(&args[1..], testmode);

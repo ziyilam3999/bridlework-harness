@@ -4,8 +4,9 @@ A release is cut by CI when a version tag is pushed. Nothing is built or publish
 
 ## What is published
 
-The `plugins/claude` bundle at the tag, as one tarball (`bridlework-harness-claude-plugin-X.Y.Z.tar.gz`), plus `SHA256SUMS`.
-The release notes are a fixed template. The tarball is reproducible: the same tag gives the same bytes.
+The `plugins/claude` bundle at the tag, as one tarball (`bridlework-harness-claude-plugin-X.Y.Z.tar.gz`), the engine as a
+second tarball (`bridlework-harness-engine-X.Y.Z-<triple>.tar.gz`), plus `SHA256SUMS`.
+The release notes are a fixed template. Both tarballs are reproducible: the same tag and the same engine bytes give the same bytes.
 
 ## Steps
 
@@ -35,8 +36,11 @@ A refused run shows `surface:class-id` lines and the item index only, never the 
 
 ## Engine binary
 
-The `harness` engine binary is not shipped yet (it carries the scanner's own test strings, so it cannot pass the scan).
-Build it from source at the tag (`cargo build --release --locked` in `core/rust`) and point `HARNESS_BIN` at it.
+The `harness` engine ships as `bridlework-harness-engine-<version>-<triple>.tar.gz` (the release job runs on linux x86_64, so
+the published asset is `x86_64-unknown-linux-gnu`). It holds `harness` and `LICENSE`. It is the same binary that ran the scan,
+and the scan reads the tarball member like every other file. The fixture generators (`harness fixtures ...`) are compiled only
+into debug builds, and the detector's search strings are stored encoded, so a release build holds no test marker. Point
+`HARNESS_BIN` at the unpacked `harness`, or build it from source (`cargo build --release --locked` in `core/rust`).
 
 ## Tests
 
