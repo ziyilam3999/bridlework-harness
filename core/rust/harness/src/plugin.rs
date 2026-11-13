@@ -269,7 +269,7 @@ mod tests {
         assert!(e.contains("hooks.json") && e.contains("line"), "{}", e);
         std::fs::write(&hp, base.replacen("\"Bash\"", "\"Bash|Read\"", 1)).unwrap();
         assert!(check(root).unwrap_err().contains("hooks.json"));
-        std::fs::write(&hp, format!("{}", base)).unwrap();
+        std::fs::write(&hp, &base).unwrap();
         check(root).unwrap();
         let mut extra = base.clone();
         extra = extra.replacen("\"PreToolUse\": [", "\"PreToolUse\": [\n      {\"matcher\": \"Read\", \"hooks\": []},", 1);
