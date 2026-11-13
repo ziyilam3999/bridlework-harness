@@ -28,10 +28,12 @@ no event kind is added.
 ## The command
 
 ```
-harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--dir <manifest-dir>] -- <program> [args...]
+harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--worker [--log <path>] [--root <dir>]] [--dir <manifest-dir>] -- <program> [args...]
 harness process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]]
 harness process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]]
 harness process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>] [--session <uuid> --checkpoint <sha>]
+harness process claim <ticket> --session <uuid> [--dir <manifest-dir>] [--log <path>] [--root <dir>]
+harness process sessions <ticket> [--dir <manifest-dir>]
 ```
 
 `--dir` defaults to `.harness/manifests`, the same default as `harness manifest`. Listing stays
@@ -452,3 +454,38 @@ Record mode adds ONE stdout line per death this run recorded, after the verb's o
   today's sizes. Both record-mode log reads (the pre-flight and the idempotence lookup) go through the
   same capped, regular-file-proving reader as every other log read (64 MiB cap, a FIFO or directory at
   the log path refused without being opened).
+
+## Worker sessions (#3706)
+
+`process start --worker [--log <path>] [--root <dir>]` gives the started program a session id. BEFORE any
+spawn the supervisor mints a v4 uuid from 16 bytes of `/dev/urandom` (an unreadable source refuses with exit
+2, nothing spawned or listed) and sets `HARNESS_WORKER_SESSION=<uuid>` for the program. After the process (and
+limit) line it writes one `session` line ([resource manifest](resource-manifest.md)), and after the port line
+it appends `session_started {session_id, source: launch}` to the log (default `.harness/events.jsonl`, same
+resolver as the record-mode verbs). A failure of either write runs the start rollback: the entry is removed
+and the spawned group stopped, so a refused worker start leaves nothing running and nothing live. The
+append-only manifest keeps the `session` line, so `process sessions` shows that attempt as `closed`.
+Success prints one extra stdout line, `worker <id> session <uuid>`. `--log` and `--root` without `--worker`
+are a usage error (exit 2, nothing spawned). Without `--worker` the start is byte-for-byte unchanged.
+
+`process claim <ticket> --session <uuid>` is how a process says "I am this ticket's worker". The claimant is
+identified by OS ancestry, never by an argument: the walk starts at the claimant's OWN pid (a shell that
+`exec`s the claim holds the launched pid itself), then its parents, at most 32, stopping at pid <= 1. The
+first pid that equals a live `process` entry's pid AND passes the recorded start-time identity (the same proof
+`stop` uses) is the claimant's launch. The whole claim runs under the per-ticket supervisor lock, so it waits
+out an in-flight `start` of the same ticket and sees either the finished lines or nothing.
+
+| Case | stdout | exit |
+|---|---|---|
+| launched worker, entry has a session equal to `--session` | `counted <id> <uuid>` (nothing written) | 0 |
+| launched worker, entry's session differs from `--session` | — (stderr: `session id mismatch: launched <id> holds a different session id`; nothing written, the launched id is not echoed) | 2 |
+| no ancestor is a live entry, or the matching entry has no session (not a worker): `unmanaged_session {reason: not_supervisor_launched}` is appended | `unmanaged: not counted` | 7 |
+| an ancestor's parent or start time cannot be read, damaged manifest, bad ticket or non-uuid `--session`, or the `unmanaged_session` append failed | — (stderr names it; "unknown" is never read as "not launched") | 2 |
+
+`process sessions <ticket>` is read-only: one `<id> <uuid> live|closed` line per `session` line ever written
+(closed = a later `remove` of that entry, e.g. after `stop`), then `counted <n>` = the live sessions.
+
+Honest limits: (a) any descendant of the worker (a shell it spawned) claims as the worker — the family is the
+unit, as with `stop`; (b) the id is the harness's own launch handle; whether the host CLI reports the same id
+is the live check of a later row; (c) the finalize join (closing the session at ticket finalize) is not wired
+here — `stop` closes it.
