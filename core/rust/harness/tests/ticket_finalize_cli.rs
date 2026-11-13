@@ -47,6 +47,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 fn run(args: &[&str]) -> Output {
     let mut c = Command::new(BIN);
     c.args(args).stdin(Stdio::null());
+    // `evidence check` scans what it prints and refuses without a privacy list: a one-entry list that never matches.
+    c.env("HARNESS_PRIVACY_LIST_SECRET", "zz-never-in-output-zz");
     for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
         c.env_remove(k);
     }
@@ -315,6 +317,9 @@ impl Fx {
         }
         let mut c = Command::new(BIN);
         c.args(&a).stdin(Stdio::null()).env("STUB_DIR", &self.sdir);
+        // The evidence check scans what it prints and refuses without a privacy list (G2.4): a one-entry list that never matches.
+        // A test may override it through `envs` (a later `env` call wins).
+        c.env("HARNESS_PRIVACY_LIST_SECRET", "zz-never-in-output-zz");
         for k in [
             "GIT_DIR",
             "GIT_WORK_TREE",
@@ -571,6 +576,27 @@ fn finalize_failed_run_refused_after_teardown() {
     assert!(!fx.root().join("tree").exists());
     git(&fx.repo, &["rev-parse", "--verify", "ws/t1"]);
     assert!(fx.root().join("evidence").exists(), "evidence folder gone");
+}
+
+/// G2.4 both ends at finalize: evidence text that hits the privacy list is refused (fail closed, nothing printed from it),
+/// the same fixture with a clean list passes, and no list at all is refused rather than passed unscanned.
+#[test]
+fn finalize_evidence_scan_both_ends() {
+    let fx = Fx::new();
+    fx.gate_pass();
+    let o = fx.finalize_env(&[("HARNESS_PRIVACY_LIST_SECRET", "evidence=allowed")]);
+    assert_eq!(code(&o), 1, "dirty evidence must refuse: {} {}", out(&o), err(&o));
+    assert!(out(&o).contains("check=evidence"), "{}", out(&o));
+    assert!(!out(&o).contains("finalize=done"), "{}", out(&o));
+    // Teardown already ran on the refused fixture; the clean case is a fresh one.
+    let fx = Fx::new();
+    fx.gate_pass();
+    let o = fx.finalize();
+    assert_eq!(code(&o), 0, "clean evidence must pass: {} {}", out(&o), err(&o));
+    let fx = Fx::new();
+    fx.gate_pass();
+    let o = fx.finalize_env(&[("HARNESS_PRIVACY_LIST_SECRET", "")]);
+    assert_eq!(code(&o), 1, "empty list is not a scan: {} {}", out(&o), err(&o));
 }
 
 /// AC8: no folder is printed on any path.

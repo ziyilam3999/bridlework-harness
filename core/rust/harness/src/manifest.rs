@@ -56,6 +56,12 @@ impl Class {
     pub fn is_path(&self) -> bool {
         matches!(self, Class::Worktree | Class::TempDir | Class::Log | Class::Evidence)
     }
+
+    /// EVIDENCE never leaves private state (P1B-10): only `Evidence` is not exportable. Any export or
+    /// publish path over manifest entries must check this.
+    pub fn exportable(self) -> bool {
+        !matches!(self, Class::Evidence)
+    }
 }
 
 /// One manifest line. Key order is fixed per shape (the schema file mirrors these sets).
@@ -1379,6 +1385,14 @@ pub fn process_age_ms(pid: u64) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_is_not_exportable() {
+        assert!(!Class::Evidence.exportable());
+        for c in Class::ALL.iter().filter(|c| **c != Class::Evidence) {
+            assert!(c.exportable(), "{} is exportable", c.as_str());
+        }
+    }
 
     /// #207 r1 F2 (pure table): the boot-age arithmetic fails CLOSED on every odd clock — an uptime below
     /// the pid's own starttime (an impossible clock), nan, either infinity, a negative reading, or a finite

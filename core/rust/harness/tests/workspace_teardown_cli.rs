@@ -43,7 +43,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN).args(args).stdin(Stdio::null()).output().unwrap()
+    // `evidence show` scans what it prints and refuses without a list: a one-entry list that never matches.
+    Command::new(BIN).args(args).env("HARNESS_PRIVACY_LIST_SECRET", "zz-never-in-output-zz").stdin(Stdio::null()).output().unwrap()
 }
 
 fn code(o: &Output) -> i32 {
