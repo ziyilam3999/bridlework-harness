@@ -257,7 +257,134 @@ fn events_cmd(a: &[String]) -> i32 {
     }
 }
 
-const CONFIG_USAGE: &str = "usage: harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]";
+const CONFIG_USAGE: &str = "usage: harness config check [--config <file>] [--repo <repo_id>] [--budget <S|M|L>]\n       harness config approval-message --config <file> --from <new-file> --expires-ms <n>\n       harness config write --config <file> --from <new-file> [--approval <sig> --expires-ms <n>] [--log <file>] [--root <dir>]";
+/// Parse `--flag value` pairs against `allowed`; each flag at most once.
+fn take_flags(a: &[String], allowed: &[&str]) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut m = std::collections::HashMap::new();
+    let mut it = a.iter();
+    while let Some(flag) = it.next() {
+        let Some(k) = flag.strip_prefix("--").filter(|k| allowed.contains(k)) else { return Err("unknown option".to_string()) };
+        let Some(v) = it.next() else { return Err("an option is missing its value".to_string()) };
+        if m.insert(k.to_string(), v.clone()).is_some() {
+            return Err("an option was given twice".to_string());
+        }
+    }
+    Ok(m)
+}
+
+/// `harness config approval-message` and `harness config write` (the one human-origin write verb).
+/// Exit 0 done; 2 usage/bad content/log failure; 3 refused for lack of human origin (the config is untouched).
+#[cfg(unix)]
+fn config_write_cmd(sub: &str, a: &[String]) -> i32 {
+    use crate::config::Config;
+    use crate::events::{self, Field, Kind, Record};
+    use crate::human_origin::{self, Anchor, Target};
+    use std::io::Write;
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    #[cfg(debug_assertions)]
+    const WRITE_FLAGS: &[&str] = &["config", "from", "approval", "expires-ms", "log", "root", "trust-anchor"];
+    #[cfg(not(debug_assertions))]
+    const WRITE_FLAGS: &[&str] = &["config", "from", "approval", "expires-ms", "log", "root"];
+    let o = match take_flags(a, if sub == "write" { WRITE_FLAGS } else { &["config", "from", "expires-ms"] }) {
+        Ok(o) => o,
+        Err(e) => return fail(&e),
+    };
+    let path = match o.get("config") {
+        Some(f) => std::ffi::OsString::from(f),
+        None => match std::env::var_os("HARNESS_CONFIG") {
+            Some(v) => v,
+            None => return fail("no config configured (pass --config <file> or set HARNESS_CONFIG)"),
+        },
+    };
+    if path.is_empty() {
+        return fail("the config source is empty");
+    }
+    let path = std::path::PathBuf::from(path);
+    let Some(from) = o.get("from") else { return fail("--from <new-file> is required") };
+    let expires = match o.get("expires-ms").map(|s| s.parse::<u64>()) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) => return fail("--expires-ms must be a number"),
+        None => None,
+    };
+    let mut bytes = Vec::new();
+    match std::fs::File::open(from) {
+        Ok(f) => {
+            if f.take(1024 * 1024 + 1).read_to_end(&mut bytes).is_err() {
+                return fail("the new file is unreadable");
+            }
+        }
+        Err(_) => return fail("the new file is unreadable"),
+    }
+    if bytes.len() > 1024 * 1024 {
+        return fail("the new file is too large");
+    }
+    match std::str::from_utf8(&bytes).map_err(|_| "config: file is not utf-8".to_string()).and_then(Config::parse) {
+        Ok(_) => {}
+        Err(e) => return fail(&e),
+    }
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if events::token_ok(n) => n.to_string(),
+        _ => return fail("the config file name must be a plain token (lowercase letters, digits, '-', '_', '.')"),
+    };
+    if sub == "approval-message" {
+        let Some(exp) = expires else { return fail("--expires-ms is required") };
+        let m = human_origin::message(Target::Config, &name, exp, &bytes);
+        return match std::io::stdout().write_all(&m).and_then(|_| std::io::stdout().flush()) {
+            Ok(()) => 0,
+            Err(_) => fail("stdout is not writable"),
+        };
+    }
+    #[cfg(debug_assertions)]
+    let anchor = match o.get("trust-anchor") {
+        Some(p) => Anchor::for_test(std::path::Path::new(p)),
+        None => Anchor::system(),
+    };
+    #[cfg(not(debug_assertions))]
+    let anchor = Anchor::system();
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => return fail("clock is before the epoch"),
+    };
+    let approval = o.get("approval").map(std::path::Path::new);
+    if let Err(r) = human_origin::check(Target::Config, &name, &bytes, approval, expires, now, &anchor) {
+        let lr = crate::supervisor::resolve_log_root(o.get("log").map(|s| s.as_str()), o.get("root").map(|s| s.as_str()));
+        let logged = crate::supervisor::ensure_default_log_folder(&lr).is_ok()
+            && Record::build(Kind::HumanOriginRefused, now, &[("target", Field::Str(Target::Config.as_str().to_string())), ("path", Field::Str(name.clone()))])
+                .ok()
+                .map(|rec| events::append_record(&lr.root, &lr.log, &rec).is_ok())
+                .unwrap_or(false);
+        if !logged {
+            return fail("the refusal could not be logged");
+        }
+        eprintln!("harness: human_origin_refused target=config reason={}", r.as_str());
+        return 3;
+    }
+    // Accepted: temp file beside the config, synced, same mode, then renamed over it.
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let tmp = dir.join(format!(".{}.harness-tmp-{}", name, std::process::id()));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(&bytes)?;
+        if let Ok(md) = std::fs::metadata(&path) {
+            f.set_permissions(md.permissions())?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return fail("the config could not be written");
+    }
+    println!("config written name={}", name);
+    0
+}
+
 
 /// `harness config check`. Exit 0 the config loaded (stdout: `config ok repos=<n> shadow=ok`, plus `repo_id=<id> mapped` and
 /// `budget size=<S> wall_seconds=<n> tokens=<n>` when asked); 1 `--repo` names an id that is not in the map; 2 everything else
@@ -270,6 +397,10 @@ fn config_cmd(a: &[String]) -> i32 {
         eprintln!("harness: error: {}", m);
         2
     };
+    #[cfg(unix)]
+    if let Some(sub @ ("write" | "approval-message")) = a.first().map(|s| s.as_str()) {
+        return config_write_cmd(sub, &a[1..]);
+    }
     if a.first().map(|s| s.as_str()) != Some("check") {
         eprintln!("{}", CONFIG_USAGE);
         return 2;
@@ -331,7 +462,7 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
-const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new]";
+const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>]";
 
 /// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
 /// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->` for the launcher
@@ -347,6 +478,12 @@ fn session_cmd(a: &[String]) -> i32 {
         eprintln!("harness: error: {}", m);
         2
     };
+    #[cfg(unix)]
+    match a.first().map(|s| s.as_str()) {
+        Some("launch") => return crate::launcher::launch_cmd(&a[1..]),
+        Some("launches") => return crate::launcher::launches_cmd(&a[1..]),
+        _ => {}
+    }
     if a.first().map(|s| s.as_str()) != Some("check-name") {
         eprintln!("{}", SESSION_USAGE);
         return 2;

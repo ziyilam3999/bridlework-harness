@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--dir <manifest-dir>] -- <program> [args...] | process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]] | process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]] | process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>] [--session <uuid> --checkpoint <sha>]";
+pub const USAGE: &str = "usage: harness process start <ticket> --id <id> --cwd <dir> [--port <n>] [--timeout-ms <n>] [--worker [--log <path>] [--root <dir>]] [--dir <manifest-dir>] -- <program> [args...] | process stop <ticket> (--id <id> | --pid <n>) [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]] | process claim <ticket> --session <uuid> [--dir <manifest-dir>] [--log <path>] [--root <dir>] | process sessions <ticket> [--dir <manifest-dir>] | process check <ticket> [--grace-ms <n>] [--dir <manifest-dir>] [--session <uuid> --checkpoint <sha> --repo <token> [--log <path>] [--root <dir>]] | process step <ticket> --repo <r> --steps <s> --soft <a> --hard <b> [--grace-ms <n>] [--dir <manifest-dir>] [--log <path>] [--root <dir>] [--session <uuid> --checkpoint <sha>]";
 
 /// Default manifest dir, the same default as `harness manifest`.
 const DEFAULT_DIR: &str = ".harness/manifests";
@@ -99,6 +99,8 @@ pub fn process_cmd(a: &[String]) -> i32 {
         "stop" => stop_cmd(rest),
         "check" => check_cmd(rest),
         "step" => step_cmd(rest),
+        "claim" => claim_cmd(rest),
+        "sessions" => sessions_cmd(rest),
         // hidden: the supervisor's own waiter (#209, `evidence.rs`). An implementation verb of `start`,
         // never typed by a user, so it stays out of USAGE.
         "waiter" => crate::evidence::waiter_cmd(rest),
@@ -299,6 +301,9 @@ struct StartArgs {
     cwd: String,
     port: Option<u64>,
     timeout_ms: Option<u64>,
+    worker: bool,
+    log: Option<String>,
+    root: Option<String>,
     dir: String,
     program: String,
     prog_args: Vec<String>,
@@ -314,9 +319,17 @@ fn parse_start(a: &[String]) -> Result<StartArgs, String> {
     let mut port: Option<String> = None;
     let mut timeout: Option<String> = None;
     let mut dir: Option<String> = None;
+    let mut worker = false;
+    let mut log: Option<String> = None;
+    let mut root: Option<String> = None;
     let mut it = before.iter();
     while let Some(arg) = it.next() {
-        if let Some(name) = arg.strip_prefix("--") {
+        if arg == "--worker" {
+            if worker {
+                return Err("--worker given twice".to_string());
+            }
+            worker = true;
+        } else if let Some(name) = arg.strip_prefix("--") {
             let value = it.next().ok_or_else(|| format!("{} needs a value", arg))?;
             let slot = match name {
                 "id" => &mut id,
@@ -324,6 +337,8 @@ fn parse_start(a: &[String]) -> Result<StartArgs, String> {
                 "port" => &mut port,
                 "timeout-ms" => &mut timeout,
                 "dir" => &mut dir,
+                "log" => &mut log,
+                "root" => &mut root,
                 _ => return Err(format!("unknown option {}", arg)),
             };
             if slot.replace(value.clone()).is_some() {
@@ -332,6 +347,9 @@ fn parse_start(a: &[String]) -> Result<StartArgs, String> {
         } else if ticket.replace(arg.clone()).is_some() {
             return Err("more than one ticket given".to_string());
         }
+    }
+    if !worker && (log.is_some() || root.is_some()) {
+        return Err("--log and --root are only valid with --worker".to_string());
     }
     let after = &after[1..];
     let program = after.first().cloned().ok_or_else(|| "no program after --".to_string())?;
@@ -365,7 +383,19 @@ fn parse_start(a: &[String]) -> Result<StartArgs, String> {
         }
         None => None,
     };
-    Ok(StartArgs { ticket, id, cwd, port, timeout_ms, dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()), program, prog_args: after[1..].to_vec() })
+    Ok(StartArgs {
+        ticket,
+        id,
+        cwd,
+        port,
+        timeout_ms,
+        worker,
+        log,
+        root,
+        dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()),
+        program,
+        prog_args: after[1..].to_vec(),
+    })
 }
 
 fn start_cmd(a: &[String]) -> i32 {
@@ -380,6 +410,19 @@ fn start_cmd(a: &[String]) -> i32 {
         return fail("id must be a plain token (lowercase letters, digits, '-', '_', '.')");
     }
     let dir = PathBuf::from(&args.dir);
+    // A worker start mints its session id BEFORE any lock, write or spawn: an unreadable entropy source
+    // refuses with nothing started and nothing listed. The supervisor mints it; the caller never supplies one.
+    let worker_session: Option<String> = if args.worker {
+        match mint_uuid() {
+            Ok(u) => Some(u),
+            Err(e) => return fail(&e),
+        }
+    } else {
+        None
+    };
+    let worker_lr = args
+        .worker
+        .then(|| resolve_log_root(args.log.as_deref(), args.root.as_deref()));
     // The supervisor lock is held for the whole start, so supervisor operations on one ticket serialise and
     // cannot read a manifest that does not yet list the process this start is about to spawn.
     let _lock = match lock_ticket(&dir, &args.ticket) {
@@ -493,6 +536,7 @@ fn start_cmd(a: &[String]) -> i32 {
         .arg("--")
         .arg(&args.program)
         .args(&args.prog_args)
+        .envs(worker_session.iter().map(|u| (WORKER_ENV, u.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -544,6 +588,27 @@ fn start_cmd(a: &[String]) -> i32 {
             return refuse_after_spawn(&mut waiter, pid, e.to_string());
         }
     }
+    // The session line (#3706): after the process (and limit) line, before the port line. A failed write
+    // runs the same rollback as a failed port write.
+    if let Some(sid) = &worker_session {
+        if let Err(e) = manifest::apply(
+            &dir,
+            &args.ticket,
+            &manifest::Op::Session {
+                id: &args.id,
+                session_id: sid,
+            },
+            ts_ms,
+        ) {
+            let _ = manifest::apply(
+                &dir,
+                &args.ticket,
+                &manifest::Op::Remove { id: &args.id },
+                now_ms(),
+            );
+            return refuse_after_spawn(&mut waiter, pid, e.to_string());
+        }
+    }
     if let Some(p) = args.port {
         if let Err(e) = manifest::apply(&dir, &args.ticket, &manifest::Op::AddPort { id: &port_id, port: p }, ts_ms) {
             // The process line is already on the sheet: take it back off (best effort — the refusal below
@@ -551,6 +616,30 @@ fn start_cmd(a: &[String]) -> i32 {
             // nothing running and nothing listed but the attempt's evidence entries.
             let _ = manifest::apply(&dir, &args.ticket, &manifest::Op::Remove { id: &args.id }, now_ms());
             return refuse_after_spawn(&mut waiter, pid, e.to_string());
+        }
+    }
+    // The launch event (#3706): after every manifest line, so a failed append rolls the whole start back.
+    if let (Some(sid), Some(lr)) = (&worker_session, &worker_lr) {
+        if let Err(e) = write_session_event(lr, sid) {
+            let _ = manifest::apply(
+                &dir,
+                &args.ticket,
+                &manifest::Op::Remove { id: &args.id },
+                now_ms(),
+            );
+            if args.port.is_some() {
+                let _ = manifest::apply(
+                    &dir,
+                    &args.ticket,
+                    &manifest::Op::Remove { id: &port_id },
+                    now_ms(),
+                );
+            }
+            return refuse_after_spawn(
+                &mut waiter,
+                pid,
+                format!("session_started not recorded: {e}"),
+            );
         }
     }
     // Commit handshake: the lines are on the sheet, so the waiter may let its program run to its natural
@@ -561,6 +650,9 @@ fn start_cmd(a: &[String]) -> i32 {
         let _ = commit.flush();
     }
     println!("{}\t{}\t{}", args.id, pid, start_ms);
+    if let Some(sid) = &worker_session {
+        println!("worker {} session {}", args.id, sid);
+    }
     0
 }
 
@@ -965,13 +1057,13 @@ fn check_record_shapes(session: &str, checkpoint: &str, repo: &str) -> Result<()
 /// The resolved log/root pair of a record-mode call, following the `events append` defaults:
 /// `.harness/events.jsonl` with root `.` when neither is given, an explicit log's parent as the root
 /// when only the log is given. `log_is_default` drives the create-only-inside-the-root folder rule.
-struct LogRoot {
-    log_is_default: bool,
-    log: PathBuf,
-    root: PathBuf,
+pub(crate) struct LogRoot {
+    pub(crate) log_is_default: bool,
+    pub(crate) log: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
-fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
+pub(crate) fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
     let log_is_default = log.is_none();
     let log = PathBuf::from(log.unwrap_or(".harness/events.jsonl"));
     let root = match root {
@@ -987,7 +1079,7 @@ fn resolve_log_root(log: Option<&str>, root: Option<&str>) -> LogRoot {
 /// The default log folder is created only after the working folder is proven inside the root (a refusal
 /// leaves no empty folder behind), the same rule `events append` and `step` use. An EXPLICIT log is
 /// never pre-created: a missing parent is the path check's own refusal.
-fn ensure_default_log_folder(lr: &LogRoot) -> Result<(), String> {
+pub(crate) fn ensure_default_log_folder(lr: &LogRoot) -> Result<(), String> {
     if !lr.log_is_default {
         return Ok(());
     }
@@ -2178,6 +2270,283 @@ fn kill_decision(leader: Liveness, group_empty: bool, identity: impl FnOnce() ->
         ),
         Liveness::Unknown(e) => KillDecision::Barred(e),
     }
+}
+
+// ---------------------------------------------------------------- worker sessions (#3706)
+
+/// The env var a `--worker` start sets on the program: the session id the supervisor minted for it.
+const WORKER_ENV: &str = "HARNESS_WORKER_SESSION";
+/// `process claim` answers this when the claimant is not a supervisor-launched worker (logged, not counted).
+const EXIT_UNMANAGED: i32 = 7;
+/// A claim walks the claimant itself plus at most this many ancestors, then stops (fail closed: past the
+/// bound the chain is simply not extended, so an unlaunched claimant is logged, never counted).
+const ANCESTOR_BOUND: usize = 32;
+
+/// A v4 uuid from 16 bytes of `/dev/urandom` (std only). An unreadable source is a refusal, never a weak id.
+fn mint_uuid() -> Result<String, String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| {
+            format!(
+                "cannot mint a worker session id: /dev/urandom unreadable ({})",
+                e.kind()
+            )
+        })?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
+}
+
+fn write_session_event(lr: &LogRoot, session_id: &str) -> Result<(), String> {
+    use crate::events::{Field, Kind, Record};
+    ensure_default_log_folder(lr)?;
+    let rec = Record::build(
+        Kind::SessionStarted,
+        now_ms(),
+        &[
+            ("session_id", Field::Str(session_id.to_string())),
+            ("source", Field::Str("launch".to_string())),
+        ],
+    )?;
+    crate::events::append_record(&lr.root, &lr.log, &rec).map_err(|e| e.to_string())
+}
+
+fn write_unmanaged_event(lr: &LogRoot, ticket: &str, session_id: &str) -> Result<(), String> {
+    use crate::events::{Field, Kind, Record};
+    ensure_default_log_folder(lr)?;
+    let rec = Record::build(
+        Kind::UnmanagedSession,
+        now_ms(),
+        &[
+            ("session_id", Field::Str(session_id.to_string())),
+            ("ticket", Field::Str(ticket.to_string())),
+            ("reason", Field::Str("not_supervisor_launched".to_string())),
+        ],
+    )?;
+    crate::events::append_record(&lr.root, &lr.log, &rec).map_err(|e| e.to_string())
+}
+
+/// The parent pid of `pid`: Linux reads `/proc/<pid>/stat` field 4 (after the last `)`, since the command
+/// name may hold anything); elsewhere `/bin/ps -o ppid= -p <pid>` by absolute path. A reading that cannot be
+/// made is an Err ("unknown"), never a made-up parent.
+fn parent_of(pid: u64) -> Result<u64, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|e| format!("cannot read the parent of pid {pid}: {}", e.kind()))?;
+        let rest = stat
+            .rsplit_once(')')
+            .map(|(_, r)| r)
+            .ok_or_else(|| format!("cannot parse /proc/{pid}/stat"))?;
+        rest.split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| format!("cannot parse the parent of pid {pid}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = Command::new("/bin/ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run /bin/ps: {}", e.kind()))?;
+        if !out.status.success() {
+            return Err(format!("/bin/ps could not read the parent of pid {pid}"));
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("cannot parse the parent of pid {pid}"))
+    }
+}
+
+struct ClaimArgs {
+    ticket: String,
+    session: String,
+    dir: String,
+    log: Option<String>,
+    root: Option<String>,
+}
+
+fn parse_claim(a: &[String]) -> Result<ClaimArgs, String> {
+    let (mut ticket, mut session, mut dir, mut log, mut root) = (None, None, None, None, None);
+    let mut it = a.iter();
+    while let Some(arg) = it.next() {
+        if let Some(name) = arg.strip_prefix("--") {
+            let value = it.next().ok_or_else(|| format!("{} needs a value", arg))?;
+            let slot: &mut Option<String> = match name {
+                "session" => &mut session,
+                "dir" => &mut dir,
+                "log" => &mut log,
+                "root" => &mut root,
+                _ => return Err(format!("unknown option {}", arg)),
+            };
+            if slot.replace(value.clone()).is_some() {
+                return Err(format!("{} given twice", arg));
+            }
+        } else if ticket.replace(arg.clone()).is_some() {
+            return Err("more than one ticket given".to_string());
+        }
+    }
+    let ticket: String = ticket.ok_or_else(|| "a ticket is required".to_string())?;
+    let session: String = session.ok_or_else(|| "--session is required".to_string())?;
+    if !crate::events::token_ok(&ticket) {
+        return Err("ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')".to_string());
+    }
+    if !death::uuid_ok(&session) {
+        return Err("--session must be a lowercase uuid (8-4-4-4-12 hex)".to_string());
+    }
+    Ok(ClaimArgs {
+        ticket,
+        session,
+        dir: dir.unwrap_or_else(|| DEFAULT_DIR.to_string()),
+        log,
+        root,
+    })
+}
+
+/// `harness process claim <ticket> --session <uuid>` (#3706): a process says "I am this ticket's worker, my
+/// session id is <uuid>". The claimant is identified by OS ancestry (itself, then up to 32 parents), never by an
+/// argument: the first pid that is a live `process` entry of the ticket AND passes the recorded start-time
+/// identity is the claimant's launch. Held under the per-ticket supervisor lock from the manifest read to the
+/// event append, so it waits out an in-flight `start` of the same ticket. Exit: 0 counted; 2 refusal (mismatch,
+/// unknown, damaged, event not written); 7 unmanaged (logged, not counted).
+fn claim_cmd(a: &[String]) -> i32 {
+    let args = match parse_claim(a) {
+        Ok(x) => x,
+        Err(e) => return fail(&e),
+    };
+    let dir = PathBuf::from(&args.dir);
+    let _lock = match lock_ticket(&dir, &args.ticket) {
+        Ok(l) => l,
+        Err(e) => return fail(&e),
+    };
+    let read = match manifest::read_manifest(&dir, &args.ticket) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    if !read.is_clean() {
+        return fail(&damage_msg(&read));
+    }
+    // The chain: self first (a shell that exec'd the claim IS the entry's pid), then at most 32 parents.
+    let mut chain: Vec<u64> = vec![std::process::id() as u64];
+    while chain.len() <= ANCESTOR_BOUND {
+        let last = *chain.last().expect("the chain holds at least the claimant");
+        let parent = match parent_of(last) {
+            Ok(p) => p,
+            Err(e) => return fail(&format!("claim is unknown, nothing written: {e}")),
+        };
+        if parent <= 1 {
+            break;
+        }
+        chain.push(parent);
+    }
+    for pid in chain {
+        let Some(e) = read
+            .live
+            .iter()
+            .find(|e| matches!(&e.target, Target::Process { pid: p, .. } if *p == pid))
+        else {
+            continue;
+        };
+        let Target::Process { pid_start_ms, .. } = &e.target else {
+            continue;
+        };
+        match probe_identity(pid, *pid_start_ms) {
+            Identity::Same => {}
+            Identity::Reused => continue,
+            Identity::Unknown(why) => {
+                return fail(&format!("claim is unknown, nothing written: {why}"))
+            }
+        }
+        return match &e.session {
+            Some(sid) if *sid == args.session => {
+                println!("counted {} {}", e.id, sid);
+                0
+            }
+            Some(_) => fail(&format!(
+                "session id mismatch: launched {} holds a different session id",
+                e.id
+            )),
+            None => unmanaged(&args),
+        };
+    }
+    unmanaged(&args)
+}
+
+fn unmanaged(args: &ClaimArgs) -> i32 {
+    let lr = resolve_log_root(args.log.as_deref(), args.root.as_deref());
+    if let Err(e) = write_unmanaged_event(&lr, &args.ticket, &args.session) {
+        return fail(&format!("unmanaged_session not recorded: {e}"));
+    }
+    println!("unmanaged: not counted");
+    EXIT_UNMANAGED
+}
+
+/// `harness process sessions <ticket> [--dir <d>]`: read-only; one `<id> <uuid> live|closed` line per
+/// `session` line ever written, then `counted <n>` (the live ones).
+fn sessions_cmd(a: &[String]) -> i32 {
+    let mut ticket: Option<String> = None;
+    let mut dir: Option<String> = None;
+    let mut it = a.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--dir" {
+            match it.next() {
+                Some(v) if dir.replace(v.clone()).is_none() => {}
+                Some(_) => return fail("--dir given twice"),
+                None => return fail("--dir needs a value"),
+            }
+        } else if arg.starts_with("--") {
+            return fail(&format!("unknown option {}", arg));
+        } else if ticket.replace(arg.clone()).is_some() {
+            return fail("more than one ticket given");
+        }
+    }
+    let Some(ticket) = ticket else {
+        return fail("a ticket is required");
+    };
+    if !crate::events::token_ok(&ticket) {
+        return fail("ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')");
+    }
+    let dir = PathBuf::from(dir.unwrap_or_else(|| DEFAULT_DIR.to_string()));
+    let read = match manifest::read_manifest(&dir, &ticket) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    if !read.is_clean() {
+        return fail(&damage_msg(&read));
+    }
+    // Replay the lines: a session is live from its line until a later `remove` of that id.
+    let mut rows: Vec<(String, String, bool)> = Vec::new();
+    for l in &read.lines {
+        match l {
+            manifest::Line::Session { id, session_id, .. } => {
+                rows.push((id.clone(), session_id.clone(), true))
+            }
+            manifest::Line::Remove { id, .. } => {
+                if let Some(r) = rows.iter_mut().rev().find(|r| r.0 == *id && r.2) {
+                    r.2 = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (id, sid, live) in &rows {
+        println!("{} {} {}", id, sid, if *live { "live" } else { "closed" });
+    }
+    println!("counted {}", rows.iter().filter(|r| r.2).count());
+    0
 }
 
 // ---------------------------------------------------------------- #207: limits (tests)
