@@ -253,8 +253,9 @@ Expected: exit 0; `last_gate=pass`
 ## Build from source on macOS
 
 The project publishes only one prebuilt engine build (see `TRIPLE` above), so on macOS you build the engine yourself. You
-need a Rust toolchain (`cargo`) and `git`. The repo pins its Rust version in `core/rust/rust-toolchain.toml`, so `rustup`
-fetches that version on the first build.
+need `git` and a Rust toolchain (`cargo`). Install Rust with `rustup`: the repo pins its Rust version in
+`core/rust/rust-toolchain.toml`, and `rustup` fetches that version on the first build. A `cargo` from another installer
+ignores the pin.
 
 ```
 git clone https://github.com/<owner>/bridlework-harness.git
@@ -266,8 +267,10 @@ cargo build --release --locked
 The build writes the binary to `core/rust/target/release/harness`. `--locked` uses the committed `Cargo.lock`. Running the
 binary with no arguments is the check. It prints a line that starts with `usage: harness --version` to stderr and exits 2.
 
-This was checked on an Apple silicon Mac. The release download and checksum steps of this guide do not apply to a source
-build, because there is no release tarball to download or verify. Point `HARNESS_BIN` at the binary you built.
+This was checked once by hand on an Apple silicon Mac. It is **not covered by the guide test**. The download, checksum and
+install steps of this guide do not apply to a source build, because there is no release tarball. Point `HARNESS_BIN` at the
+binary you built. Where a later step names `$PREFIX/plugins/claude`, use `plugins/claude` in your clone, and where it names
+a path under `$PREFIX/src`, use the same path under the clone's top folder.
 
 ## Other platforms
 
