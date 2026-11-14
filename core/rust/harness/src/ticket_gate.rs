@@ -5,8 +5,13 @@
 //! Every value is checked once against its one root, then only the checked value is used: the repo folder is canonicalized once, the base is a
 //! full sha, the result folder is canonicalized once and must lie outside the repo, the file name comes only from the validated ticket id.
 //! No error or stdout line repeats a mapped or result folder.
+//! `--log <absolute path>` (optional): a FAIL verdict appends ONE `gate_fail` event to that event log, through the events module's own record
+//! writer. The order is fixed and fails closed: the round and streak records first, THEN the log append, THEN the result file. A failed append
+//! is an error (exit 2, `EVENT NOT RECORDED`, no result file written by this run), never a quiet FAIL: the round stays counted, so the ticket is
+//! never uncounted, and a result file only ever exists for a FAIL that was also logged. A PASS appends nothing.
 
 use crate::both_ends;
+use crate::events::{self, Field, Kind};
 use crate::caps::{self, Caps, LockError, Record};
 use crate::gate_result::{GateResult, Status};
 use crate::gates::{self, Gates};
@@ -19,7 +24,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: harness ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir>";
+pub const USAGE: &str = "usage: harness ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> [--log <absolute-path>]";
 /// The folded result's gate id.
 pub const GATE_ID: &str = "ticket-gate";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
@@ -42,6 +47,7 @@ struct Args {
     base: String,
     result_dir: PathBuf,
     caps_dir: PathBuf,
+    log: Option<PathBuf>,
 }
 
 fn base_ok(s: &str) -> bool {
@@ -66,6 +72,7 @@ fn result_dir_arg_ok(s: &str) -> bool {
 fn parse_args(a: &[String]) -> Result<Args, Stop> {
     let mut map = RepoMap::new();
     let (mut file, mut base, mut dir, mut caps_dir): (Option<&str>, Option<&str>, Option<&str>, Option<&str>) = (None, None, None, None);
+    let mut log: Option<&str> = None;
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
@@ -77,6 +84,7 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
             "--base" => &mut base,
             "--result-dir" => &mut dir,
             "--caps-dir" => &mut caps_dir,
+            "--log" => &mut log,
             s if s.starts_with("--") => return Err(usage_err("unknown option")),
             _ => {
                 if file.replace(arg.as_str()).is_some() {
@@ -103,7 +111,12 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
     if !result_dir_arg_ok(caps_dir) {
         return Err(usage_err("--caps-dir must be an absolute path with no `..` component"));
     }
-    Ok(Args { ticket_file: file.to_string(), map, base: base.to_string(), result_dir: PathBuf::from(dir), caps_dir: PathBuf::from(caps_dir) })
+    if let Some(l) = log {
+        if !result_dir_arg_ok(l) {
+            return Err(usage_err("--log must be an absolute path with no `..` component"));
+        }
+    }
+    Ok(Args { ticket_file: file.to_string(), map, base: base.to_string(), result_dir: PathBuf::from(dir), caps_dir: PathBuf::from(caps_dir), log: log.map(PathBuf::from) })
 }
 
 /// One git call: no hooks, no inherited `GIT_*` name, no stdin, pinned to the canonical root's own `.git`. Same shape as `path_map::changed_paths`.
@@ -246,6 +259,29 @@ fn write_result(dir: &Path, id: &str, target: &Path, r: &GateResult) -> Result<(
     }
 }
 
+/// Append ONE `gate_fail` event: the cause is the failing gate's id and the failure class (never the message), `head_sha` is the head judged.
+/// The log's parent folder is the root, as `session record-start` and `events append --log` do.
+fn append_gate_fail(log: &Path, ticket: &str, repo: &str, gate_id: &str, r: &GateResult) -> Result<(), Stop> {
+    let not_recorded = |m: String| Stop(2, format!("harness: error: {}\nharness: EVENT NOT RECORDED", m));
+    let ts_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| not_recorded("clock is before the epoch".to_string()))?.as_millis() as u64;
+    let s = |v: &str| Field::Str(v.to_string());
+    let rec = events::Record::build(
+        Kind::GateFail,
+        ts_ms,
+        &[
+            ("ticket", s(ticket)),
+            ("repo", s(repo)),
+            ("gate_id", s(gate_id)),
+            ("failure_class", s(r.failure_class.as_deref().unwrap_or("unknown"))),
+            ("head_sha", s(&r.head_sha)),
+            ("result", s("fail")),
+        ],
+    )
+    .map_err(not_recorded)?;
+    let parent = log.parent().ok_or_else(|| not_recorded("--log has no parent folder".to_string()))?;
+    events::append_record(parent, log, &rec).map_err(|e| not_recorded(e.to_string()))
+}
+
 struct Outcome {
     ticket_id: String,
     head: String,
@@ -289,9 +325,17 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
         return Err(err2("--base is the same commit as the head"));
     }
 
-    // 3. Result target.
+    // 3. Result target. With a log, the ticket id must also be an event token (lowercase) and the log path must pass the writer's own check,
+    // both BEFORE any check runs, so a FAIL can never be unloggable for a reason known at the start.
     if !ticket_id_ok(&ticket.id) {
         return Err(err2("the ticket id cannot be used as a file name"));
+    }
+    if let Some(log) = &args.log {
+        if !events::token_ok(&ticket.id) {
+            return Err(err2("with --log the ticket id must be a lowercase event token (lowercase letters, digits, `-`, `_`, `.`)"));
+        }
+        let parent = log.parent().ok_or_else(|| err2("--log has no parent folder"))?;
+        events::check_log_path(parent, log).map_err(|e| err2(e.to_string()))?;
     }
     let rdir = resolve_result_dir(&args.result_dir, &root)?;
     let target = check_target(&rdir, &format!("{}.json", ticket.id))?;
@@ -407,6 +451,10 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
         None => caps.clear_streak(&ticket.id, &lock).map_err(err2)?,
     }
     caps.write(&Record { ticket: ticket.id.clone(), repo_id: repo_id.clone(), fix_rounds: fixed, in_flight: false }, &lock).map_err(err2)?;
+    // The log append comes AFTER the counts and BEFORE the result file (fail closed, see the top comment). Only a FAIL is logged.
+    if let (Some(log), Status::Fail) = (&args.log, &result.status) {
+        append_gate_fail(log, &ticket.id, &repo_id, &failing_gate, &result)?;
+    }
     write_result(&rdir, &ticket.id, &target, &result)?;
     drop(lock);
     Ok(Ran::Verdict(Outcome { ticket_id: ticket.id, head, result, failing_gate, cap_reached: fixed >= caps::MAX_FIX_ROUNDS, replan_reached: next.as_ref().map(|s| s.latched()).unwrap_or(false) }))

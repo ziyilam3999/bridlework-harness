@@ -78,8 +78,8 @@ signature (the CAUSE a repeat of which files no second row that week) per kind:
 | the other twelve kinds | no — zero rows | — |
 
 A sweep `blocked` is not an event kind today, so it cannot map yet (a deferred follow-up to
-ticket 193); a gate FAIL maps through `gate_fail` (whose writer is a later ticket). The mapper is pure: it never opens or writes the inbox — a later weekly sweep files its rows
-through `harness friction add`, and because the dedup key below IS the row `id`, the duplicate-id rule of
+ticket 193); a gate FAIL maps through `gate_fail` (written by `harness ticket gate ... --log <absolute-path>`, see `docs/event-log.md`). The mapper is pure: it never opens or writes the inbox — `harness friction sweep` (below) feeds it one week of the log and files its rows
+through the same checks `add` walks, and because the dedup key below IS the row `id`, the duplicate-id rule of
 `add`/`lint` is a second backstop against double-filing.
 
 Every event row carries the constants: `ticket` `t-9.3` (the catcher is the capturer — never the event's own
@@ -126,7 +126,7 @@ absent, its folder is not; a refused row never creates the file (a first row who
 `breaks` with nothing to name is refused before the file is opened). On success stdout is `stored id=<id>`. The new row is scanned before any cross rule
 runs, so a refusal can never echo an unscanned byte of it. `--source` accepts only `event` (anything else is
 a row refusal naming the field); the flag exists so the T-9.3 mapper's rows are fileable exactly as the
-weekly sweep will file them.
+weekly sweep (`harness friction sweep`) files them.
 
 **Recording a repeat.** A friction that happened again is filed as a new row with `--breaks <id of the first row>`;
 `harness friction rank` groups rows by that `breaks` chain, so the repeat counts toward the first row's group.
