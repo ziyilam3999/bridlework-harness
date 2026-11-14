@@ -45,9 +45,11 @@ The short id is read from the `--bg` stdout by two rules. `agents --json --all` 
    line has no such id, the launcher reads no short id: exit 3, a `launch_failed` row with `stage=start`, and no
    `stop` call to the host.
 2. With no `backgrounded` line, the id is the first whitespace token of the last non-empty stdout line. A host
-   that prints further lines after the id line, without a `backgrounded` line, still gets a token the launcher
-   cannot map (exit 4 or 5, see the exit-code table below); the stop then targets that token, so check
-   `<host> agents` and stop the real session by hand.
+   that prints further lines after the id line, without a `backgrounded` line, is read by its last line: if that
+   line's first token is not token-shaped (letters, digits, `-` and `_` only, at most 64 characters, no leading
+   `-`) the launcher reads no short id (exit 3, no `stop` call); otherwise it gets a token it cannot map (exit 4
+   or 5, see the exit-code table below) and the stop targets that token. In both cases check `<host> agents` and
+   stop the real session by hand.
 
 ## Rows
 
