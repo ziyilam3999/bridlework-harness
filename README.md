@@ -33,7 +33,7 @@ Install the new version next to the old one and switch; rollback is the reverse 
 - `providers/anthropic/`, `providers/zai/`, `providers/openai/`, `providers/jev/` : model provider adapters (placeholders).
 - `plugins/claude/` : the Claude Code plugin (hooks that call the engine).
 - `plugins/openai/` : the OpenAI host plugin (placeholder).
-- `mcp/` : MCP servers (placeholder).
+- `mcp/` : the read-only MCP server (`mcp/server/`) and its tool list (`mcp/tools.json`); see `docs/mcp.md`.
 - `evals/` : evaluations (placeholder).
 - `examples/` : the example project and ticket used by the install guide.
 - `config/` : example configuration files.
