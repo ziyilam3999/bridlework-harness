@@ -515,9 +515,16 @@ pub(crate) fn run_host(host: &Path, args: &[&std::ffi::OsStr], cwd: Option<&Path
     }
 }
 
-/// O-1 parser (default stub contract): the short id is the first whitespace token of the last non-empty stdout line.
+/// O-1 parser. When a stdout line starts with `backgrounded`, the id is the second `·` (U+00B7) separated field of
+/// the first such line and must be 8 lowercase hex characters, else there is no id. With no such line the default
+/// stub contract holds: the short id is the first whitespace token of the last non-empty stdout line.
 fn parse_short_id(stdout: &[u8]) -> Option<String> {
     let s = String::from_utf8_lossy(stdout);
+    if let Some(bg) = s.lines().find(|l| l.trim_start().starts_with("backgrounded")) {
+        let id = bg.split('\u{b7}').nth(1)?.trim();
+        let ok = id.len() == 8 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+        return ok.then(|| id.to_string());
+    }
     let line = s.lines().rev().find(|l| !l.trim().is_empty())?;
     let tok = line.split_whitespace().next()?;
     let ok = !tok.starts_with('-') && tok.len() <= 64 && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');

@@ -35,15 +35,19 @@ harness session launches [--records <file>]
 
 ## Host output shape
 
-The short id is the first whitespace token of the last non-empty stdout line of `--bg`. `agents --json --all`
-is a JSON array of objects with `id` (short id), `sessionId` (full uuid) and `name`. Both live in one place in
-`launcher.rs` (`parse_short_id` and the `AGENT_KEY_*` constants).
+The short id is read from the `--bg` stdout by two rules. `agents --json --all` is a JSON array of objects with
+`id` (short id), `sessionId` (full uuid) and `name`. All of this lives in one place in `launcher.rs`
+(`parse_short_id` and the `AGENT_KEY_*` constants).
 
-Because the id is taken from the last non-empty stdout line, a host CLI that prints further lines after the
-line carrying the id does not bind: the launcher reads no short id (exit 3) or a token it cannot map (exit 4
-or 5, see the exit-code table below); the stop then targets that token, so check `<host> agents` and stop the
-real session by hand. Such a host needs a thin `--host` wrapper that passes every other verb and the exit
-status through unchanged and, for `--bg`, prints the short id alone as the final line after the host's output.
+1. If a stdout line starts with `backgrounded` (leading whitespace ignored), the first such line carries the id:
+   `backgrounded · <8 lowercase hex> · <name>`, fields separated by the middle dot U+00B7. The id is the second
+   field and must be exactly 8 lowercase hex characters; other lines, before or after it, are ignored. If that
+   line has no such id, the launcher reads no short id: exit 3, a `launch_failed` row with `stage=start`, and no
+   `stop` call to the host.
+2. With no `backgrounded` line, the id is the first whitespace token of the last non-empty stdout line. A host
+   that prints further lines after the id line, without a `backgrounded` line, still gets a token the launcher
+   cannot map (exit 4 or 5, see the exit-code table below); the stop then targets that token, so check
+   `<host> agents` and stop the real session by hand.
 
 ## Rows
 
