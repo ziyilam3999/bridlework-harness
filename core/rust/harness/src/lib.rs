@@ -34,6 +34,7 @@ pub mod human_origin;
 pub mod intake;
 #[cfg(unix)]
 pub mod launcher;
+pub mod lesson;
 pub mod manifest;
 pub mod overlay;
 pub mod permission;
