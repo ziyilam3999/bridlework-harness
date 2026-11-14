@@ -8,7 +8,7 @@
 //!
 //! The mapper only translates. It never opens the inbox, never scans (the friction verbs scan every field
 //! of every row they store or lint, so a privacy hit refuses the row, fail closed) and never writes: the
-//! weekly sweep that feeds it the log and files its rows through `harness friction add` is a later ticket.
+//! weekly sweep that feeds it the log and files its rows is `harness friction sweep` (`friction::sweep_cmd`).
 //! Because the dedup key is the row `id`, the inbox's own duplicate-id rule is a second backstop against
 //! double-filing. An event row is never a ticket: every event row carries the fixed ticket `t-9.3` (the
 //! catcher is the capturer), never the event's own ticket — the event's ticket lives in the key and the
@@ -208,7 +208,7 @@ pub fn map_line(line: &str) -> Result<Option<Row>, String> {
     map_record(&rec)
 }
 
-/// The batch helper the weekly sweep will call: map many lines, keep ONE row per key (the earliest `ts_ms`
+/// The batch helper the weekly sweep (`harness friction sweep`) calls: map many lines, keep ONE row per key (the earliest `ts_ms`
 /// of the week; a tie keeps the first-seen, so input order among equals never matters), and return the rows
 /// sorted by id. Fail closed on the whole batch: one bad line is an error with NO rows returned, so a
 /// half-mapped week can never be filed. Linear in the input: one decode and at most one linear scan of the

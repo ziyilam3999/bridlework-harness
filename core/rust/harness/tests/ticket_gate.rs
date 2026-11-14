@@ -803,3 +803,120 @@ fn a_base_equal_to_the_head_is_refused() {
     no_result_file(&fx);
     assert_eq!(code(&gate(&fx, &fx.c0)), 0, "twin: base C0");
 }
+
+// `--log`: a FAIL appends one `gate_fail` event. Both ends: a planted failing gate writes one line, a pass writes none, a bad `--log` is refused.
+fn gate_logged(fx: &Fx, id: &str, base: &str, log: &str) -> Output {
+    let tf = ticket_file(fx, &ticket_json("r", id, false));
+    let mut args = args_for(&tf, &fx.repo, base, fx.res.to_str().unwrap(), &fx.caps);
+    args.extend(["--log".to_string(), log.to_string()]);
+    run_args(&fx.other, &args, &[("GATE_MARKER", fx.marker.as_path())])
+}
+
+fn log_path(fx: &Fx) -> PathBuf {
+    fx.t.0.join("events.jsonl")
+}
+
+fn read_events(log: &Path) -> harness::events::LogRead {
+    harness::events::parse_log(&fs::read(log).expect("the log exists"))
+}
+
+#[test]
+fn a_fail_with_log_appends_one_gate_fail_event_and_a_pass_appends_none() {
+    use harness::events::{Field, Kind};
+    let fx = Fx::new();
+    let log = log_path(&fx);
+    let c1 = fx.commit(&[("src/value.txt", "bad2")]);
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    assert_eq!(out(&o), format!("ticket=t-1 head={c1} result=fail done=refused\n"), "the stdout line is unchanged");
+    let lr = read_events(&log);
+    assert!(lr.is_clean() && lr.events.len() == 1, "exactly one line: {lr:?}");
+    let e = &lr.events[0];
+    assert_eq!(e.kind, Kind::GateFail);
+    for (k, v) in [("ticket", "t-1"), ("repo", "r"), ("gate_id", "t"), ("failure_class", "check-failed"), ("head_sha", c1.as_str()), ("result", "fail")] {
+        assert_eq!(e.field(k), Some(&Field::Str(v.to_string())), "{k}");
+    }
+    assert_eq!(fx.result("t-1").status, Status::Fail, "the result file was written too");
+
+    // Twin: the fix commit passes; nothing is appended and the log is byte-identical.
+    let before = fs::read(&log).unwrap();
+    fx.commit(&[("src/value.txt", "ok")]);
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(fs::read(&log).unwrap(), before, "a PASS appends nothing");
+    assert_eq!(fx.result("t-1").status, Status::Pass);
+
+    // Twin: a PASS with a log path that does not exist yet never creates it.
+    let fx2 = Fx::new();
+    fx2.commit(&[("src/value.txt", "ok")]);
+    let log2 = log_path(&fx2);
+    assert_eq!(code(&gate_logged(&fx2, "t-1", &fx2.c0, log2.to_str().unwrap())), 0);
+    assert!(!log2.exists(), "a PASS never creates the log");
+}
+
+#[test]
+fn a_bad_log_is_refused_before_any_check_runs() {
+    let fx = Fx::new();
+    fx.commit(&[("src/value.txt", "bad2")]);
+    let log = log_path(&fx);
+    let missing_parent = fx.t.0.join("nope").join("events.jsonl");
+    let cases: Vec<(&str, &str, String, &str)> = vec![
+        ("relative log", "--log must be an absolute path", "events.jsonl".to_string(), "t-1"),
+        ("dot-dot log", "--log must be an absolute path", format!("{}/../events.jsonl", fx.t.0.display()), "t-1"),
+        ("uppercase ticket id", "lowercase event token", log.to_str().unwrap().to_string(), "T-1"),
+        ("log under a missing folder", "log path refused", missing_parent.to_str().unwrap().to_string(), "t-1"),
+    ];
+    for (label, own_fault, l, id) in &cases {
+        let o = gate_logged(&fx, id, &fx.c0, l);
+        errored(&o);
+        assert!(err(&o).contains(own_fault), "{label}: {}", err(&o));
+        assert!(fx.markers().is_empty(), "{label}: no check ran");
+        no_result_file(&fx);
+        assert!(!log.exists(), "{label}: no log created");
+        assert!(fs::read_dir(&fx.caps).unwrap().next().is_none(), "{label}: no round was paid");
+    }
+    // Twin: the same run with a good log and a lowercase id runs, and fails, and logs.
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    assert_eq!(read_events(&log).events.len(), 1);
+}
+
+// The order is: counts, then the log append, then the result file. A log that cannot take the line is an error, not a quiet FAIL.
+#[test]
+fn a_failed_append_is_an_error_and_writes_no_result_file_but_keeps_the_round() {
+    let fx = Fx::new();
+    fx.commit(&[("src/value.txt", "bad2")]);
+    let log = log_path(&fx);
+    fs::write(&log, "{\"v\":2,\"kind\":\"gate_fa").unwrap(); // a torn tail: the writer refuses and changes nothing
+    let torn = fs::read(&log).unwrap();
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    errored(&o);
+    assert!(err(&o).contains("EVENT NOT RECORDED"), "{}", err(&o));
+    assert!(!leaks(&o, fx.t.0.to_str().unwrap()), "no folder is echoed");
+    assert_eq!(fs::read(&log).unwrap(), torn, "the log is unchanged");
+    no_result_file(&fx);
+    let rec = fs::read_to_string(fx.caps.join("t-1.rounds")).unwrap();
+    assert!(rec.contains("\"fix_rounds\":1") && rec.contains("\"in_flight\":false"), "the FAIL's round stays counted: {rec}");
+    // Twin: a clean log takes the line (the next run, same ticket, a new head).
+    fs::write(&log, "").unwrap();
+    fx.commit(&[("src/value.txt", "bad3")]);
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    assert_eq!(read_events(&log).events.len(), 1);
+    assert_eq!(fx.result("t-1").status, Status::Fail);
+}
+
+// The logged `gate_id` of a `no-checks` FAIL is the gate's own id, `ticket-gate` (the documented value). Twin: a failing check logs ITS id.
+#[test]
+fn a_no_checks_fail_logs_the_gates_own_id() {
+    use harness::events::Field;
+    let fx = Fx::new();
+    git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+    let log = log_path(&fx);
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    let lr = read_events(&log);
+    assert_eq!(lr.events.len(), 1, "{lr:?}");
+    assert_eq!(lr.events[0].field("gate_id"), Some(&Field::Str("ticket-gate".to_string())));
+    assert_eq!(lr.events[0].field("failure_class"), Some(&Field::Str("no-checks".to_string())));
+}
