@@ -1,0 +1,15 @@
+[package]
+name = "harness-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only MCP stdio server for the harness CLI"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "harness-mcp"
+path = "src/main.rs"
+
+[dependencies]
+
+[workspace]
