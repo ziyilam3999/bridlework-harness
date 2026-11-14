@@ -6,7 +6,9 @@ harness lesson lint <path> [<path> ...]
 
 Checks the shape of lesson pages. A `<path>` that is a file is one page. A `<path>` that is a directory means every
 file directly inside it whose name is `ISSUE-<digits>-<anything>.md` (other files, such as a README, and sub-folders
-are skipped). Every page is checked even when one fails.
+are skipped; an entry with such a name that cannot be read as a regular file, such as a broken symbolic link, is an
+error). The same page reached twice in one run (the same file given twice, or a file and the directory that holds it,
+compared by canonical path) is checked and counted once. Every page is checked even when one fails.
 
 The lint checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 
@@ -22,7 +24,8 @@ The lint checks shape only: it does not check that a sentence is true, that a li
 - `0`: every page passed.
 - `1`: at least one problem line was printed.
 - `2`: a usage or read error, with a message on stderr and nothing on stdout: no path given; a path that does not
-  exist or cannot be read; a file that is not valid UTF-8; zero pages found. `harness lesson` with no verb or an
+  exist or cannot be read; a page-shaped entry inside a given directory that cannot be read as a regular file; a
+  file that is not valid UTF-8; zero pages found. `harness lesson` with no verb or an
   unknown verb prints a usage text that includes `lesson lint <path>` and exits 2.
 
 ## Front matter rules
@@ -39,7 +42,8 @@ inside a code fence is never a heading.
 - `ID`: `id` is missing, or is not `ISSUE-<digits>`, or the file name does not start with that id followed by `-`.
 - `STATUS`: `status` is missing or is not one of `unvalidated`, `validated`, `retired`.
 - `TIER`: `minimum_proven_tier` is missing or empty.
-- `CONTROLS`: `controls` is missing or is not an inline list `[...]` (an empty list, `[]` or `[ ]`, is fine).
+- `CONTROLS`: `controls` is missing, is not an inline list `[...]` (an empty list, `[]` or `[ ]`, is fine), or holds
+  an empty token.
 - `MATCH`: `match` is present but is not an inline list, is an empty list (`[]` or `[ ]`), or holds an empty token (a missing `match` is fine).
 - `DUPLICATE-ID`: two pages of one run carry the same `id`; the problem names the later page.
 
@@ -48,7 +52,9 @@ inside a code fence is never a heading.
 - `TITLE`: the body does not hold exactly one level-1 heading, or that heading does not start with `# <id>:` (this second check is skipped when the page has no `id` of the form `ISSUE-<digits>`).
 - `SECTIONS`: the level-2 headings are not exactly `Issue and symptoms`, `Context`, `Root cause`, `Resolution`,
   `Controls`, `Verification`, `Effectiveness`, each once and in this order (a missing, repeated, extra or
-  out-of-order heading is refused and the detail names the heading), or one of the sections holds no non-blank line. A section runs from its heading to the next level-1 or level-2 heading (a `###` line belongs to the section).
+  out-of-order heading is refused and the detail names the heading), or one of the sections holds no text: every line
+  of it is blank or a code-fence line (a line that starts with three backticks; a fenced block with at least one
+  non-blank line inside it is text). A section runs from its heading to the next level-1 or level-2 heading (a `###` line belongs to the section).
 - `ROOT-CAUSE`: the text of `Root cause` is the same as the text of `Issue and symptoms` (compared after trimming).
 - `EFFECTIVENESS`: the `Effectiveness` section does not hold, ignoring blank lines, exactly the four lines
   `- metric: <text>`, `- value: <text>`, `- date: <YYYY-MM-DD>`, `- source: <text>`, each with a non-empty value

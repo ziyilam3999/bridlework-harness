@@ -2,8 +2,8 @@
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]";
 
@@ -71,13 +71,25 @@ fn split_list(v: &str) -> Vec<&str> {
     inner.split(',').map(|t| t.trim()).collect()
 }
 
+/// Add a page unless an equal one (compared by canonical path) was already added: the same page reached twice in
+/// one run (the same file given twice, or a file and the directory that holds it) is checked and counted once.
+fn push_page(pages: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, p: PathBuf) {
+    let c = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+    if seen.insert(c) {
+        pages.push(p);
+    }
+}
+
 /// Expand the path arguments into page files: a file is one page, a directory means every matching file directly
-/// inside it (sorted by name); anything else, an unreadable directory, or nothing found at all is an error.
-fn expand(args: &[String]) -> Result<Vec<std::path::PathBuf>, String> {
+/// inside it (sorted by name); anything else, an unreadable directory, or nothing found at all is an error. An
+/// entry directly inside a directory whose name is `ISSUE-<digits>-<anything>.md` but that cannot be read as a
+/// regular file (a broken symbolic link) is an error too; a sub-folder with such a name is skipped.
+fn expand(args: &[String]) -> Result<Vec<PathBuf>, String> {
     if args.is_empty() {
         return Err("no path given".to_string());
     }
-    let mut pages = Vec::new();
+    let mut pages: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for a in args {
         let p = Path::new(a);
         if p.is_dir() {
@@ -85,16 +97,24 @@ fn expand(args: &[String]) -> Result<Vec<std::path::PathBuf>, String> {
             let mut names: Vec<String> = Vec::new();
             for entry in rd.flatten() {
                 let n = entry.file_name().to_string_lossy().to_string();
-                if is_page_name(&n) && entry.path().is_file() {
-                    names.push(n);
+                if !is_page_name(&n) {
+                    continue;
                 }
+                let ep = entry.path();
+                if ep.is_dir() {
+                    continue;
+                }
+                if !ep.is_file() {
+                    return Err(format!("the file {} cannot be read", n));
+                }
+                names.push(n);
             }
             names.sort();
             for n in names {
-                pages.push(p.join(n));
+                push_page(&mut pages, &mut seen, p.join(n));
             }
         } else if p.is_file() {
-            pages.push(p.to_path_buf());
+            push_page(&mut pages, &mut seen, p.to_path_buf());
         } else {
             return Err(format!("the path {} does not exist or cannot be read", a));
         }
@@ -201,7 +221,11 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
         None => out.push("CONTROLS controls is missing".to_string()),
         Some(&v) => {
             if v.starts_with('[') && v.ends_with(']') {
-                controls = Some(split_list(v));
+                let tokens = split_list(v);
+                if tokens.iter().any(|t| t.is_empty()) {
+                    out.push("CONTROLS controls has an empty token".to_string());
+                }
+                controls = Some(tokens);
             } else {
                 out.push(format!("CONTROLS controls {} is not an inline list [..]", v));
             }
@@ -298,7 +322,8 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
     };
     for (t, start) in &h2 {
         let end = heads.iter().copied().find(|&h| h > *start).unwrap_or(body.len());
-        if body[*start + 1..end].iter().all(|l| l.trim().is_empty()) {
+        // A code-fence line (a line that starts with three backticks) is not section text.
+        if body[*start + 1..end].iter().all(|l| l.trim().is_empty() || l.starts_with("```")) {
             out.push(format!("SECTIONS the heading {} has no text", t));
         }
     }
