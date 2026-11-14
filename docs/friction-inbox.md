@@ -232,7 +232,7 @@ or unreadable log, a log over the cap, or no privacy list configured is a setup 
 ### `harness friction rank`
 
 ```
-harness friction rank [--top <k>] [--record <file>] [--config <file>]
+harness friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>]
 ```
 
 The ranked list of friction GROUPS (ticket 3601). It runs the FULL lint first (any lint failure is the same exit and
@@ -259,6 +259,13 @@ rank ok groups=<n> listed=<k>
 `--top` defaults to `friction.triage_top` (config contract, the second optional key; absent = 3). `--record <file>`
 appends one JSONL trial line `{"date","groups","listed":[ids]}` BEFORE anything is printed, with the same failure
 rule as `patterns --record` (exit 2; the record may not name the inbox).
+
+`--min-occurrences <n>` (a positive whole number, parsed like `--top`; `0`, `abc` or an empty value is exit 2 with
+nothing on stdout) lists only groups whose `occurrences` is `n` or more. The filter runs first and `--top` then caps
+what is left. Without the flag every group passes, so the output is unchanged. The filter never changes the counts
+of the whole inbox: in `rank ok groups=<n> listed=<k>`, `groups` stays the number of ALL ranked groups and `listed`
+is the number of `rank group=` lines printed. The `--record` line follows the same split: `groups` is the number of
+all ranked groups and `listed` holds only the ids of the groups printed.
 
 ### `harness friction triage`
 
