@@ -35,7 +35,7 @@ fn good_page() -> String {
         "updated: 2026-01-02",
         "sources: synthetic log",
         "verified: yes",
-        "minimum_proven_tier: two",
+        "minimum_proven_tier: T2",
         "controls: [restart, check-log]",
         "match: [svc-a, svc-b]",
         "---",
@@ -95,8 +95,9 @@ fn cases() -> Vec<(&'static str, String, String)> {
     // STATUS
     add("STATUS", good_page().replace("status: validated", "status: draft"));
     // TIER
-    add("TIER", good_page().replace("minimum_proven_tier: two\n", ""));
-    add("TIER", good_page().replace("minimum_proven_tier: two", "minimum_proven_tier:"));
+    add("TIER", good_page().replace("minimum_proven_tier: T2\n", ""));
+    add("TIER", good_page().replace("minimum_proven_tier: T2", "minimum_proven_tier:"));
+    add("TIER", good_page().replace("minimum_proven_tier: T2", "minimum_proven_tier: two"));
     // CONTROLS
     add("CONTROLS", good_page().replace("controls: [restart, check-log]", "controls: restart"));
     add("CONTROLS", good_page().replace("controls: [restart, check-log]\n", ""));
@@ -178,6 +179,37 @@ fn details_name_the_problem() {
     check(good_page().replace("## Context\nA synthetic service in a test rig.\n", "## Context\n"), &["SECTIONS the heading Context has no text"]);
     check(good_page().replace("match: [svc-a, svc-b]", "match: []"), &["MATCH match is an empty list"]);
     check(good_page().replace("match: [svc-a, svc-b]", "match: [svc-a, ]"), &["MATCH match has an empty token"]);
+    check(
+        good_page().replace("minimum_proven_tier: T2", "minimum_proven_tier: two"),
+        &["TIER minimum_proven_tier two is not one of T1, T2, T3, T4, unproven, unmeasured"],
+    );
+}
+
+/// The six legal `minimum_proven_tier` values each pass; any other value is refused with the value named.
+#[test]
+fn tier_values_are_checked() {
+    let d = tmp("tier");
+    for good in ["T1", "T2", "T3", "T4", "unproven", "unmeasured"] {
+        let f = d.join("ISSUE-101-g.md");
+        fs::write(&f, good_page().replace("minimum_proven_tier: T2", &format!("minimum_proven_tier: {}", good))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(0), "{}: {}{}", good, stdout(&o), stderr(&o));
+        assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    }
+    for bad in ["two", "t2", "T0", "T5", "\"T2\"", "synthetic-model"] {
+        let f = d.join("ISSUE-101-b.md");
+        fs::write(&f, good_page().replace("minimum_proven_tier: T2", &format!("minimum_proven_tier: {}", bad))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}: {}", bad, stderr(&o));
+        let out = stdout(&o);
+        assert!(
+            out.contains(&format!("TIER minimum_proven_tier {} is not one of T1, T2, T3, T4, unproven, unmeasured", bad)),
+            "{}: {}",
+            bad,
+            out
+        );
+    }
+    let _ = fs::remove_dir_all(&d);
 }
 
 #[test]
