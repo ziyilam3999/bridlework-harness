@@ -497,7 +497,7 @@ fn session_record_start(rest: &[String]) -> i32 {
     }
 }
 
-const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>]";
+const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> [--log <absolute-path>] | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>]";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 
