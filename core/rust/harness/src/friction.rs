@@ -563,9 +563,9 @@ pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
             } else if !by_id.contains_key(row.repeats.as_str()) {
                 problems.push((*line, "repeats names no row in the inbox".to_string()));
             } else if row.kind != "pattern" {
-                problems.push((*line, "repeats is allowed only on a kind: pattern row".to_string()));
+                problems.push((*line, "repeats is allowed only on a kind: pattern row; a repeat of a friction row is filed with --breaks <row-id>".to_string()));
             } else if by_id[row.repeats.as_str()].kind != "pattern" {
-                problems.push((*line, "repeats must name a kind: pattern row (its chain root)".to_string()));
+                problems.push((*line, "repeats must name a kind: pattern row (its chain root); a repeat of a friction row is filed with --breaks <row-id>".to_string()));
             } else if !by_id[row.repeats.as_str()].repeats.is_empty() {
                 problems.push((*line, "repeats must name the chain root: the row it names itself carries repeats".to_string()));
             }
@@ -707,7 +707,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--record <file>] [--config <file>] | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <digits> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--record <file>] [--config <file>] | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <digits> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.

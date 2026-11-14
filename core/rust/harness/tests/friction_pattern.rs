@@ -152,6 +152,29 @@ fn add(_t: &Tmp, cfg: &Path, id: &str, kind: &str, repeats: &str, text: &str) ->
     run(&a)
 }
 
+/// `friction add` with a `--breaks <row-id>` pointer (a repeat of a friction row, the flag the
+/// `repeats` refusals point at): ticket 192, tag memory, a clean text.
+fn add_breaks(_t: &Tmp, cfg: &Path, id: &str, breaks: &str, text: &str) -> Output {
+    run(&[
+        s("friction"),
+        s("add"),
+        s("--config"),
+        cfg.to_str().unwrap().to_string(),
+        s("--id"),
+        s(id),
+        s("--date"),
+        s("2026-11-02"),
+        s("--ticket"),
+        s("192"),
+        s("--where-it-lives"),
+        s("memory"),
+        s("--breaks"),
+        s(breaks),
+        s("--text"),
+        s(text),
+    ])
+}
+
 /// `friction lint` against the given config.
 fn lint(cfg: &Path) -> Output {
     run(&[s("friction"), s("lint"), s("--config"), cfg.to_str().unwrap().to_string()])
@@ -363,6 +386,54 @@ fn refuses_non_token_repeats() {
     assert!(out(&o).is_empty());
     assert!(err(&o).contains("line 2"), "{}", err(&o));
     assert!(err(&o).contains("repeats"), "{}", err(&o));
+}
+
+// ---------------------------------------------------------------- AC (friction-repeat-hint): the wrong-flag hint
+
+/// The wrong-flag repeat refusals point at `--breaks`, and the same repeat filed the right way stores.
+/// A non-pattern row carrying `--repeats <existing row>` is refused naming the rule AND `--breaks`; a
+/// pattern row whose `--repeats` names a non-pattern row likewise; and a friction repeat filed with
+/// `--breaks <row-id>` is stored (both ends of the hint).
+#[test]
+fn wrong_flag_repeat_points_at_breaks() {
+    let t = Tmp::new();
+    let cfg = t.config();
+    let o = add(&t, &cfg, "f-1", "", "", "the first friction row");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    seed_root(&t, &cfg, "a");
+    // a friction row carrying --repeats <an existing row>: refused naming the rule and the right flag
+    let before = fs::read(t.inbox()).ok();
+    let o = add(&t, &cfg, "p-1", "", "a", "a friction repeat behind the wrong flag");
+    refused_untouched(&t, &o, 1, before);
+    assert!(err(&o).contains("repeats is allowed only on a kind: pattern row"), "{}", err(&o));
+    assert!(err(&o).contains("--breaks"), "the refusal must point at --breaks: {}", err(&o));
+    assert!(!err(&o).contains("behind the wrong flag"), "the text is never echoed: {}", err(&o));
+    // a pattern row whose --repeats names a non-pattern row: the same hint
+    let before = fs::read(t.inbox()).ok();
+    let o = add(&t, &cfg, "p-2", "pattern", "f-1", "a pattern pointing at a friction row");
+    refused_untouched(&t, &o, 1, before);
+    assert!(err(&o).contains("repeats must name a kind: pattern row"), "{}", err(&o));
+    assert!(err(&o).contains("--breaks"), "the refusal must point at --breaks: {}", err(&o));
+    // the same repeat filed the right way: `--breaks <row-id>` stores
+    let o = add_breaks(&t, &cfg, "f-1-r1", "f-1", "the same repeat, filed with --breaks");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "stored id=f-1-r1\n");
+    let body = fs::read_to_string(t.inbox()).unwrap();
+    let last = body.lines().last().unwrap();
+    assert!(friction::parse_row(last).is_ok(), "the stored line parses: {last}");
+    assert!(last.contains("\"breaks\":\"f-1\""), "the repeat carries the breaks pointer: {last}");
+    let o = lint(&cfg);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+}
+
+/// `harness friction` with no verb: exit 2, the usage line saying `[--breaks <row-id>]` (not lesson-id).
+#[test]
+fn usage_says_breaks_row_id() {
+    let o = run(&[s("friction")]);
+    assert_eq!(code(&o), 2, "stderr: {}", err(&o));
+    assert!(out(&o).is_empty(), "stdout must be empty on a usage error: {}", out(&o));
+    assert!(err(&o).contains("[--breaks <row-id>]"), "the usage must say --breaks <row-id>: {}", err(&o));
+    assert!(!err(&o).contains("lesson-id"), "the usage must not say lesson-id: {}", err(&o));
 }
 
 // ---------------------------------------------------------------- AC 3: the green chain
