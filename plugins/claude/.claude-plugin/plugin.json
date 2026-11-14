@@ -1,0 +1,6 @@
+{
+  "name": "bridlework-harness",
+  "version": "0.1.0",
+  "description": "Fail-closed Claude Code hooks for the bridlework harness; every hook calls the harness CLI.",
+  "license": "Apache-2.0"
+}

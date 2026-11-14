@@ -4,6 +4,7 @@
 //!
 //! Repo ids that a YAML reader would read as a non-string (`true`, `false`, `null`, `yes`, `no`, `on`, `off`) are refused as map keys.
 
+use crate::fix_tier::Tier;
 use crate::repo_id::RepoId;
 use std::io::Read;
 use std::path::Path;
@@ -33,7 +34,29 @@ pub const KEYS: [&str; 15] = [
 /// value shape differs. A refusal over it never carries the value (the path names a private folder).
 pub const INBOX_KEY: &str = "friction.inbox";
 
-const SECTIONS: [&str; 5] = ["repos", "budgets", "shadow", "lanes", "friction"];
+/// The one OPTIONAL key in the contract (ticket 192): `friction.pattern_threshold`, the N a pattern chain's
+/// repeat count must reach before `harness friction patterns` lists it. Absent means the default, 3. It is the
+/// first key in the contract a file may omit; every other key stays required.
+pub const PATTERN_THRESHOLD_KEY: &str = "friction.pattern_threshold";
+/// The default N when `friction.pattern_threshold` is absent.
+pub const PATTERN_THRESHOLD_DEFAULT: u64 = 3;
+
+/// The second OPTIONAL key (ticket 3601): `friction.triage_top`, the K of the top-K groups `harness friction rank`
+/// lists and `harness friction triage` proposes. Absent means the default, 3 (the spec's "often 1-3").
+pub const TRIAGE_TOP_KEY: &str = "friction.triage_top";
+/// The default K when `friction.triage_top` is absent.
+pub const TRIAGE_TOP_DEFAULT: u64 = 3;
+
+/// The config v4 string key (ticket 190): the tier the factory designs new fixes at (G8.3). One of
+/// `T1`, `T2`, `T3` — a tier, never a brand; `T4` is refused (the design tier is never the top of the
+/// ladder). A refusal over it never carries the value.
+pub const DESIGN_TIER_KEY: &str = "factory.design_tier";
+
+/// The OPTIONAL section (ticket 3703): builder state a signer brief must not name. `<entry-name>: <text>`.
+const BUILDER_STATE: &str = "builder_state";
+const SECTIONS: [&str; 7] = ["repos", "budgets", "shadow", "lanes", "friction", "factory", BUILDER_STATE];
+/// Sections 0..REQUIRED_SECTIONS must be present; the rest are optional.
+const REQUIRED_SECTIONS: usize = 6;
 const YAML_WORDS: [&str; 11] = ["true", "false", "null", "yes", "no", "on", "off", "y", "n", ".inf", ".nan"];
 
 /// The wall-time and token limit of one ticket size.
@@ -64,6 +87,14 @@ pub struct Config {
     nums: [u64; 15],
     /// The `friction.inbox` path (v3). Never printed.
     inbox: String,
+    /// The optional `friction.pattern_threshold` (default 3 when absent).
+    pattern_threshold: u64,
+    /// The optional `friction.triage_top` (default 3 when absent).
+    triage_top: u64,
+    /// The `factory.design_tier` tier (v4, ticket 190): the tier the factory designs new fixes at.
+    design_tier: Tier,
+    /// The optional `builder_state` entries (ticket 3703), file order: (entry name, text). Never printed.
+    builder_state: Vec<(String, String)>,
 }
 
 /// A refusal that names the line, and the section and key when known. Never carries a value.
@@ -127,11 +158,15 @@ impl Config {
         if text.is_empty() {
             return Err("config: file is empty".to_string());
         }
-        let mut seen = [false; 5];
+        let mut seen = [false; 7];
+        let mut builder_state: Vec<(String, String)> = Vec::new();
         let mut section: Option<usize> = None;
         let mut repos: Vec<(RepoId, String)> = Vec::new();
         let mut nums: [Option<u64>; 15] = [None; 15];
         let mut inbox: Option<String> = None;
+        let mut pattern_threshold: Option<u64> = None;
+        let mut triage_top: Option<u64> = None;
+        let mut design_tier: Option<Tier> = None;
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
             let here = match section {
@@ -181,10 +216,10 @@ impl Config {
             let at = format!("section `{sec}` key `{}`", shown(key));
             let (val, quoted) = plain_value(raw).map_err(|why| refuse(n, &at, why))?;
             if sec == "repos" {
-                let id = RepoId::parse(key).map_err(|_| refuse(n, &format!("section `repos` key `repo_id`"), "must be a plain repo id"))?;
+                let id = RepoId::parse(key).map_err(|_| refuse(n, "section `repos` key `repo_id`", "must be a plain repo id"))?;
                 let numeric = id.as_str().parse::<f64>().is_ok() && id.as_str().starts_with(|c: char| c.is_ascii_digit() || c == '.');
                 if YAML_WORDS.contains(&id.as_str()) || numeric {
-                    return Err(refuse(n, &format!("section `repos` key `repo_id`"), "a YAML special word or number cannot be a repo id"));
+                    return Err(refuse(n, "section `repos` key `repo_id`", "a YAML special word or number cannot be a repo id"));
                 }
                 let at = format!("section `repos` repo `{}`", id.as_str());
                 if !folder_ok(val) {
@@ -197,18 +232,68 @@ impl Config {
                     return Err(refuse(n, &at, "two repo ids on one folder"));
                 }
                 repos.push((id, val.to_string()));
+            } else if sec == BUILDER_STATE {
+                let at = format!("section `{sec}` key `{}`", shown(key));
+                if key.len() > 64 || !crate::events::token_ok(key) {
+                    return Err(refuse(n, &at, "the entry name must be a token of at most 64 bytes (lowercase letters, digits, `-`, `_`, `.`)"));
+                }
+                if val.is_empty() || val.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+                    return Err(refuse(n, &at, "the entry text must be non-empty with no control character"));
+                }
+                if builder_state.iter().any(|(k, _)| k == key) {
+                    return Err(refuse(n, &at, "duplicate entry name"));
+                }
+                builder_state.push((key.to_string(), val.to_string()));
             } else if sec == "friction" {
                 let at = format!("section `{sec}` key `{}`", shown(key));
-                if key != "inbox" {
+                if key == "pattern_threshold" {
+                    // The one OPTIONAL key (ticket 192): a positive whole number exactly like every numeric
+                    // key, but a file may omit it (absent = the default 3).
+                    if pattern_threshold.is_some() {
+                        return Err(refuse(n, &at, "duplicate key"));
+                    }
+                    if quoted {
+                        return Err(refuse(n, &at, "a number must not be quoted"));
+                    }
+                    pattern_threshold = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
+                } else if key == "triage_top" {
+                    // The second OPTIONAL key (ticket 3601), the same grammar as `pattern_threshold`.
+                    if triage_top.is_some() {
+                        return Err(refuse(n, &at, "duplicate key"));
+                    }
+                    if quoted {
+                        return Err(refuse(n, &at, "a number must not be quoted"));
+                    }
+                    triage_top = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
+                } else if key == "inbox" {
+                    if inbox.is_some() {
+                        return Err(refuse(n, &at, "duplicate key"));
+                    }
+                    if !folder_ok(val) {
+                        return Err(refuse(n, &at, "the inbox path must be absolute, with no `..` component, no control character and no trailing `/`"));
+                    }
+                    inbox = Some(val.to_string());
+                } else {
                     return Err(refuse(n, &at, "unknown key"));
                 }
-                if inbox.is_some() {
+} else if sec == "factory" {
+                let at = format!("section `{sec}` key `{}`", shown(key));
+                if key != "design_tier" {
+                    return Err(refuse(n, &at, "unknown key"));
+                }
+                if design_tier.is_some() {
                     return Err(refuse(n, &at, "duplicate key"));
                 }
-                if !folder_ok(val) {
-                    return Err(refuse(n, &at, "the inbox path must be absolute, with no `..` component, no control character and no trailing `/`"));
+                if quoted {
+                    return Err(refuse(n, &at, "a tier must not be quoted"));
                 }
-                inbox = Some(val.to_string());
+                // A tier, never a brand: the value is read as one of T1, T2, T3 and nothing else. T4
+                // (the top of the ladder) is refused here: the factory designs at a cheaper tier and
+                // escalates on purpose, it never starts at the top. The refusal never carries the value.
+                design_tier = Some(match Tier::parse(val) {
+                    Some(t) if t != Tier::T4 => t,
+                    _ => return Err(refuse(n, &at, "must be one of T1, T2, T3")),
+                });
             } else {
                 let full = format!("{sec}.{key}");
                 let slot = KEYS.iter().position(|k| *k == full).ok_or_else(|| refuse(n, &at, "unknown key"))?;
@@ -222,10 +307,14 @@ impl Config {
             }
         }
         // v3: a missing `friction` section is named by its key (a v2 file is refused naming `friction.inbox`), but an
-        // earlier missing section is named first, in file order, as before.
-        if let Some(i) = seen.iter().position(|s| !s) {
+        // earlier missing section is named first, in file order, as before. v4 does the same for `factory`
+        // (a v3 file is refused naming `factory.design_tier`).
+        if let Some(i) = seen[..REQUIRED_SECTIONS].iter().position(|s| !s) {
             if i == 4 {
                 return Err(format!("config: missing key `{INBOX_KEY}`"));
+            }
+            if i == 5 {
+                return Err(format!("config: missing key `{DESIGN_TIER_KEY}`"));
             }
             return Err(format!("config: missing section `{}`", SECTIONS[i]));
         }
@@ -233,7 +322,20 @@ impl Config {
         for (i, slot) in nums.iter().enumerate() {
             out[i] = slot.ok_or_else(|| format!("config: missing key `{}`", KEYS[i]))?;
         }
-        Ok(Config { repos, nums: out, inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))? })
+        Ok(Config {
+            repos,
+            nums: out,
+            inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))?,
+            pattern_threshold: pattern_threshold.unwrap_or(PATTERN_THRESHOLD_DEFAULT),
+            triage_top: triage_top.unwrap_or(TRIAGE_TOP_DEFAULT),
+            design_tier: design_tier.ok_or_else(|| format!("config: missing key `{DESIGN_TIER_KEY}`"))?,
+            builder_state,
+        })
+    }
+
+    /// The `builder_state` entries in file order: (entry name, text). Empty when the section is absent.
+    pub fn builder_state(&self) -> &[(String, String)] {
+        &self.builder_state
     }
 
     /// Read at most the cap plus one byte, then parse. No search, no default location: the caller names the file. Errors never carry the path.
@@ -283,6 +385,23 @@ impl Config {
         &self.inbox
     }
 
+    /// The configured N a pattern chain's repeat count must reach before `friction patterns` lists it
+    /// (`friction.pattern_threshold`, optional; the default 3 when absent).
+    pub fn pattern_threshold(&self) -> u64 {
+        self.pattern_threshold
+    }
+
+    /// The configured K for `friction rank` / `friction triage` (`friction.triage_top`, optional; default 3).
+    pub fn triage_top(&self) -> u64 {
+        self.triage_top
+    }
+
+    /// The configured design tier (`factory.design_tier`, v4): one of T1, T2, T3. Read by the G8.3
+    /// fix-round tier rule's callers; never a brand.
+    pub fn design_tier(&self) -> Tier {
+        self.design_tier
+    }
+
     pub fn shadow(&self) -> Shadow {
         let n = &self.nums;
         Shadow {
@@ -307,7 +426,7 @@ mod tests {
 
     fn text(repos: &str) -> String {
         format!(
-            "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 111\n  s_tokens: 222\n  m_wall_seconds: 333\n  m_tokens: 444\n  l_wall_seconds: 555\n  l_tokens: 666\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 7\n  p4a_token_budget: 8\n  d2a_token_budget: 9\n  p7_token_budget: 11\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n"
+            "repos:\n{repos}\nbudgets:\n  s_wall_seconds: 111\n  s_tokens: 222\n  m_wall_seconds: 333\n  m_tokens: 444\n  l_wall_seconds: 555\n  l_tokens: 666\n\nshadow:\n  p1a_cap: 5\n  p4a_cap: 10\n  d2a_cap: 20\n  p7_cap: 10\n  p1a_token_budget: 7\n  p4a_token_budget: 8\n  d2a_token_budget: 9\n  p7_token_budget: 11\n\nlanes:\n  count: 4\n\nfriction:\n  inbox: /synthetic-inbox.jsonl\n\nfactory:\n  design_tier: T3\n"
         )
     }
 
@@ -519,6 +638,19 @@ mod tests {
     }
 
     #[test]
+    fn triage_top_is_optional_defaults_to_three_and_is_shape_checked() {
+        assert_eq!(Config::parse(&valid()).unwrap().triage_top(), 3);
+        let with = |line: &str| valid().replace("  inbox: /synthetic-inbox.jsonl\n", &format!("  inbox: /synthetic-inbox.jsonl\n{line}\n"));
+        assert_eq!(Config::parse(&with("  triage_top: 7")).unwrap().triage_top(), 7);
+        for bad in ["0", "04", "x", "\"2\""] {
+            let e = refused(&with(&format!("  triage_top: {bad}")));
+            assert!(e.contains("`triage_top`"), "{bad}: {e}");
+        }
+        let e = refused(&with("  triage_top: 2\n  triage_top: 3"));
+        assert!(e.contains("duplicate key"), "{e}");
+    }
+
+    #[test]
     fn v3_friction_inbox_is_required_shape_checked_and_read() {
         // the value is read back, not compiled in
         assert_eq!(Config::parse(&valid()).unwrap().friction_inbox(), "/synthetic-inbox.jsonl");
@@ -536,9 +668,37 @@ mod tests {
             let e = refused(&valid().replace("/synthetic-inbox.jsonl", bad));
             assert!(e.contains("`friction`") && e.contains("`inbox`") && !e.contains("synthetic-inbox"), "{bad}: {e}");
         }
-        // only `inbox` lives under friction
+        // only `inbox` and the optional `pattern_threshold` live under friction
         let e = refused(&valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  extra: 1"));
         assert!(e.contains("unknown key"), "{e}");
+    }
+
+
+    #[test]
+    fn pattern_threshold_is_optional_shape_checked_and_read() {
+        // absent: the default 3
+        assert_eq!(Config::parse(&valid()).unwrap().pattern_threshold(), 3);
+        // present: read from the text, not compiled in
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: 5");
+        assert_eq!(Config::parse(&t).unwrap().pattern_threshold(), 5);
+        // 0, a non-number, a fraction, a negative, a leading zero: refused naming the section and the key
+        for bad in ["0", "x", "1.5", "-1", "007", ""] {
+            let t = valid().replace("  inbox: /synthetic-inbox.jsonl", &format!("  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: {bad}"));
+            let e = refused(&t);
+            assert!(e.contains("`friction`") && e.contains("`pattern_threshold`") && e.contains("positive whole number"), "{bad:?}: {e}");
+        }
+        // a quoted value is refused as a type error, naming the section and the key
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: \"3\"");
+        let e = refused(&t);
+        assert!(e.contains("`pattern_threshold`") && e.contains("quoted"), "{e}");
+        // a second line under friction is refused as a duplicate key
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", "  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: 3\n  pattern_threshold: 4");
+        let e = refused(&t);
+        assert!(e.contains("`pattern_threshold`") && e.contains("duplicate key"), "{e}");
+        // a refusal never carries the value
+        let t = valid().replace("  inbox: /synthetic-inbox.jsonl", &format!("  inbox: /synthetic-inbox.jsonl\n  pattern_threshold: {SECRET}"));
+        let e = refused(&t);
+        assert!(!leaks(&e, SECRET), "{e}");
     }
 
 
@@ -688,5 +848,56 @@ mod tests {
         std::fs::write(&p, "repos:\n  a: /x/\n").unwrap();
         assert!(!Config::load(&p).unwrap_err().contains(secret));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn with_bs(entries: &str) -> String {
+        format!("{}\nbuilder_state:\n{entries}\n", valid())
+    }
+
+    #[test]
+    fn builder_state_two_entries_load_in_file_order() {
+        let c = Config::parse(&with_bs("  zeta: /scratch/one\n  alpha: /scratch/two")).unwrap();
+        let e = c.builder_state();
+        assert_eq!(e.len(), 2);
+        assert_eq!((e[0].0.as_str(), e[0].1.as_str()), ("zeta", "/scratch/one"));
+        assert_eq!((e[1].0.as_str(), e[1].1.as_str()), ("alpha", "/scratch/two"));
+    }
+
+    #[test]
+    fn builder_state_bad_entry_name_is_refused_naming_the_line() {
+        let t = with_bs("  Upper: /scratch/one");
+        let m = refused(&t);
+        assert!(m.contains("line ") && m.contains("builder_state"), "{m}");
+        let long = format!("  {}: /x", "a".repeat(65));
+        assert!(refused(&with_bs(&long)).contains("builder_state"));
+    }
+
+    #[test]
+    fn builder_state_duplicate_entry_name_is_refused() {
+        let m = refused(&with_bs("  one: /scratch/a\n  one: /scratch/b"));
+        assert!(m.contains("duplicate entry name"), "{m}");
+    }
+
+    #[test]
+    fn builder_state_empty_value_is_refused() {
+        assert!(refused(&with_bs("  one:")).contains("non-empty"));
+    }
+
+    #[test]
+    fn builder_state_refusal_never_carries_the_entry_text() {
+        let secret = "/synthetic-secret-0xB2";
+        for t in [with_bs(&format!("  one: {secret}\n  one: {secret}")), with_bs(&format!("  One: {secret}")), with_bs(&format!("  one: {secret}: x"))] {
+            assert!(!leaks(&refused(&t), secret));
+        }
+    }
+
+    #[test]
+    fn builder_state_absent_section_loads_with_zero_entries() {
+        assert!(Config::parse(&valid()).unwrap().builder_state().is_empty());
+    }
+
+    #[test]
+    fn builder_state_duplicate_section_is_refused() {
+        assert!(refused(&format!("{}\nbuilder_state:\n  a: /x\nbuilder_state:\n  b: /y\n", valid())).contains("duplicate section"));
     }
 }

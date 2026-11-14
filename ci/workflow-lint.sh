@@ -24,6 +24,12 @@ SECRET_WORKFLOWS = {"privacy-gate.yml", "privacy-gate-next.yml", "privacy-text.y
 SECRET_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "working-directory"}
 SECRET_JOB_KEYS = {"runs-on", "timeout-minutes", "environment", "steps"}
 SECRET_TOP_KEYS = {"name", "on", "permissions", "jobs"}
+# The ONE named exception to the write ban (ticket 3676): release.yml, job `publish`, the exact grant `contents: write`, and the
+# job keys `needs` and `permissions`. It holds only while that job has no secrets., no actions/checkout, no environment: and
+# `needs: scan`; each line that breaks that is refused as release-publish-shape. Every other file and job keeps today's rules.
+RELEASE_WORKFLOW = "release.yml"
+RELEASE_PUBLISH_JOB = "publish"
+RELEASE_NEEDS = "scan"
 SECRET_WD = "core/rust"        # the engine build dir: allowed as a working-directory only, and never on a step that holds the secret
 FILTERS = {"paths", "paths-ignore", "branches", "branches-ignore", "types"}
 # A YAML mapping key, with optional quotes and optional space before the colon: `if: x`, `"if": x`, `'if' : x`.
@@ -245,7 +251,61 @@ def skeleton_bad(path):
     return bad
 
 
-def secret_keys_bad(cl):
+def release_publish(path, cl):
+    """(allowed, bad): for release.yml only, the line indexes inside job `publish` that the named exception accepts (the exact
+    `contents: write` grant under the job's own `permissions:`, and the job keys `needs` / `permissions`), and the
+    release-publish-shape refusals (line numbers). Any other file name gets ((), ())."""
+    if os.path.basename(path) != RELEASE_WORKFLOW:
+        return set(), []
+    sec = section(cl, "jobs")
+    if not sec:
+        return set(), []
+    start = end = None
+    for i in range(sec[0] + 1, sec[1]):
+        c = cl[i]
+        if not c.strip():
+            continue
+        k = kv(c)
+        if len(c) - len(c.lstrip()) == 2 and k and not k[4]:
+            if k[1] == RELEASE_PUBLISH_JOB and not k[3]:
+                start = i
+            elif start is not None and end is None:
+                end = i
+    if start is None:
+        return set(), []
+    end = end if end is not None else sec[1]
+    allowed, bad = set(), []
+    needs = None
+    prev = None
+    for i in range(start + 1, end):
+        c = cl[i]
+        if not c.strip():
+            continue
+        n = i + 1
+        ind = len(c) - len(c.lstrip())
+        k = kv(c)
+        if "secrets." in c:
+            bad.append((n, "release-publish-shape"))
+        if re.search(r"actions/checkout", c):
+            bad.append((n, "release-publish-shape"))
+        if k and k[1] == "environment":
+            bad.append((n, "release-publish-shape"))
+        if ind == 4 and k and k[1] == "needs":
+            needs = n
+            allowed.add(i)
+            if k[3] != RELEASE_NEEDS:
+                bad.append((n, "release-publish-shape"))
+        if ind == 4 and k and k[1] == "permissions" and not k[3]:
+            allowed.add(i)
+        if ind == 6 and re.fullmatch(r"\s*contents:\s*write", c) and prev is not None and re.fullmatch(r"    permissions:", cl[prev]):
+            allowed.add(i)
+        prev = i if ind <= 6 else prev
+    if needs is None:
+        bad.append((start + 1, "release-publish-shape"))
+    return allowed, bad
+
+
+def secret_keys_bad(cl, allowed=frozenset()):
     """(line, rule) for each unmodelled step / job / top-level key in a secret-holding workflow (never prints a value)."""
     bad = []
     jobs_sec = section(cl, "jobs")
@@ -255,6 +315,8 @@ def secret_keys_bad(cl):
         n = i + 1
         k = kv(c)
         ind = len(c) - len(c.lstrip())
+        if i in allowed and ind == 4:
+            continue
         if ind == 0:
             if not k or k[1] not in SECRET_TOP_KEYS:
                 bad.append((n, "secret-workflow-top-key"))
@@ -289,6 +351,8 @@ def lint(path):
     lines = open(path, encoding="utf-8").read().split("\n")
     cl = [code(x) for x in lines]
     has_perm = False
+    rel_ok, rel_bad = release_publish(path, cl)
+    bad.extend(rel_bad)
     for i, c in enumerate(cl):
         if not c.strip():
             continue
@@ -302,7 +366,7 @@ def lint(path):
             bad.append((n, "checkout-pr-head"))
         if re.search(r"toJSON\(\s*secrets|secrets:\s*inherit", c):
             bad.append((n, "secret-wide"))
-        if re.search(r":\s*write\b|write-all", c):
+        if re.search(r":\s*write\b|write-all", c) and i not in rel_ok:
             bad.append((n, "permission-write"))
         if re.match(r"^permissions:", c):
             has_perm = True
@@ -326,7 +390,9 @@ def lint(path):
                 in_perm = False
             else:
                 g = re.match(r"\s*([\w-]+):\s*(\S+)$", c)
-                if not g or g.group(1) not in ALLOWED_PERMS or g.group(2) != "read":
+                if i in rel_ok and g and g.group(1) == "contents" and g.group(2) == "write":
+                    pass
+                elif not g or g.group(1) not in ALLOWED_PERMS or g.group(2) != "read":
                     bad.append((i + 1, "permission-grant"))
     # steps
     starts = [i for i, c in enumerate(cl) if re.match(r"^      - ", c)]
@@ -345,7 +411,7 @@ def lint(path):
                 bad.append((s + 1, "checkout-persist-credentials"))
             if re.search(r"^\s*(-\s+)?(ref|repository):", text, re.M):
                 bad.append((s + 1, "checkout-ref"))
-        if "secrets." in text and not re.search(r"ci/privacy-(gate|text|release-text)\.sh", text):
+        if "secrets." in text and not re.search(r"ci/privacy-(gate|text|release-text|release-artifacts)\.sh", text):
             bad.append((s + 1, "secret-outside-scan-step"))
         # ${{ github.event.* }} inside a run: script
         for j, line in enumerate(body):
@@ -366,7 +432,7 @@ def lint(path):
     bad.extend(lint_14c(path, cl))
     # by name, or by content (a renamed or copied workflow that reads the list secret is held to the same rule)
     if os.path.basename(path) in SECRET_WORKFLOWS or "PRIVACY_LIST" in "\n".join(lines):
-        bad.extend(secret_keys_bad(cl))
+        bad.extend(secret_keys_bad(cl, rel_ok))
     if os.path.basename(path) == "final-gate.yml":
         bad.extend(skeleton_bad(path))
     return bad

@@ -1,0 +1,401 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "harness_version",
+      "description": "Print the harness version.",
+      "argv": [
+        "--version"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "--version"
+        ],
+        "exit": 0,
+        "stream": "stdout",
+        "contains": "harness "
+      }
+    },
+    {
+      "name": "harness_status",
+      "description": "Show the status of a ticket across the mapped repos.",
+      "argv": [
+        "status"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ticket_file": {
+            "type": "string"
+          },
+          "repo_map": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "repo_id=absolute-dir"
+          },
+          "result_dir": {
+            "type": "string"
+          },
+          "caps_dir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_file",
+          "repo_map",
+          "result_dir",
+          "caps_dir"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "status"
+        ],
+        "exit": 2,
+        "stream": "stderr",
+        "contains": "usage: harness status "
+      }
+    },
+    {
+      "name": "harness_ticket_intake",
+      "description": "Read a ticket file and report its intake result.",
+      "argv": [
+        "ticket",
+        "intake"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ticket_file": {
+            "type": "string"
+          },
+          "repo_map": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "repo_id=absolute-dir"
+          }
+        },
+        "required": [
+          "ticket_file",
+          "repo_map"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "ticket",
+          "intake",
+          "/nonexistent-mcp/t.md"
+        ],
+        "exit": 2,
+        "stream": "stderr",
+        "contains": "the ticket file cannot be read"
+      }
+    },
+    {
+      "name": "harness_events_list",
+      "description": "List the events in an event log.",
+      "argv": [
+        "events",
+        "list"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "log": {
+            "type": "string",
+            "description": "absolute path"
+          }
+        },
+        "required": [
+          "log"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "events",
+          "list",
+          "--log",
+          "/nonexistent-mcp/events.jsonl"
+        ],
+        "exit": 2,
+        "stream": "stderr",
+        "contains": "cannot read log"
+      }
+    },
+    {
+      "name": "harness_evidence_show",
+      "description": "Show the evidence recorded for a ticket.",
+      "argv": [
+        "evidence",
+        "show"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ticket": {
+            "type": "string"
+          },
+          "manifest_dir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket",
+          "manifest_dir"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "evidence",
+          "show"
+        ],
+        "exit": 2,
+        "stream": "stderr",
+        "contains": "a ticket is required"
+      }
+    },
+    {
+      "name": "harness_privacy_scan_text",
+      "description": "Scan text for denied tokens using the privacy list.",
+      "argv": [
+        "privacy",
+        "scan",
+        "--text"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "sent on stdin"
+          },
+          "surface": {
+            "type": "string",
+            "pattern": "^[a-z_.]+$"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "privacy",
+          "scan",
+          "--text"
+        ],
+        "stdin": "hello\n",
+        "env": {
+          "HARNESS_PRIVACY_LIST": "mcp/fixtures/probe-list.txt"
+        },
+        "exit": 0,
+        "stream": "stdout",
+        "contains": ""
+      }
+    },
+    {
+      "name": "harness_config_check",
+      "description": "Check a harness config file.",
+      "argv": [
+        "config",
+        "check"
+      ],
+      "read_only": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "config": {
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "budget": {
+            "type": "string",
+            "enum": [
+              "S",
+              "M",
+              "L"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "exit": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit",
+          "stdout",
+          "stderr"
+        ],
+        "additionalProperties": false
+      },
+      "probe": {
+        "argv": [
+          "config",
+          "check",
+          "--config",
+          "/nonexistent-mcp/c"
+        ],
+        "exit": 2,
+        "stream": "stderr",
+        "contains": "config: file missing or unreadable"
+      }
+    }
+  ]
+}

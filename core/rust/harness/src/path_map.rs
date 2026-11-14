@@ -160,7 +160,7 @@ impl PathMap {
         let mut best: Option<&(String, Vec<String>)> = None;
         for e in &self.entries {
             let hit = changed == e.0 || (changed.starts_with(e.0.as_str()) && changed.as_bytes().get(e.0.len()) == Some(&b'/'));
-            if hit && best.map_or(true, |b| e.0.len() > b.0.len()) {
+            if hit && best.is_none_or(|b| e.0.len() > b.0.len()) {
                 best = Some(e);
             }
         }
@@ -224,7 +224,7 @@ pub(crate) fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<S
         return Err("git refused the request".to_string());
     }
     let mut parts: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
-    if parts.last().map_or(false, |l| l.is_empty()) {
+    if parts.last().is_some_and(|l| l.is_empty()) {
         parts.pop();
     }
     parts

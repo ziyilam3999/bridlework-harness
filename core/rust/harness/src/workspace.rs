@@ -78,8 +78,8 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
         return Err(Stop(2, format!("usage: harness workspace create <ticket-file> ...\n{}", USAGE)));
     }
     let mut map = RepoMap::new();
-    let (mut file, mut base, mut ws, mut md, mut ts): (Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>) =
-        (None, None, None, None, None);
+    type ArgOpt<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+    let (mut file, mut base, mut ws, mut md, mut ts): ArgOpt = (None, None, None, None, None);
     let mut it = a[1..].iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -145,7 +145,7 @@ fn parse_args(a: &[String]) -> Result<Args, Stop> {
 
 /// One git call: no hooks, no inherited `GIT_*` name (so an inherited `GIT_DIR` cannot redirect it), no stdin, and
 /// stderr dropped (git's own message may name a folder). The `tree_prep.rs` git-call rule.
-fn git(repo: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Option<String> {
     let mut c = Command::new("git");
     c.arg("-C").arg(repo).args(["-c", "core.hooksPath=/dev/null"]).args(args);
     for (k, _) in std::env::vars_os() {
@@ -162,12 +162,17 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
 
 /// The repo the ticket names, resolved once the `tree_prep.rs` way: canonical, the top level of its work tree, and
 /// a MAIN work tree (git dir == common dir), so a workspace is never made from another ticket's workspace.
-struct Repo {
-    top: PathBuf,
-    common: PathBuf,
+pub(crate) struct Repo {
+    pub(crate) top: PathBuf,
+    #[allow(dead_code)]
+    pub(crate) common: PathBuf,
 }
 
-fn resolve_main_work_tree(path: &Path) -> Result<Repo, Stop> {
+pub(crate) fn resolve_main_work_tree(path: &Path) -> Result<Repo, String> {
+    resolve_main_work_tree_stop(path).map_err(|Stop(_, l)| l)
+}
+
+fn resolve_main_work_tree_stop(path: &Path) -> Result<Repo, Stop> {
     let canon = path.canonicalize().map_err(|_| err2("the mapped repo folder is unreadable"))?;
     let out = git(&canon, &["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"])
         .ok_or_else(|| err2("the mapped repo folder is not a readable git work tree"))?;
@@ -277,6 +282,20 @@ fn manifest_stop(e: manifest::ManifestError) -> Stop {
 /// fields); 1 the ticket is refused at intake (bad ticket, unknown repo id, repo not found — the same meaning as
 /// `harness ticket intake`); 2 every other refusal or error. Any non-zero exit means "no usable workspace".
 pub fn workspace_cmd(a: &[String]) -> i32 {
+    // P1B-11: the read-only clean-state check is a sibling subcommand, dispatched first so `create` (which
+    // requires its own literal first token) is untouched.
+    if a.first().map(|s| s.as_str()) == Some("check") {
+        #[cfg(unix)]
+        return crate::workspace_check::check_cmd(&a[1..]);
+        #[cfg(not(unix))]
+        {
+            eprintln!("harness: error: workspace check is not available on this platform");
+            return 3;
+        }
+    }
+    if a.first().map(|s| s.as_str()) == Some("teardown") {
+        return crate::teardown::teardown_cmd(&a[1..]);
+    }
     match create(a) {
         Ok(s) => {
             println!("workspace=created ticket={} repo_id={} base={} branch={}", s.ticket, s.repo_id, s.base, s.branch);
@@ -314,7 +333,7 @@ fn create(a: &[String]) -> Result<Success, Stop> {
         .map
         .lookup(&accepted.repo_id)
         .ok_or_else(|| err2("the repo map no longer lists the ticket's repo"))?;
-    let repo = resolve_main_work_tree(dir)?;
+    let repo = resolve_main_work_tree_stop(dir)?;
     let base = resolve_base(&repo, &args.base)?;
     let branch = format!("ws/{}", ticket.id);
 
@@ -370,7 +389,7 @@ fn create(a: &[String]) -> Result<Success, Stop> {
 
     // 7-8. Write-ahead: init the manifest with the ticket root as its ONE root, then list both entries BEFORE the
     // things exist, so a crash between steps can leave only listed things, never an orphan.
-    manifest::apply(&md, &ticket.id, &Op::Init { roots: &[ticket_root.clone()] }, ts_ms).map_err(manifest_stop)?;
+    manifest::apply(&md, &ticket.id, &Op::Init { roots: std::slice::from_ref(&ticket_root) }, ts_ms).map_err(manifest_stop)?;
     manifest::apply(&md, &ticket.id, &Op::AddPath { id: "worktree", class: Class::Worktree, path: &tree }, ts_ms).map_err(manifest_stop)?;
     manifest::apply(&md, &ticket.id, &Op::AddPath { id: "tmp", class: Class::TempDir, path: &tmp }, ts_ms).map_err(manifest_stop)?;
     // P1B-04 write-ahead: the link's entry goes on the manifest in the SAME write-ahead block, BEFORE the tree or

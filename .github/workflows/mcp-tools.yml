@@ -1,0 +1,25 @@
+name: mcp-tools
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mcp-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: MCP tools lint
+        run: sh ci/mcp-tools-lint.sh --build
+      - name: MCP tools lint self-test
+        run: sh ci/mcp-tools-lint.sh --build --self-test
+      - name: MCP server smoke
+        run: sh ci/mcp-smoke.sh

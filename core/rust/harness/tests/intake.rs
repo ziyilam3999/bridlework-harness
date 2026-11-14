@@ -262,7 +262,7 @@ fn broken_tickets_are_refused_and_name_the_field() {
     let pos = non_utf8.windows(8).position(|w| w == b"A title\"").unwrap();
     non_utf8[pos] = 0xff;
     let mut oversize = valid.clone().into_bytes();
-    oversize.extend(std::iter::repeat(b' ').take(MAX + 1));
+    oversize.extend(std::iter::repeat_n(b' ', MAX + 1));
     let cases: Vec<(&str, Vec<u8>, &str)> = vec![
         ("unknown key", render(&unknown).into_bytes(), "surprise"),
         ("duplicate key", render(&dup).into_bytes(), "id"),
@@ -354,6 +354,10 @@ fn a_folder_that_is_not_a_repo_top_is_refused_without_naming_it() {
     let a_file = t.file("just-a-file.txt", "x");
     let empty_repo = t.dir("empty-repo");
     git(&empty_repo, &["init", "-q"]);
+    // Stop git's detached upkeep from writing under .git mid-test (same fix as the intake fixture).
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        git(&empty_repo, &["config", k, v]);
+    }
     let tf = t.file("tb.json", ticket_for("b"));
     for (label, dir) in [("missing", &missing), ("plain", &plain), ("subfolder", &sub), ("file", &a_file), ("no commit", &empty_repo)] {
         let o = go(&b, &tf, &[("b", dir)]);

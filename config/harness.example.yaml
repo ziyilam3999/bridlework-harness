@@ -26,5 +26,16 @@ lanes:
   count: 4
 
 # The friction inbox (docs/friction-inbox.md) lives only in the private overlay; this path is a placeholder.
+# pattern_threshold (ticket 192) is the ONE OPTIONAL key in the contract: absent means 3. It is the N a
+# pattern chain's repeat count must reach before `harness friction patterns` lists it.
+# triage_top (ticket 3601) is the SECOND optional key: absent means 3. It is the K of the top-K groups
+# `harness friction rank` lists and `harness friction triage` proposes.
 friction:
   inbox: /placeholder/friction-inbox.jsonl
+  pattern_threshold: 3
+  triage_top: 3
+
+# The tier the factory designs new fixes at (G8.3, docs/fix-tier.md). A tier, never a brand.
+# T3 is the spec default; an unseeded install refuses to guess (config v4).
+factory:
+  design_tier: T3

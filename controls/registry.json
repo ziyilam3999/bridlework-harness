@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "controls": [
+    {
+      "id": "path-restriction-hook",
+      "kind": "hook",
+      "class": "policy",
+      "enabled": true,
+      "failure": "An edit lands outside the ticket's repo and declared paths.",
+      "test": "plugins/claude/smoke-path-restriction.sh",
+      "retirement_test": "Retire when the engine refuses every out-of-scope write itself and the smoke shows no case only this hook catches.",
+      "owner": "execution_verification",
+      "hook": {
+        "script": "plugins/claude/path-restriction-hook.sh",
+        "manifest": "plugins/claude/manifest.json",
+        "event": "PreToolUse",
+        "tools": ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+      }
+    },
+    {
+      "id": "gh-text-hook",
+      "kind": "hook",
+      "class": "policy",
+      "enabled": true,
+      "failure": "A gh call publishes text that the privacy scan would refuse.",
+      "test": "plugins/claude/text-rule-smoke.sh",
+      "retirement_test": "Retire when every gh write goes through the engine's own text scan and the smoke shows no case only this hook catches.",
+      "owner": "execution_verification",
+      "hook": {
+        "script": "plugins/claude/gh-text-hook.sh",
+        "manifest": "plugins/claude/gh-text-manifest.json",
+        "event": "PreToolUse",
+        "tools": ["Bash"]
+      }
+    },
+    {
+      "id": "pre-completion-hook",
+      "kind": "hook",
+      "class": "policy",
+      "enabled": true,
+      "failure": "A task is marked complete while the gate result for the current head is not PASS.",
+      "test": "plugins/claude/pre-completion-smoke.sh",
+      "retirement_test": "Retire when completion is only reachable through the engine's gate verb and the smoke shows no case only this hook catches.",
+      "owner": "execution_verification",
+      "hook": {
+        "script": "plugins/claude/pre-completion-hook.sh",
+        "manifest": "plugins/claude/pre-completion-manifest.json",
+        "event": "PreToolUse",
+        "tools": ["TaskUpdate"]
+      }
+    },
+    {
+      "id": "session-start-hook",
+      "kind": "hook",
+      "class": "crutch",
+      "enabled": true,
+      "failure": "An interactive session starts and the event log never learns its id.",
+      "test": "plugins/claude/session-start-smoke.sh",
+      "retirement_test": "Retire when the host hands the session id to the engine directly and the smoke shows no case only this hook covers.",
+      "owner": "execution_verification",
+      "hook": {
+        "script": "plugins/claude/session-start-hook.sh",
+        "manifest": "plugins/claude/session-start-manifest.json",
+        "event": "SessionStart",
+        "tools": ["startup", "resume", "clear", "compact"]
+      }
+    }
+  ]
+}

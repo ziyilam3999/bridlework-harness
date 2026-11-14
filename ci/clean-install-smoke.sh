@@ -1,0 +1,540 @@
+#!/bin/sh
+# Smoke for the clean-machine install test (ticket 3677). Usage: ci/clean-install-smoke.sh <arm>
+# Arms: static fresh container planted twice all (all = static, fresh, container, planted, twice)
+# The `twice` arm (ticket 3678) installs twice into one prefix beside a seeded private overlay (ci/clean-install/twice.sh): the overlay
+# must stay byte-, mode-, inode- and mtime-identical and the second install must change nothing. Plants copy one built base HOME.
+# The driver builds a scratch repo from the worktree's tracked files (index), tags it, builds the engine, then runs #3676's own
+# ci/release-build.sh to make the dist folder and `git archive` for the source. The `fresh` arm and every plant that runs the real
+# install use `env -i` with a fresh HOME plus exactly two non-HARNESS_ variables, CARGO_HOME and RUSTUP_HOME, both outside HOME.
+# There is no plant switch in install.sh or e2e.sh: plants mutate inputs or run the phases one by one.
+# The smoke checks release-build's own dist_files=N line against the files it listed and the files in dist, never a fixed count.
+# Fixture git identity and every planted value are built at run time; a home path is never typed.
+# Prints "ok <id>" / "FAIL <id>" per check, then "N ok, M failed". Exit 0 only if every check holds, 1 otherwise, 2 on setup error.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
+exec python3 -I - "$here/.." "$@" <<'PY'
+import hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, tempfile
+
+ROOT = os.path.realpath(sys.argv[1])
+ARM = sys.argv[2] if len(sys.argv) > 2 else ""
+ARMS = ("static", "fresh", "container", "planted", "twice", "all")
+MAX_COPY = 5000
+oks = 0
+fails = 0
+S = None
+
+
+class Setup(Exception):
+    pass
+
+
+def ok(i):
+    global oks
+    print("ok   " + i)
+    oks += 1
+
+
+def bad(i, why=""):
+    global fails
+    print("FAIL " + i)
+    if why:
+        sys.stdout.write("     " + why.replace("\n", "\n     ")[:1500] + "\n")
+    fails += 1
+
+
+def check(i, cond, why=""):
+    ok(i) if cond else bad(i, why)
+
+
+def rd(p):
+    return open(os.path.join(ROOT, p), encoding="utf-8").read()
+
+
+def code_only(text):
+    return "\n".join(l for l in text.split("\n") if not l.lstrip().startswith("#"))
+
+
+# ------------------------------------------------------------------ static
+def arm_static():
+    for f in ("ci/clean-install/install.sh", "ci/clean-install/e2e.sh", "ci/clean-install/twice.sh"):
+        t = code_only(rd(f))
+        bad_words = [w for w in ("curl", "wget", "git clone", "gh ") if w in t]
+        check("static-no-network-" + os.path.basename(f), not bad_words, "found " + ",".join(bad_words))
+        check("static-no-overlay-assign-" + os.path.basename(f), not re.search(r"HARNESS_PRIVACY\w*\s*=", t))
+    inst = rd("ci/clean-install/install.sh")
+    cb = [l for l in inst.split("\n") if '"cargo", "build"' in l]
+    check("static-cargo-locked-offline", len(cb) == 1 and '"--locked"' in cb[0] and '"--offline"' in cb[0])
+    ct = code_only(rd("ci/clean-install-container.sh"))
+    check("static-container-network-none", "--network none" in ct)
+    check("static-container-user", re.search(r"--user \S+", ct) is not None)
+    check("static-container-digest", re.search(r"^FROM \S+@sha256:[0-9a-f]{64}$", rd("ci/clean-install/Dockerfile"), re.M) is not None
+          and re.search(r"IMAGE=\"[^\"]+\"", ct) is not None)
+    mounts = re.findall(r'-v\s+"?[^\s]+:[^\s]+:ro', ct)
+    check("static-container-three-ro-mounts", len(mounts) == 3 and len(re.findall(r"\s-v\s", ct)) == 4, "mounts=%d" % len(mounts))
+    check("static-container-no-repo-mount", "target" not in ct and '"$root' not in ct and "$here/.." not in ct and '-v "$here":' not in ct)
+    tk = json.loads(rd("examples/project-template/tickets/ex-1.json"))
+    check("static-ticket-id", re.fullmatch(r"[a-z0-9._-]+", tk["id"]) is not None)
+    pm = json.loads(rd("examples/project-template/project/gates/path-map.json"))
+    text = json.dumps(pm)
+    tops = os.listdir(os.path.join(ROOT, "examples/project-template/project"))
+    check("static-pathmap-covers-project", all(t in text for t in tops), "tops=%s" % tops)
+    r = subprocess.run(["git", "-C", ROOT, "ls-files", "-s", "examples/project-template/project/checks/hello.sh"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    check("static-hello-mode-100755", r.stdout.decode().startswith("100755 "))
+    wf = rd(".github/workflows/clean-install.yml")
+    check("static-job-named-clean-install", re.search(r"^  clean-install:\s*$", wf, re.M) is not None
+          and "final-gate" not in code_only(wf) and not re.search(r"^  gate:", wf, re.M))
+    fx = tempfile.mkdtemp(prefix="dist-count-fixture-")
+    try:
+        names = ["SHA256SUMS", "a.tar.gz", "b.tar.gz", "release-notes.md"]
+        for nm in names:
+            open(os.path.join(fx, nm), "w").close()
+        body = "\n".join(names) + "\n"
+        check("static-dist-count-accepts-true-count", dist_count_ok("dist_files=4\n" + body, fx)[0])
+        check("static-dist-count-refuses-wrong-count", not dist_count_ok("dist_files=3\n" + body, fx)[0])
+        check("static-dist-count-refuses-missing-line", not dist_count_ok(body, fx)[0])
+    finally:
+        shutil.rmtree(fx, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ setup: scratch repo, release dist, source archive
+def run(args, **kw):
+    return subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+
+
+def dist_count_ok(stdout, dist):
+    """Cross-check release-build's count line against the names it listed and the files in dist. No count is hard-coded."""
+    lines = [l for l in stdout.split("\n") if l.strip()]
+    if not lines or re.fullmatch(r"dist_files=[1-9][0-9]*", lines[0].strip()) is None:
+        return False, "first line is not a dist_files=N count line"
+    if any(l.startswith("dist_files=") for l in lines[1:]):
+        return False, "more than one dist_files= line"
+    n = int(lines[0].strip().split("=", 1)[1])
+    listed = [l.strip() for l in lines[1:]]
+    try:
+        actual = sorted(os.listdir(dist))
+    except OSError:
+        return False, "dist folder unreadable"
+    if n == len(listed) == len(actual) and listed == actual:
+        return True, ""
+    return False, "count line says %d, listed %d, dist holds %d" % (n, len(listed), len(actual))
+
+
+def setup():
+    global S, DIST, SRC, VER
+    S = tempfile.mkdtemp(prefix="clean-install-smoke-")
+    r = run(["git", "-C", ROOT, "ls-files", "-z", "-c"])
+    files = [f for f in r.stdout.decode("utf-8", "replace").split("\0") if f]
+    if not files or len(files) > MAX_COPY:
+        raise Setup("tracked file count out of bounds")
+    repo = os.path.join(S, "repo")
+    for f in files:
+        src = os.path.join(ROOT, f)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(repo, f)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+    cargo = open(os.path.join(repo, "core/rust/harness/Cargo.toml"), encoding="utf-8").read()
+    VER = re.search(r'^version\s*=\s*"([^"]+)"', cargo, re.M).group(1)
+    dom = "example"
+    dom += ".invalid"
+    env = dict(os.environ, GIT_AUTHOR_NAME="smoke", GIT_AUTHOR_EMAIL="smoke@" + dom,
+               GIT_COMMITTER_NAME="smoke", GIT_COMMITTER_EMAIL="smoke@" + dom)
+    g = ["git", "-C", repo, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
+    for a in (["init", "-q", "-b", "master"], ["add", "-A"], ["commit", "-q", "-m", "scratch"], ["tag", "v" + VER]):
+        r = run(g + a, env=env)
+        if r.returncode != 0:
+            raise Setup("scratch git %s failed" % a[0])
+    r = run(["cargo", "build", "--release", "--locked"], cwd=os.path.join(repo, "core/rust"))
+    if r.returncode != 0:
+        raise Setup("engine build failed:\n" + r.stdout.decode("utf-8", "replace")[-800:])
+    DIST = os.path.join(S, "dist")
+    r = run(["sh", "ci/release-build.sh", "refs/tags/v" + VER, DIST], cwd=repo)
+    out = r.stdout.decode("utf-8", "replace")
+    if r.returncode != 0:
+        raise Setup("release-build failed:\n" + out[-800:])
+    ok, why = dist_count_ok(out, DIST)
+    if not ok:
+        raise Setup("release-build dist count mismatch: " + why + "\n" + out[-800:])
+    SRC = os.path.join(S, "src.tar.gz")
+    r = run(g + ["archive", "--format=tar.gz", "--prefix=bridlework-harness-%s/" % VER, "-o", SRC, "v" + VER])
+    if r.returncode != 0:
+        raise Setup("git archive failed")
+    os.chmod(DIST, 0o755)
+    for f in os.listdir(DIST):
+        os.chmod(os.path.join(DIST, f), 0o644)
+    os.chmod(SRC, 0o644)
+
+
+def toolchain_env(tag, drop=(), override=None):
+    """The fresh env: a new empty HOME, CARGO_HOME and RUSTUP_HOME as siblings of it (never inside)."""
+    base = os.path.join(S, tag)
+    home = os.path.join(base, "h")
+    os.makedirs(home)
+    cargo = shutil.which("cargo")
+    if not cargo:
+        raise Setup("cargo not on PATH")
+    ch = os.path.join(base, "cargo-home")
+    if shutil.which("rustup"):
+        rh = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    else:
+        rh = os.path.join(base, "rustup-home")
+        os.makedirs(rh)
+    os.makedirs(ch)
+    d = {"HOME": home, "CARGO_HOME": ch, "RUSTUP_HOME": rh,
+         "PATH": "/usr/bin:/bin:" + os.path.dirname(os.path.realpath(cargo)) if False else "/usr/bin:/bin:" + os.path.dirname(cargo)}
+    dom = "example"
+    dom += ".invalid"
+    d.update(GIT_AUTHOR_NAME="smoke", GIT_AUTHOR_EMAIL="smoke@" + dom, GIT_COMMITTER_NAME="smoke", GIT_COMMITTER_EMAIL="smoke@" + dom)
+    for k in drop:
+        d.pop(k, None)
+    if override:
+        d.update(override)
+    return d
+
+
+def e2e(env, phase, dist=None, src=None):
+    args = ["env", "-i"] + ["%s=%s" % kv for kv in env.items()] + ["sh", os.path.join(ROOT, "ci/clean-install/e2e.sh"),
+                                                                    phase, dist or DIST, src or SRC]
+    return run(args)
+
+
+def out(r):
+    return r.stdout.decode("utf-8", "replace")
+
+
+def top(home):
+    return sorted(os.listdir(home))
+
+
+# ------------------------------------------------------------------ fresh
+def arm_fresh():
+    env = toolchain_env("fresh")
+    r = e2e(env, "all")
+    t = out(r)
+    m = re.search(r"^clean-install: ok ticket=ex-1 version=%s core_files=\d+ unchanged$" % re.escape(VER), t, re.M)
+    check("fresh-e2e", r.returncode == 0 and m is not None, "rc=%d\n%s" % (r.returncode, t[-1200:]))
+    if m:
+        print("     " + m.group(0))
+    check("fresh-home-clean", top(env["HOME"]) == ["bridlework", "work"], "HOME top level %s" % top(env["HOME"]))
+
+
+# ------------------------------------------------------------------ container
+def arm_container():
+    if not shutil.which("docker"):
+        raise Setup("docker missing")
+    r = run(["sh", os.path.join(ROOT, "ci/clean-install-container.sh"), DIST, SRC])
+    t = out(r)
+    if r.returncode == 2 and "docker" in t:
+        raise Setup(t.strip())
+    m = re.search(r"^clean-install: ok ticket=ex-1 version=%s core_files=(\d+) unchanged$" % re.escape(VER), t, re.M)
+    check("container-e2e", r.returncode == 0 and m is not None, "rc=%d\n%s" % (r.returncode, t[-1500:]))
+    if not m:
+        return
+    print("     " + m.group(0))
+    with tarfile.open(SRC, "r:gz") as tf:
+        nsrc = sum(1 for ti in tf if ti.isreg())
+    check("container-core-files-count", int(m.group(1)) >= 15 + nsrc, "n=%s src=%d" % (m.group(1), nsrc))
+    steps = ["step hook-before exit=2", "step gate-wrong exit=1 result=fail", "step hook-wrong exit=2",
+             "step gate-right exit=0 done=allowed", "step hook-right exit=0", "step status last_gate=pass gate_current=yes"]
+    pos = -1
+    inorder = True
+    for s in steps:
+        p = t.find(s, pos + 1)
+        if p < 0:
+            inorder = False
+            break
+        pos = p
+    check("container-steps-in-order", inorder)
+    mounts = re.findall(r"^mount_source=(.*)$", t, re.M)
+    check("container-three-mounts-no-repo", len(mounts) == 3 and all(os.path.realpath(x) != ROOT and "target" not in x for x in mounts),
+          "mounts=%s" % mounts)
+
+
+# ------------------------------------------------------------------ planted
+def plugin_tarball_name(d):
+    """Exact plugin tarball name (ci/release-build.sh); refuse when missing, never pick the first *.tar.gz."""
+    name = "bridlework-harness-claude-plugin-%s.tar.gz" % VER
+    if not os.path.isfile(os.path.join(d, name)):
+        print("clean-install-smoke: plugin tarball %s missing in %s" % (name, d), file=sys.stderr)
+        sys.exit(1)
+    return name
+
+
+def repack(dest, mutate, rename=None):
+    """Copy DIST to dest with the plugin tarball rebuilt through mutate(members)->members; SHA256SUMS matched."""
+    shutil.copytree(DIST, dest)
+    name = plugin_tarball_name(dest)
+    p = os.path.join(dest, name)
+    members = []
+    with tarfile.open(p, "r:gz") as tf:
+        for ti in tf:
+            members.append((ti, tf.extractfile(ti).read() if ti.isreg() else None))
+    members = mutate(members)
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as tf:
+        for ti, data in members:
+            tf.addfile(ti, io.BytesIO(data) if data is not None else None)
+    import gzip
+    with open(p, "wb") as fh:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=fh, mtime=0) as gz:
+            gz.write(raw.getvalue())
+    h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    lines = open(os.path.join(dest, "SHA256SUMS")).read().splitlines()
+    lines = ["%s  %s" % (h, name) if l.endswith("  " + name) else l for l in lines]
+    open(os.path.join(dest, "SHA256SUMS"), "w").write("\n".join(lines) + "\n")
+    return dest
+
+
+def refused(i, r, reason, home=None, extra_absent=()):
+    t = out(r)
+    good = r.returncode != 0 and reason in t and "clean-install: ok" not in t and not any(x in t for x in extra_absent)
+    check(i, good, "rc=%d want %r\n%s" % (r.returncode, reason, t[-800:]))
+
+
+def arm_planted():
+    # (a) one byte of the tarball flipped
+    d = os.path.join(S, "pa")
+    shutil.copytree(DIST, d)
+    tarp = os.path.join(d, plugin_tarball_name(d))
+    b = bytearray(open(tarp, "rb").read())
+    b[len(b) // 2] ^= 0xFF
+    open(tarp, "wb").write(bytes(b))
+    refused("planted-a-sha256-mismatch", e2e(toolchain_env("a"), "all", dist=d), "sha256 mismatch")
+
+    # (b) ../x member, (c) symlink member
+    def add_dotdot(ms):
+        ti = tarfile.TarInfo("bridlework-harness/plugins/claude/../x")
+        ti.size = 1
+        return ms + [(ti, b"x")]
+
+    def add_link(ms):
+        ti = tarfile.TarInfo("bridlework-harness/plugins/claude/lnk")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = "/etc/hostname"
+        return ms + [(ti, None)]
+
+    refused("planted-b-dotdot-member", e2e(toolchain_env("b"), "all", dist=repack(os.path.join(S, "pb"), add_dotdot)), "unsafe member")
+    refused("planted-c-symlink-member", e2e(toolchain_env("c"), "all", dist=repack(os.path.join(S, "pc"), add_link)), "unsafe member")
+
+    # (d) HOME pre-seeded with one empty file
+    env = toolchain_env("d")
+    open(os.path.join(env["HOME"], "stray"), "w").close()
+    refused("planted-d-home-not-empty", e2e(env, "all"), "not fresh")
+
+    # (e) the overlay present
+    env = toolchain_env("e")
+    lst = os.path.join(S, "e-list")
+    open(lst, "w").write("sentinel\n")
+    env["HARNESS_PRIVACY_LIST"] = lst
+    refused("planted-e-overlay-present", e2e(env, "all"), "not fresh", extra_absent=(lst,))
+
+    # (f) hook edited after the ticket, (g) engine source edited after the ticket
+    for tag, rel, i in (("f", "plugins/claude/pre-completion-hook.sh", "planted-f-hook-edited"),
+                        ("g", "src/core/rust/harness/src/lib.rs", "planted-g-source-edited")):
+        env = toolchain_env(tag)
+        rcs = [e2e(env, ph).returncode for ph in ("preflight", "install", "snapshot", "ticket")]
+        if rcs != [0, 0, 0, 0]:
+            bad(i, "setup phases rc=%s" % rcs)
+            continue
+        target = os.path.join(env["HOME"], "bridlework", rel)
+        os.chmod(target, 0o644)
+        with open(target, "ab") as fh:
+            fh.write(b"\n")
+        refused(i, e2e(env, "verify"), "core edited: " + rel)
+
+    # (h) a template whose check always passes: the real both-ends gate must refuse
+    env = toolchain_env("h")
+    rcs = [e2e(env, ph).returncode for ph in ("preflight", "install")]
+    chk = os.path.join(env["HOME"], "bridlework", "src", "examples", "project-template", "project", "checks", "hello.sh")
+    if rcs != [0, 0]:
+        bad("planted-h-vacuous-check", "setup phases rc=%s" % rcs)
+    else:
+        open(chk, "w").write("#!/bin/sh\nexit 0\n")
+        os.chmod(chk, 0o755)
+        e2e(env, "snapshot")
+        r = e2e(env, "ticket")
+        t = out(r)
+        check("planted-h-vacuous-check", r.returncode == 1 and t.startswith("step ") and "ticket: gate-" in t and "clean-install: ok" not in t,
+              "rc=%d\n%s" % (r.returncode, t[-800:]))
+        print("     " + [l for l in t.split("\n") if l.startswith("ticket:")][0][:300] if "ticket:" in t else "")
+
+    # (i) plugin.json version differs from the source Cargo version
+    def bump(ms):
+        res = []
+        for ti, data in ms:
+            if ti.name.endswith(".claude-plugin/plugin.json"):
+                j = json.loads(data.decode())
+                j["version"] = "9.9.9"
+                data = json.dumps(j).encode()
+                ti.size = len(data)
+            res.append((ti, data))
+        return res
+
+    refused("planted-i-version-mismatch", e2e(toolchain_env("i"), "all", dist=repack(os.path.join(S, "pi"), bump)), "version mismatch")
+
+    # (j) the toolchain variables cannot smuggle a HOME write past verify
+    env = toolchain_env("j1")
+    env["CARGO_HOME"] = os.path.join(env["HOME"], ".cargo")
+    refused("planted-j-cargo-home-inside", e2e(env, "preflight"), "not fresh: CARGO_HOME inside HOME")
+    env = toolchain_env("j2")
+    env["RUSTUP_HOME"] = os.path.join(env["HOME"], ".rustup")
+    refused("planted-j-rustup-home-inside", e2e(env, "preflight"), "not fresh: RUSTUP_HOME inside HOME")
+    env = toolchain_env("j3", drop=("CARGO_HOME",))
+    refused("planted-j-cargo-home-unset", e2e(env, "preflight"), "not fresh: CARGO_HOME unset")
+
+
+# ------------------------------------------------------------------ twice (ticket 3678)
+OKLINE = r"^install-twice: ok version=%s overlay_files=3 unchanged core_files=\d+ idempotent$"
+
+
+def twice(env, phase, script=None, dist=None, src=None):
+    args = ["env", "-i"] + ["%s=%s" % kv for kv in env.items()] + [
+        "sh", script or os.path.join(ROOT, "ci/clean-install/twice.sh"), phase, dist or DIST, src or SRC]
+    return run(args)
+
+
+def arm_twice():
+    env = toolchain_env("twice")
+    ov = os.path.join(env["HOME"], "overlay")
+    env["HARNESS_CONFIG"] = os.path.join(ov, "harness.yaml")
+    env["HARNESS_PRIVACY_LIST"] = os.path.join(ov, "privacy-list.txt")
+    r = twice(env, "all")
+    t = out(r)
+    m = re.search(OKLINE % re.escape(VER), t, re.M)
+    check("twice-fresh", r.returncode == 0 and m is not None, "rc=%d\n%s" % (r.returncode, t[-1200:]))
+    if m:
+        print("     " + m.group(0))
+    if shutil.which("docker"):
+        r = run(["sh", os.path.join(ROOT, "ci/clean-install-container.sh"), DIST, SRC, "twice"])
+        t = out(r)
+        if r.returncode == 2 and "docker" in t:
+            raise Setup(t.strip())
+        m = re.search(OKLINE % re.escape(VER), t, re.M)
+        check("twice-container", r.returncode == 0 and m is not None, "rc=%d\n%s" % (r.returncode, t[-1500:]))
+        if m:
+            print("     " + m.group(0))
+    else:
+        raise Setup("docker missing")
+
+    # plants: one built base HOME (seed, first, snap), copied per plant
+    base = toolchain_env("twice-base")
+    for ph in ("seed", "first", "snap"):
+        r = twice(base, ph)
+        if r.returncode != 0:
+            raise Setup("twice base phase %s failed:\n%s" % (ph, out(r)[-800:]))
+    scripts = os.path.join(S, "twice-scripts")
+
+    def plant_env(tag):
+        e = toolchain_env(tag)
+        shutil.copytree(base["HOME"], e["HOME"], symlinks=True, dirs_exist_ok=True)
+        fo = os.path.join(e["HOME"], "work", "first.out")
+        txt = open(fo, encoding="utf-8").read().replace(base["HOME"], e["HOME"])
+        open(fo, "w", encoding="utf-8").write(txt)
+        return e
+
+    def scripts_copy(tag, wrapper=None, edit=None):
+        """Copy ci/clean-install/ to scratch. wrapper: shell text run after the real installer (install.sh becomes a wrapper).
+        edit: (anchor, replacement) text edit of the copied install.sh; the anchor must occur exactly once, else Setup."""
+        d = os.path.join(scripts, tag)
+        shutil.copytree(os.path.join(ROOT, "ci/clean-install"), d)
+        ins = os.path.join(d, "install.sh")
+        if edit:
+            t = open(ins, encoding="utf-8").read()
+            if t.count(edit[0]) != 1:
+                raise Setup("plant %s: anchor occurs %d times" % (tag, t.count(edit[0])))
+            open(ins, "w", encoding="utf-8").write(t.replace(edit[0], edit[1]))
+        if wrapper:
+            os.rename(ins, os.path.join(d, "install-real.sh"))
+            open(ins, "w", encoding="utf-8").write(
+                '#!/bin/sh\nh=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2\n'
+                'sh "$h/install-real.sh" "$@" || exit $?\n' + wrapper)
+        return os.path.join(d, "twice.sh")
+
+    def py(code):
+        return "python3 -I -c '%s'\n" % code
+
+    HEAD = "import os;ov=os.path.join(os.environ[\"HOME\"],\"overlay\");"
+    muts = {
+        "overlay-bytes": ("overlay changed: privacy-list.txt", py(
+            HEAD + "p=os.path.join(ov,\"privacy-list.txt\");b=open(p,\"rb\").read();open(p,\"wb\").write(b[::-1]);"
+            "os.utime(p,ns=(10**18,10**18))")),
+        "overlay-touch": ("overlay changed: harness.yaml", py(
+            HEAD + "p=os.path.join(ov,\"harness.yaml\");os.utime(p,ns=(10**18+10**9,10**18+10**9))")),
+        "overlay-new-file": ("overlay changed", py(HEAD + "open(os.path.join(ov,\"extra\"),\"w\").close()")),
+        "rewrite": ("second install not idempotent: plugins/claude/", py(
+            "import os;p=os.path.join(os.environ[\"HOME\"],\"bridlework\",\"plugins\",\"claude\",\".claude-plugin\",\"plugin.json\");"
+            "b=open(p,\"rb\").read();open(p,\"wb\").write(b);s=os.stat(p);os.utime(p,ns=(s.st_atime_ns,s.st_mtime_ns+10**9))")),
+    }
+    for name, (reason, wrap) in muts.items():
+        i = "twice-planted-" + name
+        e = plant_env("tp-" + name)
+        sc = scripts_copy("tp-" + name, wrapper=wrap)
+        rs = twice(e, "snap", script=sc)
+        r2 = twice(e, "second", script=sc)
+        r3 = twice(e, "check", script=sc)
+        t = out(rs) + out(r2) + out(r3)
+        check(i, rs.returncode == 0 and r2.returncode == 0 and r3.returncode != 0 and reason in out(r3)
+              and "install-twice: ok" not in t, "rc=%d/%d/%d want %r\n%s" % (rs.returncode, r2.returncode, r3.returncode, reason, t[-800:]))
+        shutil.rmtree(e["HOME"], ignore_errors=True)
+
+    # old installer: the base-rev refusal put back by a text edit (anchor kept by the change)
+    anchor = '    die("prefix must be an absolute path")\n'
+    old = anchor + 'if os.path.lexists(prefix) and (not os.path.isdir(prefix) or os.listdir(prefix)):\n    die("prefix exists and is not empty")\n'
+    e = plant_env("tp-old")
+    sc = scripts_copy("tp-old", edit=(anchor, old))
+    twice(e, "snap", script=sc)
+    r = twice(e, "second", script=sc)
+    t = out(r)
+    check("twice-planted-old-installer", r.returncode == 1 and "prefix exists and is not empty" in t and "install-twice: ok" not in t,
+          "rc=%d\n%s" % (r.returncode, t[-800:]))
+    shutil.rmtree(e["HOME"], ignore_errors=True)
+
+    # tampered prefix: the real installer refuses and writes nothing
+    e = plant_env("tp-tamper")
+    twice(e, "snap")
+    tf = os.path.join(e["HOME"], "bridlework", "plugins", "claude", ".claude-plugin", "plugin.json")
+    n0 = os.path.getsize(tf)
+    with open(tf, "ab") as fh:
+        fh.write(b"\n")
+    r = twice(e, "second")
+    t = out(r)
+    check("twice-planted-tampered-prefix", r.returncode == 1 and "prefix holds a different install" in t and os.path.getsize(tf) == n0 + 1
+          and "install-twice: ok" not in t, "rc=%d size=%d want %d\n%s" % (r.returncode, os.path.getsize(tf), n0 + 1, t[-800:]))
+    shutil.rmtree(e["HOME"], ignore_errors=True)
+
+    # a stray HARNESS_ variable at seed
+    e = toolchain_env("tp-stray")
+    e["HARNESS_PRIVACY" + "_OLD_LIST"] = os.path.join(S, "nowhere")
+    r = twice(e, "seed")
+    check("twice-planted-stray-var", r.returncode == 1 and "not fresh" in out(r), "rc=%d\n%s" % (r.returncode, out(r)[-400:]))
+
+
+if ARM not in ARMS:
+    sys.stderr.write("clean-install-smoke: usage: ci/clean-install-smoke.sh <static|fresh|container|planted|twice|all>\n")
+    sys.exit(2)
+rc = 0
+try:
+    if ARM in ("static", "all"):
+        arm_static()
+    if ARM != "static":
+        setup()
+    if ARM in ("fresh", "all"):
+        arm_fresh()
+    if ARM in ("container", "all"):
+        arm_container()
+    if ARM in ("planted", "all"):
+        arm_planted()
+    if ARM in ("twice", "all"):
+        arm_twice()
+except Setup as e:
+    sys.stderr.write("clean-install-smoke: setup error: %s\n" % e)
+    rc = 2
+finally:
+    if S:
+        shutil.rmtree(S, ignore_errors=True)
+if rc == 0:
+    print("%d ok, %d failed" % (oks, fails))
+    rc = 0 if fails == 0 else 1
+sys.exit(rc)
+PY

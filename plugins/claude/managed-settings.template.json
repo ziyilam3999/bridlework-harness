@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "mcp__github",
+      "mcp__playwright",
+      "mcp__puppeteer",
+      "mcp__computer"
+    ]
+  }
+}

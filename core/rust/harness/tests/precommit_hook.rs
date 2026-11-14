@@ -854,3 +854,91 @@ fn ac16_comment_looking_lines_are_judged_raw() {
     // clean twin: an ordinary comment line commits
     s.assert_msg_commits("change\n\n# an ordinary note", true, "ordinary comment line");
 }
+
+// ---- AC 17: private working folder path ----
+
+impl Scratch {
+    /// Stage a file the way a forced add does: past any ignore rule.
+    fn stage_force(&self, rel: &str, content: &str) {
+        self.write(rel, format!("{}\n", content).as_bytes());
+        assert_eq!(self.git(&["add", "-f", rel]).0, 0);
+    }
+}
+
+/// A scratch repo with a stub engine that always passes, so only the path check can refuse.
+fn path_repo(name: &str, root: bool) -> Scratch {
+    let s = scratch(name);
+    s.install_stub_engine(0);
+    s.write(".gitignore", b".ai-workspace/\n");
+    if !root {
+        s.seed("seed.txt", CLEAN);
+    }
+    s.enable_hook();
+    s
+}
+
+#[test]
+fn ac17a_force_added_ai_workspace_file_refused() {
+    let s = path_repo("m17a", false);
+    s.stage_force(".ai-workspace/reviews/x-close.md", CLEAN);
+    let t = s.assert_refused("force-added private file");
+    assert!(t.contains(".ai-workspace/reviews/x-close.md"), "path not named: {}", t);
+}
+
+#[test]
+fn ac17b_clean_twin_commits() {
+    let s = path_repo("m17b", false);
+    s.stage_force(".ai-workspace/reviews/x-close.md", CLEAN);
+    assert_eq!(s.git(&["restore", "--staged", "--", ".ai-workspace/reviews/x-close.md"]).0, 0);
+    s.stage("g.txt", CLEAN);
+    s.assert_commits("clean twin");
+}
+
+#[test]
+fn ac17c_nested_ai_workspace_refused() {
+    let s = path_repo("m17c", false);
+    s.stage_force("sub/.ai-workspace/n.md", CLEAN);
+    let t = s.assert_refused("nested private folder");
+    assert!(t.contains("sub/.ai-workspace/n.md"), "path not named: {}", t);
+}
+
+#[test]
+fn ac17d_removal_of_tracked_ai_workspace_file_commits() {
+    let s = scratch("m17d");
+    s.install_stub_engine(0);
+    s.seed(".ai-workspace/old.md", CLEAN);
+    s.enable_hook();
+    assert_eq!(s.git(&["rm", "-q", "--", ".ai-workspace/old.md"]).0, 0);
+    s.assert_commits("removal of a tracked private file");
+}
+
+#[test]
+fn ac17e_root_commit_refused() {
+    let s = path_repo("m17e", true);
+    s.stage_force(".ai-workspace/r.md", CLEAN);
+    let t = s.assert_refused("root commit with private file");
+    assert!(t.contains(".ai-workspace/r.md"), "path not named: {}", t);
+    assert_eq!(s.git(&["rm", "-q", "--cached", "--", ".ai-workspace/r.md"]).0, 0);
+    s.stage("f.txt", CLEAN);
+    s.assert_commits("root commit, clean twin");
+}
+
+#[test]
+fn ac17f_lookalike_names_commit() {
+    let s = path_repo("m17f", false);
+    s.stage("ai-workspace/a.md", CLEAN);
+    s.stage(".ai-workspace-notes.md", CLEAN);
+    s.stage("docs/x.ai-workspace", CLEAN);
+    s.assert_commits("look-alike names");
+}
+
+#[test]
+fn ac17g_path_refused_even_with_engine_missing() {
+    let s = scratch("m17g");
+    s.write(".gitignore", b".ai-workspace/\n");
+    s.seed("seed.txt", CLEAN);
+    s.enable_hook();
+    s.stage_force(".ai-workspace/x.md", CLEAN);
+    let t = s.assert_refused("private file, no engine");
+    assert!(t.contains(".ai-workspace/x.md"), "path message missing: {}", t);
+}

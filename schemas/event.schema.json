@@ -216,6 +216,53 @@
         "target": { "enum": ["config", "permission", "control_registry"], "description": "The class of write refused." },
         "path": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Relative path of the target file under the harness root, never its content." }
       }
+    },
+    {
+      "title": "human_origin_accepted",
+      "description": "A config, permission or control-registry write carried a valid human-origin approval and was accepted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "target", "path"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "human_origin_accepted" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "target": { "enum": ["config", "permission", "control_registry"], "description": "The class of write accepted." },
+        "path": { "type": "string", "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$", "not": { "anyOf": [ { "pattern": "(^|/)\\.\\.(/|$)" }, { "pattern": "(^|/)\\.(/|$)" } ] }, "description": "Relative path of the target file under the harness root, never its content." }
+      }
+    },
+    {
+      "title": "question_class",
+      "description": "One operator question, classified: its size and risk class and the rule that decided it (docs/question-class.md). Only size=L AND risk=high consults the T3 advisor; the event never names a model brand.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "size", "risk", "rule_hit"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "question_class" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "size": { "enum": ["S", "M", "L", "unclassified"], "description": "The question's size class: a plan-change or section-7 question is L, no ticket named is S, else the named ticket's size; unclassified on a status request or a fail-closed row." },
+        "risk": { "enum": ["low", "high", "unclassified"], "description": "The question's risk class: high on a section-7 decision or a named risk signal, else low; unclassified on a status request or a fail-closed row." },
+        "rule_hit": { "enum": ["status", "advisor", "t2_only", "fail_closed"], "description": "The rule that decided it: a status request, the L-and-high advisor rule, everything else, or a missing/unknown fact (which never reaches the advisor)." }
+      }
+    },
+    {
+      "title": "gate_fail",
+      "description": "A ticket gate check FAILED. The cause is the gate id and the failure class (the halves of the caps' signature), never the message, a line or a head. Nothing writes it yet; the gate runner's writer is a later ticket.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "ts_ms", "ticket", "repo", "gate_id", "failure_class", "head_sha", "result"],
+      "properties": {
+        "v": { "const": 2, "description": "Schema version. A reader refuses any other value (a v1 line is never upgraded)." },
+        "kind": { "const": "gate_fail" },
+        "ts_ms": { "type": "integer", "minimum": 0, "description": "Milliseconds since the epoch, caller-supplied." },
+        "ticket": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "repo": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] } },
+        "gate_id": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The failing gate's id — one half of the cause, per the caps' signature." },
+        "failure_class": { "type": "string", "pattern": "^[a-z0-9._-]+$", "not": { "enum": [".", ".."] }, "description": "The failure class — the other half of the cause, per the caps' signature; never the message." },
+        "head_sha": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$", "description": "The head the gate judged (a git sha, 40 or 64 lowercase hex)." },
+        "result": { "enum": ["fail"], "description": "The event exists only for a FAIL; anything else is refused." }
+      }
     }
   ]
 }

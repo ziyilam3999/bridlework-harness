@@ -14,7 +14,7 @@ pub fn percent(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 0 {
+        if b[i] == b'%' && i + 2 < b.len() {
             if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
                 out.push(h * 16 + l);
                 i += 3;
@@ -43,12 +43,12 @@ pub fn escapes(s: &str) -> String {
                 out.push(n);
                 i += 2;
             }
-            'x' if i + 3 < c.len() + 0 && c[i + 2].is_ascii_hexdigit() && c[i + 3].is_ascii_hexdigit() => {
+            'x' if i + 3 < c.len() && c[i + 2].is_ascii_hexdigit() && c[i + 3].is_ascii_hexdigit() => {
                 let v = c[i + 2].to_digit(16).unwrap() * 16 + c[i + 3].to_digit(16).unwrap();
                 out.push(char::from_u32(v).unwrap_or('?'));
                 i += 4;
             }
-            'u' if i + 5 < c.len() + 0 && c[i + 2..i + 6].iter().all(|d| d.is_ascii_hexdigit()) => {
+            'u' if i + 5 < c.len() && c[i + 2..i + 6].iter().all(|d| d.is_ascii_hexdigit()) => {
                 let mut v = 0;
                 for d in &c[i + 2..i + 6] {
                     v = v * 16 + d.to_digit(16).unwrap();
@@ -56,7 +56,7 @@ pub fn escapes(s: &str) -> String {
                 out.push(char::from_u32(v).unwrap_or('?'));
                 i += 6;
             }
-            '0'..='3' if i + 3 < c.len() + 0 && c[i + 2].is_digit(8) && c[i + 3].is_digit(8) => {
+            '0'..='3' if i + 3 < c.len() && c[i + 2].is_digit(8) && c[i + 3].is_digit(8) => {
                 let v = n.to_digit(8).unwrap() * 64 + c[i + 2].to_digit(8).unwrap() * 8 + c[i + 3].to_digit(8).unwrap();
                 out.push(char::from_u32(v).unwrap_or('?'));
                 i += 4;

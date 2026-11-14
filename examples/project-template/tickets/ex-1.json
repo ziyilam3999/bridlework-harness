@@ -1,0 +1,1 @@
+{"id":"ex-1","repo_id":"example","title":"Say hello","group":"examples","size":"S","objective":"Make the greeting say hello.","acceptance_criteria":["checks/hello.sh passes"],"dependencies":[],"risk":"normal","owner_role":"execution_verification","evidence_links":["checks/hello.sh"]}

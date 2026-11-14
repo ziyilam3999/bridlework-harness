@@ -24,11 +24,19 @@ One operation per line, compact, fixed key order, every key present. Each line c
 | `add` (path class) | `v, op, ticket, id, class, path, ts_ms` | `class` is `worktree`, `temp_dir`, `log` or `evidence`. `path` is absolute and stored resolved; it must resolve inside one of the ticket's roots (symlinks and `..` resolved first). It may not exist yet; then its parent must resolve inside a root. |
 | `add` (process) | `v, op, ticket, id, class, pid, pid_start_ms, ts_ms` | `class` = `process`. `pid` is an integer > 1 (0, 1 and negatives are refused: signalling them would hit a group or init). `pid_start_ms` is the process's OS start time in ms since the epoch, read by the writer (on Linux from `/proc`; otherwise the system `ps`); a pid whose start time cannot be read is refused. It lets a later reader tell a reused pid from the recorded one. Off Linux the value comes from `ps` elapsed time at whole-second precision and jitters between reads (about a second), so a caller comparing start times needs a tolerance of at least 2000 ms. |
 | `add` (port) | `v, op, ticket, id, class, port, ts_ms` | `class` = `port`. `port` is an integer in 1..65535. |
+| `session` | `v, op, ticket, id, session_id, ts_ms` | Library-only (#3706): `harness manifest add` cannot write it; only `process start --worker` does, right after the process (and limit) line. `session_id` is a lowercase uuid (8-4-4-4-12) the supervisor minted. Valid only for an id that is a LIVE `process` entry with no session yet; a `remove` of the id closes it. A reader that does not know the `session` op refuses the manifest (strict reader). |
 | `remove` | `v, op, ticket, id, ts_ms` | `id` must be a live entry when the line is written. |
 
 `ticket` and `id` are plain tokens (lowercase letters, digits, `-`, `_`, `.`; not empty, not `.` or `..` — the event log's token rule). No other key is allowed, no key may appear twice, and strings carry no escape sequences: a path may legally contain a space, but a path holding `"` or `\` or a control character is refused.
 
 **Current state** = the roots plus every `add` whose `id` has no later `remove`. "Manifest empty" means no live entries; roots do not count.
+
+**Evidence id convention (#209).** The process supervisor signs out every started program's captures as
+three `evidence` entries per start, ids `<id>.<ts_ms>.stdout`, `<id>.<ts_ms>.stderr` and
+`<id>.<ts_ms>.exit`, whose paths are `<root>/evidence/proc/<id>.<ts_ms>/{stdout,stderr,exit}` — written
+AHEAD of the spawn, so the files are never unlisted orphans. They stay live after a `stop` (evidence
+outlives the process); the run stamp lets the same `--id` start again without colliding. The reader
+verbs are `harness evidence show|check` ([evidence reading](evidence.md)); retention is P1B-14.
 
 ## The fence
 

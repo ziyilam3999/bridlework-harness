@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE, placeholders only (ticket 3601, A5). The operator copies this to ~/Library/LaunchAgents/ and fills the
+  <PLACEHOLDER> values in the private copy; agents never run launchctl. Weekly, Monday 06:00 local time.
+  The week argument is computed by the tiny wrapper script named below (the loop itself runs no wall clock):
+  a one-line wrapper that execs friction-loop.sh with the week from date +%G-w%V and the private env file.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bridlework.friction-weekly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>PLACEHOLDER-wrapper-script-path</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>PLACEHOLDER-log-folder/friction-weekly.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>PLACEHOLDER-log-folder/friction-weekly.err.log</string>
+</dict>
+</plist>

@@ -67,3 +67,177 @@ Any non-zero exit means "no usable workspace". Before step 6 nothing is written 
 ## Events
 
 None. No P1b event kind names workspace creation, and the manifest file is the durable record.
+
+## Clean-state check (P1B-11)
+
+Before a ticket is marked Done, its workspace must hold only what belongs there, so a stray edit cannot ride
+into Done unnoticed. `harness workspace check` is that look, and it is READ-ONLY: it never writes, deletes,
+moves or locks anything in the repo or the manifest (it reads the manifest through the existing reader only),
+and every git call runs under `--no-optional-locks` with fsmonitor forced off, so not even the index's stat
+cache is refreshed. Its one write anywhere is a single private throwaway index file in the system temp folder
+(never inside any repo, holding nothing but paths git itself derived from HEAD) that the content compare
+below builds and removes before the command returns; git reaches it through `GIT_INDEX_FILE`, so the only
+lock ever taken is `<temp file>.lock` beside it — never the repo's own `index.lock`, whatever `TMPDIR` is set
+to. A check killed by SIGKILL cannot run that removal and leaves one such temp file behind (harmless: it is
+in the temp folder, not in any repo, and holds nothing but paths git itself derived from HEAD). P1B-15 wires it into `harness ticket finalize`; this command only answers the question.
+
+```
+harness workspace check <ticket> --manifest-dir <absolute-dir>
+```
+
+The same explicit-arguments rule as `workspace create`: no default folder, no config file, no current-folder
+lookup. The ticket must be a plain token (refused, never rewritten). The worktree is found ONLY as the live
+manifest entry id `worktree` (class `worktree`) — never by name, never from the current folder.
+
+**Expected** is: (a) everything committed on the branch `ws/<ticket>` (the content of the ticket's own commits
+is the gate's business, not this check's); and (b) a live manifest path entry lying strictly inside the
+worktree that is still what the manifest says it is — today that is the `node_modules` link, so "still what
+the manifest says" means a no-follow stat finds a symlink at that exact stored path. The exemption is for that
+one path itself, never for anything under it, and never anything matched after following a link. The stored
+text is compared to the worktree path directly; the `node_modules` path is never canonicalized (that would
+follow the link out of the worktree).
+
+**Stray** is everything else, one line per path:
+
+- `modified` — a modified, deleted, renamed, type-changed or staged tracked path (a rename names BOTH its
+  old and new paths);
+- `untracked` — an untracked path (every file named individually via `--untracked-files=all`, not just the folder),
+  including entries git never lists at all — a FIFO, a unix socket, a device file — which a no-follow walk of the
+  tree names (`stray untracked`); a path that is an unmerged conflict WITHOUT an operation in progress (for example
+  a conflicted `git stash pop`) is labelled `hidden` (the `ls-files -v` `M` tag), and the exit is still 2;
+- `ignored` — an ignored path: ignore rules do not hide files here, so a `.gitignore` or `info/exclude` edit cannot
+  sneak a file past the check (a wholly ignored folder is named by the folder itself);
+- `hidden` — a tracked path whose `git ls-files -v` tag is anything but a plain `H`: the assume-unchanged bit,
+  the skip-worktree bit, both at once (git folds them into one lowercase `s` tag), or any unknown or future
+  tag — fail closed (invisible to `git status`, so it gets its own `git ls-files -v` read; the bit alone is
+  stray, whether or not the file was also edited);
+- `submodule` — a submodule with any change, named by the submodule path. The status read never spawns git's
+  own submodule probe (that probe would run the submodule's own `git status`, which honours the submodule's own
+  config and index bits, so a submodule-local filter could execute): it compares submodule commit pointers only
+  (`--ignore-submodules=dirty`), and every checked-out submodule gets the same forced status
+  (`--untracked-files=all --ignored=matching`), the same `ls-files -v` hidden read, the same refusal scan and
+  the same content read INSIDE it, recursively into
+  nested submodules, all with the same neutral config. The outermost checked-out level that can see the change
+  names it; where the outer probe is blinded by the inner repo's own settings, the check descends and names the
+  inner submodule itself (`stray submodule sub/inner`). A submodule whose folder cannot be inspected (no git dir,
+  a failing git call, a cap hit) is exit 3 naming the submodule — never a pass;
+- `missing` — a live manifest path entry inside the worktree that no longer exists or is no longer the recorded
+  kind (for example the `node_modules` link removed, or replaced by a real directory).
+
+No repo-controlled setting or index flag is trusted when deciding clean. Every git call (in the worktree and
+inside every checked-out submodule) forces `--no-optional-locks` and `--no-replace-objects` (a `git replace` of
+HEAD cannot swap what the tree looks like), and forces on the command line — which outranks system, global, repo
+and worktree config alike: no hooks, `core.fsmonitor=false`, `core.trustctime=true`, `core.checkStat=default`,
+`core.filemode=true`, `core.untrackedCache=false`, `core.sparseCheckout=false`, `core.ignorecase=false` (a repo
+`core.ignorecase=true` cannot fold two spellings of one name into one path: a case twin or a case-only rename
+still reads as an untracked path), and `core.symlinks=true` (a repo `core.symlinks=false` cannot make a tracked
+symlink replaced by a regular file holding the link text read clean). The status read additionally
+forces `--untracked-files=all` and `--ignore-submodules=dirty` (a repo config `status.showUntrackedFiles=no`
+loses to the flag), and ignored paths are listed (`--ignored=matching`). "Modified" is decided by CONTENT, not
+by the stat cache: on top of the status read, every repo checked (the worktree and each checked-out submodule)
+gets a second tracked-file read against a throwaway index rebuilt from HEAD that carries no stat information at
+all, so git must hash every tracked file and compare bytes — a same-size edit whose mtime and ctime were forged
+back into the index-write second cannot read clean. The `core.trustctime` / `core.checkStat` forced values are
+kept as defence in depth on top of that content compare. Every inherited `GIT_*` environment
+name is stripped before each call, so a caller's `GIT_DIR`, `GIT_CONFIG_COUNT` or `GIT_CONFIG_GLOBAL` can neither
+redirect nor reconfigure the check. User-level config is not the repo's doing and never changes what the check
+sees, so it is neither read nor refused: every git call runs with the system config switched off
+(`GIT_CONFIG_NOSYSTEM=1`), the global config pointed at the null device (`GIT_CONFIG_GLOBAL`, which also covers
+the XDG config path), and the user attributes file forced to the null device (`core.attributesFile`, which also
+covers the XDG default attributes file). A filter in the user's own global config — the standard git-lfs
+install writes its `filter.lfs.*` block there — therefore does not make the check refuse, and no command it
+names can ever run on the checked tree: a configured filter only runs when a path's attributes name it, and
+every repo-scope route that could name one is refused below.
+
+Where even that cannot prove the answer, the check REFUSES (exit 3, never a pass): an `info/attributes` file in
+the worktree's git dir or common git dir (or in any checked-out submodule's), or any `filter.*` or
+`core.attributesFile` config key set in the repo or worktree scope (a key that comes from system or global
+scope is simply not seen, because those files are never read; a `core.attributesFile` key that reaches
+effect only through the repo's `include.path` is not refused — the scope-limited refusal read skips
+includes — but neutralised instead: the forced `core.attributesFile` at the null device outranks it, so the
+included file is never read; the same neutralised reading means a tracked file whose `$Id$` marker was
+expanded only through such a route reads as MODIFIED — a stray report, never a hidden edit) — a clean/smudge/process filter is both a hide
+and an arbitrary command a "read-only" check must never execute; only the key name is printed, never its
+value — or a `core.worktree` that redirects anywhere but the tree being checked. When one
+path carries two kinds, the stronger wins (order, weakest first: `untracked`, `ignored`, `modified`, `hidden`,
+`submodule`, `missing`).
+
+**Output** (stdout only, fixed fields; paths are worktree-relative — no folder is ever printed in either
+spelling, and no file content is ever printed):
+
+- clean: exactly one line `workspace=clean ticket=<ticket>`;
+- stray: one line `stray <kind> <relative-path>` per path, sorted by raw path bytes, then one line
+  `workspace=stray ticket=<ticket> count=<n>`.
+
+A path is escaped so it is always one line: printable ASCII passes through (backslash doubled), and every other
+byte — control characters, space, DEL, any non-UTF-8 byte — prints as `\xNN`. No byte sequence can panic it.
+
+**Exit codes** (any non-zero means "not proven clean", fail closed):
+
+- `0` — clean;
+- `2` — at least one stray path;
+- `3` — cannot check: usage errors, a missing/torn/corrupt manifest, no live `worktree` entry, a worktree path
+  that is missing, is a symlink (no-follow stat) or is not a directory, a folder that is not that worktree's own
+  top level, a HEAD that is detached or not `refs/heads/ws/<ticket>`, an in-progress merge/rebase/cherry-pick,
+  an `info/attributes` file or a `filter.*` / `core.attributesFile` config key (repo or worktree scope; keys
+  from system or global scope are never read; a `core.attributesFile` key pulled in through the repo's
+  `include.path` is neutralised by the forced `-c`, not refused), a redirecting `core.worktree`, a submodule that cannot be
+  inspected, a failed git call, or a size cap.
+
+**Size caps**: any git output read is capped at 8 MiB and stray entries at 10,000; the submodule pass caps
+inspected submodules at 100 and nesting depth at 8; the tree walk caps visited entries at 200,000. Hitting any
+is exit 3 with `too many paths` (or a naming refusal), never a truncated PASS and never an unbounded read.
+
+**Symlinks**: a symlink anywhere inside the worktree is judged as a path of its own (by git, by no-follow stat,
+by the walk) and never followed, so files outside the worktree are never listed or looked at. A symlinked
+worktree path itself is exit 3. The walk skips only the worktree's own `.git` and the `.git` of each
+checked-out submodule (a gitlink dir whose `.git` is a symlink is not checked out but refused — exit 3 naming
+the submodule); any other entry named `.git`, at any depth, is `stray untracked <path>` in its own right and is
+never descended into.
+
+**Git version**: the check uses `git status --porcelain=v2 -z --ignored=matching` and
+`git rev-parse --absolute-git-dir`; it assumes git 2.32 or newer (the same floor `--path-format=absolute`
+implies, plus `--ignored=matching`).
+
+**Known limits accepted with #184** (each measured equivalent to a guard that already fires, or git's own
+semantics, none with a measured hide):
+
+- R: `core.trustctime` / `core.checkStat` levers — after the content compare they are EQUIVALENT mutants (the
+  content compare alone catches the shape); the forced values are kept as defence in depth;
+- S: `core.untrackedCache` — no measured way for plain git to hide a file through the cache under
+  `--no-optional-locks` (the check never writes the cache; the existing test is a smoke, not a guard);
+- T: `core.hooksPath` — a status read runs no hooks, so the lever is equivalent;
+- U: a `u` (unmerged) entry whose operation is not in progress is also named `hidden` by its `ls-files -v` `M`
+  tag — near-equivalent, the same path is named either way;
+- V: an unmerged path without an operation in progress is labelled `hidden` (documented above); the exit is
+  still 2, never a pass;
+- W: the walk's 200,000-visit cap counts tracked files too, so a 200k-entry tree is exit 3 (fail closed); the
+  finalize caller must treat 3 as "not proven" anyway;
+- X: a committed `ident` / `eol` attribute can hide bytes inside a `$Id: ... $` marker — git's own semantics:
+  those bytes can never be committed differently, so there is nothing to hide from a commit;
+- Y: ticket 155's closed plan lacks its own deferred-follow-ups row; this list is that record.
+- sibling: `core.precomposeUnicode` is not forced (a fold only merges two spellings the filesystem itself
+  already treats as one file; no measured hide).
+
+Ignored build output inside the tree (for example `target/`) fails the check on purpose: clean it before
+finalize or list it on the manifest, as described in the P1B-11 plan. Unpushed commits (P1B-12) are covered by the separate mode `harness workspace check <ticket> --manifest-dir <dir> --pushed --repo <absolute-dir>`: exit 0 pushed (one `workspace=pushed` line), exit 4 unpushed (one `unpushed <sha> ws/<t>` line per commit plus a `workspace=unpushed ... count=<n>` line), exit 3 cannot check — a missing upstream fails closed, never a pass; the answer reads the LOCAL remote-tracking ref only (no network), so fetch first — but a fetch rule that excludes the branch (a negative refspec) never refreshes the tracking ref, keeping it stale: a stale or forged tracking ref is not detected. Not covered here: moving leftovers to quarantine (P1B-13), anything in the ticket root outside `tree` (the quarantine sweep's ground). No new event kind; P1B-15 records the
+finalize result.
+
+## Teardown (P1B-14)
+
+`harness workspace teardown <ticket> --manifest-dir <abs> --repo-dir <abs> --log <abs> --repo <token> [--grace-ms <n>] [--ts-ms <n>]` walks the ticket's manifest and clears it, in order, using only the existing tools. `--repo-dir` is the ticket repo's main work tree. All options are explicit.
+
+Refused first (exit 2, nothing changed, no event): a ticket or `--repo` that is not a token, a non-absolute or missing `--manifest-dir`/`--repo-dir`, a `--repo-dir` that is a linked work tree, a missing, torn or corrupt manifest, a `--log` that lies inside a manifest root.
+
+1. **Step 4, processes and ports.** Each live `process` entry is stopped by the child verb `harness process stop` (exit 0 or 3 settles it; 2 or 4 is a failure, entry kept). Every process is attempted. A `port` entry still listed afterwards is released only if the same 127.0.0.1 snapshot bind `process start` uses finds it free.
+2. **Step 5, transient files.** Each `temp_dir` entry, in reverse add order, is deleted by the child verb `harness quarantine delete-listed` (one id per call; exit 2 or 3 is a failure). `evidence` entries are released from the manifest; the files and run dirs are kept, and `harness evidence show|check` still read them.
+3. **Step 7, worktree.** `git worktree remove` without `--force`: a tree with uncommitted or untracked work is refused and left intact. An already-absent tree that git no longer lists just gets its manifest `remove`. The branch `ws/<ticket>` stays.
+4. **Step 8, record.** The manifest is re-read and ONE `cleanup_result` (`ticket`, `repo`, `result`, `manifest_left`) is appended. `pass` only when nothing failed and the manifest is empty.
+
+Gates: any step-4 failure skips steps 5 and 7; a step-5 `temp_dir` failure skips step 7. Both go straight to step 8 with `result=fail`.
+
+Exit codes: `0` pass, recorded; `1` fail, recorded; `2` refused at the start, or the event could not be written (the teardown ran but is unrecorded; a re-run is idempotent and records). stdout on 0 and 1 is one line `teardown=<pass|fail> ticket=<t> manifest_left=<n>`. No folder is printed. A re-run on an empty manifest records a fresh `pass`.
+
+Retained: evidence files, the ticket root (it holds the evidence), the branch. A `log` entry has no delete path and stays listed, so it forces `fail`; stderr names how many are left.
+
+Honest limits: teardown does not hold the supervisor lock across steps (the child `process stop` takes it), so a `process start` racing teardown is only caught by the step-8 re-read (`result=fail`), not prevented — P1B-15's finalize owns serialising a ticket. The port release is a snapshot bind. A stop escapee (a child that left the group) is the P2 orphan reaper's.
