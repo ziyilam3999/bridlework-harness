@@ -52,6 +52,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[test]
+fn ticket_usage_lists_the_gate_log_flag() {
+    let out = Command::new(BIN).arg("ticket").stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("[--log <absolute-path>] | ticket finalize"), "stderr: {err}");
+}
+
 fn gate_json(id: &str, program: &str, both_ends: bool) -> String {
     format!("{{\"id\":\"{id}\",\"program\":\"{program}\",\"args\":[],\"timeout_ms\":20000,\"max_output_bytes\":4096,\"both_ends\":{both_ends}}}")
 }
