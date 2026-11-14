@@ -128,6 +128,11 @@ runs, so a refusal can never echo an unscanned byte of it. `--source` accepts on
 a row refusal naming the field); the flag exists so the T-9.3 mapper's rows are fileable exactly as the
 weekly sweep will file them.
 
+**Recording a repeat.** A friction that happened again is filed as a new row with `--breaks <id of the first row>`;
+`harness friction rank` groups rows by that `breaks` chain, so the repeat counts toward the first row's group.
+`--repeats` is for rows of `kind: pattern` only (a pattern chain, counted by `harness friction patterns`): a row
+carrying `repeats` that is not `kind: pattern` is refused.
+
 A missing required field flag (`--where-it-lives` absent) is a row refusal (1) naming the field, not a usage
 error: K-1.1 counts "no tag" as refused. With no privacy list configured the verb fails closed (exit 2) — an
 unscanned row is never stored, and a usage error never echoes the raw flag or argument bytes either: it names
