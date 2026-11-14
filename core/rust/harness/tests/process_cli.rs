@@ -513,7 +513,10 @@ fn low_port_names_the_bind_error_kind() {
 ///     reach of every group signal, so only the WAITER's direct kill of its child pid ends it. The
 ///     refusal is engineered to land only AFTER the escape is provable: the lock taken at the write-ahead
 ///     is HELD while the child escapes, then the duplicate live id is injected and the process-line
-///     append is refused with the rollback running against an already-escaped child.
+///     append is refused with the rollback running against an already-escaped child. Once the lock is
+///     held the test re-reads the manifest: a process line of the id already there means the start
+///     committed before the lock was taken, so the lock is released, the start is stopped, the child
+///     pid from the pid file is killed directly, and the attempt is repeated on a fresh ticket.
 #[test]
 fn refused_start_rollback_leaves_nothing_running() {
     // (A) empty PATH after the spawn: every helper goes by absolute path, so the start succeeds — PATH
@@ -699,6 +702,24 @@ fn refused_start_rollback_leaves_nothing_running() {
                 panic!("an unexpected early refusal: stdout {:?} stderr {:?}", out(&o), err(&o));
             }
         };
+        // With the lock held no writer can append, so the file read now is final until the release: a
+        // process line of the id already there means the start committed before the lock was taken.
+        if fs::read_to_string(&file).unwrap().lines().any(|l| l.contains("\"id\":\"b-1\",\"class\":\"process\"")) {
+            drop(lock);
+            let _ = rx.recv();
+            let _ = run(&["process", "stop", &ticket, "--id", "b-1", "--dir", d.to_str().unwrap()]);
+            if poll(10_000, || read_pid(&pid_file).is_some()) {
+                let pid = read_pid(&pid_file).unwrap();
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(pid.to_string())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            continue;
+        }
         assert!(poll(10_000, || read_pid(&pid_file).is_some()), "the program never started");
         let pid = read_pid(&pid_file).unwrap();
         guard.add(pid);
