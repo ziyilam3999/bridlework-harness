@@ -362,7 +362,7 @@ fn config_cmd(a: &[String]) -> i32 {
     0
 }
 
-const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>] | session sign-off-check --ticket <t> --role <gov|e-rvw> --session <id> --claim <verdict|done> [--records <file>] [--manifest-dir <dir>] [--log <path>] [--root <dir>] | session done-check --host <abs-path> --config <file> --done <ticket-id> [--done <ticket-id> ...] | session close --host <abs-path> --config <file> --ticket <ticket-id>";
+const SESSION_USAGE: &str = "usage: harness session check-name <name> [--config <file>] [--new] | session record-start --session-id <uuid> --log <absolute-path> [--root <dir>] [--ts-ms <n>] | session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--start-timeout-ms <n>] | session launches [--records <file>] | session sign-off-check --ticket <t> --role <gov|e-rvw> --session <id> --claim <verdict|done> [--records <file>] [--manifest-dir <dir>] [--log <path>] [--root <dir>] | session done-check --host <abs-path> --config <file> --done <ticket-id> [--done <ticket-id> ...] | session close --host <abs-path> --config <file> --ticket <ticket-id> | session tokens --transcript <file>";
 
 /// `harness session check-name <name> [--config <file>] [--new]` (S-1.6.2, P1B-16). Exit 0 the name
 /// is allowed (one stdout line: `ok kind=<k> role=<r> lane=<n|-> ticket=<slug|->` for the launcher
@@ -380,6 +380,9 @@ fn session_cmd(a: &[String]) -> i32 {
     };
     if a.first().map(|s| s.as_str()) == Some("record-start") {
         return session_record_start(&a[1..]);
+    }
+    if a.first().map(|s| s.as_str()) == Some("tokens") {
+        return crate::session_tokens::tokens_cmd(&a[1..]);
     }
     #[cfg(unix)]
     match a.first().map(|s| s.as_str()) {

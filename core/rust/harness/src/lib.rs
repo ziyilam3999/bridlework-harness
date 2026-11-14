@@ -48,6 +48,7 @@ pub mod scan;
 #[cfg(unix)]
 pub mod session_close;
 pub mod session_name;
+pub mod session_tokens;
 #[cfg(unix)]
 pub mod signoff;
 pub mod status;
