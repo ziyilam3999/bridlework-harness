@@ -1,7 +1,8 @@
 # MCP tool list (v1, read-only)
 
 `mcp/tools.json` is the menu of `harness` commands an AI app may call through MCP. Version 1 is read-only: no tool
-here writes anything. The MCP server that serves this list is not built yet. It comes in P11-09b and P11-09c.
+here writes anything. The server is `mcp/server/` (`harness-mcp`), run as
+`harness-mcp --harness <absolute-path> [--privacy-list <absolute-path>]`.
 
 ## The 7 tools
 
@@ -15,7 +16,30 @@ here writes anything. The MCP server that serves this list is not built yet. It 
 | harness_privacy_scan_text | `privacy scan --text` | **text** (sent on stdin), surface (`^[a-z_.]+$`) |
 | harness_config_check | `config check` | config, repo, budget (`S`, `M` or `L`) |
 
-How each input maps to argv is the server's job (P11-09c). This file fixes only the input names and types.
+## Input to argv
+
+The server maps each input to the `harness` command line in a fixed order (`mcp/server/src/args.rs`):
+
+| tool | inputs in argv order (property: how it is passed) |
+|---|---|
+| harness_version | none |
+| harness_status | `ticket_file`: positional; `repo_map`: `--repo-map <item>` per item; `result_dir`: `--result-dir`; `caps_dir`: `--caps-dir` |
+| harness_ticket_intake | `ticket_file`: positional; `repo_map`: `--repo-map <item>` per item |
+| harness_events_list | `log`: `--log` |
+| harness_evidence_show | `ticket`: positional; `manifest_dir`: `--manifest-dir` |
+| harness_privacy_scan_text | `text`: stdin; `surface`: `--surface` |
+| harness_config_check | `config`: `--config`; `repo`: `--repo`; `budget`: `--budget` |
+
+Rules:
+
+- `text` goes on stdin, never on the command line (at most 1048576 bytes).
+- An argv-bound input that starts with `-` is refused, so no input can pose as a flag.
+- Path inputs and the dir part of each `repo_map` item (`repo_id=absolute-dir`) must be absolute.
+- A refusal is a -32602 `Invalid arguments: ...` answer, and no child is spawned.
+- `--privacy-list` reaches only the evidence and privacy tools, as `HARNESS_PRIVACY_LIST`. Every other `HARNESS_*`
+  variable is removed from the child's environment.
+- Each output stream (stdout, stderr) is capped at 262144 bytes. A longer stream is cut, ends with
+  `[harness-mcp: output truncated at 262144 bytes]`, and `isError` is true. The exit code stays the real one.
 
 ## Output schema
 
@@ -52,4 +76,4 @@ sh ci/mcp-tools-lint.sh --build --self-test   # plant bad rows and check each on
 
 Exit 0 is clean, 1 is at least one refusal (one `<row-name>:<rule>` line per refusal on stderr), 2 is a usage
 error, an unreadable list, or a harness that is missing or will not build. CI runs the lint and the self-test in
-the `rust-test` workflow.
+the `mcp-tools` workflow, which also runs `sh ci/mcp-smoke.sh`.
