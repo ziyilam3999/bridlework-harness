@@ -39,6 +39,11 @@ The short id is the first whitespace token of the last non-empty stdout line of 
 is a JSON array of objects with `id` (short id), `sessionId` (full uuid) and `name`. Both live in one place in
 `launcher.rs` (`parse_short_id` and the `AGENT_KEY_*` constants).
 
+Because the id is taken from the last non-empty stdout line, a host CLI that prints further lines after the
+line carrying the id does not bind: the launcher then reads no short id or an id it cannot map and exits 3
+or 4 (see the exit-code table below). Such a host needs a thin wrapper given as `--host` that passes the
+host's output through and prints the short id alone as the final line.
+
 ## Rows
 
 All rows are one compact JSON line in an append-only file, taken under an exclusive lock; a torn tail refuses the write.
