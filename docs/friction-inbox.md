@@ -111,7 +111,7 @@ if the inbox did not exist yet, it is still not created.
 
 ```
 harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> \
-  --where-it-lives <skill|gate|memory|wiki> [--breaks <lesson-id>] \
+  --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] \
   [--kind <friction|pattern>] [--repeats <row-id>] [--source event] \
   [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] \
   --text <lesson> [--config <file>]
