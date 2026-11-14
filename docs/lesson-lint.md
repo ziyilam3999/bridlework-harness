@@ -41,7 +41,10 @@ inside a code fence is never a heading.
 - `TYPE`: `type` is missing or is not exactly `lesson`.
 - `ID`: `id` is missing, or is not `ISSUE-<digits>`, or the file name does not start with that id followed by `-`.
 - `STATUS`: `status` is missing or is not one of `unvalidated`, `validated`, `retired`.
-- `TIER`: `minimum_proven_tier` is missing or empty.
+- `TIER`: `minimum_proven_tier` is missing, is empty, or is not exactly one of `T1`, `T2`, `T3`, `T4`, `unproven`,
+  `unmeasured` — the six values `docs/fix-tier.md` accepts for this field (the comparison is exact and
+  case-sensitive on the value after the trim of the front matter line, so `t2`, `T0` or a quoted `"T2"` is refused;
+  the detail names the value).
 - `CONTROLS`: `controls` is missing, is not an inline list `[...]` (an empty list, `[]` or `[ ]`, is fine), or holds
   an empty token.
 - `MATCH`: `match` is present but is not an inline list, is an empty list (`[]` or `[ ]`), or holds an empty token (a missing `match` is fine).

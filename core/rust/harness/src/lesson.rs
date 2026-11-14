@@ -2,6 +2,7 @@
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
 
+use crate::fix_tier::{PROVEN_ABSENT, TIERS};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -209,11 +210,18 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
         Some(v @ ("unvalidated" | "validated" | "retired")) => status = Some(v),
         Some(v) => out.push(format!("STATUS status {} is not unvalidated, validated or retired", v)),
     }
-    // TIER
+    // TIER (the six values the G8.3 reader accepts for this field, docs/fix-tier.md)
     match keys.get("minimum_proven_tier") {
         None => out.push("TIER minimum_proven_tier is missing".to_string()),
         Some(&"") => out.push("TIER minimum_proven_tier is empty".to_string()),
-        _ => {}
+        Some(&v) => {
+            if !TIERS.contains(&v) && !PROVEN_ABSENT.contains(&v) {
+                out.push(format!(
+                    "TIER minimum_proven_tier {} is not one of T1, T2, T3, T4, unproven, unmeasured",
+                    v
+                ));
+            }
+        }
     }
     // CONTROLS
     let mut controls: Option<Vec<&str>> = None;
