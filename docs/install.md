@@ -250,6 +250,25 @@ Check the existing work folder with the new engine.
 ```
 Expected: exit 0; `last_gate=pass`
 
+## Build from source on macOS
+
+The project publishes only one prebuilt engine build (see `TRIPLE` above), so on macOS you build the engine yourself. You
+need a Rust toolchain (`cargo`) and `git`. The repo pins its Rust version in `core/rust/rust-toolchain.toml`, so `rustup`
+fetches that version on the first build.
+
+```
+git clone https://github.com/<owner>/bridlework-harness.git
+cd bridlework-harness/core/rust
+cargo build --release --locked
+./target/release/harness
+```
+
+The build writes the binary to `core/rust/target/release/harness`. `--locked` uses the committed `Cargo.lock`. Running the
+binary with no arguments is the check. It prints a line that starts with `usage: harness --version` to stderr and exits 2.
+
+This was checked on an Apple silicon Mac. The release download and checksum steps of this guide do not apply to a source
+build, because there is no release tarball to download or verify. Point `HARNESS_BIN` at the binary you built.
+
 ## Other platforms
 
 Only `x86_64-unknown-linux-gnu` is published. On any other system, build from source (`cargo build --release --locked` in
