@@ -29,6 +29,7 @@ case "$1" in
     for a in "$@"; do printf '%s\0' "$a" >> "$d/argv"; done
     if [ -n "$STUB_BG_EXIT" ]; then exit "$STUB_BG_EXIT"; fi
     if [ -n "$STUB_SLEEP" ]; then exec sleep 60; fi
+    if [ -n "$STUB_BG_OUT" ]; then printf '%s\n' "$STUB_BG_OUT"; exit 0; fi
     echo "started"
     echo "$STUB_SHORT session started"
     ;;
@@ -209,6 +210,45 @@ fn ac2_twin_host_failure_is_failed() {
     assert!(!l.iter().any(|x| x.contains("launch_ids")));
     assert!(l.iter().any(|x| x.contains("\"kind\":\"launch_failed\"") && x.contains("\"stage\":\"start\"")));
     assert!(out(&e.launches(&rec)).contains("state=failed"));
+}
+
+const HEX_ID: &str = "1a2b3c4d";
+
+#[test]
+fn bg_line_multi_line_output_binds_the_hex_id() {
+    let e = Env::new();
+    e.agents(&format!("[{{\"id\":\"{HEX_ID}\",\"sessionId\":\"{}\",\"name\":\"{}\"}}]", e.uuid, session_name("L2")));
+    let rec = e.p("r.jsonl");
+    let b = e.brief(b"x\n");
+    let bg = format!("backgrounded \u{b7} {HEX_ID} \u{b7} {}\n\nuse `agents` to list sessions\nrun stop to end it", session_name("L2"));
+    let o = e.launch(&session_name("L2"), &b, 4, &["--records", rec.to_str().unwrap()], &[("STUB_BG_OUT", &bg)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains(&format!("short_id={HEX_ID} ")), "{}", out(&o));
+    assert!(lines(&rec).iter().any(|x| x.contains(&format!("\"short_id\":\"{HEX_ID}\""))));
+}
+
+#[test]
+fn bg_line_with_bad_id_is_refused_without_stop() {
+    for bad in ["backgrounded \u{b7} nothex12 \u{b7} n", "backgrounded \u{b7} 1A2B3C4D \u{b7} n", "backgrounded \u{b7} 1a2b3c \u{b7} n", "backgrounded"] {
+        let e = Env::new();
+        let rec = e.p("r.jsonl");
+        let b = e.brief(b"x\n");
+        let bg = format!("{bad}\nlast line tok");
+        let o = e.launch(&session_name("L2"), &b, 4, &["--records", rec.to_str().unwrap()], &[("STUB_BG_OUT", &bg)]);
+        assert_eq!(code(&o), 3, "{bad}: {}", err(&o));
+        assert!(!e.p("stub/stop").exists(), "{bad}: no stop call");
+        let l = lines(&rec);
+        assert!(l.iter().any(|x| x.contains("\"kind\":\"launch_failed\"") && x.contains("\"stage\":\"start\"")), "{l:?}");
+        assert!(!l.iter().any(|x| x.contains("launch_ids")));
+    }
+}
+
+#[test]
+fn old_stub_shape_without_bg_line_still_binds() {
+    let e = Env::new();
+    let o = e.ok_launch(&[]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains(&format!("short_id={} ", e.short)), "{}", out(&o));
 }
 
 #[test]
