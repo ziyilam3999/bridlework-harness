@@ -8,7 +8,7 @@
 //! `--log <absolute path>` (optional): a FAIL verdict appends ONE `gate_fail` event to that event log, through the events module's own record
 //! writer. The order is fixed and fails closed: the round and streak records first, THEN the log append, THEN the result file. A failed append
 //! is an error (exit 2, `EVENT NOT RECORDED`, no result file written by this run), never a quiet FAIL: the round stays counted, so the ticket is
-//! never uncounted, and a result file only ever exists for a FAIL that was also logged. A PASS appends nothing.
+//! never uncounted, and this run writes its result file only after its event line was appended (an earlier result file is left as it was). A PASS appends nothing.
 
 use crate::both_ends;
 use crate::events::{self, Field, Kind};

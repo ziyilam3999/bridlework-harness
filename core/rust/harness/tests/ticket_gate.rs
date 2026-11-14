@@ -905,3 +905,18 @@ fn a_failed_append_is_an_error_and_writes_no_result_file_but_keeps_the_round() {
     assert_eq!(read_events(&log).events.len(), 1);
     assert_eq!(fx.result("t-1").status, Status::Fail);
 }
+
+// The logged `gate_id` of a `no-checks` FAIL is the gate's own id, `ticket-gate` (the documented value). Twin: a failing check logs ITS id.
+#[test]
+fn a_no_checks_fail_logs_the_gates_own_id() {
+    use harness::events::Field;
+    let fx = Fx::new();
+    git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+    let log = log_path(&fx);
+    let o = gate_logged(&fx, "t-1", &fx.c0, log.to_str().unwrap());
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    let lr = read_events(&log);
+    assert_eq!(lr.events.len(), 1, "{lr:?}");
+    assert_eq!(lr.events[0].field("gate_id"), Some(&Field::Str("ticket-gate".to_string())));
+    assert_eq!(lr.events[0].field("failure_class"), Some(&Field::Str("no-checks".to_string())));
+}
