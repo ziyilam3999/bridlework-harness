@@ -105,6 +105,32 @@ To load the plugin in Claude Code, start it with `claude --plugin-dir "$PREFIX/p
 there is no marketplace manifest yet). That line is **not run by the guide test**, because Claude Code is interactive. The
 next steps run the hook the way `hooks.json` registers it, so you see what Claude Code would see.
 
+## Load the guard hooks for one session
+
+Load the hooks for one session only. Start Claude Code from the shell where the `HARNESS_` variables are set:
+
+```
+claude --plugin-dir <clone>/plugins/claude
+```
+
+`<clone>` is your clone of the repository. With a release install, use `"$PREFIX/plugins/claude"` instead.
+
+Do **not** register these hooks in the global settings (`~/.claude/settings.json`). The hooks refuse a tool call with exit 2
+when the `HARNESS_` ticket variables are not set or are not valid. With a global registration, every Claude Code session on
+the machine would hit that refusal, ticket or not.
+
+The hooks read these variables. Each is an absolute path, except `HARNESS_REPO_MAP` and `HARNESS_PUBLIC_REPO`.
+
+- `HARNESS_BIN`: the engine. Every hook reads it.
+- `HARNESS_TICKET_FILE`: the ticket file. The path hook and the completion hook read it.
+- `HARNESS_REPO_MAP`: one `id=folder` entry. The path hook and the completion hook read it.
+- `HARNESS_SCOPE_FILE`: the list of paths the ticket may edit. The path hook reads it.
+- `HARNESS_RESULT_DIR`: the result folder. The completion hook reads it.
+- `HARNESS_CAPS_DIR`: the caps folder. The completion hook reads it.
+- `HARNESS_PRIVACY_LIST`: the deny list for text sent to GitHub. The `gh` text hook reads it.
+- `HARNESS_PUBLIC_REPO`: the public repository as `owner/name`. The `gh` text hook reads it.
+- `HARNESS_EVENT_LOG`: the event log. The session-start hook reads it.
+
 ## First run on the example ticket
 
 Copy the example project and ticket, and make the project a git repository with one commit.
