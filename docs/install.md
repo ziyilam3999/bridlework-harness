@@ -85,8 +85,10 @@ Expected: exit 0; the first output line is `none`, and the output contains `repo
 
 ## Use the plugin
 
-The hooks read five variables. All five must be absolute paths, and the ticket file, result folder, caps folder and engine must
-sit outside the repository the hooks guard. `HARNESS_REPO_MAP` is one `id=folder` entry.
+This step sets five of the variables the hooks read: `HARNESS_BIN`, `HARNESS_TICKET_FILE`, `HARNESS_REPO_MAP`,
+`HARNESS_RESULT_DIR` and `HARNESS_CAPS_DIR`. The full list is in the section "Load the guard hooks for one session". Here,
+the engine, ticket file, result folder and caps folder must be absolute paths outside the repository the hooks guard.
+`HARNESS_REPO_MAP` is one `id=folder` entry.
 
 <!-- step: plugin -->
 ```sh
