@@ -270,6 +270,92 @@ fn a_file_that_is_not_utf8_exits_2() {
 }
 
 #[test]
+fn controls_with_an_empty_token_is_refused() {
+    let d = tmp("ctrlempty");
+    for bad in ["[,]", "[restart,,check-log]", "[restart, ]"] {
+        let f = d.join("ISSUE-101-e.md");
+        fs::write(&f, good_page().replace("controls: [restart, check-log]", &format!("controls: {}", bad))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}: {}", bad, stderr(&o));
+        assert!(stdout(&o).contains("CONTROLS controls has an empty token"), "{}: {}", bad, stdout(&o));
+    }
+    // an empty list ([] or [ ]) with the no-reusable-control words still passes
+    for good in ["[]", "[ ]"] {
+        let f = d.join("ISSUE-101-g.md");
+        fs::write(
+            &f,
+            good_page()
+                .replace("controls: [restart, check-log]", &format!("controls: {}", good))
+                .replace("- restart the service\n- check the log\n", "There is no reusable control for this one.\n"),
+        )
+        .unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(0), "{}: {}{}", good, stdout(&o), stderr(&o));
+    }
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_section_of_only_fence_lines_is_refused() {
+    let d = tmp("fence");
+    // the only non-blank lines of the section are the fence lines themselves
+    let bad = d.join("ISSUE-101-f.md");
+    fs::write(&bad, good_page().replace("A synthetic service in a test rig.", "```\n```")).unwrap();
+    let o = run(&["lesson", "lint", bad.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stdout(&o).contains("SECTIONS the heading Context has no text"), "{}", stdout(&o));
+    // a fenced block with at least one non-blank line inside it still counts as text
+    let good = d.join("ISSUE-101-t.md");
+    fs::write(&good, good_page().replace("A synthetic service in a test rig.", "```\na synthetic rig\n```")).unwrap();
+    let o = run(&["lesson", "lint", good.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_same_page_reached_twice_is_checked_once() {
+    let d = tmp("twice");
+    let f = d.join("ISSUE-101-t.md");
+    fs::write(&f, good_page()).unwrap();
+    let o = run(&["lesson", "lint", f.to_str().unwrap(), f.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    // the same page through the file and through the directory that holds it
+    let o = run(&["lesson", "lint", f.to_str().unwrap(), d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    // two different files with the same id are still refused
+    let g = d.join("ISSUE-101-u.md");
+    fs::write(&g, good_page()).unwrap();
+    let o = run(&["lesson", "lint", f.to_str().unwrap(), g.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stdout(&o).contains("DUPLICATE-ID"), "{}", stdout(&o));
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn an_unreadable_page_shaped_entry_in_a_directory_exits_2() {
+    // a broken symbolic link with a page-shaped name is no longer skipped silently
+    let d = tmp("broken");
+    fs::write(d.join("ISSUE-606-good.md"), good_page().replace("ISSUE-101", "ISSUE-606")).unwrap();
+    std::os::unix::fs::symlink(d.join("nowhere-607.md"), d.join("ISSUE-607-broken.md")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).contains("ISSUE-607-broken.md"), "{}", stderr(&o));
+    // a sub-folder with such a name is still skipped
+    let d2 = tmp("folder");
+    fs::write(d2.join("ISSUE-608-good.md"), good_page().replace("ISSUE-101", "ISSUE-608")).unwrap();
+    fs::create_dir_all(d2.join("ISSUE-609-dir.md")).unwrap();
+    let o = run(&["lesson", "lint", d2.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    let _ = fs::remove_dir_all(&d);
+    let _ = fs::remove_dir_all(&d2);
+}
+
+#[test]
 fn usage_errors_print_the_usage_text() {
     for args in [vec!["lesson"], vec!["lesson", "frobnicate"], vec!["lesson", "lint"]] {
         let o = run(&args);
