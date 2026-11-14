@@ -248,17 +248,22 @@ fn lint_rows(cfg: &Config, ctx: &crate::scan::Ctx) -> Result<Vec<Row>, i32> {
 }
 
 fn parse_top(v: &str) -> Result<usize, i32> {
+    parse_positive(v, "--top must be a positive whole number")
+}
+
+fn parse_positive(v: &str, refusal: &str) -> Result<usize, i32> {
     if v.is_empty() || v.len() > 6 || !v.bytes().all(|c| c.is_ascii_digit()) || v.starts_with('0') {
-        return Err(fail("--top must be a positive whole number"));
+        return Err(fail(refusal));
     }
     Ok(v.parse().unwrap_or(1))
 }
 
 // ---------------------------------------------------------------- rank
 
-/// `harness friction rank [--top K] [--record <file>] [--config <file>]`.
+/// `harness friction rank [--top K] [--min-occurrences N] [--record <file>] [--config <file>]`. The occurrence
+/// filter runs before `--top`; `groups=` and the record's `groups` stay the count of all ranked groups.
 pub fn rank_cmd(rest: &[String], testmode: bool) -> i32 {
-    let flags = match parse_flags(rest, &["--top", "--record", "--config"], "rank") {
+    let flags = match parse_flags(rest, &["--top", "--min-occurrences", "--record", "--config"], "rank") {
         Ok(f) => f,
         Err(m) => return fail(&m),
     };
@@ -272,6 +277,13 @@ pub fn rank_cmd(rest: &[String], testmode: bool) -> i32 {
             Err(c) => return c,
         },
         None => cfg.triage_top() as usize,
+    };
+    let min_occ = match flag(&flags, "--min-occurrences") {
+        Some(v) => match parse_positive(v, "--min-occurrences must be a positive whole number") {
+            Ok(n) => n,
+            Err(c) => return c,
+        },
+        None => 1,
     };
     let record = flag(&flags, "--record");
     if let Some(path) = record {
@@ -296,7 +308,7 @@ pub fn rank_cmd(rest: &[String], testmode: bool) -> i32 {
         }
     };
     let order = ranked(&all);
-    let listed: Vec<&&Group> = order.iter().take(top).collect();
+    let listed: Vec<&&Group> = order.iter().filter(|g| g.occurrences >= min_occ).take(top).collect();
     // The trial line is appended BEFORE anything is printed (a failed append is a clean exit 2, empty stdout).
     if let Some(path) = record {
         let ids: Vec<String> = listed.iter().map(|g| friction::jstr(&g.id)).collect();

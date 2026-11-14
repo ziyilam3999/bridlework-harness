@@ -184,6 +184,43 @@ fn top_comes_from_the_flag_then_the_config_then_three() {
 }
 
 #[test]
+fn min_occurrences_lists_only_groups_seen_that_often() {
+    let t = Tmp::new();
+    t.write_inbox(&[hand("once", "2026-11-01", "", "high"), hand("twice-1", "2026-11-01", "", "low"), hand("twice-2", "2026-11-02", "twice-1", "low")]);
+    let o = rank(&t, &["--top", "9", "--min-occurrences", "2"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let l = rank_lines(&o);
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert!(l[0].starts_with("rank group=twice-1 ") && l[0].contains("occurrences=2"), "{l:?}");
+    assert!(!out(&o).contains("group=once"));
+    // groups= counts every ranked group, listed= the printed ones
+    assert!(out(&o).ends_with("rank ok groups=2 listed=1\n"), "{}", out(&o));
+    // the filter runs before --top
+    let o = rank(&t, &["--top", "1", "--min-occurrences", "2"]);
+    assert_eq!(rank_lines(&o).len(), 1);
+    assert!(rank_lines(&o)[0].starts_with("rank group=twice-1 "));
+    // without the flag nothing is filtered
+    assert_eq!(rank_lines(&rank(&t, &["--top", "9"])).len(), 2);
+    // the record holds all-groups count and only the printed ids
+    let rec = t.0.join("trial.jsonl");
+    let o = rank(&t, &["--top", "9", "--min-occurrences", "2", "--record", p(&rec)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let body = fs::read_to_string(&rec).unwrap();
+    assert!(body.contains("\"groups\":2") && body.contains("\"listed\":[\"twice-1\"]"), "{body}");
+}
+
+#[test]
+fn min_occurrences_refuses_a_bad_value() {
+    let t = Tmp::new();
+    t.write_inbox(&[hand("a", "2026-11-01", "", "")]);
+    for bad in ["0", "abc", "", "-1"] {
+        let o = rank(&t, &["--min-occurrences", bad]);
+        assert_eq!(code(&o), 2, "{bad:?}");
+        assert!(out(&o).is_empty(), "{bad:?}");
+    }
+}
+
+#[test]
 fn record_appends_one_trial_line_before_printing() {
     let t = Tmp::new();
     t.write_inbox(&[hand("a", "2026-11-01", "", "high")]);
