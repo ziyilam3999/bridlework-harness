@@ -25,8 +25,8 @@ LIST = TOKEN + "\n# " + SENTINEL + "\n"
 # Every key that can change what runs, or where, is either modelled by this driver or refused (an unmodelled key is a failure,
 # never a skip). `working-directory` is modelled for ONE literal only (the engine build dir, which the three older workflows
 # keep and the final-gate smoke freezes) and never on a step that holds the secret. `shell`, `continue-on-error`, `timeout-minutes`
-# (step level), `container`, `services`, `defaults`, `strategy`, job `env`, extra top-level keys and quoted/flow keys are refused.
-ALLOWED_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "if", "working-directory"}
+# (step level), `if` (not modelled: a skipped Scan would stay green), `container`, `services`, `defaults`, `strategy`, job `env`, extra top-level keys and quoted/flow keys are refused.
+ALLOWED_STEP_KEYS = {"name", "run", "env", "uses", "with", "id", "working-directory"}
 ALLOWED_JOB_KEYS = {"runs-on", "timeout-minutes", "environment", "steps"}
 ALLOWED_TOP_KEYS = {"name", "on", "permissions", "jobs"}
 WD_LITERAL = "core/rust"
@@ -359,7 +359,7 @@ STEPS = ["Event read", "Fetch data", "Scan"]
 
 def job_of(wf):
     names = [k for k in parse_jobs(wf)]
-    return names[0] if len(names) == 1 else "gate-next"
+    return names[0] if len(names) == 1 else "gate"
 
 
 def mutate(src, pattern, repl, dst):
@@ -416,6 +416,9 @@ def arm_exfil():
         m1 = mutate(NEXT, r'^(\s*)sh "\$base/ci/privacy-gate\.sh" --tree \|\| rc=1$',
                     '    git checkout -q -f refs/gate/head\n    sh ./ci/privacy-gate.sh --tree || rc=1', os.path.join(tmp, "m1.yml"))
         check("exfil-mutant-checkout-pr-and-run-it-is-caught", bool(exfil_reasons(m1, os.path.join(tmp, "b"))))
+        # step `if:` is not modelled, so it is refused by key name only (review r2 F-new): a skipped Scan must not stay green
+        mif = mutate(NEXT, r'^      - name: Scan$', '      - name: Scan\n        if: ${{ false }}', os.path.join(tmp, "mif.yml"))
+        check("exfil-mutant-step-if-is-refused-by-name", "if" in key_problems(mif))
         m2 = mutate(NEXT, r'sh "\$base/ci/privacy-gate\.sh"', 'sh ./ci/privacy-gate.sh', os.path.join(tmp, "m2.yml"))
         check("exfil-mutant-script-from-data-dir-is-caught", bool(exfil_reasons(m2, os.path.join(tmp, "c"))))
         # m3 (review r1 F1): the Scan step runs in the data dir through `working-directory:`, checks the PR out and runs ITS script
@@ -577,7 +580,7 @@ def arm_failclosed():
 
 
 # ------------------------------------------------------------------ timeout (static)
-def timeout_ok(path, job="gate-next"):
+def timeout_ok(path, job="gate"):
     try:
         jobs = parse_jobs(path)
     except Exception:
@@ -708,8 +711,11 @@ def arm_static():
     text = open(NEXT, encoding="utf-8").read()
     check("static-next-triggers-on-pull_request_target-only", re.search(r"^  pull_request_target:", text, re.M) and not re.search(r"^  (pull_request|workflow_run|push|schedule):", text, re.M))
     check("static-next-types-opened-synchronize-reopened", re.search(r"types:\s*\[opened, synchronize, reopened\]", text) is not None)
-    j = nx.get("gate-next")
-    check("static-next-job-named-gate-next", j is not None and len(nx) == 1)
+    j = nx.get("gate")
+    check("static-next-job-named-gate", j is not None and len(nx) == 1)
+    check("static-rename-guard-no-job-named-gate-next", "gate-next" not in nx)
+    mg = parse_jobs(MASTERGATE, strict=False)
+    check("static-rename-guard-privacy-gate-job-still-gate", list(mg) == ["gate"] and "name" not in mg["gate"]["props"])
     if j:
         names = [s["name"] for s in j["steps"]]
         check("static-next-step-order", names[1:] == ["Event read", "Fetch data", "Build engine", "Scan"])
