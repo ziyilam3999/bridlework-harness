@@ -93,10 +93,10 @@ if ! grep -rqi 'fixture' "$root"/gates/*.json; then ok B3-no-fixture-in-real-gat
 
 # ---------------------------------------------------------------- B4 the printed gate ids come from the written result
 ids_of() { sed -n "s/.*\"$2\":\\[\\([^]]*\\)\\].*/\\1/p" "$1" | tr -d '"' | sed 's/,/, /g'; }
-mkrepo "$tmp/b4r" "$root/gates/path-map.json" cargo-test core-layering && chg "$tmp/b4r" docs/f.txt || exit 2
+mkrepo "$tmp/b4r" "$root/gates/path-map.json" cargo-clippy cargo-test core-layering && chg "$tmp/b4r" docs/f.txt || exit 2
 run_entry "$tmp/b4r"
 want="checks passed: $(ids_of "$root/gates/path-map.json" docs)"
-if [ "$rc" -eq 0 ] && has "$out" "$want" && has "$want" "cargo-test" && has "$want" "core-layering"; then ok B4-real-map-prints-both-gates; else bad B4-real-map-prints-both-gates; fi
+if [ "$rc" -eq 0 ] && has "$out" "$want" && has "$want" "cargo-clippy" && has "$want" "cargo-test" && has "$want" "core-layering"; then ok B4-real-map-prints-both-gates; else bad B4-real-map-prints-both-gates; fi
 want="checks passed: $(ids_of "$fx/map-clean.json" area-clean)"
 run_entry "$tmp/b1c"
 if [ "$rc" -eq 0 ] && has "$out" "$want" && [ "$want" = "checks passed: fixture-clean" ]; then ok B4-scratch-map-prints-exactly-its-ids; else bad B4-scratch-map-prints-exactly-its-ids; fi
