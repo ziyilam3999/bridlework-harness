@@ -207,12 +207,12 @@ fn admission_field_ok(f: &str, v: &str) -> Result<(), String> {
             if v.is_empty() {
                 Err(field_bad(f, "is empty"))
             } else if v.len() > 256 || v.bytes().any(|b| !b.is_ascii_graphic()) {
-                Err(field_bad(f, "is not one plain token of printable characters (no whitespace, no control character)"))
+                Err(field_bad(f, "is not one token of printable ASCII (at most 256 bytes)"))
             } else {
                 Ok(())
             }
         }
-        "step2" | "verdict" | "l3" => plain_text("is not plain text of at most 256 characters"),
+        "step2" | "verdict" | "l3" => plain_text("is not plain text of at most 256 bytes (no control character, no U+2028 or U+2029)"),
         "reviewer" => {
             if v.is_empty() {
                 Err(field_bad(f, "is empty"))
@@ -297,7 +297,8 @@ fn read_admission(p: &Path) -> Result<AdmissionRead, String> {
 }
 
 /// Resolve `--admission <path>` to the admitted lane count: `None` when the cap stays 1 (no option, or nothing at the path), `Some(n)` for a
-/// valid record. A file that is there and not valid is the `bad-admission` refusal, returned as `Err`.
+/// valid record, both inside `Ok(Ok(..))`. A file that is there and not valid is the `bad-admission` refusal, `Ok(Err(..))`; the outer `Err` is an
+/// exit-2 problem (the path cannot be inspected or read).
 fn admitted_lanes(m: &std::collections::HashMap<String, String>) -> Result<Result<Option<u32>, Refusal>, String> {
     match m.get("admission") {
         None => Ok(Ok(None)),

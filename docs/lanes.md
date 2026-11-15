@@ -13,7 +13,7 @@ harness lane admission-check <file> --config <file>
 - The scope file holds one relative path per line. A truly empty line is skipped; a line of only whitespace is refused. A missing or empty file, an entry starting with `/` or `\`, a `..` part (split on `/` and `\`), an empty part (`a//b`) or a control character is refused with exit 2 and nothing is recorded. One trailing `/` is allowed (a folder, `a/`). Entries are stored as given (`./a`, `a/`).
 - `list` prints one line per live ticket, `ticket=<id> lane=<n> repo_id=<id> scope=<entries>`, then a last line `live=<n> cap=<n>`, where the cap is computed as for a claim (1 without `--admission`, the smaller of the admitted count and `lanes.count` with a valid record; a record that exists and is not valid refuses the list with `bad-admission`). When more tickets are live than the cap, `list` still prints them and exits 0 (a claim is what gets refused).
 - `release` prints `ticket=<id> released`. It takes `--config <file>` (required, like `list`): the legal record names follow the config, not the admission, so a release works for a ticket in lane 2 whether or not an admission is around.
-- `admission-check` checks one admission record against the config: a valid record exits 0 and prints one line `admission ok lanes=<n> cap=<c>` with c the smaller of n and the config `lanes.count`; a record that exists and is not valid exits 1 with one `lane: refused reason=bad-admission` line; a path that does not exist exits 2.
+- `admission-check` checks one admission record against the config: a valid record exits 0 and prints one line `admission ok lanes=<n> cap=<c>` with c the smaller of n and the config `lanes.count`; a record that exists and is not valid exits 1 with one `lane: refused reason=bad-admission` line; a path that does not exist exits 2, and so does an admission file that exists but cannot be read, or a path that runs through a regular file.
 
 ## The admission record
 
@@ -22,12 +22,12 @@ A small text file: a regular file (a symbolic link is refused too), utf-8, at mo
 | field | holds | shape |
 | --- | --- | --- |
 | `lanes` | the admitted lane count | a whole number of at least 2 (digits only, no leading zero, at most 9 digits) |
-| `baseline` | the baseline reference | one plain token of printable characters (no whitespace, no control character), at most 256 bytes |
-| `step2` | the cited step-2 numbers | non-empty plain text, no control character, at most 256 characters |
+| `baseline` | the baseline reference | one token of printable ASCII (no space, no control character), at most 256 bytes |
+| `step2` | the cited step-2 numbers | non-empty plain text, at most 256 bytes, no control character and no U+2028 / U+2029 |
 | `reviewer` | the reviewer token | letters, digits, `.`, `_`, `-`, at most 128 bytes |
-| `verdict` | the reviewer verdict | non-empty plain text, no control character, at most 256 characters |
-| `operator` | the operator go reference | one plain token of printable characters, at most 256 bytes |
-| `l3` | the L3 check result | non-empty plain text, no control character, at most 256 characters |
+| `verdict` | the reviewer verdict | non-empty plain text, at most 256 bytes, no control character and no U+2028 / U+2029 |
+| `operator` | the operator go reference | one token of printable ASCII (no space, no control character), at most 256 bytes |
+| `l3` | the L3 check result | non-empty plain text, at most 256 bytes, no control character and no U+2028 / U+2029 |
 | `signed` | the signing date | a real calendar date spelled YYYY-MM-DD |
 
 A full example:
@@ -67,7 +67,7 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 
 ## Concurrency
 
-`claim`, `release` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then the cap (`no-admission` when no valid admission is given, else `cap-full`), then writes the record to `.claim.tmp` and renames it onto `lane-<n>`; a release removes only the record it just read. So with any cap a ticket never holds two lanes, live never exceeds the cap, and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim or release is not guaranteed to survive a crash of the machine.
+`claim`, `release` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then the cap (`no-admission` when no valid admission is given, else `cap-full`), then writes the record to `.claim.tmp` and renames it onto `lane-<n>`; a release removes only the record it just read. So with any cap a ticket never holds two lanes, a claim never makes live exceed the cap that claim runs under (a later call given a different admission, or none, may see live above its own cap), and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim or release is not guaranteed to survive a crash of the machine.
 
 ## Reading the lanes dir (fail closed)
 

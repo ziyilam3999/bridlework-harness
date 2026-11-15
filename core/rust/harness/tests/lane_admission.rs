@@ -147,6 +147,39 @@ fn admission_check_prints_the_cap_and_a_missing_path_exits_2() {
     fs::write(&big, format!("{}#{}\n", admission_text(2).trim_end_matches('\n'), "x".repeat(64 * 1024))).unwrap();
     let o = run(&["lane", "admission-check", big.to_str().unwrap(), "--config", cfg.to_str().unwrap()]);
     assert!(bad_admission_once(&o), "big: {}", err(&o));
+    assert!(err(&o).contains("over 65536 bytes"), "big: {}", err(&o));
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn text_fields_are_bounded_and_dates_are_real() {
+    let d = tmp("textdate");
+    let cfg = config(&d, 4);
+    let check = |tag: &str, body: String| -> Output {
+        let p = d.join(format!("{tag}.txt"));
+        fs::write(&p, body).unwrap();
+        run(&["lane", "admission-check", p.to_str().unwrap(), "--config", cfg.to_str().unwrap()])
+    };
+    // too long (257 bytes) and a control character, for each text field
+    for f in ["step2", "verdict", "l3"] {
+        let good = admission_text(2);
+        let too_long = good.lines().map(|l| if l.starts_with(&format!("{f}=")) { format!("{f}={}", "a".repeat(257)) } else { l.to_string() }).collect::<Vec<String>>().join("\n") + "\n";
+        let o = check(&format!("long-{f}"), too_long);
+        assert!(bad_admission_once(&o) && err(&o).contains(f), "{f} long: {}", err(&o));
+        let ctl = good.lines().map(|l| if l.starts_with(&format!("{f}=")) { format!("{f}=a\u{7}b") } else { l.to_string() }).collect::<Vec<String>>().join("\n") + "\n";
+        let o = check(&format!("ctl-{f}"), ctl);
+        assert!(bad_admission_once(&o) && err(&o).contains(f), "{f} control: {}", err(&o));
+    }
+    // the leap-year rule
+    for (date, ok) in [("2025-02-29", false), ("1900-02-29", false), ("2024-02-29", true), ("2000-02-29", true)] {
+        let body = admission_text(2).replacen("signed=2026-11-14", &format!("signed={date}"), 1);
+        let o = check(&format!("date-{date}"), body);
+        if ok {
+            assert_eq!(o.status.code(), Some(0), "{date}: {}", err(&o));
+        } else {
+            assert!(bad_admission_once(&o) && err(&o).contains("signed"), "{date}: {}", err(&o));
+        }
+    }
     let _ = fs::remove_dir_all(&d);
 }
 
