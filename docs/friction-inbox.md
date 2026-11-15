@@ -326,8 +326,8 @@ Bind does not check that the task fixes the group; a repeat after the resolve st
 Refused (exit 1, state byte-identical): a group with no state row and no inbox row, a last status other than
 `proposed`, a binding to a different task, a `--task-id` outside that set, a `--task-session` that is not a plain
 token, a privacy hit in the group, the task id or the session, and, on the fresh-row path, an inbox that fails lint or has a
-privacy hit and a new row the state reader would refuse (for example a last row dated 9999-12-31). A missing or unreadable
-inbox file exits 2, and so does a `--config` that cannot be loaded; with no `--config`, a missing or unloadable config exits 2 on the fresh-row path. Re-binding the same pair prints `bind already group=<id>`; success prints `bind group=<id> task=<id>`.
+privacy hit and a new row the state reader would refuse (for example a last row dated 9999-12-31). A `--config` that
+cannot be loaded exits 2; on the fresh-row path a missing or unreadable inbox file exits 2 and, with no `--config`, so does a missing or unloadable config. Re-binding the same pair prints `bind already group=<id>`; success prints `bind group=<id> task=<id>`.
 
 ### `harness friction page`
 
