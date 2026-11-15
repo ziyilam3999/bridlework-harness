@@ -280,23 +280,25 @@ existing `sweep` for that week (the same function); (2) lint + rank; (3) the `--
 nine string keys (`group`, `status` of `proposed|resolved|regressed|escalated`, `ticket_file`, `proposed_week`,
 `task_id`, `task_session`, `resolved_pr`, `resolved_date`, `attempts`; the last row per group wins), read under the
 4 MiB cap; a torn or bad state refuses (exit 1) and nothing is written; (4) with `--controls <file> --lessons-dir
-<dir>` (both flags together, either one alone is exit 2; both inputs are read before the `--log` sweep, so a refusal
-leaves the inbox unchanged) each line of the controls file: blank lines and lines that start with `#` after a trim
-are skipped, other lines are three parts split on ` | ` — a group id with no spaces, `control: <pointer>` or
-`not machine-checkable: <reason>` with non-blank text, and `lesson: ISSUE-NNN` (exactly three digits) naming a
-regular file `ISSUE-NNN-*.md` (a symbolic link or a folder does not count) directly in the lessons folder. A bad
-line refuses the run (exit 1): stderr names the line number, no line text, and the state and the hand-off folder
-stay byte-identical. A missing controls file, a folder as the controls path, a controls file over 1 MiB or a missing
-lessons folder is a setup error (exit 2) with nothing written. The engine is stricter than `bw start` here: a
-control character or a lone CR inside a line refuses, the file cap is 1 MiB, and no line text is printed. A valid
-line whose id is a group root seeds one `resolved` state row: `task_id`, `task_session`, `resolved_pr` and
-`ticket_file` empty, `attempts` 0, `proposed_week` the `--week` value, and `resolved_date` the `at` of the group's
-latest member row when that row has one, else that row date. The group is not proposed in that run, and a second
-run with the same file writes no seed row. A group whose last row is `proposed` with an empty `task_id` is seeded
-the same way and keeps its `attempts`, `proposed_week` and `ticket_file`; a group in another status, or `proposed`
-with a `task_id`, gets no row. A line whose id is a row inside another group prints `control-not-root line=<n>
-group=<root id>`; an id that is no row prints `control-unknown line=<n>`. Both note lines seed nothing, no text of
-the line reaches stdout or stderr, and the run exits 0; (5) with `--closed` (a JSON object whose
+<dir>` (both flags together, either one alone is exit 2, after the state and the closed feed are read; both inputs
+are read before the `--log` sweep, so a refusal leaves the inbox unchanged) each line of the controls file: blank
+lines and lines that start with `#` after a trim are skipped (a control character, a lone CR or non-UTF-8 bytes
+refuse any line, a comment too), other lines are three parts split on ` | ` — a group id with no white space,
+`control: <pointer>` or `not machine-checkable: <reason>` with non-blank text, and `lesson: ISSUE-NNN` (exactly
+three ASCII digits) naming a regular file `ISSUE-NNN-*.md` (a symbolic link or a folder does not count) directly in
+the lessons folder. A bad line refuses the run (exit 1): stderr names the line number, no line text, and the state
+and the hand-off folder stay byte-identical. A missing controls file, a folder as the controls path, a controls
+file over 1 MiB or a missing lessons folder is a setup error (exit 2) with nothing written. The engine is stricter
+than `bw start` here: a control character other than a tab, or a lone CR, inside a line refuses; the file cap is
+1 MiB; no refusal or note prints line text. A valid line whose id is a group root with no state row seeds one
+`resolved` state row: `task_id`, `task_session`, `resolved_pr` and `ticket_file` empty, `attempts` 0,
+`proposed_week` the `--week` value, and `resolved_date` the latest `at` among the member rows on the group's last
+date, else that date. The group is not proposed in that run, and a seeded group is not seeded again, also after it
+regresses. A group whose last row is `proposed` with an empty `task_id` and `attempts` 0 is seeded the same way and
+keeps its `attempts`, `proposed_week` and `ticket_file`; a group in another status, `proposed` with a `task_id`,
+or `proposed` with `attempts` 1 or more, gets no row. A line whose id is a row inside another group prints
+`control-not-root line=<n> group=<root id>`; an id that is no row prints `control-unknown line=<n>`. Both note
+lines seed nothing, print no text of the line, and do not change the exit code; (5) with `--closed` (a JSON object whose
 `closed_with_evidence` array holds ticket-reconcile rows `id`, `repo`, `at` and `pr` (digits) or, when `pr` is absent or an empty string,
 `head` (7 to 40 hex characters), plus an optional `session`; a row with neither, or a `pr` that is not a string or a
 number (`true`, an object, an array, `null`), refuses the whole feed, exit 1; `resolved_pr`
@@ -327,10 +329,10 @@ triage week=<w> proposed=<n> open=<n> resolved=<n> escalated=<n>
 ```
 
 `open` lists every `proposed` group with its age (`bound=no` makes a forgotten bind visible each week);
-`signature` lists an event signature seen in 2 or more weeks; `pattern` is the `patterns` listing; `proposed` and
-`resolved` in the summary count this run's transitions, `open` and `escalated` the standing groups. A second run
-for the same week proposes 0. Every check precedes every write: a refused run leaves the state and the hand-off
-folder byte-identical.
+`signature` lists an event signature seen in 2 or more weeks; `pattern` is the `patterns` listing; `proposed`
+counts this run's proposals, `resolved` its feed resolutions (a seed is not counted), `open` and `escalated`
+the standing groups. A second run for the same week proposes 0. Every check precedes every write: a refused run
+leaves the state and the hand-off folder byte-identical.
 
 ### `harness friction bind`
 

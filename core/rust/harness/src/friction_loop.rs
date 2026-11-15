@@ -3,9 +3,9 @@
 //! `rank` is a pure function of the inbox: rows are grouped by the TRANSITIVE `breaks` closure (a chain, a forward
 //! pointer or a cycle are all lint-legal, so the walk is iterative and a revisit is a refusal), scored as
 //! impact weight x occurrences, and listed in one total order. `triage` is the loop's one deterministic step: it
-//! reads an append-only state file, resolves groups from a closed feed keyed by a BOUND task id, flags
-//! regressions, and writes ticket-contract hand-off files for the groups to fix. `bind` is the one writer of the
-//! task binding. `page` writes the weekly report text ONLY to its `--out` file.
+//! reads an append-only state file, resolves groups from a closed feed keyed by a BOUND task id or seeds
+//! them from a controls file, flags regressions, and writes ticket-contract hand-off files for the groups to
+//! fix. `bind` is the one writer of the task binding. `page` writes the weekly report text ONLY to its `--out` file.
 //!
 //! No wall clock runs in `rank`, `triage` or `bind`: the week is an argument. Every verb runs the full inbox lint
 //! first (same refusal as `friction lint`), and nothing printed to stdout carries a row's `text`, `why` or `proof`:
@@ -23,7 +23,7 @@ use std::path::Path;
 const STATE_CAP: u64 = 4 * 1024 * 1024;
 /// The closed feed is read no further than 1 MiB.
 const CLOSED_CAP: u64 = 1024 * 1024;
-/// The controls file is read no further than 1 MiB.
+/// A controls file over 1 MiB is refused.
 const CONTROLS_CAP: u64 = 1024 * 1024;
 /// Nesting bound of the closed-feed reader: a deeper document is refused, so no input can recurse far.
 const JSON_DEPTH: usize = 16;
@@ -748,7 +748,7 @@ fn read_closed(path: &Path) -> Result<Vec<Closed>, (i32, String)> {
 /// The line shape `bw start` checks, named in the refusal (no line text is echoed: it is private prose).
 const CONTROL_SHAPE: &str = "<group id> | control: <pointer> | lesson: ISSUE-NNN or <group id> | not machine-checkable: <reason> | lesson: ISSUE-NNN";
 
-/// One valid controls line: its line number and the group id it names.
+/// One valid controls line: its line number and the id it names.
 struct Control {
     line: usize,
     id: String,
@@ -766,8 +766,9 @@ fn control_kind_ok(p: &str) -> bool {
     rest.is_some_and(|r| !r.trim().is_empty())
 }
 
-/// Read the controls file and check each line as `bw start` does; a lesson must have a regular file
-/// `ISSUE-NNN-*.md` (not a symbolic link) directly in `lessons`. Any bad line refuses the whole file (1).
+/// Read the controls file and check each line against the `bw start` shape (a little stricter); a lesson
+/// must have a regular file `ISSUE-NNN-*.md` (not a symbolic link) directly in `lessons`. Any bad line
+/// refuses the whole file (1).
 fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, String)> {
     match fs::metadata(path) {
         Ok(m) if m.is_file() => {}
@@ -915,8 +916,8 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         return fail("--handoff-dir must be an existing folder");
     }
     let state_path = Path::new(state_path);
-    // Step 3 and 4 inputs are read BEFORE the sweep touches the inbox, so a corrupt state or feed refuses with
-    // every file still byte-identical.
+    // Steps (3) to (5) are read BEFORE the sweep touches the inbox, so a corrupt state, feed or controls
+    // file refuses with nothing written.
     let (orig, st_rows) = match read_state(state_path) {
         Ok(v) => v,
         Err((c, m)) => {
@@ -940,7 +941,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         (None, None) => Vec::new(),
         _ => return fail("--controls and --lessons-dir go together"),
     };
-    // Step 1: the existing sweep path (the same function `harness friction sweep` runs).
+    // Step (1): the existing sweep path (the same function `harness friction sweep` runs).
     if let Some(log) = flag(&flags, "--log") {
         let mut a: Vec<String> = vec!["--log".into(), log.into(), "--week".into(), week.into()];
         if let Some(c) = flag(&flags, "--config") {
@@ -952,7 +953,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             return c;
         }
     }
-    // Step 2: lint + rank.
+    // Step (2): lint + rank.
     let rows = match lint_rows(&cfg, &ctx) {
         Ok(r) => r,
         Err(c) => return c,
@@ -969,8 +970,9 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
     let mut cur = last_per_group(&st_rows);
     let mut new_rows: Vec<St> = Vec::new();
 
-    // Step 3b: a valid controls line seeds a group as resolved at its latest member row: a group with no
-    // state row, or a proposed group with no task id (it keeps attempts, proposed_week and ticket_file).
+    // Step (4): a valid controls line seeds a group as resolved at its latest member row: a group with no
+    // state row, or a proposed group with an empty task_id and attempts 0 (it keeps attempts, proposed_week
+    // and ticket_file).
     let mut root_of: HashMap<&str, &str> = HashMap::new();
     for g in &all {
         for &m in &g.members {
@@ -989,7 +991,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         };
         let kept = match cur.get(&g.id) {
             None => None,
-            Some(s) if s.status == "proposed" && s.task_id.is_empty() => Some(s),
+            Some(s) if s.status == "proposed" && s.task_id.is_empty() && s.attempts == 0 => Some(s),
             Some(_) => continue,
         };
         let last_at = g.members.iter().map(|&m| &rows[m]).filter(|r| r.date == g.last && !r.at.is_empty()).map(|r| r.at.as_str()).max().unwrap_or(&g.last).to_string();
@@ -1012,7 +1014,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         new_rows.push(n);
     }
 
-    // Step 4: resolve a proposed group ONLY by its bound task id (never the hand-off id).
+    // Step (5): the feed resolves a proposed group ONLY by its bound task id (not the hand-off id).
     let mut resolved_now = 0usize;
     for g in cur.keys().cloned().collect::<Vec<_>>() {
         let s = cur[&g].clone();
@@ -1027,8 +1029,8 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             resolved_now += 1;
         }
     }
-    // Step 5: a resolved group with a member row dated after its resolved_date regresses; the second
-    // regression (attempts >= 2) escalates and is never auto-proposed again.
+    // Step (6): a resolved group with a member row dated after its resolved_date regresses; the second
+    // regression (attempts >= 2) escalates and is not auto-proposed again.
     for g in cur.keys().cloned().collect::<Vec<_>>() {
         let s = cur[&g].clone();
         if s.status != "resolved" {
@@ -1042,7 +1044,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             new_rows.push(n);
         }
     }
-    // Step 6: proposals. Regressed groups first, then every group broken twice (always), then the top K
+    // Step (7): proposals. Regressed groups first, then the groups broken twice, then the top K
     // (taken from the full ranked list BEFORE the already-filed groups are subtracted, so a re-run proposes 0).
     let topk: HashSet<&str> = order.iter().take(top).map(|g| g.id.as_str()).collect();
     let mut props: Vec<(&Group, &'static str)> = Vec::new();
@@ -1061,7 +1063,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             props.push((g, "rank"));
         }
     }
-    // Step 7: the hand-off files, built and checked before any write.
+    // Step (8): the hand-off files, built and checked before any write.
     let first_n = st_rows
         .iter()
         .filter_map(|s| s.ticket_file.strip_prefix(&format!("{week}-")).and_then(|r| r.strip_suffix(".json")).and_then(|n| n.parse::<u32>().ok()))
@@ -1104,8 +1106,8 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         new_rows.push(n);
         files.push((path, json));
     }
-    // Step 8: write. The state lock is taken first (and the state re-read through it), then the hand-off files,
-    // then the state rows.
+    // Step (9): write. The state lock is taken first (and the state re-read through it), then the hand-off
+    // files, then the state rows.
     if !new_rows.is_empty() {
         let mut lock = match lock_state(state_path, &orig) {
             Ok(l) => l,

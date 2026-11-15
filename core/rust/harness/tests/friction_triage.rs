@@ -58,6 +58,11 @@ fn files(dir: &Path) -> Vec<String> {
     v
 }
 
+/// The hand-off folder as name/content pairs, for byte-identity checks.
+fn handoff_snap(dir: &Path) -> Vec<(String, String)> {
+    files(dir).into_iter().map(|f| (f.clone(), sha(&dir.join(&f)))).collect()
+}
+
 fn five(t: &Tmp) {
     t.write_inbox(&[
         hand("g-1", "2026-11-02", "", "blocker"),
@@ -483,7 +488,7 @@ fn usage_errors() {
 
 // ---- --controls (FT-2): a valid controls line seeds a group as resolved ----
 
-/// A lessons folder holding the regular file ISSUE-001-x.md, and a controls file with the given text.
+/// A lessons folder holding ISSUE-001-x.md (and wrong-length decoys), and a controls file with the given text.
 fn controls(t: &Tmp, text: impl AsRef<[u8]>) -> (std::path::PathBuf, std::path::PathBuf) {
     let l = t.0.join("lessons");
     fs::create_dir_all(&l).unwrap();
@@ -511,7 +516,7 @@ fn a_controls_line_seeds_the_group_as_resolved() {
     assert!(!out(&o).contains("propose group=g-1") && !out(&o).contains("a guard pointer"), "{}", out(&o));
     assert_eq!(last_status(&t, "g-1"), "resolved");
     assert!(state_rows(&t)[0].contains("\"resolved_date\":\"2026-11-02\"") && state_rows(&t)[0].contains("\"task_id\":\"\""));
-    // a group in the state is not seeded again
+    // a seeded (resolved) group is not seeded again
     let n = state_rows(&t).len();
     let o = triage_c(&t, W45, &c, &l);
     assert!(!out(&o).contains("seed group="), "{}", out(&o));
@@ -555,6 +560,48 @@ fn a_proposed_unbound_group_is_seeded_and_keeps_its_fields() {
 }
 
 #[test]
+fn a_regressed_group_is_not_seeded_again_by_the_same_controls_file() {
+    let t = Tmp::new();
+    five(&t);
+    let (c, l) = controls(&t, LINE);
+    assert_eq!(code(&triage_c(&t, W45, &c, &l)), 0);
+    // a repeat row dated after resolved_date regresses the seed (proposed again, attempts 1)
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", "")]);
+    let o = triage_c(&t, W46, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("reason=regressed"), "{}", out(&o));
+    // the same controls file does not seed it again: it stays proposed and unbound
+    let o = triage_c(&t, W47, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(!out(&o).contains("seed group="), "{}", out(&o));
+    let last = state_rows(&t).into_iter().rev().find(|r| r.contains("\"group\":\"g-1\"")).unwrap();
+    assert!(last.contains("\"status\":\"proposed\"") && last.contains("\"attempts\":\"1\""), "{last}");
+    assert!(out(&o).contains("open group=g-1 age_weeks=1 bound=no"), "{}", out(&o));
+}
+
+#[test]
+fn a_second_regression_after_a_seed_escalates() {
+    let t = Tmp::new();
+    five(&t);
+    let (c, l) = controls(&t, LINE);
+    assert_eq!(code(&triage_c(&t, W45, &c, &l)), 0);
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", "")]);
+    assert_eq!(code(&triage_c(&t, W46, &c, &l)), 0);
+    // bind and close through the feed: resolved again
+    assert_eq!(code(&bind(&t, "g-1", "4243", "s-fake")), 0);
+    let cf = closed_file(&t, "c4.json", "4243", Some("s-fake"), "2026-11-14");
+    let o = triage(&t, W47, &["--top", "1", "--closed", p(&cf)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(last_status(&t, "g-1"), "resolved");
+    // a second repeat dated after that resolve escalates
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", ""), hand("g-1c", "2026-11-20", "g-1", "")]);
+    let o = triage(&t, "2026-w48", &[]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("escalate group=g-1 attempts=2"), "{}", out(&o));
+    assert_eq!(last_status(&t, "g-1"), "escalated");
+}
+
+#[test]
 fn a_bound_group_gets_no_row_from_the_controls_file() {
     let t = Tmp::new();
     five(&t);
@@ -586,6 +633,7 @@ fn a_bad_controls_file_refuses_with_nothing_changed() {
     five(&t);
     assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
     let before = fs::read(t.state()).unwrap();
+    let before_h = handoff_snap(&t.handoff());
     let bad: Vec<Vec<u8>> = [
         "g-1 | control: x\n",
         "g-1 | control:  | lesson: ISSUE-001\n",
@@ -609,6 +657,7 @@ fn a_bad_controls_file_refuses_with_nothing_changed() {
         assert_eq!(code(&o), 1, "{:?}: {}", String::from_utf8_lossy(&b), err(&o));
         assert!(out(&o).is_empty() && !err(&o).contains("control: x"), "{}", err(&o));
         assert_eq!(fs::read(t.state()).unwrap(), before);
+        assert_eq!(handoff_snap(&t.handoff()), before_h);
     }
     // a lesson that is only a symbolic link or a folder does not count
     let (c, l) = controls(&t, "g-1 | control: x | lesson: ISSUE-003\n");
@@ -616,10 +665,11 @@ fn a_bad_controls_file_refuses_with_nothing_changed() {
     fs::create_dir_all(l.join("ISSUE-003-b.md")).unwrap();
     assert_eq!(code(&triage_c(&t, W46, &c, &l)), 1);
     assert_eq!(fs::read(t.state()).unwrap(), before);
+    assert_eq!(handoff_snap(&t.handoff()), before_h);
 }
 
 #[test]
-fn a_missing_controls_input_is_a_setup_error() {
+fn a_bad_controls_input_is_a_setup_error() {
     let t = Tmp::new();
     five(&t);
     let (c, l) = controls(&t, LINE);
@@ -632,7 +682,23 @@ fn a_missing_controls_input_is_a_setup_error() {
     for half in [["--controls", p(&c)], ["--lessons-dir", p(&l)]] {
         assert_eq!(code(&triage(&t, W45, &half)), 2);
     }
-    // an empty controls file is valid and seeds nothing
+    // an empty controls file is valid, seeds nothing and writes no state row
+    t.write_inbox(&[]);
     let (c, l) = controls(&t, "");
     assert_eq!(code(&triage_c(&t, W45, &c, &l)), 0);
+    assert!(!t.state().exists());
+}
+
+#[test]
+fn a_bad_controls_line_refuses_before_the_log_sweep_files_anything() {
+    let t = Tmp::new();
+    fs::write(t.inbox(), "").unwrap();
+    let log = t.file("events.jsonl", "{\"v\":2,\"kind\":\"gate_fail\",\"ts_ms\":1793577600000,\"ticket\":\"199\",\"repo\":\"bridlework-harness\",\"gate_id\":\"rust-test\",\"failure_class\":\"suite-fail\",\"head_sha\":\"aa11bb22cc33dd44ee55ff6600112233445566aa\",\"result\":\"fail\"}\n");
+    let (c, l) = controls(&t, "g-1 | control: x\n");
+    let before = sha(&t.inbox());
+    let o = triage(&t, W45, &["--log", p(&log), "--controls", p(&c), "--lessons-dir", p(&l)]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert_eq!(sha(&t.inbox()), before);
+    assert!(!t.state().exists());
 }
