@@ -18,8 +18,9 @@ The lint checks shape only: it does not check that a sentence is true, that a li
 - Any page breaks a rule: stdout holds one line per problem, `<file name>: <RULE> <short detail>` (`<file name>` is the last part of the path, without folders), and nothing else;
   exit 1. Problems are listed in path order: the paths in the order they were given, the pages of one directory in
   name order, the problems of one page in rule order.
-- In a problem line or a stderr message, a control character (C0, DEL, C1) or a blank other than a plain space is
-  written `\u{<hex>}`; stdout holds no control character except its line ends.
+- In a problem line or a stderr message, a control character (C0, DEL, C1) or a Unicode white-space character
+  other than a plain space is written `\u{<hex>}` (a format character such as U+200B or U+FEFF is printed as it is);
+  stdout holds no control character except its line ends.
 
 ## Exit codes
 
@@ -46,8 +47,8 @@ inside a code fence is never a heading.
 - `TIER`: `minimum_proven_tier` is missing, is empty, or is not exactly one of `T1`, `T2`, `T3`, `T4`, `unproven`,
   `unmeasured` — the six values `docs/fix-tier.md` accepts for this field (the comparison is exact and
   case-sensitive on the value after the trim of the front matter line, which removes only ASCII spaces and tabs
-  around the key and the value, so `t2`, `T0`, a quoted `"T2"` or a non-space blank such as a no-break space is
-  refused; the detail names the value).
+  around the key and the value, so `t2`, `T0`, a quoted `"T2"` or a blank other than an ASCII space or tab (such as a
+  no-break space) is refused; the detail names the value).
 - `CONTROLS`: `controls` is missing, is not an inline list `[...]` (an empty list, `[]` or `[ ]`, is fine), or holds
   an empty token.
 - `MATCH`: `match` is present but is not an inline list, is an empty list (`[]` or `[ ]`), or holds an empty token (a missing `match` is fine).

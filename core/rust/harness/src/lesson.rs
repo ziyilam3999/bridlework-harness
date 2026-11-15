@@ -72,7 +72,7 @@ fn split_list(v: &str) -> Vec<&str> {
     inner.split(',').map(|t| t.trim()).collect()
 }
 
-/// A control character or a blank other than a plain space is written `\u{hex}` in a printed line.
+/// A control character or a Unicode white-space character other than a plain space is written `\u{hex}`.
 fn esc(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() || (c.is_whitespace() && c != ' ') {

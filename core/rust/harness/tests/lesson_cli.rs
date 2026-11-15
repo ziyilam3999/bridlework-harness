@@ -387,7 +387,7 @@ fn an_unreadable_page_shaped_entry_in_a_directory_exits_2() {
     let _ = fs::remove_dir_all(&d2);
 }
 
-/// A non-space blank around the tier value is not trimmed; ASCII spaces and tabs are.
+/// A blank other than an ASCII space or tab around the tier value is not trimmed.
 #[test]
 fn non_space_blanks_around_the_tier_are_refused() {
     let d = tmp("blank");
