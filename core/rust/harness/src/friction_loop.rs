@@ -1055,7 +1055,7 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     let ctx = crate::scan::Ctx { list: &list, testmode };
     if !task_id_ok(task_id) {
-        return refuse("--task-id must be letters, digits, '.', '-' or '_', starting with a letter or digit");
+        return refuse("--task-id must be ASCII letters, digits, '.', '-' or '_', starting with a letter or digit, at most 64 bytes");
     }
     if !token_ok(task_session) {
         return refuse("--task-session must be a plain token");
