@@ -271,14 +271,32 @@ all ranked groups and `listed` holds only the ids of the groups printed.
 
 ```
 harness friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> \
-  [--log <event-log>] [--closed <file>] [--top <k>] [--config <file>]
+  [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] \
+  [--top <k>] [--config <file>]
 ```
 
 The loop's one deterministic step: no wall clock runs, the week is an argument. In order: (1) with `--log`, the
 existing `sweep` for that week (the same function); (2) lint + rank; (3) the `--state` file, an append-only JSONL of
 nine string keys (`group`, `status` of `proposed|resolved|regressed|escalated`, `ticket_file`, `proposed_week`,
 `task_id`, `task_session`, `resolved_pr`, `resolved_date`, `attempts`; the last row per group wins), read under the
-4 MiB cap; a torn or bad state refuses (exit 1) and nothing is written; (4) with `--closed` (a JSON object whose
+4 MiB cap; a torn or bad state refuses (exit 1) and nothing is written; (4) with `--controls <file> --lessons-dir
+<dir>` (both flags together, either one alone is exit 2; both inputs are read before the `--log` sweep, so a refusal
+leaves the inbox unchanged) each line of the controls file: blank lines and lines that start with `#` after a trim
+are skipped, other lines are three parts split on ` | ` — a group id with no spaces, `control: <pointer>` or
+`not machine-checkable: <reason>` with non-blank text, and `lesson: ISSUE-NNN` (exactly three digits) naming a
+regular file `ISSUE-NNN-*.md` (a symbolic link or a folder does not count) directly in the lessons folder. A bad
+line refuses the run (exit 1): stderr names the line number, no line text, and the state and the hand-off folder
+stay byte-identical. A missing controls file, a folder as the controls path, a controls file over 1 MiB or a missing
+lessons folder is a setup error (exit 2) with nothing written. The engine is stricter than `bw start` here: a
+control character or a lone CR inside a line refuses, the file cap is 1 MiB, and no line text is printed. A valid
+line whose id is a group root seeds one `resolved` state row: `task_id`, `task_session`, `resolved_pr` and
+`ticket_file` empty, `attempts` 0, `proposed_week` the `--week` value, and `resolved_date` the `at` of the group's
+latest member row when that row has one, else that row date. The group is not proposed in that run, and a second
+run with the same file writes no seed row. A group whose last row is `proposed` with an empty `task_id` is seeded
+the same way and keeps its `attempts`, `proposed_week` and `ticket_file`; a group in another status, or `proposed`
+with a `task_id`, gets no row. A line whose id is a row inside another group prints `control-not-root line=<n>
+group=<root id>`; an id that is no row prints `control-unknown line=<n>`. Both note lines seed nothing, no text of
+the line reaches stdout or stderr, and the run exits 0; (5) with `--closed` (a JSON object whose
 `closed_with_evidence` array holds ticket-reconcile rows `id`, `repo`, `at` and `pr` (digits) or, when `pr` is absent or an empty string,
 `head` (7 to 40 hex characters), plus an optional `session`; a row with neither, or a `pr` that is not a string or a
 number (`true`, an object, an array, `null`), refuses the whole feed, exit 1; `resolved_pr`
@@ -286,17 +304,20 @@ becomes `<repo>#<pr>` or `<repo>@<head>`; `at` as `YYYY-MM-DDTHH:MM:SSZ` is kept
 `at` is kept as the date; any other `at` (`T10:00:00z`, an offset such as `+08:00`, a fraction such as `T10:00:00.5Z`, `T25:00:00Z`,
 `2026-11-05junk`) refuses the whole feed, exit 1) a `proposed` group resolves ONLY when its bound `task_id` equals a row's `id` (and, when both
 carry a session, the sessions match); the hand-off id is not compared, and a group with no bound task is not resolved by the feed;
-(5) a `resolved` group with a member row dated after its `resolved_date` becomes `regressed` (`attempts` + 1; when
+(6) a `resolved` group with a member row dated after its `resolved_date` becomes `regressed` (`attempts` + 1; when
 `resolved_date` is a full time and the row has an `at`, the two times are compared, so a later `at` on the same day
 regresses and an earlier one does not; otherwise the row's date is compared with the date), and
-at `attempts >= 2` becomes `escalated` instead, which is never auto-proposed again; (6) proposals: every `regressed`
+at `attempts >= 2` becomes `escalated` instead, which is never auto-proposed again; (7) proposals: every `regressed`
 group (first), every group with break count >= 2 (always, regardless of rank) and the top K ranked groups, minus
-groups already `proposed`, `resolved` or `escalated`; (7) one ticket-contract file `<handoff-dir>/<week>-<n>.json`
+groups already `proposed`, `resolved` or `escalated`; (8) one ticket-contract file `<handoff-dir>/<week>-<n>.json`
 per proposal (id `friction-<week>-<n>`, owner `friction_learning`, size `M` / `L` and risk `normal` / `high` for a
-`blocker`), each round-tripped through the ticket reader before any write; (8) the state rows are appended under the
+`blocker`), each round-tripped through the ticket reader before any write; (9) the state rows are appended under the
 exclusive lock (section 4) and ids/numbers are printed:
 
 ```
+seed group=<id> line=<n>
+control-not-root line=<n> group=<id>
+control-unknown line=<n>
 propose group=<id> file=<basename> reason=<rank|twice-broken|regressed>
 open group=<id> age_weeks=<n> bound=<yes|no>
 signature group=<id> weeks=<n>

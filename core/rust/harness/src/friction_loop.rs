@@ -23,6 +23,8 @@ use std::path::Path;
 const STATE_CAP: u64 = 4 * 1024 * 1024;
 /// The closed feed is read no further than 1 MiB.
 const CLOSED_CAP: u64 = 1024 * 1024;
+/// The controls file is read no further than 1 MiB.
+const CONTROLS_CAP: u64 = 1024 * 1024;
 /// Nesting bound of the closed-feed reader: a deeper document is refused, so no input can recurse far.
 const JSON_DEPTH: usize = 16;
 
@@ -741,6 +743,73 @@ fn read_closed(path: &Path) -> Result<Vec<Closed>, (i32, String)> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------- the controls file
+
+/// The line shape `bw start` checks, named in the refusal (no line text is echoed: it is private prose).
+const CONTROL_SHAPE: &str = "<group id> | control: <pointer> | lesson: ISSUE-NNN or <group id> | not machine-checkable: <reason> | lesson: ISSUE-NNN";
+
+/// One valid controls line: its line number and the group id it names.
+struct Control {
+    line: usize,
+    id: String,
+}
+
+/// The lesson number of `lesson: ISSUE-NNN` (exactly three ASCII digits), or None.
+fn control_lesson(p: &str) -> Option<&str> {
+    let n = p.strip_prefix("lesson: ISSUE-")?;
+    (n.len() == 3 && n.bytes().all(|c| c.is_ascii_digit())).then_some(n)
+}
+
+/// Is `p` `control: <pointer>` or `not machine-checkable: <reason>` with a non-blank pointer or reason?
+fn control_kind_ok(p: &str) -> bool {
+    let rest = p.strip_prefix("control: ").or_else(|| p.strip_prefix("not machine-checkable: "));
+    rest.is_some_and(|r| !r.trim().is_empty())
+}
+
+/// Read the controls file and check each line as `bw start` does; a lesson must have a regular file
+/// `ISSUE-NNN-*.md` (not a symbolic link) directly in `lessons`. Any bad line refuses the whole file (1).
+fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, String)> {
+    match fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err((2, "the controls path is not a file".to_string())),
+        Err(_) => return Err((2, "the controls file cannot be read".to_string())),
+    }
+    let bytes = friction::read_capped(path, CONTROLS_CAP).map_err(|_| (2, "the controls file cannot be read".to_string()))?;
+    if bytes.len() as u64 > CONTROLS_CAP {
+        return Err((2, format!("the controls file is over the {CONTROLS_CAP}-byte cap")));
+    }
+    let names: Vec<String> = fs::read_dir(lessons)
+        .map_err(|_| (2, "the lessons folder cannot be read".to_string()))?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    let mut out = Vec::new();
+    for (i, raw) in bytes.split(|&b| b == b'\n').enumerate() {
+        let n = i + 1;
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let l = std::str::from_utf8(raw).map_err(|_| (1, format!("controls line {n} is not utf-8")))?;
+        if l.chars().any(|c| c.is_control() && c != '\t') {
+            return Err((1, format!("controls line {n} has a control character")));
+        }
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let p: Vec<&str> = t.split(" | ").collect();
+        let lesson = if p.len() == 3 && !p[0].chars().any(char::is_whitespace) && control_kind_ok(p[1]) { control_lesson(p[2]) } else { None };
+        let Some(num) = lesson else {
+            return Err((1, format!("controls line {n} is malformed; the shape is {CONTROL_SHAPE}")));
+        };
+        let prefix = format!("ISSUE-{num}-");
+        if !names.iter().any(|f| f.starts_with(&prefix) && f.ends_with(".md")) {
+            return Err((1, format!("controls line {n} names a lesson with no regular file ISSUE-NNN-*.md in the lessons folder")));
+        }
+        out.push(Control { line: n, id: p[0].to_string() });
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- weeks
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -812,10 +881,10 @@ fn ticket_json(id: &str, g: &Group, rows: &[Row], week: &str) -> String {
 }
 
 /// `harness friction triage --week <w> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>]
-/// [--top K] [--config <file>]`. All checks come before any write; a refused run leaves the state and the
+/// [--controls <file> --lessons-dir <dir>] [--top K] [--config <file>]`. All checks come before any write; a refused run leaves the state and the
 /// hand-off folder byte-identical (the optional `--log` sweep is the existing sweep, itself all-or-nothing).
 pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
-    let flags = match parse_flags(rest, &["--week", "--state", "--handoff-dir", "--log", "--closed", "--top", "--config"], "triage") {
+    let flags = match parse_flags(rest, &["--week", "--state", "--handoff-dir", "--log", "--closed", "--controls", "--lessons-dir", "--top", "--config"], "triage") {
         Ok(f) => f,
         Err(m) => return fail(&m),
     };
@@ -863,6 +932,14 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         },
         None => Vec::new(),
     };
+    let controls = match (flag(&flags, "--controls"), flag(&flags, "--lessons-dir")) {
+        (Some(c), Some(l)) => match read_controls(Path::new(c), Path::new(l)) {
+            Ok(v) => v,
+            Err((c, m)) => return if c == 1 { refuse(&m) } else { fail(&m) },
+        },
+        (None, None) => Vec::new(),
+        _ => return fail("--controls and --lessons-dir go together"),
+    };
     // Step 1: the existing sweep path (the same function `harness friction sweep` runs).
     if let Some(log) = flag(&flags, "--log") {
         let mut a: Vec<String> = vec!["--log".into(), log.into(), "--week".into(), week.into()];
@@ -891,6 +968,49 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
     let by_id: HashMap<&str, &Group> = all.iter().map(|g| (g.id.as_str(), g)).collect();
     let mut cur = last_per_group(&st_rows);
     let mut new_rows: Vec<St> = Vec::new();
+
+    // Step 3b: a valid controls line seeds a group as resolved at its latest member row: a group with no
+    // state row, or a proposed group with no task id (it keeps attempts, proposed_week and ticket_file).
+    let mut root_of: HashMap<&str, &str> = HashMap::new();
+    for g in &all {
+        for &m in &g.members {
+            root_of.insert(rows[m].id.as_str(), g.id.as_str());
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    for c in &controls {
+        let Some(g) = by_id.get(c.id.as_str()) else {
+            if let Some(root) = root_of.get(c.id.as_str()) {
+                notes.push(format!("control-not-root line={} group={root}", c.line));
+            } else {
+                notes.push(format!("control-unknown line={}", c.line));
+            }
+            continue;
+        };
+        let kept = match cur.get(&g.id) {
+            None => None,
+            Some(s) if s.status == "proposed" && s.task_id.is_empty() => Some(s),
+            Some(_) => continue,
+        };
+        let last_at = g.members.iter().map(|&m| &rows[m]).filter(|r| r.date == g.last && !r.at.is_empty()).map(|r| r.at.as_str()).max().unwrap_or(&g.last).to_string();
+        let n = match kept {
+            None => St {
+                group: g.id.clone(),
+                status: "resolved".into(),
+                ticket_file: String::new(),
+                proposed_week: week.to_string(),
+                task_id: String::new(),
+                task_session: String::new(),
+                resolved_pr: String::new(),
+                resolved_date: last_at,
+                attempts: 0,
+            },
+            Some(s) => St { status: "resolved".into(), task_id: String::new(), task_session: String::new(), resolved_pr: String::new(), resolved_date: last_at, ..s.clone() },
+        };
+        notes.push(format!("seed group={} line={}", g.id, c.line));
+        cur.insert(g.id.clone(), n.clone());
+        new_rows.push(n);
+    }
 
     // Step 4: resolve a proposed group ONLY by its bound task id (never the hand-off id).
     let mut resolved_now = 0usize;
@@ -1002,6 +1122,9 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         for (g, s) in new_rows.iter().map(|s| (s.group.clone(), s.clone())) {
             cur.insert(g, s);
         }
+    }
+    for n in &notes {
+        println!("{n}");
     }
     for ((g, reason), (_, _)) in props.iter().zip(files.iter()) {
         let s = &cur[&g.id];
