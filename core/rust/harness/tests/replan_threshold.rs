@@ -418,10 +418,11 @@ fn a_failure_that_changes_gate_keeps_going() {
 #[test]
 fn the_same_gate_with_a_different_class_does_not_latch() {
     let test = "v=$(cat docs/x.txt)\n[ \"$v\" = bad ] && exit 1\n[ \"$v\" = hang ] && exec sleep 30\ntrue";
-    // The runner's budget clock starts before the spawn, so a slow start of the script eats the budget: the budget must sit far above the
-    // slowest start this proves robust against — a sleep of 8 seconds planted in front of the bad check (a reviewer's scratch twin of a
-    // loaded host) still exits on its own at ~8s, inside 11s, so leg 1 stays `check-failed`. The hang leg waits out only these 11 seconds,
-    // so the whole test stays quick on an idle host; a budget big enough to hide real load (a minute) would make that leg wait a minute.
+    // The runner's budget clock starts before the spawn, so a slow start of the script eats the budget. The budget is 11 s: with a
+    // sleep of 8 s planted in front of the bad check (a reviewer's scratch copy of this test), the script exits on its own at ~8 s,
+    // leaving 3 s of room, so leg 1 stays `check-failed`. The first leg still has to start and run its check inside those 11 s, so
+    // the test still depends on the clock — with more room than before. The hang leg waits out only these 11 s, so the test stays
+    // quick on an idle host; a budget big enough to hide real load (a minute) would make that leg wait a minute.
     let fx = Fx::with_docs_gate("h", test, 11000);
     fx.commit(&[("src/value.txt", "ok"), ("docs/x.txt", "bad")]);
     let o = gate(&fx);
