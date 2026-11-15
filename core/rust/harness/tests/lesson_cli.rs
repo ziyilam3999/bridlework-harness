@@ -465,7 +465,7 @@ fn control_characters_in_a_value_are_escaped() {
     let _ = fs::remove_dir_all(&d);
 }
 
-/// A blank that is not a control character is escaped in a problem line too.
+/// A blank other than a plain space (U+00A0, U+2028) is escaped in a problem line too.
 #[test]
 fn blanks_that_are_not_control_characters_are_escaped() {
     let d = tmp("blankesc");
