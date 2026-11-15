@@ -179,7 +179,7 @@ fn date_ok(v: &str) -> bool {
     let y: u64 = v[..4].parse().unwrap();
     let m: u64 = v[5..7].parse().unwrap();
     let d: u64 = v[8..10].parse().unwrap();
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     (1..=12).contains(&m) && d >= 1 && d <= days[(m - 1) as usize]
 }
