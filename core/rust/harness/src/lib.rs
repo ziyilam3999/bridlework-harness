@@ -32,6 +32,7 @@ pub mod handback;
 #[cfg(unix)]
 pub mod human_origin;
 pub mod intake;
+pub mod lane;
 #[cfg(unix)]
 pub mod launcher;
 pub mod lesson;
