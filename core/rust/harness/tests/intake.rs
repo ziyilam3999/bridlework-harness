@@ -12,7 +12,8 @@ const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const MAX: usize = 1024 * 1024;
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// `p` made canonical; a missing tail is added to its nearest existing folder, made canonical.
+/// `p` made canonical; if it is missing, its longest existing start is made canonical and the rest is added as
+/// written. A path with `..` in the missing rest, or a relative path with no existing start, comes back as written.
 fn canon(p: &Path) -> PathBuf {
     if let Ok(c) = p.canonicalize() {
         return c;
@@ -23,7 +24,7 @@ fn canon(p: &Path) -> PathBuf {
     }
 }
 
-/// True when `p` lies under `root`.
+/// True when `canon(p)` starts with `canon(root)`; `p` equal to `root` counts.
 fn is_under(root: &Path, p: &Path) -> bool {
     canon(p).starts_with(canon(root))
 }
@@ -193,7 +194,7 @@ fn the_leak_helper_catches_a_message_that_echoes_the_folder() {
     assert!(!leaks("ticket=T-1 repo_id=b head=abc", "repo not found for repo id `b`", dir), "a clean pair passes");
 }
 
-// AC 9 twin: each half of the scratch rule, wherever the checkout lives.
+// AC 9 twin: each half of the scratch rule, for a checkout that is not at or above the temp folder.
 #[test]
 fn the_scratch_location_check_rejects_a_folder_beside_the_checkout() {
     let manifest = Path::new(MANIFEST);
@@ -205,7 +206,7 @@ fn the_scratch_location_check_rejects_a_folder_beside_the_checkout() {
     assert!(!is_under(manifest, &t.0), "the scratch folder is not beside the checkout");
 }
 
-// A missing path is judged by its nearest existing folder, made canonical, plus the missing tail.
+// An absolute missing path is judged by its longest existing start, made canonical, plus the missing tail.
 #[test]
 fn a_missing_path_is_judged_by_its_nearest_existing_folder() {
     let t = Tmp::new();
