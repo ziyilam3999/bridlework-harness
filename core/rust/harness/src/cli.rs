@@ -653,8 +653,11 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "lesson" {
         return crate::lesson::lesson_cmd(&args[1..]);
     }
+    if !args.is_empty() && args[0] == "lane" {
+        return crate::lane::lane_cmd(&args[1..]);
+    }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ... | lesson lint <path> ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ... | lesson lint <path> ... | lane claim|release|list ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";
