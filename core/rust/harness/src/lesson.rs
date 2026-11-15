@@ -55,6 +55,12 @@ fn is_issue_id(s: &str) -> bool {
     }
 }
 
+/// A front matter key: not empty, and no character in it is a blank or a control character (an ASCII
+/// space or tab inside the key is refused too).
+fn is_key(k: &str) -> bool {
+    !k.is_empty() && !k.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// A page file name inside a directory argument: `ISSUE-<digits>-<anything>.md`.
 fn is_page_name(n: &str) -> bool {
     let Some(rest) = n.strip_prefix("ISSUE-") else { return false };
@@ -172,7 +178,7 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
     for (i, &l) in lines[1..close].iter().enumerate() {
         match l.split_once(':') {
             // Only ASCII spaces and tabs are trimmed around the key and the value.
-            Some((k, v)) if !k.trim_matches([' ', '\t']).is_empty() => {
+            Some((k, v)) if is_key(k.trim_matches([' ', '\t'])) => {
                 let (k, v) = (k.trim_matches([' ', '\t']), v.trim_matches([' ', '\t']));
                 if keys.insert(k, v).is_some() {
                     out.push(format!("FRONT-MATTER line {} repeats the key {}", i + 2, k));

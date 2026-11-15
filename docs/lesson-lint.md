@@ -39,7 +39,7 @@ after the closing `---`), a level-1 heading is a line that starts with `# ` and 
 with `## `. A line that starts with three backticks opens a code fence, another such line closes it, and a line
 inside a code fence is never a heading.
 
-- `FRONT-MATTER`: the block is not there (line 1 is not `---`, or no later line closes it) or a line inside it is not `key: value`. When the block is not there, this is the only problem listed for that page, because nothing else can be checked. A key written twice is refused with `FRONT-MATTER line <n> repeats the key <key>` (`<n>` is the later line).
+- `FRONT-MATTER`: the block is not there (line 1 is not `---`, or no later line closes it) or a line inside it is not `key: value`. When the block is not there, this is the only problem listed for that page, because nothing else can be checked. A key holding a blank or a control character is not `key: value`. A key written twice is refused with `FRONT-MATTER line <n> repeats the key <key>` (`<n>` is the later line).
 - `SHARED-FIELD`: one of `kind`, `updated`, `sources`, `verified` is missing, or `updated` is not a real calendar date written `YYYY-MM-DD`, or `verified` is not `yes` or `no`.
 - `TYPE`: `type` is missing or is not exactly `lesson`.
 - `ID`: `id` is missing, or is not `ISSUE-<digits>`, or the file name does not start with that id followed by `-`.
