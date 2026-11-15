@@ -715,6 +715,9 @@ fn read_closed(path: &Path) -> Result<Vec<Closed>, (i32, String)> {
         let g = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
         let id = scalar(g("id")).filter(|s| !s.is_empty()).ok_or_else(|| bad("a row has no id"))?;
         let repo = scalar(g("repo")).filter(|s| !s.is_empty()).ok_or_else(|| bad("a row has no repo"))?;
+        if matches!(g("pr"), Some(v) if scalar(Some(v)).is_none()) {
+            return Err(bad("a row pr is not a string or a number"));
+        }
         let pr = scalar(g("pr")).filter(|s| !s.is_empty());
         let head = scalar(g("head")).filter(|s| !s.is_empty());
         let pr_ref = match (pr, head) {

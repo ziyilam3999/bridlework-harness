@@ -388,6 +388,21 @@ fn closed_row_with_head_resolves_and_neither_refuses() {
     assert!(fs::read_to_string(t.state()).unwrap().contains("\"resolved_pr\":\"owner/repo@abc1234\""));
 }
 
+#[test]
+fn a_closed_pr_that_is_not_a_string_or_a_number_refuses_the_feed() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
+    let before = fs::read(t.state()).unwrap();
+    for pr in ["true", "{}", "[\"7\"]", "null"] {
+        let c = closed_with(&t, "4242", "2026-11-10", &format!("\"pr\":{pr},\"head\":\"abc1234\","));
+        let o = triage(&t, W46, &["--top", "1", "--closed", p(&c)]);
+        assert_eq!(code(&o), 1, "{pr}: {}", err(&o));
+        assert_eq!(fs::read(t.state()).unwrap(), before, "{pr}");
+    }
+}
+
 /// g-1 resolved at 2026-11-10T12:00:00Z; the inbox then gains one member row.
 fn resolved_at_noon_then(t: &Tmp, member: String) -> Output {
     t.write_inbox(&[hand("g-1", "2026-11-02", "", "high")]);
