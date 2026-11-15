@@ -1,4 +1,4 @@
-//! `harness lane claim|release|list`: real binary, synthetic fixtures only.
+//! `harness lane claim|release|list`: real binary, synthetic fixtures only. The admission-gated cap is tested in `tests/lane_admission.rs`.
 #![cfg(unix)]
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,14 +71,14 @@ fn claim_list_release_cycle() {
 
     let o = claim(&t2, &lanes, &sf);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(err(&o).trim(), "lane: refused reason=cap-full");
+    assert_eq!(err(&o).trim(), "lane: refused reason=no-admission");
     assert!(list(&lanes).contains("live=1 cap=1"));
 
     let o = claim(&t1, &lanes, &sf);
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(err(&o).trim(), "lane: refused reason=already-live");
 
-    let rel = |id: &str| run(&["lane", "release", id, "--lanes-dir", lanes.to_str().unwrap()]);
+    let rel = |id: &str| run(&["lane", "release", id, "--lanes-dir", lanes.to_str().unwrap(), "--config", EXAMPLE]);
     assert_eq!(rel("t-one").status.code(), Some(0));
     assert!(list(&lanes).contains("live=0 cap=1"));
     let o = rel("t-one");
@@ -142,7 +142,7 @@ fn racing_claims_never_pass_the_cap() {
         let lanes = d.join(format!("lanes-{round}"));
         let res = race(&lanes, &sf, &tickets);
         assert_eq!(res.iter().filter(|r| r.0 == Some(0)).count(), 1, "{res:?}");
-        assert!(res.iter().filter(|r| r.0 != Some(0)).all(|r| r.0 == Some(1) && r.1.trim() == "lane: refused reason=cap-full"), "{res:?}");
+        assert!(res.iter().filter(|r| r.0 != Some(0)).all(|r| r.0 == Some(1) && r.1.trim() == "lane: refused reason=no-admission"), "{res:?}");
         let l = list(&lanes);
         assert!(l.contains("live=1 cap=1"), "{l}");
         assert_eq!(l.lines().count(), 2);
@@ -196,7 +196,7 @@ fn all_verbs_refuse(d: &Path, lanes: &Path, what: &str) {
     let outs = [
         run(&["lane", "list", "--lanes-dir", lanes.to_str().unwrap(), "--config", EXAMPLE]),
         claim(&t, lanes, &sf),
-        run(&["lane", "release", "t-x", "--lanes-dir", lanes.to_str().unwrap()]),
+        run(&["lane", "release", "t-x", "--lanes-dir", lanes.to_str().unwrap(), "--config", EXAMPLE]),
     ];
     for o in &outs {
         assert_eq!(o.status.code(), Some(2), "{what}: {}", err(o));
@@ -214,8 +214,8 @@ fn a_bad_lanes_dir_fails_closed_for_every_verb() {
         ("empty record", "lane-1", ""),
         ("junk record", "lane-1", "hello\n"),
         ("lane 0", "lane-0", GOOD),
-        ("above the cap", "lane-2", GOOD),
-        ("far above the cap", "lane-99", GOOD),
+        ("above the config count", "lane-5", GOOD),
+        ("far above the config count", "lane-99", GOOD),
         ("leading zero", "lane-01", GOOD),
         ("not a number", "lane-x", GOOD),
     ];
@@ -233,8 +233,7 @@ fn a_bad_lanes_dir_fails_closed_for_every_verb() {
     plant(&lanes, "lane-01", &GOOD.replace("t-x", "t-y"));
     all_verbs_refuse(&d, &lanes, "two records, one lane");
     let _ = fs::remove_dir_all(&d);
-    // two records for one ticket: at cap 1 the second name is already refused (above the cap); the ticket repeat itself is unit-tested in
-    // lane.rs with cap 2.
+    // two records for one ticket: both names are legal under the config count, so it is the ticket repeat that is refused
     let d = tmp("sameticket");
     let lanes = d.join("lanes");
     plant(&lanes, "lane-1", GOOD);
@@ -281,5 +280,5 @@ fn a_bad_lanes_dir_fails_closed_for_every_verb() {
 fn the_usage_line_lists_the_lane_verbs() {
     let o = run(&[]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(err(&o).contains("lane claim|release|list"));
+    assert!(err(&o).contains("lane claim|release|list|admission-check"));
 }
