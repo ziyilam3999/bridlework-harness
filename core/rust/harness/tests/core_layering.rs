@@ -191,7 +191,7 @@ fn the_real_repo_graph_is_clean_and_the_gate_file_loads() {
     assert_eq!(judge(&g), Verdict::Clean);
 
     let gates = harness::gates::Gates::load(&root).unwrap();
-    assert_eq!(gates.ids(), ["cargo-test", "core-layering"]);
+    assert_eq!(gates.ids(), ["cargo-clippy", "cargo-test", "core-layering"]);
     let gate = gates.get("core-layering").unwrap();
     assert_eq!(gate.program, "ci/core-layering.sh");
     harness::gates::to_check(&root, gate).unwrap();
