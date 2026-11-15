@@ -1153,7 +1153,7 @@ fn the_as_of_lines_carry_ids_and_numbers_only() {
         hand("g-2b", "2026-11-04", "g-2", ""),
         hand("g-3", "2026-11-04", "", ""),
     ]);
-    let (c, l) = controls(&t, format!("g-3 | control: pointer zzmarkerzz | lesson: ISSUE-001\ng-2b | control: x | lesson: ISSUE-001\n"));
+    let (c, l) = controls(&t, "g-3 | control: pointer zzmarkerzz | lesson: ISSUE-001\ng-2b | control: x | lesson: ISSUE-001\n");
     let o = triage(&t, W46, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l), "--as-of", "2026-11-15T00:00:00Z"]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     let all = format!("{}{}", out(&o), err(&o));
