@@ -137,6 +137,13 @@ fn price_file_refusals() {
         ("a 1 2 3\n", "line 1"),
         ("# c\na 1 2 3 x\n", "line 2"),
         ("a 1 2 3 -4\n", "line 1"),
+        // A leading plus sign is not a plain decimal, although number parsing alone would take it.
+        ("a 1 2 3 +2\n", "line 1"),
+        ("a +1 2 3 4\n", "line 1"),
+        ("a 1 2 3 .5\n", "line 1"),
+        // Ten digits before the point is one more than the limit of nine.
+        ("a 1 2 3 1234567890\n", "line 1"),
+        ("a 1 2 3 1234567890.5\n", "line 1"),
         ("a 1 2 3 1e3\n", "line 1"),
         ("a 1 2 3 0.1234567\n", "line 1"),
         ("a 1 2 3 4 5\n", "line 1"),
@@ -162,6 +169,25 @@ fn price_file_refusals() {
     assert!(stderr(&o).contains("larger"), "{}", stderr(&o));
     // Missing.
     refused(&run(&["--transcript", s(&t), "--model", "a", "--prices", s(&d.join("none.txt"))]));
+    // A byte that is not valid UTF-8, even inside a comment line.
+    let p = d.join("bytes.txt");
+    fs::write(&p, b"# \xff\na 1 1 1 1\n").unwrap();
+    let o = run(&["--transcript", s(&t), "--model", "a", "--prices", s(&p)]);
+    refused(&o);
+    assert!(stderr(&o).contains("UTF-8"), "{}", stderr(&o));
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_price_with_nine_digits_before_the_point_is_accepted() {
+    // By hand: 1000000 input tokens at 999999999 dollars per million tokens is 999999999 dollars,
+    // so the amount is 999999999.000000 (nine digits before the point, which the limit allows).
+    let d = fresh_dir();
+    let t = transcript(&d, &one(1_000_000, 0, 0, 0));
+    let p = prices(&d, "a 999999999 0 0 0\n");
+    let o = run(&["--transcript", s(&t), "--model", "a", "--prices", s(&p)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stdout(&o).ends_with("usd=999999999.000000\n"), "{}", stdout(&o));
     let _ = fs::remove_dir_all(&d);
 }
 
@@ -179,6 +205,23 @@ fn bad_model_and_bad_label_are_refused() {
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     let o = run(&["--transcript", s(&t)]);
     refused(&o);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_model_or_label_that_starts_with_a_dash_is_refused() {
+    // `--label --out <file>` must not take `--out` as the label and drop the append silently.
+    let d = fresh_dir();
+    let t = transcript(&d, &one(1, 1, 1, 1));
+    let out = d.join("log.txt");
+    refused(&run(&["--transcript", s(&t), "--model", "a", "--label", "--out", s(&out)]));
+    refused(&run(&["--transcript", s(&t), "--model", "--out", s(&out)]));
+    refused(&run(&["--transcript", s(&t), "--model", "-a"]));
+    refused(&run(&["--transcript", s(&t), "--model", "a", "--label", "-"]));
+    assert!(!out.exists());
+    // A dash inside the value is fine.
+    let o = run(&["--transcript", s(&t), "--model", "a-b", "--label", "x-y"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     let _ = fs::remove_dir_all(&d);
 }
 
@@ -220,6 +263,19 @@ fn out_creates_appends_and_keeps_the_first_line() {
 }
 
 #[test]
+fn out_file_without_a_final_newline_gets_the_line_glued_on() {
+    // The verb appends the line and a newline; it does not add a newline before it.
+    let d = fresh_dir();
+    let t = transcript(&d, &one(1, 2, 3, 4));
+    let out = d.join("log.txt");
+    fs::write(&out, "partial").unwrap();
+    let o = run(&["--transcript", s(&t), "--model", "a", "--out", s(&out)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(fs::read_to_string(&out).unwrap(), format!("partial{}", stdout(&o)));
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
 fn out_refuses_a_symbolic_link_a_directory_and_a_relative_path() {
     let d = fresh_dir();
     let t = transcript(&d, &one(1, 2, 3, 4));
@@ -241,6 +297,8 @@ fn out_refuses_a_symbolic_link_a_directory_and_a_relative_path() {
     let o = run(&["--transcript", s(&t), "--model", "a", "--out", s(&d.join("no-dir").join("x.txt"))]);
     assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("could not be written"), "{}", stderr(&o));
+    // The line was printed before the append failed, and it says unpriced although the exit code is 2.
+    assert!(stdout(&o).ends_with("usd=unpriced\n"), "{}", stdout(&o));
     let _ = fs::remove_dir_all(&d);
 }
 

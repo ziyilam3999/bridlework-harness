@@ -326,6 +326,12 @@ fn safe_value(v: &str) -> bool {
     !v.is_empty() && v.len() <= 128 && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
 }
 
+/// The values of the `--model` and `--label` flags: `safe_value`, and not starting with `-` (so `--label --out` cannot swallow
+/// the next flag). The model ids in a price file follow `safe_value` only.
+fn flag_value_ok(v: &str) -> bool {
+    safe_value(v) && !v.starts_with('-')
+}
+
 /// One price in millionths of a US dollar per million tokens, from a plain decimal with at most 6 digits after the point.
 fn parse_price(t: &str) -> Option<u128> {
     let (int, frac) = match t.split_once('.') {
@@ -358,8 +364,8 @@ fn parse_prices(text: &str) -> Result<Vec<(String, Prices)>, String> {
             return Err(format!("the price file line {n} is malformed: want <model> <input> <cache_write> <cache_read> <output>"));
         }
         let mut p: Prices = [0; 4];
-        for k in 0..4 {
-            p[k] = parse_price(f[k + 1]).ok_or_else(|| format!("the price file line {n} is malformed: bad price {:?}", f[k + 1]))?;
+        for (slot, text) in p.iter_mut().zip(&f[1..]) {
+            *slot = parse_price(text).ok_or_else(|| format!("the price file line {n} is malformed: bad price {text:?}"))?;
         }
         if out.iter().any(|(m, _)| m == f[0]) {
             return Err(format!("the price file line {n} repeats the model {}", f[0]));
@@ -416,11 +422,14 @@ fn check_out(path: &str) -> Result<(), String> {
 /// was printed).
 pub fn cost_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
-        eprintln!("harness: error: {}", m);
+        eprintln!("harness: error: {m}");
         2
     };
-    let (mut transcript, mut model, mut prices, mut label, mut out_path): (Option<&str>, Option<&str>, Option<&str>, Option<&str>, Option<&str>) =
-        (None, None, None, None, None);
+    let mut transcript: Option<&str> = None;
+    let mut model: Option<&str> = None;
+    let mut prices: Option<&str> = None;
+    let mut label: Option<&str> = None;
+    let mut out_path: Option<&str> = None;
     let mut it = a.iter();
     while let Some(flag) = it.next() {
         let slot = match flag.as_str() {
@@ -430,29 +439,27 @@ pub fn cost_cmd(a: &[String]) -> i32 {
             "--label" => &mut label,
             "--out" => &mut out_path,
             _ => {
-                eprintln!("{}", COST_USAGE);
+                eprintln!("{COST_USAGE}");
                 return 2;
             }
         };
         match it.next() {
             Some(v) if slot.is_none() => *slot = Some(v.as_str()),
             _ => {
-                eprintln!("{}", COST_USAGE);
+                eprintln!("{COST_USAGE}");
                 return 2;
             }
         }
     }
     let (Some(transcript), Some(model)) = (transcript, model) else {
-        eprintln!("{}", COST_USAGE);
+        eprintln!("{COST_USAGE}");
         return 2;
     };
-    if !safe_value(model) {
-        return fail("--model must be 1 to 128 characters of ASCII letters, digits, '.', '_', '-' and ':'");
+    if !flag_value_ok(model) {
+        return fail("--model must be 1 to 128 characters of ASCII letters, digits, '.', '_', '-' and ':', and must not start with '-'");
     }
-    if let Some(l) = label {
-        if !safe_value(l) {
-            return fail("--label must be 1 to 128 characters of ASCII letters, digits, '.', '_', '-' and ':'");
-        }
+    if label.is_some_and(|l| !flag_value_ok(l)) {
+        return fail("--label must be 1 to 128 characters of ASCII letters, digits, '.', '_', '-' and ':', and must not start with '-'");
     }
     let t = match read_transcript_file(transcript) {
         Ok(t) => t,
@@ -471,10 +478,8 @@ pub fn cost_cmd(a: &[String]) -> i32 {
             Err(e) => return fail(&e),
         },
     };
-    if let Some(o) = out_path {
-        if let Err(e) = check_out(o) {
-            return fail(&e);
-        }
+    if let Some(Err(e)) = out_path.map(check_out) {
+        return fail(&e);
     }
     let line = format!(
         "cost label={} model={} messages={} input={} cache_write={} cache_read={} output={} max_context={} compactions={} usd={}",
@@ -489,7 +494,7 @@ pub fn cost_cmd(a: &[String]) -> i32 {
         t.compactions,
         amount
     );
-    println!("{}", line);
+    println!("{line}");
     if let Some(o) = out_path {
         use std::io::Write;
         let r = std::fs::OpenOptions::new().append(true).create(true).open(o).and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
