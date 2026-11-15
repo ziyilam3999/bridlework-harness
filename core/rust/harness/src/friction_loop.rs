@@ -1044,7 +1044,8 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             new_rows.push(n);
         }
     }
-    // Step (7): proposals. Regressed groups first, then the groups broken twice, then the top K
+    // Step (7): proposals. Regressed groups first, then in rank order each group with no state row that has a
+    // break count of 2 or more or is in the top K
     // (taken from the full ranked list BEFORE the already-filed groups are subtracted, so a re-run proposes 0).
     let topk: HashSet<&str> = order.iter().take(top).map(|g| g.id.as_str()).collect();
     let mut props: Vec<(&Group, &'static str)> = Vec::new();

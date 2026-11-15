@@ -282,7 +282,7 @@ nine string keys (`group`, `status` of `proposed|resolved|regressed|escalated`, 
 4 MiB cap; a torn or bad state refuses (exit 1) and nothing is written; (4) with `--controls <file> --lessons-dir
 <dir>` (both flags together, either one alone is exit 2, after the state and the closed feed are read; both inputs
 are read before the `--log` sweep, so a refusal leaves the inbox unchanged) each line of the controls file: blank
-lines and lines that start with `#` after a trim are skipped (a control character, a lone CR or non-UTF-8 bytes
+lines and lines that start with `#` after a trim are skipped (a control character other than a tab, a lone CR or non-UTF-8 bytes
 refuse any line, a comment too), other lines are three parts split on ` | ` — a group id with no white space,
 `control: <pointer>` or `not machine-checkable: <reason>` with non-blank text, and `lesson: ISSUE-NNN` (exactly
 three ASCII digits) naming a regular file `ISSUE-NNN-*.md` (a symbolic link or a folder does not count) directly in
