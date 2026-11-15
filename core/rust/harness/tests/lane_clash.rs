@@ -260,6 +260,61 @@ fn the_line_names_the_first_pair_in_the_stated_order() {
 }
 
 #[test]
+fn a_clash_with_a_record_in_lane_2_names_that_ticket() {
+    let d = tmp("lane2");
+    let cfg = config(&d, 4);
+    let adm = admission(&d, 4);
+    let lanes = d.join("lanes");
+    // lane 1 holds a disjoint scope of the same repo, lane 2 holds `b/`: the clash is found in the lane-2 record, not only in lane 1
+    assert_eq!(claim(&ticket(&d, "t-a", "r"), &lanes, &cfg, &scope(&d, "a/\n"), Some(&adm)).status.code(), Some(0));
+    assert_eq!(claim(&ticket(&d, "t-b", "r"), &lanes, &cfg, &scope(&d, "b/\n"), Some(&adm)).status.code(), Some(0));
+    let before = snapshot(&lanes);
+    let listed = list(&lanes, &cfg, Some(&adm));
+    let o = claim(&ticket(&d, "t-c", "r"), &lanes, &cfg, &scope(&d, "b/x\n"), Some(&adm));
+    assert!(clash_once(&o, "t-b", "b/", "b/x"), "{}", err(&o));
+    assert_eq!(snapshot(&lanes), before);
+    assert_eq!(list(&lanes, &cfg, Some(&adm)), listed);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_live_entries_are_scanned_before_the_new_entries() {
+    let d = tmp("entryorder");
+    let cfg = config(&d, 4);
+    let adm = admission(&d, 2);
+    let lanes = d.join("lanes");
+    assert_eq!(claim(&ticket(&d, "t-live", "r"), &lanes, &cfg, &scope(&d, "a/\nb/\n"), Some(&adm)).status.code(), Some(0));
+    // scanning the new ticket's entries first would report `live=b/ new=b/x`; the stated order scans the live record's entries first and
+    // reports `live=a/ new=a/x`
+    let o = claim(&ticket(&d, "t-new", "r"), &lanes, &cfg, &scope(&d, "b/x\na/x\n"), Some(&adm));
+    assert!(clash_once(&o, "t-live", "a/", "a/x"), "{}", err(&o));
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_live_record_whose_repo_id_is_not_a_plain_name_is_a_bad_record() {
+    let d = tmp("badrepo");
+    let cfg = config(&d, 4);
+    let adm = admission(&d, 4);
+    for bad in ["repo_id=R", "repo_id=r ", "repo_id="] {
+        let lanes = d.join(format!("lanes-{}", SEQ.fetch_add(1, Ordering::SeqCst)));
+        fs::create_dir_all(&lanes).unwrap();
+        // a hand-written live record: read as another repo, a claim of repo `r` for `docs/a.md` would take lane 2 past the live `docs/`
+        fs::write(lanes.join("lane-1"), format!("lane-record v1\nticket=t-live\n{bad}\nscope=docs/\n")).unwrap();
+        let before = snapshot(&lanes);
+        let o = claim(&ticket(&d, "t-new", "r"), &lanes, &cfg, &scope(&d, "docs/a.md\n"), Some(&adm));
+        assert_eq!(o.status.code(), Some(2), "{bad}: {}", err(&o));
+        assert!(err(&o).starts_with("lane: error: ") && err(&o).trim().lines().count() == 1, "{bad}: {}", err(&o));
+        let o = run(&["lane", "list", "--lanes-dir", lanes.to_str().unwrap(), "--config", cfg.to_str().unwrap(), "--admission", adm.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(2), "{bad}: {}", err(&o));
+        let o = release("t-live", &lanes, &cfg);
+        assert_eq!(o.status.code(), Some(2), "{bad}: {}", err(&o));
+        assert_eq!(snapshot(&lanes), before, "{bad}");
+    }
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_first_claim_with_no_live_ticket_is_never_a_clash() {
     let d = tmp("first");
     let cfg = config(&d, 4);

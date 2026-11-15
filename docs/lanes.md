@@ -9,7 +9,7 @@ harness lane list --lanes-dir <abs dir> --config <file> [--admission <file>]
 harness lane admission-check <file> --config <file>
 ```
 
-- `claim` prints `ticket=<id> lane=<n>` (the lowest free lane from 1 to the cap, when fewer tickets are live than the cap). The ticket goes through the strict ticket reader. `--admission <path>` names an admission record: with no option, or with a path where nothing exists, the cap is 1; with a record that exists and is not valid the claim is refused with `bad-admission` and nothing is recorded, even when no ticket is live.
+- `claim` prints `ticket=<id> lane=<n>` (the lowest free lane from 1 to the cap, when fewer tickets are live than the cap and no live ticket of the same repo holds a scope entry that overlaps one of the claim's — see *The scope clash*; a clash refuses the claim even when a lane is free). The ticket goes through the strict ticket reader. `--admission <path>` names an admission record: with no option, or with a path where nothing exists, the cap is 1; with a record that exists and is not valid the claim is refused with `bad-admission` and nothing is recorded, even when no ticket is live.
 - The scope file holds one relative path per line. A truly empty line is skipped; a line of only whitespace is refused. A missing or empty file, an entry starting with `/` or `\`, a `..` part (split on `/` and `\`), an empty part (`a//b`) or a control character is refused with exit 2 and nothing is recorded. One trailing `/` is allowed (a folder, `a/`). Entries are stored as given (`./a`, `a/`).
 - `list` prints one line per live ticket, `ticket=<id> lane=<n> repo_id=<id> scope=<entries>`, then a last line `live=<n> cap=<n>`, where the cap is computed as for a claim (1 without `--admission`, the smaller of the admitted count and `lanes.count` with a valid record; a record that exists and is not valid refuses the list with `bad-admission`). When more tickets are live than the cap, `list` still prints them and exits 0 (a claim is what gets refused).
 - `release` prints `ticket=<id> released`. It takes `--config <file>` (required, like `list`): the legal record names follow the config, not the admission, so a release works for a ticket in lane 2 whether or not an admission is around.
@@ -60,7 +60,7 @@ A claim for ticket T in repo R is refused with `clash` when a live record of ano
 lane: refused reason=clash ticket=<live-ticket> live=<live-entry> new=<new-entry>
 ```
 
-When several live tickets or several pairs clash, the line names the first one in this order: the live records by lane number (lowest first; `list` prints them in the same order), then each live record's scope entries in stored order, then the new ticket's scope entries in stored order. The lanes dir is unchanged after the refusal, and `lane list` shows the same live tickets as before.
+When several live tickets or several pairs clash, the line names the first one in this order: the live records by lane number (lowest first; `list` prints them in the same order), then each live record's scope entries in stored order, then the new ticket's scope entries in stored order. The lanes dir is unchanged after the refusal, and `lane list` shows the same live tickets as before. A `live=` or `new=` value is an entry as stored, and the scope file accepts an entry that holds a space or an `=`, so such a value can hold them too: the line is written to be read, and cannot always be parsed back into its three parts.
 
 Two entries overlap when, after one normal form, the path parts of one are a prefix of the path parts of the other, counted in whole parts. So equal entries overlap (`docs/a.md` against `docs/a.md`); a folder entry (it ends in `/`) overlaps every entry inside it, in both orders (`docs/` against `docs/x/y.md`, and `docs/x/y.md` against `docs/`; `docs/` against `docs/sub/` in both orders); and a file entry overlaps a folder entry of the same name and every entry inside it (`docs` against `docs/`, and `docs` against `docs/x.md`, in both orders), because the same name cannot be both a file and a folder in one tree, so refusing is the safe side. `docs/a.md` against `docs/a.md.bak` is not a clash (`a.md` and `a.md.bak` differ as whole parts), and `docs/` against `docs2/x.md` is not a clash (`docs` and `docs2` differ).
 
@@ -68,7 +68,7 @@ The normal form, used only for this comparison (records keep storing entries as 
 
 What the normal form does not do: no Unicode normalization (a composed and a decomposed spelling of one accented name stay two entries), no symbolic link resolution (an entry is judged by its text), and a backslash is an ordinary character (only `/` splits the parts).
 
-Order of the checks in a claim: `bad-admission` is an input check and comes first, before the lanes dir is touched, as before. Under the lock: `already-live` first, as before; then the cap (`no-admission` with no valid admission, else `cap-full`); then `clash`. The clash stands after the cap because the cap decides whether the claim may hold a lane at all under the admission it was given, and that refusal does not look at the scope; a claim that passes it and would break a live ticket of the same repo is refused with `clash` before anything is written. So a clash claim made with a valid admission that has a free lane is refused with `clash`, and a first claim with no live ticket is never a clash.
+Order of the checks in a claim: the exit-2 input errors come first — the usage, the `--lanes-dir` path, the ticket file, the config and the scope file are all checked before any refusal; then the admission record is read, and `bad-admission` is the first refusal, an input check that comes before the lanes dir is touched, as before. Under the lock: `already-live` first, as before; then the cap (`no-admission` with no valid admission, else `cap-full`); then `clash`. The clash stands after the cap because the cap decides whether the claim may hold a lane at all under the admission it was given, and that refusal does not look at the scope; a claim that passes it and would break a live ticket of the same repo is refused with `clash` before anything is written. So a clash claim made with a valid admission that has a free lane is refused with `clash`, and a first claim with no live ticket is never a clash.
 
 What the rule does not catch: two tickets with disjoint entries that still break each other (for example one edits `docs/a.md` while the other writes a generated file outside both scopes); tickets of different repos (their entries never clash, whatever they name); and anything the normal form does not do (two spellings that differ only by Unicode normalization, or by the case of a non-ASCII letter, do not clash).
 
@@ -83,7 +83,7 @@ repo_id=<id>
 scope=<entry>        (one line per entry, at least one)
 ```
 
-A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.`).
+A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.`). The `repo_id` follows the one rule of a ticket's `repo_id`: a plain name (lowercase letters, digits, `-`, `_`, `.`; not empty, not `.` or `..`). A record that holds anything else is a bad record (exit 2, see below), not a ticket of another repo: the clash is decided by the repo id.
 
 ## Concurrency
 
@@ -91,7 +91,7 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 
 ## Reading the lanes dir (fail closed)
 
-`list`, `claim` and `release` exit 2 with one `lane: error: ...` line, and change nothing in the dir, when the lanes dir is a symbolic link or not a directory, or holds an entry named `lane-...` that is not a regular file, cannot be read, does not parse, is not named `lane-<n>` with n from 1 to the config `lanes.count` (so `lane-0`, `lane-01`, `lane-99` are refused under a count of 4), or repeats a ticket held by another record. Other names (such as a stale `.claim.tmp`) are ignored.
+`list`, `claim` and `release` exit 2 with one `lane: error: ...` line, and change nothing in the dir, when the lanes dir is a symbolic link or not a directory, or holds an entry named `lane-...` that is not a regular file, cannot be read, does not parse, is not named `lane-<n>` with n from 1 to the config `lanes.count` (so `lane-0`, `lane-01`, `lane-99` are refused under a count of 4), or repeats a ticket held by another record. A record whose `repo_id` is not a plain repo id is a bad record the same way (so `repo_id=R`, `repo_id=r ` with its trailing space, or an empty `repo_id=` each exit 2): the clash is decided by the repo id, and a record that spells another repo id must not read as another repo. Other names (such as a stale `.claim.tmp`) are ignored.
 
 ## Exit codes
 

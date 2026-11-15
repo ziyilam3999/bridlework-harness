@@ -5,16 +5,19 @@
 //! on the lanes dir itself (no lock file is created), so the read-check-write of two `harness` processes never interleaves. A claim writes the
 //! record to a temp file (`.claim.tmp`, default permissions, one left by a killed claim is removed under the lock by the next claim that takes a
 //! lane) and renames it onto the lane name, so a reader never sees a half-written record. The lanes dir is read strictly: a record that is not a
-//! regular file, cannot be read or parsed, has a name other than `lane-<n>` (n canonical, 1..=the config `lanes.count`), or repeats a ticket, is
-//! an error and nothing is changed. The admission record is read fail closed too: one that exists and is not valid is a `bad-admission` refusal
+//! regular file, cannot be read or parsed (a `repo_id` that is not a legal repo id does not parse: the clash is decided by the repo id, so a
+//! record that spells another repo id is a bad record, not another repo), has a name other than `lane-<n>` (n canonical, 1..=the config
+//! `lanes.count`), or repeats a ticket, is an error and nothing is changed. The admission record is read fail closed too: one that exists and is not valid is a `bad-admission` refusal
 //! checked before the lanes dir is touched, while a path where nothing exists means no admission (cap 1). A claim whose scope overlaps the scope
 //! of a live ticket of the same repo is refused with `clash`: checked after `already-live` and the cap, before anything is written (`scope_entry_parts`
 //! is the normal form of that comparison). No directory fsync is done, so a claim or release is not guaranteed to survive a crash. Release is
 //! explicit: a lane is not freed by a dead process.
-//! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`, and `bad-admission` also names the field when the problem is a
-//! field); 2 usage error, unreadable or refused input, or a lanes dir in a bad state.
+//! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
+//! field, and `clash` also names the live ticket and the overlapping pair of entries); 2 usage error, unreadable or refused input, or a lanes
+//! dir in a bad state.
 
 use crate::config::Config;
+use crate::repo_id::RepoId;
 use crate::ticket::Ticket;
 use std::fs;
 use std::io::{Read, Write};
@@ -125,26 +128,30 @@ pub fn scope_entry_parts(e: &str) -> Vec<String> {
     e.strip_suffix('/').unwrap_or(e).split('/').filter(|p| *p != ".").map(|p| p.to_ascii_lowercase()).collect()
 }
 
-/// Do two scope entries of one repo overlap, after the normal form? The parts of one are a prefix of the parts of the other, counted in
-/// whole parts: equal entries overlap; a folder entry (one that ends in `/`) overlaps every entry inside it; a file entry overlaps an entry
-/// that lies inside it too (`docs` against `docs/x.md`: the same name cannot be both a file and a folder in one tree, so refusing is the
-/// safe side); and an entry with no parts (the whole repo) overlaps every entry, including another whole-repo entry.
-fn entries_overlap(a: &str, b: &str) -> bool {
-    let (pa, pb) = (scope_entry_parts(a), scope_entry_parts(b));
-    pa.iter().zip(&pb).all(|(x, y)| x == y)
+/// Do two scope entries of one repo overlap, in normal form (`scope_entry_parts` of each)? The parts of one are a prefix of the parts of the
+/// other, counted in whole parts: equal entries overlap; a folder entry (one that ends in `/`) overlaps every entry inside it; a file entry
+/// overlaps an entry that lies inside it too (`docs` against `docs/x.md`: the same name cannot be both a file and a folder in one tree, so
+/// refusing is the safe side); and an entry with no parts (the whole repo) overlaps every entry, including another whole-repo entry.
+fn parts_overlap(pa: &[String], pb: &[String]) -> bool {
+    pa.iter().zip(pb).all(|(x, y)| x == y)
 }
 
 /// The first clash of `rec` against the live records, in a repeatable order: the live records by lane number (lowest first; `list_records`
 /// returns them sorted), then each live record's entries in stored order, then `rec`'s entries in stored order. Only records of the same
-/// `repo_id` are compared. Returns the live ticket, its entry and the new entry, as stored.
+/// `repo_id` are compared, and every repo id in play is a legal one (`decode` refuses a record whose repo id is not, and the claim's comes
+/// from the ticket reader), so a plain comparison cannot pass a pair whose two sides are spellings of one repo. Each entry is put into the
+/// normal form once per call, not once per comparison, so that work grows with the two entry counts, not with their product. Returns the
+/// live ticket, its entry and the new entry, as stored.
 fn find_clash(live: &[Record], rec: &Record) -> Option<(String, String, String)> {
+    let new_parts: Vec<Vec<String>> = rec.scope.iter().map(|e| scope_entry_parts(e)).collect();
     for r in live {
         if r.repo_id != rec.repo_id {
             continue;
         }
-        for le in &r.scope {
-            for ne in &rec.scope {
-                if entries_overlap(le, ne) {
+        let live_parts: Vec<Vec<String>> = r.scope.iter().map(|e| scope_entry_parts(e)).collect();
+        for (le, lp) in r.scope.iter().zip(&live_parts) {
+            for (ne, np) in rec.scope.iter().zip(&new_parts) {
+                if parts_overlap(lp, np) {
                     return Some((r.ticket.clone(), le.clone(), ne.clone()));
                 }
             }
@@ -169,6 +176,9 @@ fn decode(lane: u32, text: &str) -> Result<Record, String> {
     }
     let ticket = lines.next().and_then(|l| l.strip_prefix("ticket=")).filter(|t| ticket_id_ok(t)).ok_or("a lane record has no valid ticket line")?;
     let repo_id = lines.next().and_then(|l| l.strip_prefix("repo_id=")).ok_or("a lane record has no repo_id line")?;
+    // The clash is decided by the repo id, so a record that holds anything but a legal repo id (the one rule of `repo_id.rs`, the same rule a
+    // ticket goes through) is a bad record, not another repo.
+    let repo_id = RepoId::parse(repo_id).map_err(|_| "a lane record has a repo_id that is not a plain name".to_string())?;
     let mut scope = Vec::new();
     for l in lines {
         let e = l.strip_prefix("scope=").ok_or("a lane record has an unknown line")?;
@@ -178,7 +188,7 @@ fn decode(lane: u32, text: &str) -> Result<Record, String> {
     if scope.is_empty() {
         return Err("a lane record has no scope entry".to_string());
     }
-    Ok(Record { lane, ticket: ticket.to_string(), repo_id: repo_id.to_string(), scope })
+    Ok(Record { lane, ticket: ticket.to_string(), repo_id: repo_id.as_str().to_string(), scope })
 }
 
 fn lane_path(dir: &Path, n: u32) -> PathBuf {
@@ -748,6 +758,15 @@ mod tests {
     }
 
     #[test]
+    fn a_record_whose_repo_id_is_not_a_plain_name_is_bad() {
+        // the clash is decided by the repo id, so a record that spells another repo id must not read as another repo
+        for bad in ["R", "r ", "", "my repo", ".."] {
+            let text = format!("{HEADER}\nticket=t-1\nrepo_id={bad}\nscope=a\n");
+            assert!(decode(1, &text).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn the_normal_form_of_the_clash_comparison() {
         // a `.` part does not change what an entry names; ASCII case does not either
         assert_eq!(scope_entry_parts("docs/./a.md"), vec!["docs", "a.md"]);
@@ -763,13 +782,14 @@ mod tests {
 
     #[test]
     fn entries_overlap_in_whole_path_parts() {
+        let overlap = |a: &str, b: &str| parts_overlap(&scope_entry_parts(a), &scope_entry_parts(b));
         let both = |a: &str, b: &str| {
-            assert!(entries_overlap(a, b), "{a} vs {b}");
-            assert!(entries_overlap(b, a), "{a} vs {b}");
+            assert!(overlap(a, b), "{a} vs {b}");
+            assert!(overlap(b, a), "{a} vs {b}");
         };
         let none = |a: &str, b: &str| {
-            assert!(!entries_overlap(a, b), "{a} vs {b}");
-            assert!(!entries_overlap(b, a), "{a} vs {b}");
+            assert!(!overlap(a, b), "{a} vs {b}");
+            assert!(!overlap(b, a), "{a} vs {b}");
         };
         // equal after the normal form, in both orders
         both("docs/a.md", "docs/a.md");
