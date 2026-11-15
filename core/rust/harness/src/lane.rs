@@ -1,11 +1,11 @@
 //! `harness lane claim | release | list` (std only; `docs/lanes.md` is the contract). A lane holds one live ticket. In this slice the cap
 //! is one constant, `CAP`. One record file per held lane, `<lanes-dir>/lane-<n>` with n in 1..=CAP. Every claim, release and list runs as one
 //! critical section under an exclusive `flock` on the lanes dir itself (no lock file is created), so the read-check-write of two `harness` processes never interleaves. A claim writes the
-//! record to a temp file (`.claim.tmp`, default permissions, a stale one is removed under the lock) and renames it onto the lane name, so a
+//! record to a temp file (`.claim.tmp`, default permissions, one left by a killed claim is removed under the lock by the next claim that takes a lane) and renames it onto the lane name, so a
 //! reader never sees a half-written record. The lanes dir is read strictly: a record that is not a regular file, cannot be read or parsed, has
 //! a name other than `lane-<n>` (n canonical, 1..=CAP), or repeats a ticket, is an error and nothing is changed. No directory fsync is done, so a
 //! claim or release is not guaranteed to survive a crash. Release is explicit: a lane is not freed by a dead process.
-//! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`); 2 usage error or unreadable or refused input.
+//! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`); 2 usage error, unreadable or refused input, or a lanes dir in a bad state.
 
 use crate::config::Config;
 use crate::ticket::Ticket;

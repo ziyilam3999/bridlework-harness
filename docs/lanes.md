@@ -28,7 +28,7 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 
 ## Concurrency
 
-`claim`, `release` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then `cap-full`, then writes the record to `.claim.tmp` and renames it onto `lane-<n>`; a release removes only the record it just read. So with any cap a ticket never holds two lanes, live never exceeds the cap, and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A stale `.claim.tmp` of a killed claim is removed by the next claim under the lock, so at most one is left. No directory fsync is done: a claim or release is not guaranteed to survive a crash of the machine.
+`claim`, `release` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then `cap-full`, then writes the record to `.claim.tmp` and renames it onto `lane-<n>`; a release removes only the record it just read. So with any cap a ticket never holds two lanes, live never exceeds the cap, and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim or release is not guaranteed to survive a crash of the machine.
 
 ## Reading the lanes dir (fail closed)
 
@@ -40,7 +40,7 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 | --- | --- |
 | 0 | done |
 | 1 | policy refusal: exactly one stderr line starting `lane: refused reason=<token>` |
-| 2 | usage error, or unreadable or refused input |
+| 2 | usage error, unreadable or refused input, or a lanes dir in a bad state (see above) |
 
 ## Refusal tokens
 
