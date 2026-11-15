@@ -689,6 +689,481 @@ fn a_bad_controls_input_is_a_setup_error() {
     assert!(!t.state().exists());
 }
 
+// ---- --as-of: the hand-over numbers ----
+
+/// The pinned fixture: a state row escalated (attempts 2) for a group with no inbox row, a pattern chain of
+/// 3 repeats, an event signature over two weeks, a controls file that seeds one root and names one member row.
+fn pinned_fixture(t: &Tmp) -> (std::path::PathBuf, std::path::PathBuf) {
+    t.write_inbox(&[
+        hand("g-1", "2026-11-02", "", "high"),
+        hand("g-2", "2026-11-02", "", ""),
+        hand("g-2b", "2026-11-03", "g-2", ""),
+        hand("g-2c", "2026-11-04", "g-2", ""),
+        pattern("pat-1", "2026-11-01", ""),
+        row("pat-1-r1", "2026-11-02", "", "rep", &[("kind", "pattern"), ("repeats", "pat-1")]),
+        row("pat-1-r2", "2026-11-03", "", "rep", &[("kind", "pattern"), ("repeats", "pat-1")]),
+        row("pat-1-r3", "2026-11-04", "", "rep", &[("kind", "pattern"), ("repeats", "pat-1")]),
+        event("sig-one", "2026-w45", "2026-11-03", ""),
+        event("sig-one", "2026-w46", "2026-11-10", ""),
+    ]);
+    fs::write(
+        t.state(),
+        "{\"group\":\"g-esc\",\"status\":\"escalated\",\"ticket_file\":\"\",\"proposed_week\":\"2026-w45\",\"task_id\":\"\",\"task_session\":\"\",\"resolved_pr\":\"\",\"resolved_date\":\"\",\"attempts\":\"2\"}\n",
+    )
+    .unwrap();
+    controls(t, "g-1 | control: a guard pointer | lesson: ISSUE-001\ng-2b | control: x | lesson: ISSUE-001\n")
+}
+
+/// Written before --as-of existed; it passed with friction_loop.rs and friction.rs as on origin/master.
+#[test]
+fn triage_output_without_as_of_is_pinned() {
+    let t = Tmp::new();
+    let (c, l) = pinned_fixture(&t);
+    let o = triage_c(&t, W46, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "seed group=g-1 line=1\n\
+         control-not-root line=2 group=g-2\n\
+         propose group=g-2 file=2026-w46-1.json reason=twice-broken\n\
+         open group=g-2 age_weeks=0 bound=no\n\
+         signature group=sig-one weeks=2\n\
+         pattern id=pat-1 repeats=3\n\
+         escalate group=g-esc attempts=2\n\
+         triage week=2026-w46 proposed=1 open=1 resolved=0 escalated=1\n"
+    );
+}
+
+/// The lines a run with `--as-of` prints after the `triage week=` line.
+fn new_lines(o: &Output) -> String {
+    let s = out(o);
+    let i = s.find("triage week=").expect("the week line");
+    let j = s[i..].find('\n').unwrap() + i + 1;
+    s[j..].to_string()
+}
+
+/// The worked-case inbox: g-1..g-4 with no at, g-5 with an at.
+fn worked_inbox(t: &Tmp) {
+    t.write_inbox(&[
+        hand("g-1", "2026-11-02", "", ""),
+        hand("g-2", "2026-11-03", "", ""),
+        hand("g-3", "2026-11-03", "", ""),
+        hand("g-4", "2026-11-04", "", ""),
+        row("g-5", "2026-11-04", "", "lesson", &[("at", "2026-11-04T10:00:00Z")]),
+    ]);
+}
+
+/// The worked-case inbox plus g-1b, g-1c (2026-11-09) and g-1d (2026-11-10) breaking g-1.
+fn worked_inbox_broken(t: &Tmp) {
+    t.write_inbox(&[
+        hand("g-1", "2026-11-02", "", ""),
+        hand("g-2", "2026-11-03", "", ""),
+        hand("g-3", "2026-11-03", "", ""),
+        hand("g-4", "2026-11-04", "", ""),
+        row("g-5", "2026-11-04", "", "lesson", &[("at", "2026-11-04T10:00:00Z")]),
+        hand("g-1b", "2026-11-09", "g-1", ""),
+        hand("g-1c", "2026-11-09", "g-1", ""),
+        hand("g-1d", "2026-11-10", "g-1", ""),
+    ]);
+}
+
+const G1_CONTROLS: &str = "g-1 | control: x | lesson: ISSUE-001\n";
+
+#[test]
+fn the_output_without_as_of_is_a_prefix_of_the_output_with_it() {
+    fn run_fixture(as_of: bool) -> Output {
+        let t = Tmp::new();
+        let (c, l) = pinned_fixture(&t);
+        let mut extra: Vec<&str> = vec!["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l)];
+        if as_of {
+            extra.push("--as-of");
+            extra.push("2026-11-15T00:00:00Z");
+        }
+        triage(&t, W46, &extra)
+    }
+    let a = run_fixture(false);
+    let b = run_fixture(true);
+    assert_eq!((code(&a), code(&b)), (0, 0), "{}{}", err(&a), err(&b));
+    let (sa, sb) = (out(&a), out(&b));
+    assert!(sb.starts_with(&sa), "{sb}");
+    let tail = &sb[sa.len()..];
+    let lines: Vec<&str> = tail.lines().collect();
+    assert!(!lines.is_empty());
+    let mut i = 0;
+    while i < lines.len() && lines[i].starts_with("unsettled ") {
+        i += 1;
+    }
+    let n_unset = i;
+    while i < lines.len() && lines[i].starts_with("after ") {
+        i += 1;
+    }
+    assert!(n_unset > 0 && i > n_unset, "{tail}");
+    assert_eq!(i, lines.len() - 1, "the due line is the last line: {tail}");
+    assert!(lines[i].starts_with("due "), "{tail}");
+}
+
+#[test]
+fn as_of_skips_seeded_and_proposed_groups_and_counts_state_groups_without_rows() {
+    let t = Tmp::new();
+    let (c, l) = pinned_fixture(&t);
+    let o = triage(&t, W46, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l), "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        new_lines(&o),
+        "unsettled group=sig-one rows=2 rows_over_24h=2 age_hours=288\n\
+         after group=g-1 status=resolved bound=no rows_after=0\n\
+         due as_of=2026-11-15T00:00:00Z unsettled=1 unsettled_rows=2 unsettled_over_24h=2 after_ge3=0 after_ge3_unbound=0 escalated=1 state_no_rows=1\n"
+    );
+}
+
+#[test]
+fn as_of_worked_case_run_one() {
+    let t = Tmp::new();
+    worked_inbox(&t);
+    let (c, l) = controls(&t, G1_CONTROLS);
+    let o = triage(&t, W45, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l), "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        new_lines(&o),
+        "unsettled group=g-2 rows=1 rows_over_24h=1 age_hours=288\n\
+         unsettled group=g-3 rows=1 rows_over_24h=1 age_hours=288\n\
+         unsettled group=g-5 rows=1 rows_over_24h=1 age_hours=254\n\
+         after group=g-1 status=resolved bound=no rows_after=0\n\
+         due as_of=2026-11-15T00:00:00Z unsettled=3 unsettled_rows=3 unsettled_over_24h=3 after_ge3=0 after_ge3_unbound=0 escalated=0 state_no_rows=0\n"
+    );
+}
+
+#[test]
+fn as_of_worked_case_after_regression_and_bind() {
+    let t = Tmp::new();
+    worked_inbox(&t);
+    let (c, l) = controls(&t, G1_CONTROLS);
+    // run 1 without --as-of: g-1 seeded, g-4 proposed (the top slot)
+    assert_eq!(code(&triage(&t, W45, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l)])), 0);
+    // rows that break g-1; run 2 regresses it and proposes it again
+    worked_inbox_broken(&t);
+    assert_eq!(code(&triage(&t, W46, &["--top", "1"])), 0);
+    let want_unsettled = "unsettled group=g-2 rows=1 rows_over_24h=1 age_hours=288\n\
+         unsettled group=g-3 rows=1 rows_over_24h=1 age_hours=288\n\
+         unsettled group=g-5 rows=1 rows_over_24h=1 age_hours=254\n";
+    let o = triage(&t, W46, &["--top", "1", "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        new_lines(&o),
+        format!(
+            "{want_unsettled}\
+             after group=g-1 status=proposed bound=no rows_after=3\n\
+             due as_of=2026-11-15T00:00:00Z unsettled=3 unsettled_rows=3 unsettled_over_24h=3 after_ge3=1 after_ge3_unbound=1 escalated=0 state_no_rows=0\n"
+        )
+    );
+    // bound: the same run after a bind of g-1
+    assert_eq!(code(&bind(&t, "g-1", "word-id", "s-fake")), 0);
+    let o = triage(&t, W46, &["--top", "1", "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        new_lines(&o),
+        format!(
+            "{want_unsettled}\
+             after group=g-1 status=proposed bound=yes rows_after=3\n\
+             due as_of=2026-11-15T00:00:00Z unsettled=3 unsettled_rows=3 unsettled_over_24h=3 after_ge3=1 after_ge3_unbound=0 escalated=0 state_no_rows=0\n"
+        )
+    );
+}
+
+#[test]
+fn as_of_counts_the_24_hour_boundary() {
+    let t = Tmp::new();
+    // a two-row group takes the top slot, so the single-row groups below stay without a state row
+    t.write_inbox(&[
+        hand("top-a", "2026-11-10", "", "blocker"),
+        hand("top-b", "2026-11-11", "top-a", "blocker"),
+        row("g-a", "2026-11-14", "", "lesson", &[("at", "2026-11-14T12:00:00Z")]),
+        row("g-b", "2026-11-14", "", "lesson", &[("at", "2026-11-14T12:00:01Z")]),
+        hand("g-c", "2026-11-15", "", ""),
+        row("g-d", "2026-11-15", "", "lesson", &[("at", "2026-11-15T12:00:00Z")]),
+    ]);
+    let o = triage(&t, W46, &["--top", "1", "--as-of", "2026-11-15T12:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let s = out(&o);
+    assert!(s.contains("unsettled group=g-a rows=1 rows_over_24h=1 age_hours=24\n"), "{s}");
+    assert!(s.contains("unsettled group=g-b rows=1 rows_over_24h=0 age_hours=23\n"), "{s}");
+    assert!(s.contains("unsettled group=g-c rows=1 rows_over_24h=0 age_hours=12\n"), "{s}");
+    assert!(s.contains("unsettled group=g-d rows=1 rows_over_24h=0 age_hours=0\n"), "{s}");
+    assert!(!s.contains("unsettled group=top-a"), "{s}");
+}
+
+#[test]
+fn the_after_line_counts_rows_after_the_last_resolved_date_only() {
+    let t = Tmp::new();
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "high")]);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
+    // resolved at T1 = 2026-11-10T12:00:00Z
+    let c1 = closed_with(&t, "4242", "2026-11-10T12:00:00Z", "\"pr\":\"77\",");
+    assert_eq!(code(&triage(&t, W46, &["--top", "1", "--closed", p(&c1)])), 0);
+    // two rows between T1 and T2 regress it once
+    t.write_inbox(&[
+        hand("g-1", "2026-11-02", "", "high"),
+        row("g-1b", "2026-11-11", "g-1", "lesson", &[("at", "2026-11-11T00:00:00Z")]),
+        row("g-1c", "2026-11-12", "g-1", "lesson", &[("at", "2026-11-12T00:00:00Z")]),
+    ]);
+    assert_eq!(code(&triage(&t, W47, &["--top", "1"])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4243", "s-fake")), 0);
+    // resolved again at T2 = 2026-11-12T12:00:00Z, later than both rows above
+    let c2 = closed_with(&t, "4243", "2026-11-12T12:00:00Z", "\"pr\":\"78\",");
+    assert_eq!(code(&triage(&t, "2026-w48", &["--top", "1", "--closed", p(&c2)])), 0);
+    // one row after T2 escalates
+    t.write_inbox(&[
+        hand("g-1", "2026-11-02", "", "high"),
+        row("g-1b", "2026-11-11", "g-1", "lesson", &[("at", "2026-11-11T00:00:00Z")]),
+        row("g-1c", "2026-11-12", "g-1", "lesson", &[("at", "2026-11-12T00:00:00Z")]),
+        row("g-1d", "2026-11-13", "g-1", "lesson", &[("at", "2026-11-13T00:00:00Z")]),
+    ]);
+    let o = triage(&t, "2026-w49", &["--top", "1", "--as-of", "2026-11-20T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("escalate group=g-1 attempts=2"), "{}", out(&o));
+    // 3 rows break g-1; 2 sit between T1 and T2 and only g-1d is after T2, so rows_after is 1, not 3
+    assert_eq!(
+        new_lines(&o),
+        "after group=g-1 status=escalated bound=yes rows_after=1\n\
+         due as_of=2026-11-20T00:00:00Z unsettled=0 unsettled_rows=0 unsettled_over_24h=0 after_ge3=0 after_ge3_unbound=0 escalated=1 state_no_rows=0\n"
+    );
+}
+
+#[test]
+fn the_after_line_bound_matches_the_page_bound_line() {
+    let t = Tmp::new();
+    worked_inbox(&t);
+    let (c, l) = controls(&t, G1_CONTROLS);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l)])), 0);
+    worked_inbox_broken(&t);
+    assert_eq!(code(&triage(&t, W46, &["--top", "1"])), 0);
+    let cfg = t.config();
+    let page = t.0.join("page.md");
+    let page_run = || run(&["friction", "page", "--week", W46, "--state", p(&t.state()), "--out", p(&page), "--config", p(&cfg)]);
+    let o = triage(&t, W46, &["--top", "1", "--as-of", "2026-11-15T00:00:00Z"]);
+    assert!(out(&o).contains("after group=g-1 status=proposed bound=no rows_after=3"), "{}", out(&o));
+    assert_eq!(code(&page_run()), 0);
+    assert!(fs::read_to_string(&page).unwrap().contains("- bound: no"), "the page agrees on no");
+    assert_eq!(code(&bind(&t, "g-1", "word-id", "s-fake")), 0);
+    let o = triage(&t, W46, &["--top", "1", "--as-of", "2026-11-15T00:00:00Z"]);
+    assert!(out(&o).contains("after group=g-1 status=proposed bound=yes rows_after=3"), "{}", out(&o));
+    assert_eq!(code(&page_run()), 0);
+    assert!(fs::read_to_string(&page).unwrap().contains("- bound: yes"), "the page agrees on yes");
+}
+
+#[test]
+fn as_of_changes_no_write_and_the_follow_up_verbs_agree() {
+    fn scenario(as_of: bool) -> (Tmp, Output) {
+        let t = Tmp::new();
+        t.write_inbox(&[
+            hand("g-1", "2026-11-02", "", "high"),
+            hand("g-2", "2026-11-02", "", "medium"),
+            hand("g-2b", "2026-11-11", "g-2", ""),
+            hand("g-3", "2026-11-03", "", ""),
+        ]);
+        fs::write(
+            t.state(),
+            "{\"group\":\"g-2\",\"status\":\"proposed\",\"ticket_file\":\"\",\"proposed_week\":\"2026-w45\",\"task_id\":\"4242\",\"task_session\":\"s-fake\",\"resolved_pr\":\"\",\"resolved_date\":\"\",\"attempts\":\"0\"}\n",
+        )
+        .unwrap();
+        let closed = closed_with(&t, "4242", "2026-11-10", "\"pr\":\"77\",");
+        let (c, l) = controls(&t, G1_CONTROLS);
+        let mut extra: Vec<&str> = vec!["--top", "5", "--closed", p(&closed), "--controls", p(&c), "--lessons-dir", p(&l)];
+        if as_of {
+            extra.push("--as-of");
+            extra.push("2026-11-15T00:00:00Z");
+        }
+        let o = triage(&t, W46, &extra);
+        (t, o)
+    }
+    // the run seeds (g-1), resolves (g-2 by the feed), regresses (g-2b) and proposes (g-2, g-3)
+    let (ta, oa) = scenario(false);
+    let (tb, ob) = scenario(true);
+    assert_eq!((code(&oa), code(&ob)), (0, 0), "{}{}", err(&oa), err(&ob));
+    assert!(out(&ob).contains("due as_of="), "{}", out(&ob));
+    assert_eq!(fs::read(ta.state()).unwrap(), fs::read(tb.state()).unwrap());
+    assert_eq!(handoff_snap(&ta.handoff()), handoff_snap(&tb.handoff()));
+    let (ba, bb) = (bind(&ta, "g-3", "task-one", "s-fake"), bind(&tb, "g-3", "task-one", "s-fake"));
+    assert_eq!((code(&ba), out(&ba)), (code(&bb), out(&bb)));
+    let (pa, pb) = (ta.0.join("page.md"), tb.0.join("page.md"));
+    let (va, vb) = (
+        run(&["friction", "page", "--week", W46, "--state", p(&ta.state()), "--out", p(&pa), "--config", p(&ta.config())]),
+        run(&["friction", "page", "--week", W46, "--state", p(&tb.state()), "--out", p(&pb), "--config", p(&tb.config())]),
+    );
+    assert_eq!((code(&va), out(&va)), (code(&vb), out(&vb)));
+    // a run with --as-of that has nothing to file leaves a missing state file missing
+    let t = Tmp::new();
+    t.write_inbox(&[]);
+    let o = triage(&t, W46, &["--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(!t.state().exists());
+}
+
+#[test]
+fn an_inbox_with_no_group_prints_the_due_line_with_zeros() {
+    let t = Tmp::new();
+    t.write_inbox(&[]);
+    let o = triage(&t, W46, &["--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).ends_with(
+        "due as_of=2026-11-15T00:00:00Z unsettled=0 unsettled_rows=0 unsettled_over_24h=0 after_ge3=0 after_ge3_unbound=0 escalated=0 state_no_rows=0\n"
+    ), "{}", out(&o));
+}
+
+#[test]
+fn a_group_named_only_by_a_control_not_root_line_stays_unsettled() {
+    let t = Tmp::new();
+    t.write_inbox(&[
+        hand("big", "2026-11-02", "", "blocker"),
+        hand("g-9", "2026-11-03", "", ""),
+        hand("g-9b", "2026-11-04", "g-9", ""),
+    ]);
+    let (c, l) = controls(&t, "g-9b | control: x | lesson: ISSUE-001\n");
+    let o = triage(&t, W46, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l), "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("control-not-root line=1 group=g-9"), "{}", out(&o));
+    assert!(out(&o).contains("unsettled group=g-9 rows=2 rows_over_24h=2 age_hours=288\n"), "{}", out(&o));
+}
+
+#[test]
+fn as_of_is_not_compared_with_week() {
+    let t = Tmp::new();
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "")]);
+    // 2026-11-15 sits in 2026-w46; the run takes 2026-w20 and still exits 0 with the new lines
+    let o = triage(&t, "2026-w20", &["--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("due as_of=2026-11-15T00:00:00Z unsettled=0"), "{}", out(&o));
+}
+
+#[test]
+fn a_bad_as_of_value_is_a_usage_error_before_any_write() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    let log = t.file(
+        "events.jsonl",
+        format!("{}\n", "{\"v\":2,\"kind\":\"gate_fail\",\"ts_ms\":1793577600000,\"ticket\":\"199\",\"repo\":\"bridlework-harness\",\"gate_id\":\"rust-test\",\"failure_class\":\"suite-fail\",\"head_sha\":\"aa11bb22cc33dd44ee55ff6600112233445566aa\",\"result\":\"fail\"}"),
+    );
+    let before = (sha(&t.state()), sha(&t.inbox()), handoff_snap(&t.handoff()));
+    for v in ["2026-11-15", "2026-11-15T10:00:00z", "2026-11-15T10:00:00+08:00", "2026-11-15T25:00:00Z", "2026-02-30T10:00:00Z", ""] {
+        let o = triage(&t, W46, &["--as-of", v, "--log", p(&log)]);
+        assert_eq!(code(&o), 2, "{v}");
+        assert!(out(&o).is_empty(), "{v}");
+        assert!(err(&o).contains("--as-of must be a UTC instant YYYY-MM-DDTHH:MM:SSZ"), "{v}: {}", err(&o));
+        if !v.is_empty() {
+            assert!(!err(&o).contains(v), "{v}: {}", err(&o));
+        }
+        assert_eq!((sha(&t.state()), sha(&t.inbox()), handoff_snap(&t.handoff())), before, "{v}");
+    }
+    // given twice
+    let o = triage(&t, W46, &["--as-of", "2026-11-15T00:00:00Z", "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 2);
+    assert!(err(&o).contains("--as-of was given twice"), "{}", err(&o));
+    // the last argument with no value (run directly: the helper appends --config after the extras)
+    let o = run(&["friction", "triage", "--week", W46, "--state", p(&t.state()), "--handoff-dir", p(&t.handoff()), "--config", p(&t.config()), "--as-of"]);
+    assert_eq!(code(&o), 2);
+    assert!(err(&o).contains("--as-of is missing its value"), "{}", err(&o));
+    assert_eq!((sha(&t.state()), sha(&t.inbox()), handoff_snap(&t.handoff())), before);
+}
+
+#[test]
+fn the_existing_refusals_keep_their_exit_and_message_with_a_valid_as_of() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    let good = "2026-11-15T00:00:00Z";
+    let good_state = fs::read_to_string(t.state()).unwrap();
+    // a row with a malformed at
+    t.write_inbox(&[row("bad-at", "2026-11-02", "", "lesson", &[("at", "2026-11-02 09:00")])]);
+    let o = triage(&t, W46, &["--as-of", good]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("at must be a real UTC instant"), "{}", err(&o));
+    assert!(out(&o).is_empty() && !out(&o).contains("due as_of="));
+    five(&t);
+    // a bad state file
+    fs::write(t.state(), format!("{good_state}not json\n")).unwrap();
+    let o = triage(&t, W46, &["--as-of", good]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("state line 2"), "{}", err(&o));
+    fs::write(t.state(), &good_state).unwrap();
+    // a missing controls file
+    let l = t.0.join("lessons");
+    fs::create_dir_all(&l).unwrap();
+    let o = triage(&t, W46, &["--as-of", good, "--controls", p(&t.0.join("none.txt")), "--lessons-dir", p(&l)]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    // a malformed controls line
+    let (c, l) = controls(&t, "g-1 | control: x\n");
+    let o = triage(&t, W46, &["--as-of", good, "--controls", p(&c), "--lessons-dir", p(&l)]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("controls line 1 is malformed"), "{}", err(&o));
+    // an unknown option: the message lists --as-of
+    let o = triage(&t, W46, &["--bogus", "x", "--as-of", good]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(err(&o).contains("an unknown option (triage takes only"), "{}", err(&o));
+    assert!(err(&o).contains("--as-of"), "{}", err(&o));
+    assert!(out(&o).is_empty());
+}
+
+#[test]
+fn a_row_later_than_as_of_refuses_with_nothing_written() {
+    // an at one second after; the first such row in inbox order is named
+    let t = Tmp::new();
+    t.write_inbox(&[
+        hand("g-0", "2026-11-01", "", ""),
+        row("g-x", "2026-11-16", "", "lesson", &[("at", "2026-11-16T00:00:01Z")]),
+        row("g-y", "2026-11-16", "", "lesson", &[("at", "2026-11-16T00:00:02Z")]),
+    ]);
+    let o = triage(&t, W46, &["--as-of", "2026-11-16T00:00:00Z"]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert_eq!(err(&o), "harness: friction refused: --as-of is before row g-x\n");
+    assert!(out(&o).is_empty());
+    assert!(!t.state().exists());
+    assert!(files(&t.handoff()).is_empty());
+    // a row with no at dated the day after
+    let t = Tmp::new();
+    t.write_inbox(&[hand("g-9", "2026-11-17", "", "")]);
+    let o = triage(&t, W46, &["--as-of", "2026-11-16T00:00:00Z"]);
+    assert_eq!(code(&o), 1);
+    assert_eq!(err(&o), "harness: friction refused: --as-of is before row g-9\n");
+    assert!(!t.state().exists());
+    assert!(files(&t.handoff()).is_empty());
+    // with --log the sweep runs first: the inbox holds the swept row and the refusal names it
+    let t = Tmp::new();
+    fs::write(t.inbox(), "").unwrap();
+    let log = t.file(
+        "events.jsonl",
+        format!("{}\n", "{\"v\":2,\"kind\":\"gate_fail\",\"ts_ms\":1793577600000,\"ticket\":\"199\",\"repo\":\"bridlework-harness\",\"gate_id\":\"rust-test\",\"failure_class\":\"suite-fail\",\"head_sha\":\"aa11bb22cc33dd44ee55ff6600112233445566aa\",\"result\":\"fail\"}"),
+    );
+    let o = triage(&t, W45, &["--as-of", "2026-11-01T23:59:59Z", "--log", p(&log)]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).starts_with("harness: friction refused: --as-of is before row evt.gate_fail."), "{}", err(&o));
+    assert!(fs::read_to_string(t.inbox()).unwrap().contains("evt.gate_fail."), "the swept row is in the inbox");
+    assert!(!t.state().exists());
+    assert!(files(&t.handoff()).is_empty());
+}
+
+#[test]
+fn the_as_of_lines_carry_ids_and_numbers_only() {
+    let t = Tmp::new();
+    const M: &str = "zzmarkerzz";
+    t.write_inbox(&[
+        row("g-1", "2026-11-02", "", "text with zzmarkerzz", &[("why", "why zzmarkerzz"), ("proof", "~/zzmarkerzz.md")]),
+        hand("g-2", "2026-11-03", "", ""),
+        hand("g-2b", "2026-11-04", "g-2", ""),
+        hand("g-3", "2026-11-04", "", ""),
+    ]);
+    let (c, l) = controls(&t, format!("g-3 | control: pointer zzmarkerzz | lesson: ISSUE-001\ng-2b | control: x | lesson: ISSUE-001\n"));
+    let o = triage(&t, W46, &["--top", "1", "--controls", p(&c), "--lessons-dir", p(&l), "--as-of", "2026-11-15T00:00:00Z"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let all = format!("{}{}", out(&o), err(&o));
+    assert!(!all.contains(M), "{all}");
+    let s = out(&o);
+    assert!(s.contains("unsettled group=g-1 rows=1 rows_over_24h=1 age_hours=312\n"), "{s}");
+    assert!(s.contains("after group=g-3 status=resolved bound=no rows_after=0\n"), "{s}");
+    assert!(s.contains("due as_of=2026-11-15T00:00:00Z"), "{s}");
+}
+
 #[test]
 fn a_bad_controls_line_refuses_before_the_log_sweep_files_anything() {
     let t = Tmp::new();
