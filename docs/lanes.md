@@ -52,6 +52,26 @@ The reviewer, verdict and operator fields are self-asserted text: the engine che
 
 With no `--admission` option, or with `--admission <path>` where nothing exists, the cap is 1: the first claim of an empty lanes dir gets lane 1 with no admission at all, and a claim for another ticket while one is live is refused with `no-admission`. With a valid record the cap is the smaller of the record's `lanes` value and the config `lanes.count` (a lane number is at most nine digits, so a count beyond that bounds at 999999999).
 
+## The scope clash
+
+A claim for ticket T in repo R is refused with `clash` when a live record of another ticket holds the same `repo_id` (compared as stored) and at least one of its scope entries overlaps one of T's scope entries. The refusal is one stderr line that names the live ticket and the overlapping pair of entries as stored, the live ticket's entry first:
+
+```
+lane: refused reason=clash ticket=<live-ticket> live=<live-entry> new=<new-entry>
+```
+
+When several live tickets or several pairs clash, the line names the first one in this order: the live records by lane number (lowest first; `list` prints them in the same order), then each live record's scope entries in stored order, then the new ticket's scope entries in stored order. The lanes dir is unchanged after the refusal, and `lane list` shows the same live tickets as before.
+
+Two entries overlap when, after one normal form, the path parts of one are a prefix of the path parts of the other, counted in whole parts. So equal entries overlap (`docs/a.md` against `docs/a.md`); a folder entry (it ends in `/`) overlaps every entry inside it, in both orders (`docs/` against `docs/x/y.md`, and `docs/x/y.md` against `docs/`; `docs/` against `docs/sub/` in both orders); and a file entry overlaps a folder entry of the same name and every entry inside it (`docs` against `docs/`, and `docs` against `docs/x.md`, in both orders), because the same name cannot be both a file and a folder in one tree, so refusing is the safe side. `docs/a.md` against `docs/a.md.bak` is not a clash (`a.md` and `a.md.bak` differ as whole parts), and `docs/` against `docs2/x.md` is not a clash (`docs` and `docs2` differ).
+
+The normal form, used only for this comparison (records keep storing entries as given, and what the scope file accepts does not change): the entry is split on `/` after dropping one trailing `/`, every `.` part is dropped (`docs/./a.md` and `./docs/a.md` are `docs/a.md`), and the parts are compared without regard to ASCII letter case (`Docs/A.md` clashes with `docs/a.md`: the default macOS file system treats them as one file, and refusing too much is the safe side). An entry that is nothing but `.` parts (`.` or `./`) names the whole repo: it clashes with every entry of the same repo and with another such entry.
+
+What the normal form does not do: no Unicode normalization (a composed and a decomposed spelling of one accented name stay two entries), no symbolic link resolution (an entry is judged by its text), and a backslash is an ordinary character (only `/` splits the parts).
+
+Order of the checks in a claim: `bad-admission` is an input check and comes first, before the lanes dir is touched, as before. Under the lock: `already-live` first, as before; then the cap (`no-admission` with no valid admission, else `cap-full`); then `clash`. The clash stands after the cap because the cap decides whether the claim may hold a lane at all under the admission it was given, and that refusal does not look at the scope; a claim that passes it and would break a live ticket of the same repo is refused with `clash` before anything is written. So a clash claim made with a valid admission that has a free lane is refused with `clash`, and a first claim with no live ticket is never a clash.
+
+What the rule does not catch: two tickets with disjoint entries that still break each other (for example one edits `docs/a.md` while the other writes a generated file outside both scopes); tickets of different repos (their entries never clash, whatever they name); and anything the normal form does not do (two spellings that differ only by Unicode normalization, or by the case of a non-ASCII letter, do not clash).
+
 ## Record format
 
 The lanes dir is created by `claim` when missing. One file per held lane, `<lanes-dir>/lane-<n>`, with n written without a leading zero and from 1 to the config `lanes.count`. Text:
@@ -67,7 +87,7 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 
 ## Concurrency
 
-`claim`, `release` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then the cap (`no-admission` when no valid admission is given, else `cap-full`), then writes the record to `.claim.tmp` and renames it onto `lane-<n>`; a release removes only the record it just read. So with any cap a ticket never holds two lanes, a claim never makes live exceed the cap that claim runs under (a later call given a different admission, or none, may see live above its own cap), and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim or release is not guaranteed to survive a crash of the machine.
+`claim`, `release` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then the cap (`no-admission` when no valid admission is given, else `cap-full`), then `clash`, then writes the record to `.claim.tmp` and renames it onto `lane-<n>`; a release removes only the record it just read. So with any cap a ticket never holds two lanes, a claim never makes live exceed the cap that claim runs under (a later call given a different admission, or none, may see live above its own cap), and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim or release is not guaranteed to survive a crash of the machine.
 
 ## Reading the lanes dir (fail closed)
 
@@ -83,10 +103,11 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 
 ## Refusal tokens
 
-- `cap-full`: a claim for another ticket when as many tickets are live as the cap, under a valid admission record.
-- `no-admission`: a claim for another ticket while one ticket is live, with no valid admission (no `--admission`, or a path where nothing exists); the lanes dir is unchanged.
-- `bad-admission`: a claim or list given an admission file that exists and is not valid, or `admission-check` on one; nothing is recorded. The line names the field when the problem is a field.
-- `already-live`: the ticket already holds a lane. Checked before the cap.
+- `cap-full`: a claim for another ticket when as many tickets are live as the cap, under a valid admission record. Checked after `already-live` and before `clash`.
+- `no-admission`: a claim for another ticket while one ticket is live, with no valid admission (no `--admission`, or a path where nothing exists); the lanes dir is unchanged. Checked after `already-live` and before `clash`.
+- `bad-admission`: a claim or list given an admission file that exists and is not valid, or `admission-check` on one; nothing is recorded. The line names the field when the problem is a field. Checked before the lanes dir is touched.
+- `already-live`: the ticket already holds a lane. Checked before the cap and the clash.
+- `clash`: a claim whose scope overlaps the scope of a live ticket of the same repo (see *The scope clash*). The line names the live ticket and the overlapping pair as stored. Checked after the cap; the lanes dir is unchanged.
 - `not-live`: `release` for a ticket that holds no lane.
 
 ## Release is explicit

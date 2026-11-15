@@ -15,9 +15,10 @@ fn tmp(tag: &str) -> PathBuf {
     d.canonicalize().unwrap()
 }
 
-fn ticket(dir: &Path, id: &str) -> PathBuf {
+/// A ticket of `repo`: the cap tests below give the tickets of one test different repos, so the cap alone (not the scope clash) decides.
+fn ticket(dir: &Path, id: &str, repo: &str) -> PathBuf {
     let body = format!(
-        "{{\"id\":\"{id}\",\"repo_id\":\"synthetic-repo\",\"title\":\"t\",\"group\":\"g\",\"size\":\"S\",\"objective\":\"o\",\"acceptance_criteria\":[\"a\"],\"dependencies\":[],\"risk\":\"normal\",\"owner_role\":\"execution_verification\",\"evidence_links\":[]}}"
+        "{{\"id\":\"{id}\",\"repo_id\":\"{repo}\",\"title\":\"t\",\"group\":\"g\",\"size\":\"S\",\"objective\":\"o\",\"acceptance_criteria\":[\"a\"],\"dependencies\":[],\"risk\":\"normal\",\"owner_role\":\"execution_verification\",\"evidence_links\":[]}}"
     );
     let p = dir.join(format!("{id}.json"));
     fs::write(&p, body).unwrap();
@@ -217,12 +218,12 @@ fn an_admission_of_2_of_4_caps_at_2() {
     let adm = admission(&d, 2);
     let sf = scope(&d);
     let lanes = d.join("lanes");
-    for (id, want) in [("t-one", "lane=1"), ("t-two", "lane=2")] {
-        let o = claim(&ticket(&d, id), &lanes, &cfg, &sf, Some(&adm));
+    for (id, repo, want) in [("t-one", "repo-a", "lane=1"), ("t-two", "repo-b", "lane=2")] {
+        let o = claim(&ticket(&d, id, repo), &lanes, &cfg, &sf, Some(&adm));
         assert_eq!(o.status.code(), Some(0), "{}", err(&o));
         assert!(out(&o).contains(want), "{}", out(&o));
     }
-    let o = claim(&ticket(&d, "t-three"), &lanes, &cfg, &sf, Some(&adm));
+    let o = claim(&ticket(&d, "t-three", "repo-c"), &lanes, &cfg, &sf, Some(&adm));
     assert!(refused_once(&o, "cap-full"), "{}", err(&o));
     let o = list(&lanes, &cfg, Some(&adm));
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
@@ -240,11 +241,11 @@ fn an_admission_of_4_of_4_lets_four_claims_in() {
     let sf = scope(&d);
     let lanes = d.join("lanes");
     for i in 1..=4 {
-        let o = claim(&ticket(&d, &format!("t-{i}")), &lanes, &cfg, &sf, Some(&adm));
+        let o = claim(&ticket(&d, &format!("t-{i}"), &format!("repo-{i}")), &lanes, &cfg, &sf, Some(&adm));
         assert_eq!(o.status.code(), Some(0), "{}", err(&o));
         assert!(out(&o).contains(&format!("lane={i}")), "{}", out(&o));
     }
-    let o = claim(&ticket(&d, "t-five"), &lanes, &cfg, &sf, Some(&adm));
+    let o = claim(&ticket(&d, "t-five", "repo-5"), &lanes, &cfg, &sf, Some(&adm));
     assert!(refused_once(&o, "cap-full"), "{}", err(&o));
     let o = list(&lanes, &cfg, Some(&adm));
     assert!(out(&o).contains("live=4 cap=4"), "{}", out(&o));
@@ -259,10 +260,10 @@ fn a_config_count_of_3_bounds_an_admission_of_4() {
     let sf = scope(&d);
     let lanes = d.join("lanes");
     for i in 1..=3 {
-        let o = claim(&ticket(&d, &format!("t-{i}")), &lanes, &cfg, &sf, Some(&adm));
+        let o = claim(&ticket(&d, &format!("t-{i}"), &format!("repo-{i}")), &lanes, &cfg, &sf, Some(&adm));
         assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     }
-    let o = claim(&ticket(&d, "t-four"), &lanes, &cfg, &sf, Some(&adm));
+    let o = claim(&ticket(&d, "t-four", "repo-4"), &lanes, &cfg, &sf, Some(&adm));
     assert!(refused_once(&o, "cap-full"), "{}", err(&o));
     let o = list(&lanes, &cfg, Some(&adm));
     assert!(out(&o).contains("live=3 cap=3"), "{}", out(&o));
@@ -276,17 +277,17 @@ fn without_admission_no_second_lane_and_the_dir_is_unchanged() {
     let sf = scope(&d);
     let lanes = d.join("lanes");
     // the first claim with no live ticket still succeeds and gets lane 1
-    let o = claim(&ticket(&d, "t-one"), &lanes, &cfg, &sf, None);
+    let o = claim(&ticket(&d, "t-one", "synthetic-repo"), &lanes, &cfg, &sf, None);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(out(&o).contains("lane=1"), "{}", out(&o));
     let before = snapshot(&lanes);
     // no --admission: a claim for another ticket is refused and the dir is unchanged
-    let o = claim(&ticket(&d, "t-two"), &lanes, &cfg, &sf, None);
+    let o = claim(&ticket(&d, "t-two", "synthetic-repo"), &lanes, &cfg, &sf, None);
     assert!(refused_once(&o, "no-admission"), "{}", err(&o));
     assert_eq!(snapshot(&lanes), before);
     // --admission at a path where nothing exists is the same refusal
     let missing = d.join("no-admission.txt");
-    let o = claim(&ticket(&d, "t-two"), &lanes, &cfg, &sf, Some(&missing));
+    let o = claim(&ticket(&d, "t-two", "synthetic-repo"), &lanes, &cfg, &sf, Some(&missing));
     assert!(refused_once(&o, "no-admission"), "{}", err(&o));
     assert_eq!(snapshot(&lanes), before);
     let _ = fs::remove_dir_all(&d);
@@ -299,13 +300,13 @@ fn a_ticket_live_in_lane_2_still_fills_the_cap_of_1_without_admission() {
     let adm = admission(&d, 2);
     let sf = scope(&d);
     let lanes = d.join("lanes");
-    for id in ["t-one", "t-two"] {
-        assert_eq!(claim(&ticket(&d, id), &lanes, &cfg, &sf, Some(&adm)).status.code(), Some(0));
+    for (id, repo) in [("t-one", "repo-a"), ("t-two", "repo-b")] {
+        assert_eq!(claim(&ticket(&d, id, repo), &lanes, &cfg, &sf, Some(&adm)).status.code(), Some(0));
     }
     assert_eq!(release("t-one", &lanes, &cfg).status.code(), Some(0));
     // lane 1 is free but one ticket is live, so with no admission the cap of 1 is full
     let before = snapshot(&lanes);
-    let o = claim(&ticket(&d, "t-three"), &lanes, &cfg, &sf, None);
+    let o = claim(&ticket(&d, "t-three", "repo-c"), &lanes, &cfg, &sf, None);
     assert!(refused_once(&o, "no-admission"), "{}", err(&o));
     assert_eq!(snapshot(&lanes), before);
     let _ = fs::remove_dir_all(&d);
@@ -325,19 +326,19 @@ fn a_bad_admission_file_refuses_a_claim_and_records_nothing() {
     ] {
         let p = d.join(format!("{}.txt", what.replace(' ', "-")));
         fs::write(&p, body).unwrap();
-        let o = claim(&ticket(&d, "t-one"), &lanes, &cfg, &sf, Some(&p));
+        let o = claim(&ticket(&d, "t-one", "synthetic-repo"), &lanes, &cfg, &sf, Some(&p));
         assert_eq!(o.status.code(), Some(1), "{what}: {}", err(&o));
         assert!(err(&o).trim().starts_with("lane: refused reason=bad-admission"), "{what}: {}", err(&o));
         assert!(!lanes.exists(), "{what}: the lanes dir was created");
     }
     // the same record with one ticket live refuses and records nothing
     let good = admission(&d, 2);
-    let o = claim(&ticket(&d, "t-one"), &lanes, &cfg, &sf, Some(&good));
+    let o = claim(&ticket(&d, "t-one", "synthetic-repo"), &lanes, &cfg, &sf, Some(&good));
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let before = snapshot(&lanes);
     let p = d.join("still-one-lane.txt");
     fs::write(&p, admission_text(1)).unwrap();
-    let o = claim(&ticket(&d, "t-two"), &lanes, &cfg, &sf, Some(&p));
+    let o = claim(&ticket(&d, "t-two", "synthetic-repo"), &lanes, &cfg, &sf, Some(&p));
     assert!(err(&o).trim().starts_with("lane: refused reason=bad-admission"), "{}", err(&o));
     assert_eq!(snapshot(&lanes), before);
     let _ = fs::remove_dir_all(&d);
@@ -350,7 +351,7 @@ fn a_same_ticket_second_claim_under_a_cap_of_2_is_already_live() {
     let adm = admission(&d, 2);
     let sf = scope(&d);
     let lanes = d.join("lanes");
-    let t = ticket(&d, "t-one");
+    let t = ticket(&d, "t-one", "synthetic-repo");
     let o = claim(&t, &lanes, &cfg, &sf, Some(&adm));
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let o = claim(&t, &lanes, &cfg, &sf, Some(&adm));
@@ -369,8 +370,8 @@ fn names_follow_the_config_and_a_release_needs_no_admission() {
     let adm = admission(&d, 2);
     let sf = scope(&d);
     let lanes = d.join("lanes");
-    for id in ["t-one", "t-two"] {
-        assert_eq!(claim(&ticket(&d, id), &lanes, &cfg, &sf, Some(&adm)).status.code(), Some(0));
+    for (id, repo) in [("t-one", "repo-a"), ("t-two", "repo-b")] {
+        assert_eq!(claim(&ticket(&d, id, repo), &lanes, &cfg, &sf, Some(&adm)).status.code(), Some(0));
     }
     // list without --admission prints cap=1, still lists every live record, and exits 0 (a claim is what gets refused)
     let o = list(&lanes, &cfg, None);
@@ -379,7 +380,7 @@ fn names_follow_the_config_and_a_release_needs_no_admission() {
     assert!(text.contains("ticket=t-one") && text.contains("ticket=t-two"), "{text}");
     assert!(text.ends_with("live=2 cap=1\n"), "{text}");
     // a claim for a third ticket is what gets refused
-    let o = claim(&ticket(&d, "t-three"), &lanes, &cfg, &sf, None);
+    let o = claim(&ticket(&d, "t-three", "repo-c"), &lanes, &cfg, &sf, None);
     assert!(refused_once(&o, "no-admission"), "{}", err(&o));
     // a release works for a ticket in lane 2 (release takes --config and no admission)
     let o = release("t-two", &lanes, &cfg);
@@ -442,7 +443,7 @@ fn racing_claims_under_a_cap_of_2_leave_two_live() {
     let cfg = config(&d, 4);
     let adm = admission(&d, 2);
     let sf = scope(&d);
-    let tickets: Vec<PathBuf> = (0..32).map(|i| ticket(&d, &format!("t-{i}"))).collect();
+    let tickets: Vec<PathBuf> = (0..32).map(|i| ticket(&d, &format!("t-{i}"), &format!("repo-{i}"))).collect();
     for round in 0..2 {
         let lanes = d.join(format!("lanes-{round}"));
         let res = race(&lanes, &cfg, &sf, Some(&adm), &tickets);
@@ -459,7 +460,7 @@ fn racing_claims_under_a_cap_of_4_leave_four_live() {
     let cfg = config(&d, 4);
     let adm = admission(&d, 4);
     let sf = scope(&d);
-    let tickets: Vec<PathBuf> = (0..32).map(|i| ticket(&d, &format!("t-{i}"))).collect();
+    let tickets: Vec<PathBuf> = (0..32).map(|i| ticket(&d, &format!("t-{i}"), &format!("repo-{i}"))).collect();
     for round in 0..2 {
         let lanes = d.join(format!("lanes-{round}"));
         let res = race(&lanes, &cfg, &sf, Some(&adm), &tickets);

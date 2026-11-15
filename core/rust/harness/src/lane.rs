@@ -7,8 +7,10 @@
 //! lane) and renames it onto the lane name, so a reader never sees a half-written record. The lanes dir is read strictly: a record that is not a
 //! regular file, cannot be read or parsed, has a name other than `lane-<n>` (n canonical, 1..=the config `lanes.count`), or repeats a ticket, is
 //! an error and nothing is changed. The admission record is read fail closed too: one that exists and is not valid is a `bad-admission` refusal
-//! checked before the lanes dir is touched, while a path where nothing exists means no admission (cap 1). No directory fsync is done, so a claim
-//! or release is not guaranteed to survive a crash. Release is explicit: a lane is not freed by a dead process.
+//! checked before the lanes dir is touched, while a path where nothing exists means no admission (cap 1). A claim whose scope overlaps the scope
+//! of a live ticket of the same repo is refused with `clash`: checked after `already-live` and the cap, before anything is written (`scope_entry_parts`
+//! is the normal form of that comparison). No directory fsync is done, so a claim or release is not guaranteed to survive a crash. Release is
+//! explicit: a lane is not freed by a dead process.
 //! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`, and `bad-admission` also names the field when the problem is a
 //! field); 2 usage error, unreadable or refused input, or a lanes dir in a bad state.
 
@@ -48,6 +50,9 @@ enum Refusal {
     NoAdmission,
     /// An admission file that exists and is not valid; the string names what is wrong (the field when it is a field).
     Admission(String),
+    /// A claim whose scope overlaps the scope of a live ticket of the same repo; the string names the live ticket and the overlapping pair
+    /// (`ticket=<id> live=<entry> new=<entry>`, the entries as stored).
+    Clash(String),
 }
 
 impl Refusal {
@@ -58,6 +63,7 @@ impl Refusal {
             Refusal::NotLive => "not-live",
             Refusal::NoAdmission => "no-admission",
             Refusal::Admission(_) => "bad-admission",
+            Refusal::Clash(_) => "clash",
         }
     }
 }
@@ -108,6 +114,43 @@ pub fn parse_scope(text: &str) -> Result<Vec<String>, String> {
         return Err("the scope file holds no entry".to_string());
     }
     Ok(out)
+}
+
+/// The normal form of a scope entry for the clash comparison ONLY (records keep storing entries as given, and what `scope_entry_ok` accepts
+/// does not change): the entry is split on `/` after dropping one trailing `/`, every `.` part is dropped (`docs/./a.md` and `./docs/a.md`
+/// are `docs/a.md`), and the parts are lowercased per ASCII (`Docs/A.md` is `docs/a.md`; the default macOS file system treats them as one
+/// file, and refusing too much is the safe side). An entry that is nothing but `.` parts (`.` or `./`) has no parts: it names the whole repo.
+/// The form does no Unicode normalization, resolves no symbolic link, and treats a `\` as an ordinary character (only `/` splits the parts).
+pub fn scope_entry_parts(e: &str) -> Vec<String> {
+    e.strip_suffix('/').unwrap_or(e).split('/').filter(|p| *p != ".").map(|p| p.to_ascii_lowercase()).collect()
+}
+
+/// Do two scope entries of one repo overlap, after the normal form? The parts of one are a prefix of the parts of the other, counted in
+/// whole parts: equal entries overlap; a folder entry (one that ends in `/`) overlaps every entry inside it; a file entry overlaps an entry
+/// that lies inside it too (`docs` against `docs/x.md`: the same name cannot be both a file and a folder in one tree, so refusing is the
+/// safe side); and an entry with no parts (the whole repo) overlaps every entry, including another whole-repo entry.
+fn entries_overlap(a: &str, b: &str) -> bool {
+    let (pa, pb) = (scope_entry_parts(a), scope_entry_parts(b));
+    pa.iter().zip(&pb).all(|(x, y)| x == y)
+}
+
+/// The first clash of `rec` against the live records, in a repeatable order: the live records by lane number (lowest first; `list_records`
+/// returns them sorted), then each live record's entries in stored order, then `rec`'s entries in stored order. Only records of the same
+/// `repo_id` are compared. Returns the live ticket, its entry and the new entry, as stored.
+fn find_clash(live: &[Record], rec: &Record) -> Option<(String, String, String)> {
+    for r in live {
+        if r.repo_id != rec.repo_id {
+            continue;
+        }
+        for le in &r.scope {
+            for ne in &rec.scope {
+                if entries_overlap(le, ne) {
+                    return Some((r.ticket.clone(), le.clone(), ne.clone()));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn encode(r: &Record) -> String {
@@ -397,7 +440,9 @@ fn list_locked(dir: &Path, cap: u32) -> Result<Vec<Record>, String> {
     list_records(dir, cap)
 }
 
-/// Take the lowest free lane under `cap` for `rec` (its `lane` field is ignored), as one critical section, unless as many tickets are live as the cap. The dir is read under `bound`, the
+/// Take the lowest free lane under `cap` for `rec` (its `lane` field is ignored), as one critical section. Refused when as many tickets are
+/// live as the cap, or when the scope of `rec` overlaps the scope of a live ticket of the same repo (`clash`, checked after the cap: the cap
+/// decides whether the claim may hold a lane at all, and that refusal does not look at the scope). The dir is read under `bound`, the
 /// config name bound (a legal record name may sit above the claim cap, because the names follow the config, not the admission). `admitted`
 /// tells whether the cap comes from a valid admission record, which picks the refusal token when no lane is free. Ok(Err) is a policy refusal.
 fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Result<Result<u32, Refusal>, String> {
@@ -412,6 +457,11 @@ fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Resul
     let Some(n) = free else {
         return Ok(Err(if admitted { Refusal::CapFull } else { Refusal::NoAdmission }));
     };
+    // The clash is the last policy check, so nothing is written before it; a claim with a valid admission and a free lane is still refused
+    // here when its scope would break a live ticket of the same repo.
+    if let Some((ticket, live_entry, new_entry)) = find_clash(&live, &rec) {
+        return Ok(Err(Refusal::Clash(format!("ticket={ticket} live={live_entry} new={new_entry}"))));
+    }
     let tmp = dir.join(".claim.tmp");
     match fs::symlink_metadata(&tmp) {
         Ok(_) => fs::remove_file(&tmp).map_err(|_| "a stale temp file cannot be removed".to_string())?,
@@ -485,6 +535,7 @@ fn load_config(m: &std::collections::HashMap<String, String>) -> Result<Config, 
 fn refused(r: Refusal) -> i32 {
     match r {
         Refusal::Admission(detail) => eprintln!("lane: refused reason=bad-admission {detail}"),
+        Refusal::Clash(detail) => eprintln!("lane: refused reason=clash {detail}"),
         other => eprintln!("lane: refused reason={}", other.token()),
     }
     1
@@ -694,6 +745,71 @@ mod tests {
         let r = Record { lane: 1, ticket: "t-1".into(), repo_id: "r".into(), scope: vec!["a".into(), "b/c".into()] };
         assert_eq!(decode(1, &encode(&r)).unwrap(), r);
         assert!(decode(1, "lane-record v1\nticket=t-1\n").is_err());
+    }
+
+    #[test]
+    fn the_normal_form_of_the_clash_comparison() {
+        // a `.` part does not change what an entry names; ASCII case does not either
+        assert_eq!(scope_entry_parts("docs/./a.md"), vec!["docs", "a.md"]);
+        assert_eq!(scope_entry_parts("./docs/a.md"), scope_entry_parts("docs/a.md"));
+        assert_eq!(scope_entry_parts("Docs/A.md"), scope_entry_parts("docs/a.md"));
+        assert_eq!(scope_entry_parts("docs/"), vec!["docs"]);
+        // an entry that is nothing but `.` parts names the whole repo (no parts)
+        assert!(scope_entry_parts(".").is_empty());
+        assert!(scope_entry_parts("./").is_empty());
+        // a backslash is an ordinary character: only `/` splits the parts
+        assert_eq!(scope_entry_parts("src\\a.rs"), vec!["src\\a.rs"]);
+    }
+
+    #[test]
+    fn entries_overlap_in_whole_path_parts() {
+        let both = |a: &str, b: &str| {
+            assert!(entries_overlap(a, b), "{a} vs {b}");
+            assert!(entries_overlap(b, a), "{a} vs {b}");
+        };
+        let none = |a: &str, b: &str| {
+            assert!(!entries_overlap(a, b), "{a} vs {b}");
+            assert!(!entries_overlap(b, a), "{a} vs {b}");
+        };
+        // equal after the normal form, in both orders
+        both("docs/a.md", "docs/a.md");
+        both("docs/a.md", "docs/./a.md");
+        both("./docs/a.md", "docs/a.md");
+        both("Docs/A.md", "docs/a.md");
+        // a folder entry overlaps what lies inside it, in both orders
+        both("docs/", "docs/x/y.md");
+        both("docs/", "docs/sub/");
+        // a file entry overlaps an entry of the same name or inside it (one name cannot be both a file and a folder)
+        both("docs", "docs/");
+        both("docs", "docs/x.md");
+        // the whole repo clashes with every entry, and with another whole-repo entry
+        both(".", "src/a.rs");
+        both("./", ".");
+        // near misses, in both orders
+        none("docs/a.md", "docs/a.md.bak");
+        none("docs/", "docs2/x.md");
+        none("docs/a.md", "docs/b.md");
+        none("docs/a", "docs/a-b");
+        none("src\\a.rs", "src/a.rs");
+    }
+
+    #[test]
+    fn find_clash_picks_the_first_pair_in_the_stated_order() {
+        let mk = |lane: u32, ticket: &str, repo: &str, scope: &[&str]| Record {
+            lane,
+            ticket: ticket.into(),
+            repo_id: repo.into(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+        };
+        // lane order first, then the live record's stored entry order, then the new record's stored entry order
+        let live = vec![mk(1, "t-a", "r", &["other/x", "docs/"]), mk(2, "t-b", "r", &["Docs/a.md"])];
+        let new = mk(0, "t-c", "r", &["zz", "docs/a.md"]);
+        let (t, l, n) = find_clash(&live, &new).unwrap();
+        assert_eq!((t.as_str(), l.as_str(), n.as_str()), ("t-a", "docs/", "docs/a.md"));
+        // a different repo never clashes, whatever the entries
+        assert!(find_clash(&live, &mk(0, "t-c", "r2", &["docs/a.md"])).is_none());
+        // no live record, no clash
+        assert!(find_clash(&[], &new).is_none());
     }
 
     /// A valid twin of the admission record, for the field-by-field refusals below.
