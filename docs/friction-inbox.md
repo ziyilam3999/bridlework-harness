@@ -279,10 +279,16 @@ existing `sweep` for that week (the same function); (2) lint + rank; (3) the `--
 nine string keys (`group`, `status` of `proposed|resolved|regressed|escalated`, `ticket_file`, `proposed_week`,
 `task_id`, `task_session`, `resolved_pr`, `resolved_date`, `attempts`; the last row per group wins), read under the
 4 MiB cap; a torn or bad state refuses (exit 1) and nothing is written; (4) with `--closed` (a JSON object whose
-`closed_with_evidence` array holds ticket-reconcile rows `id`, `repo`, `pr`, `at` plus an optional `session`) a
-`proposed` group resolves ONLY when its bound `task_id` equals a row's `id` (and, when both carry a session, the
-sessions match); the hand-off id `friction-<week>-<n>` never matches, and an unbound group never resolves;
-(5) a `resolved` group with a member row dated after its `resolved_date` becomes `regressed` (`attempts` + 1), and
+`closed_with_evidence` array holds ticket-reconcile rows `id`, `repo`, `at` and `pr` (digits) or, when `pr` is absent or an empty string,
+`head` (7 to 40 hex characters), plus an optional `session`; a row with neither, or a `pr` that is not a string or a
+number (`true`, an object, an array, `null`), refuses the whole feed, exit 1; `resolved_pr`
+becomes `<repo>#<pr>` or `<repo>@<head>`; `at` as `YYYY-MM-DDTHH:MM:SSZ` is kept whole as `resolved_date`, a date-only
+`at` is kept as the date; any other `at` (`T10:00:00z`, an offset such as `+08:00`, a fraction such as `T10:00:00.5Z`, `T25:00:00Z`,
+`2026-11-05junk`) refuses the whole feed, exit 1) a `proposed` group resolves ONLY when its bound `task_id` equals a row's `id` (and, when both
+carry a session, the sessions match); the hand-off id is not compared, and a group with no bound task is not resolved by the feed;
+(5) a `resolved` group with a member row dated after its `resolved_date` becomes `regressed` (`attempts` + 1; when
+`resolved_date` is a full time and the row has an `at`, the two times are compared, so a later `at` on the same day
+regresses and an earlier one does not; otherwise the row's date is compared with the date), and
 at `attempts >= 2` becomes `escalated` instead, which is never auto-proposed again; (6) proposals: every `regressed`
 group (first), every group with break count >= 2 (always, regardless of rank) and the top K ranked groups, minus
 groups already `proposed`, `resolved` or `escalated`; (7) one ticket-contract file `<handoff-dir>/<week>-<n>.json`
@@ -308,14 +314,20 @@ folder byte-identical.
 ### `harness friction bind`
 
 ```
-harness friction bind --state <file> --group <id> --task-id <digits> --task-session <token> [--config <file>]
+harness friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>]
 ```
 
-The one writer of the task binding: it appends one state row copying the group's last row with `task_id` and
-`task_session` set, so the closed feed can match the TaskCreate id (the hand-off file's `id` is a different token).
-Refused (exit 1, state byte-identical): no state row for the group, a last status other than `proposed`, a binding to
-a different task, a `--task-id` that is not all digits, or a `--task-session` that is not a plain token. Re-binding
-the same pair prints `bind already group=<id>`; success prints `bind group=<id> task=<digits>`.
+The one writer of the task binding: it appends one state row (a copy of the group's last row, or a fresh `proposed` row, see below) with `task_id` and
+`task_session` set, so the closed feed can match the bound id.
+`--task-id` is ASCII letters, digits, `.`, `-` and `_`, starting with a letter or digit, at most 64 bytes (for example `admission-two-lanes`).
+A group with inbox rows and no state row is filed as one `proposed` row bound to the task, with an empty
+`ticket_file` and the ISO week of its last row as `proposed_week` (the inbox is read, so the config is needed).
+Bind does not check that the task fixes the group; a repeat after the resolve still regresses it.
+Refused (exit 1, state byte-identical): a group with no state row and no inbox row, a last status other than
+`proposed`, a binding to a different task, a `--task-id` outside that set, a `--task-session` that is not a plain
+token, a privacy hit in the group, the task id or the session, and, on the fresh-row path, an inbox that fails lint or has a
+privacy hit and a new row the state reader would refuse (for example a last row dated 9999-12-31). A `--config` that
+cannot be loaded exits 2; on the fresh-row path a missing or unreadable inbox file exits 2 and, with no `--config`, so does a missing or unloadable config. Re-binding the same pair prints `bind already group=<id>`; success prints `bind group=<id> task=<id>`.
 
 ### `harness friction page`
 
