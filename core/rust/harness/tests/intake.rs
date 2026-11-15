@@ -12,11 +12,21 @@ const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
 const MAX: usize = 1024 * 1024;
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// True when `p` lies under `root` (both made canonical when they exist).
+/// `p` made canonical; if it is missing, its longest existing start is made canonical and the rest is added as
+/// written. A path with `..` in the missing rest, or a relative path with no existing start, comes back as written.
+fn canon(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => canon(parent).join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// True when `canon(p)` starts with `canon(root)`; `p` equal to `root` counts.
 fn is_under(root: &Path, p: &Path) -> bool {
-    let r = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let q = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    q.starts_with(r)
+    canon(p).starts_with(canon(root))
 }
 
 struct Tmp(PathBuf);
@@ -184,13 +194,27 @@ fn the_leak_helper_catches_a_message_that_echoes_the_folder() {
     assert!(!leaks("ticket=T-1 repo_id=b head=abc", "repo not found for repo id `b`", dir), "a clean pair passes");
 }
 
-// AC 9 twin: the location helper rejects a path beside the checkout and accepts one under the temp folder.
+// AC 9 twin: each half of the scratch rule, for a checkout that is not at or above the temp folder.
 #[test]
 fn the_scratch_location_check_rejects_a_folder_beside_the_checkout() {
-    let beside = Path::new(MANIFEST).join("scratch-beside");
-    assert!(!is_under(&std::env::temp_dir(), &beside), "a folder beside the checkout is not under the temp folder");
+    let manifest = Path::new(MANIFEST);
+    let beside = manifest.join("scratch-beside");
+    assert!(is_under(manifest, &beside), "the beside check catches a path in the checkout");
+    assert!(!is_under(&std::env::temp_dir(), Path::new("/")), "the temp check catches a path outside the temp folder");
     let t = Tmp::new();
     assert!(is_under(&std::env::temp_dir(), &t.0), "the scratch folder is under the temp folder");
+    assert!(!is_under(manifest, &t.0), "the scratch folder is not beside the checkout");
+}
+
+// An absolute missing path is judged by its longest existing start, made canonical, plus the missing tail.
+#[test]
+fn a_missing_path_is_judged_by_its_nearest_existing_folder() {
+    let t = Tmp::new();
+    let root = std::env::temp_dir();
+    let missing = root.join(format!("hintake-missing-{}", std::process::id())).join("a").join("b");
+    assert!(is_under(&root, &missing), "a missing path under the temp folder is under it");
+    assert!(is_under(&t.0, &t.0.join("x").join("y")), "a missing tail under a scratch folder is under it");
+    assert_eq!(canon(&t.0.join("x").join("y")), t.0.join("x").join("y"), "the existing part is canonical, the tail is kept");
 }
 
 // AC 1: the ticket's repo is used, not the folder the process runs in. Also AC 9 and AC 10 on the accepted run.
