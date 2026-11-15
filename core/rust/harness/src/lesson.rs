@@ -55,6 +55,12 @@ fn is_issue_id(s: &str) -> bool {
     }
 }
 
+/// A front matter key: not empty, and no character in it is a blank or a control character (an ASCII
+/// space or tab inside the key is refused too).
+fn is_key(k: &str) -> bool {
+    !k.is_empty() && !k.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// A page file name inside a directory argument: `ISSUE-<digits>-<anything>.md`.
 fn is_page_name(n: &str) -> bool {
     let Some(rest) = n.strip_prefix("ISSUE-") else { return false };
@@ -70,6 +76,17 @@ fn split_list(v: &str) -> Vec<&str> {
         return Vec::new();
     }
     inner.split(',').map(|t| t.trim()).collect()
+}
+
+/// A control character or a Unicode white-space character other than a plain space is written `\u{hex}`.
+fn esc(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() || (c.is_whitespace() && c != ' ') {
+            format!("\\u{{{:x}}}", c as u32)
+        } else {
+            c.to_string()
+        })
+        .collect()
 }
 
 /// Add a page unless an equal one (compared by canonical path) was already added: the same page reached twice in
@@ -160,8 +177,12 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
     let mut keys: HashMap<&str, &str> = HashMap::new();
     for (i, &l) in lines[1..close].iter().enumerate() {
         match l.split_once(':') {
-            Some((k, v)) if !k.trim().is_empty() => {
-                keys.insert(k.trim(), v.trim());
+            // Only ASCII spaces and tabs are trimmed around the key and the value.
+            Some((k, v)) if is_key(k.trim_matches([' ', '\t'])) => {
+                let (k, v) = (k.trim_matches([' ', '\t']), v.trim_matches([' ', '\t']));
+                if keys.insert(k, v).is_some() {
+                    out.push(format!("FRONT-MATTER line {} repeats the key {}", i + 2, k));
+                }
             }
             _ => out.push(format!("FRONT-MATTER line {} is not key: value", i + 2)),
         }
@@ -387,12 +408,12 @@ pub fn lesson_cmd(a: &[String]) -> i32 {
         }
         Ok((_, problems)) => {
             for line in problems {
-                println!("{}", line);
+                println!("{}", esc(&line));
             }
             1
         }
         Err(m) => {
-            eprintln!("harness: error: {}", m);
+            eprintln!("harness: error: {}", esc(&m));
             2
         }
     }

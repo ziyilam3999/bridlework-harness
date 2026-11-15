@@ -18,6 +18,9 @@ The lint checks shape only: it does not check that a sentence is true, that a li
 - Any page breaks a rule: stdout holds one line per problem, `<file name>: <RULE> <short detail>` (`<file name>` is the last part of the path, without folders), and nothing else;
   exit 1. Problems are listed in path order: the paths in the order they were given, the pages of one directory in
   name order, the problems of one page in rule order.
+- In a problem line or a stderr message, a control character (C0, DEL, C1) or a Unicode white-space character
+  other than a plain space is written `\u{<hex>}` (a format character such as U+200B or U+FEFF is printed as it is);
+  stdout holds no control character except its line ends.
 
 ## Exit codes
 
@@ -36,15 +39,16 @@ after the closing `---`), a level-1 heading is a line that starts with `# ` and 
 with `## `. A line that starts with three backticks opens a code fence, another such line closes it, and a line
 inside a code fence is never a heading.
 
-- `FRONT-MATTER`: the block is not there (line 1 is not `---`, or no later line closes it) or a line inside it is not `key: value`. When the block is not there, this is the only problem listed for that page, because nothing else can be checked. If a key appears twice, the later line counts.
+- `FRONT-MATTER`: the block is not there (line 1 is not `---`, or no later line closes it) or a line inside it is not `key: value`. When the block is not there, this is the only problem listed for that page, because nothing else can be checked. A key holding a blank or a control character is not `key: value`. A key written twice is refused with `FRONT-MATTER line <n> repeats the key <key>` (`<n>` is the later line).
 - `SHARED-FIELD`: one of `kind`, `updated`, `sources`, `verified` is missing, or `updated` is not a real calendar date written `YYYY-MM-DD`, or `verified` is not `yes` or `no`.
 - `TYPE`: `type` is missing or is not exactly `lesson`.
 - `ID`: `id` is missing, or is not `ISSUE-<digits>`, or the file name does not start with that id followed by `-`.
 - `STATUS`: `status` is missing or is not one of `unvalidated`, `validated`, `retired`.
 - `TIER`: `minimum_proven_tier` is missing, is empty, or is not exactly one of `T1`, `T2`, `T3`, `T4`, `unproven`,
   `unmeasured` — the six values `docs/fix-tier.md` accepts for this field (the comparison is exact and
-  case-sensitive on the value after the trim of the front matter line, so `t2`, `T0` or a quoted `"T2"` is refused;
-  the detail names the value).
+  case-sensitive on the value after the trim of the front matter line, which removes only ASCII spaces and tabs
+  around the key and the value, so `t2`, `T0`, a quoted `"T2"` or a blank other than an ASCII space or tab (such as a
+  no-break space) is refused; the detail names the value).
 - `CONTROLS`: `controls` is missing, is not an inline list `[...]` (an empty list, `[]` or `[ ]`, is fine), or holds
   an empty token.
 - `MATCH`: `match` is present but is not an inline list, is an empty list (`[]` or `[ ]`), or holds an empty token (a missing `match` is fine).

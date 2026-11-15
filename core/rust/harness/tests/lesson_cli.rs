@@ -387,6 +387,114 @@ fn an_unreadable_page_shaped_entry_in_a_directory_exits_2() {
     let _ = fs::remove_dir_all(&d2);
 }
 
+/// A blank other than an ASCII space or tab around the tier value is not trimmed.
+#[test]
+fn non_space_blanks_around_the_tier_are_refused() {
+    let d = tmp("blank");
+    for bad in ["T2\u{00a0}", "\u{00a0}T2", "T2\u{2003}"] {
+        let f = d.join("ISSUE-101-b.md");
+        fs::write(&f, good_page().replace("minimum_proven_tier: T2", &format!("minimum_proven_tier: {}", bad))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}: {}{}", bad, stdout(&o), stderr(&o));
+        assert!(stdout(&o).contains("TIER minimum_proven_tier"), "{}: {}", bad, stdout(&o));
+    }
+    for good in [" T2", "\tT2\t", " T2 "] {
+        let f = d.join("ISSUE-101-g.md");
+        fs::write(&f, good_page().replace("minimum_proven_tier: T2", &format!("minimum_proven_tier: {}", good))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(0), "{}: {}{}", good, stdout(&o), stderr(&o));
+        assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    }
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A front matter key written twice is refused, whichever line holds the good value.
+#[test]
+fn a_repeated_front_matter_key_is_refused() {
+    let d = tmp("repeat");
+    for (tag, two) in [
+        ("gg", "status: validated\nstatus: validated\n"),
+        ("bg", "status: draft\nstatus: validated\n"),
+        ("gb", "status: validated\nstatus: draft\n"),
+    ] {
+        let f = d.join(format!("ISSUE-101-{}.md", tag));
+        fs::write(&f, good_page().replace("status: validated\n", two)).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}: {}{}", tag, stdout(&o), stderr(&o));
+        assert!(stdout(&o).contains("FRONT-MATTER line 6 repeats the key status"), "{}: {}", tag, stdout(&o));
+    }
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A key that is, or holds, a blank or a control character is not key: value.
+#[test]
+fn a_key_with_a_blank_or_control_character_is_refused() {
+    let d = tmp("key");
+    // an added line whose key is only a blank, holds a control character, or holds a space
+    for bad in ["\u{a0}: junk", "k\u{1b}ey: junk", "bad key: junk"] {
+        let f = d.join("ISSUE-101-k.md");
+        fs::write(&f, good_page().replace("sources: synthetic log\n", &format!("sources: synthetic log\n{}\n", bad))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}: {}{}", bad, stdout(&o), stderr(&o));
+        let out = stdout(&o);
+        assert_eq!(out.lines().count(), 1, "{}: {}", bad, out);
+        assert!(out.contains("FRONT-MATTER line 8 is not key: value"), "{}: {}", bad, out);
+    }
+    // a NBSP in front of a repeated key name is not that key
+    let f = d.join("ISSUE-101-r.md");
+    fs::write(&f, good_page().replace("status: validated\n", "status: validated\n\u{a0}status: draft\n")).unwrap();
+    let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("FRONT-MATTER line 6 is not key: value"), "{}", out);
+    assert!(!out.contains("repeats"), "{}", out);
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// Control characters planted in a value are printed escaped; stdout holds none of them.
+#[test]
+fn control_characters_in_a_value_are_escaped() {
+    let d = tmp("ctrl");
+    let f = d.join("ISSUE-101-c.md");
+    fs::write(&f, good_page().replace("status: validated", "status: valid\u{1b}\u{7}ated\u{9b}")).unwrap();
+    let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("STATUS status valid\\u{1b}\\u{7}ated\\u{9b} is not"), "{}", out);
+    assert!(out.chars().all(|c| !c.is_control() || c == '\n'), "{:?}", out);
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A blank other than a plain space (U+00A0, U+2028) is escaped in a problem line too.
+#[test]
+fn blanks_that_are_not_control_characters_are_escaped() {
+    let d = tmp("blankesc");
+    for (bad, escd) in [("valid\u{a0}ated", "valid\\u{a0}ated"), ("valid\u{2028}ated", "valid\\u{2028}ated")] {
+        let f = d.join("ISSUE-101-b.md");
+        fs::write(&f, good_page().replace("status: validated", &format!("status: {}", bad))).unwrap();
+        let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}: {}{}", bad, stdout(&o), stderr(&o));
+        let out = stdout(&o);
+        assert!(out.contains(&format!("STATUS status {} is not", escd)), "{}: {}", bad, out);
+        assert!(!out.contains(bad), "{}: {}", bad, out);
+    }
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A control character in a path argument is escaped in the stderr message.
+#[test]
+fn a_control_character_in_a_path_is_escaped_on_stderr() {
+    let d = tmp("escpath");
+    let f = d.join("no\u{1b}pe.md");
+    let o = run(&["lesson", "lint", f.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    let err = stderr(&o);
+    assert!(err.contains("\\u{1b}"), "{}", err);
+    assert!(!err.contains('\u{1b}'), "{}", err);
+    let _ = fs::remove_dir_all(&d);
+}
+
 #[test]
 fn usage_errors_print_the_usage_text() {
     for args in [vec!["lesson"], vec!["lesson", "frobnicate"], vec!["lesson", "lint"]] {
