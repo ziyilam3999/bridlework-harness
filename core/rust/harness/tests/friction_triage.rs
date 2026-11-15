@@ -58,6 +58,11 @@ fn files(dir: &Path) -> Vec<String> {
     v
 }
 
+/// The hand-off folder as name/content pairs, for byte-identity checks.
+fn handoff_snap(dir: &Path) -> Vec<(String, String)> {
+    files(dir).into_iter().map(|f| (f.clone(), sha(&dir.join(&f)))).collect()
+}
+
 fn five(t: &Tmp) {
     t.write_inbox(&[
         hand("g-1", "2026-11-02", "", "blocker"),
@@ -479,4 +484,221 @@ fn usage_errors() {
         assert_eq!(code(&o), 2);
         assert!(out(&o).is_empty());
     }
+}
+
+// ---- --controls (FT-2): a valid controls line seeds a group as resolved ----
+
+/// A lessons folder holding ISSUE-001-x.md (and wrong-length decoys), and a controls file with the given text.
+fn controls(t: &Tmp, text: impl AsRef<[u8]>) -> (std::path::PathBuf, std::path::PathBuf) {
+    let l = t.0.join("lessons");
+    fs::create_dir_all(&l).unwrap();
+    // ISSUE-01 and ISSUE-0001 have files too, so only the three-digit rule can refuse them.
+    for f in ["ISSUE-001-x.md", "ISSUE-01-x.md", "ISSUE-0001-x.md"] {
+        fs::write(l.join(f), "lesson").unwrap();
+    }
+    (t.file("controls.txt", text), l)
+}
+
+fn triage_c(t: &Tmp, week: &str, c: &Path, l: &Path) -> Output {
+    triage(t, week, &["--top", "1", "--controls", p(c), "--lessons-dir", p(l)])
+}
+
+const LINE: &str = "g-1 | control: a guard pointer | lesson: ISSUE-001\n";
+
+#[test]
+fn a_controls_line_seeds_the_group_as_resolved() {
+    let t = Tmp::new();
+    five(&t);
+    let (c, l) = controls(&t, format!("# a comment\n\n  {}", LINE.replace('\n', "\r\n")));
+    let o = triage_c(&t, W45, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("seed group=g-1 line=3"), "{}", out(&o));
+    assert!(!out(&o).contains("propose group=g-1") && !out(&o).contains("a guard pointer"), "{}", out(&o));
+    assert_eq!(last_status(&t, "g-1"), "resolved");
+    assert!(state_rows(&t)[0].contains("\"resolved_date\":\"2026-11-02\"") && state_rows(&t)[0].contains("\"task_id\":\"\""));
+    // a seeded (resolved) group is not seeded again
+    let n = state_rows(&t).len();
+    let o = triage_c(&t, W45, &c, &l);
+    assert!(!out(&o).contains("seed group="), "{}", out(&o));
+    assert_eq!(state_rows(&t).len(), n);
+    // a later repeat regresses it (re-proposed with attempts 1)
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", "")]);
+    let o = triage_c(&t, W46, &c, &l);
+    assert!(out(&o).contains("propose group=g-1 ") && out(&o).contains("reason=regressed"), "{}", out(&o));
+    assert!(state_rows(&t).last().unwrap().contains("\"attempts\":\"1\""));
+}
+
+#[test]
+fn a_seed_keeps_the_at_of_the_latest_member_row() {
+    let t = Tmp::new();
+    t.write_inbox(&[row("g-1", "2026-11-02", "", "lesson", &[]), row("g-1b", "2026-11-09", "g-1", "lesson", &[("at", "2026-11-09T08:00:00Z")])]);
+    let (c, l) = controls(&t, "g-1 | control: x | lesson: ISSUE-001\n");
+    let o = triage_c(&t, W45, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(state_rows(&t)[0].contains("\"resolved_date\":\"2026-11-09T08:00:00Z\""), "{}", state_rows(&t)[0]);
+}
+
+#[test]
+fn a_proposed_unbound_group_is_seeded_and_keeps_its_fields() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    let (c, l) = controls(&t, LINE);
+    let o = triage_c(&t, W46, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("seed group=g-1 line=1"), "{}", out(&o));
+    let last = state_rows(&t).into_iter().rev().find(|l| l.contains("\"group\":\"g-1\"")).unwrap();
+    for want in ["\"status\":\"resolved\"", "\"ticket_file\":\"2026-w45-1.json\"", "\"proposed_week\":\"2026-w45\"", "\"attempts\":\"0\"", "\"task_id\":\"\"", "\"resolved_date\":\"2026-11-02\""] {
+        assert!(last.contains(want), "{want}: {last}");
+    }
+    // a second run with the same file writes no seed row
+    let n = state_rows(&t).len();
+    let o = triage_c(&t, W46, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(!out(&o).contains("seed group="), "{}", out(&o));
+    assert_eq!(state_rows(&t).len(), n);
+}
+
+#[test]
+fn a_regressed_group_is_not_seeded_again_by_the_same_controls_file() {
+    let t = Tmp::new();
+    five(&t);
+    let (c, l) = controls(&t, LINE);
+    assert_eq!(code(&triage_c(&t, W45, &c, &l)), 0);
+    // a repeat row dated after resolved_date regresses the seed (proposed again, attempts 1)
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", "")]);
+    let o = triage_c(&t, W46, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("reason=regressed"), "{}", out(&o));
+    // the same controls file does not seed it again: it stays proposed and unbound
+    let o = triage_c(&t, W47, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(!out(&o).contains("seed group="), "{}", out(&o));
+    let last = state_rows(&t).into_iter().rev().find(|r| r.contains("\"group\":\"g-1\"")).unwrap();
+    assert!(last.contains("\"status\":\"proposed\"") && last.contains("\"attempts\":\"1\""), "{last}");
+    assert!(out(&o).contains("open group=g-1 age_weeks=1 bound=no"), "{}", out(&o));
+}
+
+#[test]
+fn a_second_regression_after_a_seed_escalates() {
+    let t = Tmp::new();
+    five(&t);
+    let (c, l) = controls(&t, LINE);
+    assert_eq!(code(&triage_c(&t, W45, &c, &l)), 0);
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", "")]);
+    assert_eq!(code(&triage_c(&t, W46, &c, &l)), 0);
+    // bind and close through the feed: resolved again
+    assert_eq!(code(&bind(&t, "g-1", "4243", "s-fake")), 0);
+    let cf = closed_file(&t, "c4.json", "4243", Some("s-fake"), "2026-11-14");
+    let o = triage(&t, W47, &["--top", "1", "--closed", p(&cf)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(last_status(&t, "g-1"), "resolved");
+    // a second repeat dated after that resolve escalates
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-09", "g-1", ""), hand("g-1c", "2026-11-20", "g-1", "")]);
+    let o = triage(&t, "2026-w48", &[]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("escalate group=g-1 attempts=2"), "{}", out(&o));
+    assert_eq!(last_status(&t, "g-1"), "escalated");
+}
+
+#[test]
+fn a_bound_group_gets_no_row_from_the_controls_file() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
+    let n = state_rows(&t).iter().filter(|l| l.contains("\"group\":\"g-1\"")).count();
+    let (c, l) = controls(&t, LINE);
+    let o = triage_c(&t, W46, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(!out(&o).contains("seed group=g-1"), "{}", out(&o));
+    assert_eq!(last_status(&t, "g-1"), "proposed");
+    assert_eq!(state_rows(&t).iter().filter(|l| l.contains("\"group\":\"g-1\"")).count(), n);
+}
+
+#[test]
+fn a_line_that_is_not_a_group_root_or_not_a_row_is_reported_and_not_seeded() {
+    let t = Tmp::new();
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "blocker"), hand("g-1b", "2026-11-03", "g-1", "")]);
+    let (c, l) = controls(&t, "g-1b | control: x | lesson: ISSUE-001\nzz-none | control: x | lesson: ISSUE-001\n");
+    let o = triage_c(&t, W45, &c, &l);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).contains("control-not-root line=1 group=g-1") && out(&o).contains("control-unknown line=2"), "{}", out(&o));
+    assert!(!out(&o).contains("zz-none") && !out(&o).contains("seed group="), "{}", out(&o));
+}
+
+#[test]
+fn a_bad_controls_file_refuses_with_nothing_changed() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    let before = fs::read(t.state()).unwrap();
+    let before_h = handoff_snap(&t.handoff());
+    let bad: Vec<Vec<u8>> = [
+        "g-1 | control: x\n",
+        "g-1 | control:  | lesson: ISSUE-001\n",
+        "g-1 | control:x | lesson: ISSUE-001\n",
+        "g-1 | ctl: x | lesson: ISSUE-001\n",
+        "g-1 | control: x | lesson: ISSUE-01\n",
+        "g-1 | control: x | lesson: ISSUE-0001\n",
+        "g-1 | control: x | lesson: ISSUE-002\n",
+        "g 1 | control: x | lesson: ISSUE-001\n",
+        "g-1 | control: x | y | lesson: ISSUE-001\n",
+        "g-1 | control: a\u{1b}b | lesson: ISSUE-001\n",
+        "g-1 | control: a\rb | lesson: ISSUE-001\n",
+    ]
+    .iter()
+    .map(|s| s.as_bytes().to_vec())
+    .chain([b"g-1 | control: \xff | lesson: ISSUE-001\n".to_vec()])
+    .collect();
+    for b in bad {
+        let (c, l) = controls(&t, &b);
+        let o = triage_c(&t, W46, &c, &l);
+        assert_eq!(code(&o), 1, "{:?}: {}", String::from_utf8_lossy(&b), err(&o));
+        assert!(out(&o).is_empty() && !err(&o).contains("control: x"), "{}", err(&o));
+        assert_eq!(fs::read(t.state()).unwrap(), before);
+        assert_eq!(handoff_snap(&t.handoff()), before_h);
+    }
+    // a lesson that is only a symbolic link or a folder does not count
+    let (c, l) = controls(&t, "g-1 | control: x | lesson: ISSUE-003\n");
+    std::os::unix::fs::symlink(l.join("ISSUE-001-x.md"), l.join("ISSUE-003-a.md")).unwrap();
+    fs::create_dir_all(l.join("ISSUE-003-b.md")).unwrap();
+    assert_eq!(code(&triage_c(&t, W46, &c, &l)), 1);
+    assert_eq!(fs::read(t.state()).unwrap(), before);
+    assert_eq!(handoff_snap(&t.handoff()), before_h);
+}
+
+#[test]
+fn a_bad_controls_input_is_a_setup_error() {
+    let t = Tmp::new();
+    five(&t);
+    let (c, l) = controls(&t, LINE);
+    let big = t.file("big.txt", vec![b'#'; 1024 * 1024 + 1]);
+    for (cf, lf) in [(t.0.join("none.txt"), l.clone()), (l.clone(), l.clone()), (big, l.clone()), (c.clone(), t.0.join("no-dir"))] {
+        let o = triage_c(&t, W45, &cf, &lf);
+        assert_eq!(code(&o), 2, "{}", err(&o));
+        assert!(!t.state().exists());
+    }
+    for half in [["--controls", p(&c)], ["--lessons-dir", p(&l)]] {
+        assert_eq!(code(&triage(&t, W45, &half)), 2);
+    }
+    // an empty controls file is valid, seeds nothing and writes no state row
+    t.write_inbox(&[]);
+    let (c, l) = controls(&t, "");
+    assert_eq!(code(&triage_c(&t, W45, &c, &l)), 0);
+    assert!(!t.state().exists());
+}
+
+#[test]
+fn a_bad_controls_line_refuses_before_the_log_sweep_files_anything() {
+    let t = Tmp::new();
+    fs::write(t.inbox(), "").unwrap();
+    let log = t.file("events.jsonl", "{\"v\":2,\"kind\":\"gate_fail\",\"ts_ms\":1793577600000,\"ticket\":\"199\",\"repo\":\"bridlework-harness\",\"gate_id\":\"rust-test\",\"failure_class\":\"suite-fail\",\"head_sha\":\"aa11bb22cc33dd44ee55ff6600112233445566aa\",\"result\":\"fail\"}\n");
+    let (c, l) = controls(&t, "g-1 | control: x\n");
+    let before = sha(&t.inbox());
+    let o = triage(&t, W45, &["--log", p(&log), "--controls", p(&c), "--lessons-dir", p(&l)]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert_eq!(sha(&t.inbox()), before);
+    assert!(!t.state().exists());
 }
