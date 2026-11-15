@@ -226,6 +226,18 @@ fn a_bad_lanes_dir_fails_closed_for_every_verb() {
         all_verbs_refuse(&d, &lanes, what);
         let _ = fs::remove_dir_all(&d);
     }
+    // a record whose repo_id is not a legal repo id: the clash is decided by the repo id, so such a record is a bad record, not another repo
+    for (what, body) in [
+        ("repo id upper case", GOOD.replace("repo_id=r", "repo_id=R")),
+        ("repo id with a trailing space", GOOD.replace("repo_id=r\n", "repo_id=r \n")),
+        ("repo id empty", GOOD.replace("repo_id=r\n", "repo_id=\n")),
+    ] {
+        let d = tmp("badrepo");
+        let lanes = d.join("lanes");
+        plant(&lanes, "lane-1", &body);
+        all_verbs_refuse(&d, &lanes, what);
+        let _ = fs::remove_dir_all(&d);
+    }
     // two records for the same lane (the same number under two spellings)
     let d = tmp("samelane");
     let lanes = d.join("lanes");
