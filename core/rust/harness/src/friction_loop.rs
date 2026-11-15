@@ -773,8 +773,8 @@ fn after(r: &Row, resolved: &str) -> bool {
     }
 }
 
-/// The ISO week `<yyyy>-w<ww>` of a calendar date. At the ends of the year range (0000-01-01, 9999-12-31) the text
-/// can be outside `week_ok`; the caller checks it.
+/// The ISO week `<yyyy>-w<ww>` of a calendar date. For a date in year 9999 and for 0000-01-01 and 0000-01-02 the
+/// text is outside `week_ok`; bind checks its new row before it writes.
 fn iso_week(date: &str) -> String {
     let n = |r: std::ops::Range<usize>| date[r].parse::<i64>().unwrap_or(1);
     let day = days_from_civil(n(0..4), n(5..7), n(8..10));
@@ -1105,7 +1105,7 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
             attempts: 0,
         };
         if st_parse(&st_encode(&n)).is_err() {
-            return refuse("the new state row would not be readable (the last row of the group has a date at a year edge)");
+            return refuse("the new state row would not be readable (the ISO week of the group's last row is not <yyyy>-w<ww>, for example a date in year 9999)");
         }
         let mut lock = match lock_state(state_path, &orig) {
             Ok(l) => l,
