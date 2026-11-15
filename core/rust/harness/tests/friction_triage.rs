@@ -265,7 +265,7 @@ fn a_corrupt_state_or_feed_refuses_and_changes_nothing() {
     assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
     let log = t.file("events.jsonl", format!("{}\n", "{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":1793577600000,\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"ai-brain\",\"reason\":\"replan-threshold\",\"role\":\"executor\",\"model\":\"worker\"}"));
     let good = fs::read_to_string(t.state()).unwrap();
-    for bad in [format!("{good}not json\n"), format!("{good}{{\"group\":\"g-1\"}}\n"), good.trim_end().to_string(), good.replace("proposed", "weird")] {
+    for bad in [format!("{good}not json\n"), format!("{good}{{\"group\":\"g-1\"}}\n"), good.trim_end().to_string(), good.replace("proposed", "weird"), good.replace("\"task_id\":\"\"", "\"task_id\":\"-x\"")] {
         fs::write(t.state(), &bad).unwrap();
         let (s0, i0, d0) = (sha(&t.state()), sha(&t.inbox()), files(&t.handoff()));
         let o = triage(&t, W46, &["--top", "9", "--log", p(&log)]);
@@ -294,14 +294,54 @@ fn bind_takes_a_word_id_and_refuses_other_characters() {
     five(&t);
     assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
     let before = fs::read(t.state()).unwrap();
-    for id in ["a b", "a/b", "-x", ".x", "a;b", "a\u{e9}"] {
+    let long = "a".repeat(65);
+    for id in ["a b", "a/b", "-x", ".x", "a;b", "a\u{e9}", long.as_str()] {
         let o = bind(&t, "g-1", id, "s-fake");
         assert_eq!(code(&o), 1, "{id}: {}", err(&o));
         assert_eq!(fs::read(t.state()).unwrap(), before, "{id}");
     }
+    // 64 bytes is the cap: accepted
+    let o = bind(&t, "g-2", &"a".repeat(64), "s-fake");
+    assert_eq!(code(&o), 0, "{}", err(&o));
     let o = bind(&t, "g-1", "admission-two-lanes", "s-fake");
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert!(state_rows(&t).last().unwrap().contains("\"task_id\":\"admission-two-lanes\""));
+}
+
+#[test]
+fn bind_refuses_a_task_id_on_the_privacy_list() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    let before = fs::read(t.state()).unwrap();
+    let o = bind(&t, "g-1", DENY, "s-fake");
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("privacy hit"), "{}", err(&o));
+    assert_eq!(fs::read(t.state()).unwrap(), before);
+}
+
+#[test]
+fn bind_refuses_a_group_whose_week_the_state_reader_would_refuse() {
+    let t = Tmp::new();
+    t.write_inbox(&[hand("g-9", "9999-12-31", "", "high")]);
+    let o = bind(&t, "g-9", "word-id", "s-fake");
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(!t.state().exists());
+}
+
+#[test]
+fn a_closed_at_with_a_broken_time_refuses_the_feed() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
+    let before = fs::read(t.state()).unwrap();
+    for at in ["2026-11-10T10:00:00z", "2026-11-10T10:00:00+08:00", "2026-11-10T10:00:00.5Z", "2026-11-10T25:00:00Z", "2026-11-10junk"] {
+        let c = closed_with(&t, "4242", at, "\"pr\":\"7\",");
+        let o = triage(&t, W46, &["--top", "1", "--closed", p(&c)]);
+        assert_eq!(code(&o), 1, "{at}: {}", err(&o));
+        assert_eq!(fs::read(t.state()).unwrap(), before, "{at}");
+    }
 }
 
 #[test]

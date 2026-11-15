@@ -723,9 +723,8 @@ fn read_closed(path: &Path) -> Result<Vec<Closed>, (i32, String)> {
             _ => return Err(bad("a row has neither pr nor head")),
         };
         let at = scalar(g("at"))
-            .map(|s| if friction::at_ok(&s) { s } else { s.chars().take(10).collect::<String>() })
             .filter(|s| friction::date_ok(s) || friction::at_ok(s))
-            .ok_or_else(|| bad("a row has no calendar at"))?;
+            .ok_or_else(|| bad("a row at is not YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ"))?;
         let session = match g("session") {
             None => String::new(),
             Some(J::S(s)) if s.is_empty() || token_ok(s) => s.clone(),
@@ -774,7 +773,8 @@ fn after(r: &Row, resolved: &str) -> bool {
     }
 }
 
-/// The ISO week `<yyyy>-w<ww>` of a calendar date.
+/// The ISO week `<yyyy>-w<ww>` of a calendar date. At the ends of the year range (0000-01-01, 9999-12-31) the text
+/// can be outside `week_ok`; the caller checks it.
 fn iso_week(date: &str) -> String {
     let n = |r: std::ops::Range<usize>| date[r].parse::<i64>().unwrap_or(1);
     let day = days_from_civil(n(0..4), n(5..7), n(8..10));
@@ -1060,7 +1060,7 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
     if !token_ok(task_session) {
         return refuse("--task-session must be a plain token");
     }
-    for (name, v) in [("group", group), ("task-session", task_session)] {
+    for (name, v) in [("group", group), ("task-id", task_id), ("task-session", task_session)] {
         let hits = crate::scan::scan_text(&ctx, "friction.bind", v);
         if !hits.is_empty() {
             let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
@@ -1104,6 +1104,9 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
             resolved_date: String::new(),
             attempts: 0,
         };
+        if st_parse(&st_encode(&n)).is_err() {
+            return refuse("the new state row would not be readable (the last row of the group has a date at a year edge)");
+        }
         let mut lock = match lock_state(state_path, &orig) {
             Ok(l) => l,
             Err((c, m)) => return if c == 1 { refuse(&m) } else { fail(&m) },
