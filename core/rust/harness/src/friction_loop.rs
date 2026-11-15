@@ -359,9 +359,19 @@ fn digits_ok(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && s.bytes().all(|c| c.is_ascii_digit())
 }
 
+/// A task id: letters, digits, `.`, `-`, `_`; starts with a letter or digit; at most 64 bytes.
+fn task_id_ok(s: &str) -> bool {
+    s.len() <= 64 && s.bytes().next().is_some_and(|c| c.is_ascii_alphanumeric()) && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
+}
+
+/// `<repo>#<digits>` or `<repo>@<7-40 hex>`.
 fn pr_ref_ok(s: &str) -> bool {
-    match s.split_once('#') {
-        Some((repo, n)) => !repo.is_empty() && repo.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')) && digits_ok(n, 15),
+    let repo_ok = |r: &str| !r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if let Some((repo, n)) = s.split_once('#') {
+        return repo_ok(repo) && digits_ok(n, 15);
+    }
+    match s.split_once('@') {
+        Some((repo, h)) => repo_ok(repo) && (7..=40).contains(&h.len()) && h.bytes().all(|c| c.is_ascii_hexdigit()),
         None => false,
     }
 }
@@ -419,17 +429,17 @@ fn st_parse(line: &str) -> Result<St, String> {
     if !friction::week_ok(&s.proposed_week) {
         return Err("proposed_week must be <iso-year>-w<ww>".to_string());
     }
-    if !s.task_id.is_empty() && !digits_ok(&s.task_id, 15) {
-        return Err("task_id must be digits or empty".to_string());
+    if !s.task_id.is_empty() && !task_id_ok(&s.task_id) {
+        return Err("task_id must be a plain id or empty".to_string());
     }
     if !s.task_session.is_empty() && !token_ok(&s.task_session) {
         return Err("task_session must be a plain token or empty".to_string());
     }
     if !s.resolved_pr.is_empty() && !pr_ref_ok(&s.resolved_pr) {
-        return Err("resolved_pr must be <repo>#<digits> or empty".to_string());
+        return Err("resolved_pr must be <repo>#<digits>, <repo>@<hex> or empty".to_string());
     }
-    if !s.resolved_date.is_empty() && !friction::date_ok(&s.resolved_date) {
-        return Err("resolved_date must be a calendar date or empty".to_string());
+    if !s.resolved_date.is_empty() && !friction::date_ok(&s.resolved_date) && !friction::at_ok(&s.resolved_date) {
+        return Err("resolved_date must be a calendar date, a UTC instant or empty".to_string());
     }
     if s.status == "resolved" && s.resolved_date.is_empty() {
         return Err("a resolved row needs resolved_date".to_string());
@@ -666,11 +676,11 @@ impl JP<'_> {
     }
 }
 
-/// One row of the closed feed (ticket-reconcile's `closed_with_evidence` shape plus an optional `session`).
+/// One row of the closed feed (ticket-reconcile's `closed_with_evidence` shape plus an optional `session`;
+/// `head` stands in for a missing `pr`). `at` is the full instant when it is one, else a date.
 struct Closed {
     id: String,
-    repo: String,
-    pr: String,
+    pr_ref: String,
     at: String,
     session: String,
 }
@@ -705,17 +715,26 @@ fn read_closed(path: &Path) -> Result<Vec<Closed>, (i32, String)> {
         let g = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
         let id = scalar(g("id")).filter(|s| !s.is_empty()).ok_or_else(|| bad("a row has no id"))?;
         let repo = scalar(g("repo")).filter(|s| !s.is_empty()).ok_or_else(|| bad("a row has no repo"))?;
-        let pr = scalar(g("pr")).filter(|s| digits_ok(s, 15)).ok_or_else(|| bad("a row has no numeric pr"))?;
-        let at = scalar(g("at")).map(|s| s.chars().take(10).collect::<String>()).filter(|s| friction::date_ok(s)).ok_or_else(|| bad("a row has no calendar at"))?;
+        let pr = scalar(g("pr")).filter(|s| !s.is_empty());
+        let head = scalar(g("head")).filter(|s| !s.is_empty());
+        let pr_ref = match (pr, head) {
+            (Some(n), _) => format!("{repo}#{n}"),
+            (None, Some(h)) => format!("{repo}@{h}"),
+            _ => return Err(bad("a row has neither pr nor head")),
+        };
+        let at = scalar(g("at"))
+            .map(|s| if friction::at_ok(&s) { s } else { s.chars().take(10).collect::<String>() })
+            .filter(|s| friction::date_ok(s) || friction::at_ok(s))
+            .ok_or_else(|| bad("a row has no calendar at"))?;
         let session = match g("session") {
             None => String::new(),
             Some(J::S(s)) if s.is_empty() || token_ok(s) => s.clone(),
             Some(_) => return Err(bad("a row has a session that is not a plain token")),
         };
-        if !pr_ref_ok(&format!("{repo}#{pr}")) {
-            return Err(bad("a row repo is not a plain repo name"));
+        if !pr_ref_ok(&pr_ref) {
+            return Err(bad("a row repo, pr or head is not plain"));
         }
-        out.push(Closed { id, repo, pr, at, session });
+        out.push(Closed { id, pr_ref, at, session });
     }
     Ok(out)
 }
@@ -745,6 +764,29 @@ fn age_weeks(proposed: &str, now: &str) -> i64 {
 }
 
 // ---------------------------------------------------------------- triage
+
+/// Is the row later than `resolved`? Two instants compare in full; otherwise the row's date meets the date part.
+fn after(r: &Row, resolved: &str) -> bool {
+    if resolved.len() == 20 && !r.at.is_empty() {
+        r.at.as_str() > resolved
+    } else {
+        r.date.as_str() > &resolved[..10]
+    }
+}
+
+/// The ISO week `<yyyy>-w<ww>` of a calendar date.
+fn iso_week(date: &str) -> String {
+    let n = |r: std::ops::Range<usize>| date[r].parse::<i64>().unwrap_or(1);
+    let day = days_from_civil(n(0..4), n(5..7), n(8..10));
+    let year = n(0..4);
+    for y in [year + 1, year, year - 1] {
+        let m1 = week_monday(&format!("{y:04}-w01"));
+        if day >= m1 {
+            return format!("{y:04}-w{:02}", (day - m1) / 7 + 1);
+        }
+    }
+    format!("{year:04}-w01")
+}
 
 fn ticket_json(id: &str, g: &Group, rows: &[Row], week: &str) -> String {
     let blocker = g.impact == "blocker";
@@ -856,7 +898,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         }
         let hit = closed.iter().find(|c| c.id == s.task_id && (s.task_session.is_empty() || c.session.is_empty() || c.session == s.task_session));
         if let Some(c) = hit {
-            let n = St { status: "resolved".into(), resolved_pr: format!("{}#{}", c.repo, c.pr), resolved_date: c.at.clone(), ..s };
+            let n = St { status: "resolved".into(), resolved_pr: c.pr_ref.clone(), resolved_date: c.at.clone(), ..s };
             cur.insert(g, n.clone());
             new_rows.push(n);
             resolved_now += 1;
@@ -870,7 +912,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             continue;
         }
         let Some(gr) = by_id.get(g.as_str()) else { continue };
-        if gr.members.iter().any(|&m| rows[m].date.as_str() > s.resolved_date.as_str()) {
+        if gr.members.iter().any(|&m| after(&rows[m], &s.resolved_date)) {
             let attempts = s.attempts + 1;
             let n = St { status: if attempts >= 2 { "escalated".into() } else { "regressed".into() }, attempts, ..s };
             cur.insert(g, n.clone());
@@ -990,7 +1032,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
 
 // ---------------------------------------------------------------- bind
 
-/// `harness friction bind --state <file> --group <id> --task-id <digits> --task-session <token> [--config <file>]`:
+/// `harness friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>]`:
 /// the one writer of the task binding.
 pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
     let flags = match parse_flags(rest, &["--state", "--group", "--task-id", "--task-session", "--config"], "bind") {
@@ -1012,8 +1054,8 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
         Err(c) => return c,
     };
     let ctx = crate::scan::Ctx { list: &list, testmode };
-    if !digits_ok(task_id, 15) {
-        return refuse("--task-id must be all digits");
+    if !task_id_ok(task_id) {
+        return refuse("--task-id must be letters, digits, '.', '-' or '_', starting with a letter or digit");
     }
     if !token_ok(task_session) {
         return refuse("--task-session must be a plain token");
@@ -1032,7 +1074,45 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     let cur = last_per_group(&rows);
     let Some(s) = cur.get(group) else {
-        return refuse("the group has no state row");
+        // No state row: a group of the inbox is filed as proposed and bound, with no hand-off file.
+        let cfg = match load_cfg(flag(&flags, "--config")) {
+            Ok(c) => c,
+            Err(c) => return c,
+        };
+        let inbox = match lint_rows(&cfg, &ctx) {
+            Ok(r) => r,
+            Err(c) => return c,
+        };
+        let all = match groups(&inbox) {
+            Ok(g) => g,
+            Err(m) => {
+                eprintln!("{m}");
+                return 1;
+            }
+        };
+        let Some(g) = all.iter().find(|g| g.id == group) else {
+            return refuse("the group has no state row and no inbox row");
+        };
+        let n = St {
+            group: group.to_string(),
+            status: "proposed".into(),
+            ticket_file: String::new(),
+            proposed_week: iso_week(&g.last),
+            task_id: task_id.to_string(),
+            task_session: task_session.to_string(),
+            resolved_pr: String::new(),
+            resolved_date: String::new(),
+            attempts: 0,
+        };
+        let mut lock = match lock_state(state_path, &orig) {
+            Ok(l) => l,
+            Err((c, m)) => return if c == 1 { refuse(&m) } else { fail(&m) },
+        };
+        if let Err((c, m)) = lock.append(orig.len(), &[n]) {
+            return if c == 1 { refuse(&m) } else { fail(&m) };
+        }
+        println!("bind group={group} task={task_id}");
+        return 0;
     };
     if s.status != "proposed" {
         return refuse("the group is not proposed (only a proposed group can be bound)");

@@ -26,7 +26,13 @@ fn triage(t: &Tmp, week: &str, extra: &[&str]) -> Output {
 
 fn bind(t: &Tmp, group: &str, id: &str, session: &str) -> Output {
     let state = t.state();
-    run(&["friction", "bind", "--state", p(&state), "--group", group, "--task-id", id, "--task-session", session])
+    let cfg = t.config();
+    run(&["friction", "bind", "--state", p(&state), "--group", group, "--task-id", id, "--task-session", session, "--config", p(&cfg)])
+}
+
+/// A closed feed whose one row carries the given extra JSON members (`"pr":"7"`, `"head":"abc1234"`).
+fn closed_with(t: &Tmp, id: &str, at: &str, extra: &str) -> std::path::PathBuf {
+    t.file("cw.json", format!("{{\"closed_with_evidence\":[{{\"id\":\"{id}\",\"repo\":\"owner/repo\",{extra}\"at\":\"{at}\",\"session\":\"s-fake\"}}]}}"))
 }
 
 fn closed_file(t: &Tmp, name: &str, id: &str, session: Option<&str>, at: &str) -> std::path::PathBuf {
@@ -187,14 +193,17 @@ fn bind_refusals_leave_state_byte_identical() {
     assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
     assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
     let before = fs::read(t.state()).unwrap();
-    for (g, id, s) in [("g-1", "42x", "s-fake"), ("g-1", "", "s-fake"), ("nope", "4242", "s-fake"), ("g-1", "4243", "s-fake"), ("g-1", "4242", "s-other"), ("g-1", "4242", "S Bad"), ("g-2", "4242", "s-fake")] {
+    // Changed by the word-id and no-state-row criteria: "42x" is a legal id now, so "4 2x" stands in; "g-2" has
+    // inbox rows, so bind files it now, and "g-1b" (no inbox row) stands in as a refusal.
+    for (g, id, s) in [("g-1", "4 2x", "s-fake"), ("g-1", "", "s-fake"), ("nope", "4242", "s-fake"), ("g-1", "4243", "s-fake"), ("g-1", "4242", "s-other"), ("g-1", "4242", "S Bad"), ("g-1b", "4242", "s-fake")] {
         let o = bind(&t, g, id, s);
         assert_eq!(code(&o), 1, "{g} {id} {s}: {}", err(&o));
         assert!(out(&o).is_empty());
         assert_eq!(fs::read(t.state()).unwrap(), before, "{g} {id} {s}");
     }
-    // a missing state file: refused, and not created
+    // a missing state file and a group with no inbox row: refused, and not created
     let t2 = Tmp::new();
+    t2.write_inbox(&[]);
     assert_eq!(code(&bind(&t2, "g-1", "1", "s-x")), 1);
     assert!(!t2.state().exists());
 }
@@ -277,6 +286,119 @@ fn a_corrupt_state_or_feed_refuses_and_changes_nothing() {
     assert_eq!(code(&o), 1);
     assert!(out(&o).is_empty());
     assert_eq!((sha(&t.state()), files(&t.handoff())), (s0, d0));
+}
+
+#[test]
+fn bind_takes_a_word_id_and_refuses_other_characters() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    let before = fs::read(t.state()).unwrap();
+    for id in ["a b", "a/b", "-x", ".x", "a;b", "a\u{e9}"] {
+        let o = bind(&t, "g-1", id, "s-fake");
+        assert_eq!(code(&o), 1, "{id}: {}", err(&o));
+        assert_eq!(fs::read(t.state()).unwrap(), before, "{id}");
+    }
+    let o = bind(&t, "g-1", "admission-two-lanes", "s-fake");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(state_rows(&t).last().unwrap().contains("\"task_id\":\"admission-two-lanes\""));
+}
+
+#[test]
+fn bind_files_a_group_that_has_no_state_row() {
+    let t = Tmp::new();
+    five(&t);
+    let o = bind(&t, "g-2", "word.id_1", "s-fake");
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let rows = state_rows(&t);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    for want in ["\"group\":\"g-2\"", "\"status\":\"proposed\"", "\"proposed_week\":\"2026-w45\"", "\"task_id\":\"word.id_1\"", "\"ticket_file\":\"\""] {
+        assert!(rows[0].contains(want), "{want}: {}", rows[0]);
+    }
+    // the filed group resolves by its word id, and a later triage does not propose it again
+    let c = closed_with(&t, "word.id_1", "2026-11-10", "\"pr\":\"5\",");
+    let o = triage(&t, W46, &["--top", "5", "--closed", p(&c)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(last_status(&t, "g-2"), "resolved");
+    assert!(!out(&o).contains("propose group=g-2"), "{}", out(&o));
+    // a group with no inbox row: refused, state byte-identical
+    let before = fs::read(t.state()).unwrap();
+    let o = bind(&t, "no-such-group", "word.id_2", "s-fake");
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert_eq!(fs::read(t.state()).unwrap(), before);
+}
+
+#[test]
+fn closed_row_with_head_resolves_and_neither_refuses() {
+    let t = Tmp::new();
+    five(&t);
+    assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
+    let before = fs::read(t.state()).unwrap();
+    for extra in ["", "\"head\":\"abc12\",", "\"head\":\"zzzzzzz\",", "\"head\":\"abc1234abc1234abc1234abc1234abc1234abc1234\",", "\"pr\":\"x\","] {
+        let c = closed_with(&t, "4242", "2026-11-10", extra);
+        let o = triage(&t, W46, &["--top", "1", "--closed", p(&c)]);
+        assert_eq!(code(&o), 1, "{extra}: {}", err(&o));
+        assert_eq!(fs::read(t.state()).unwrap(), before, "{extra}");
+    }
+    let c = closed_with(&t, "4242", "2026-11-10", "\"head\":\"abc1234\",");
+    let o = triage(&t, W46, &["--top", "1", "--closed", p(&c)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(last_status(&t, "g-1"), "resolved");
+    assert!(fs::read_to_string(t.state()).unwrap().contains("\"resolved_pr\":\"owner/repo@abc1234\""));
+}
+
+/// g-1 resolved at 2026-11-10T12:00:00Z; the inbox then gains one member row.
+fn resolved_at_noon_then(t: &Tmp, member: String) -> Output {
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "high")]);
+    assert_eq!(code(&triage(t, W45, &[])), 0);
+    assert_eq!(code(&bind(t, "g-1", "4242", "s-fake")), 0);
+    let c = closed_with(t, "4242", "2026-11-10T12:00:00Z", "\"pr\":\"77\",");
+    assert_eq!(code(&triage(t, W46, &["--closed", p(&c)])), 0);
+    assert!(fs::read_to_string(t.state()).unwrap().contains("\"resolved_date\":\"2026-11-10T12:00:00Z\""));
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "high"), member]);
+    triage(t, W47, &[])
+}
+
+#[test]
+fn closed_time_is_kept_and_orders_same_day_rows() {
+    let day = "2026-11-10";
+    let with_at = |at: &str| row("g-1b", day, "g-1", "lesson", &[("at", at)]);
+    let attempts = |t: &Tmp| state_rows(t).last().unwrap().contains("\"attempts\":\"1\"");
+    // later the same day: regressed (re-proposed with attempts 1)
+    let t = Tmp::new();
+    assert_eq!(code(&resolved_at_noon_then(&t, with_at("2026-11-10T13:00:00Z"))), 0);
+    assert!(attempts(&t), "{:?}", state_rows(&t));
+    // earlier the same day, and a row without at on the same day: not regressed
+    for m in [with_at("2026-11-10T11:00:00Z"), row("g-1b", day, "g-1", "lesson", &[])] {
+        let t = Tmp::new();
+        assert_eq!(code(&resolved_at_noon_then(&t, m)), 0);
+        assert_eq!(last_status(&t, "g-1"), "resolved");
+    }
+    // a date-only closed at keeps the date rule: a row with an at on the same day does not regress
+    let t = Tmp::new();
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "high")]);
+    assert_eq!(code(&triage(&t, W45, &[])), 0);
+    assert_eq!(code(&bind(&t, "g-1", "4242", "s-fake")), 0);
+    let c = closed_with(&t, "4242", "2026-11-10", "\"pr\":\"77\",");
+    assert_eq!(code(&triage(&t, W46, &["--closed", p(&c)])), 0);
+    t.write_inbox(&[hand("g-1", "2026-11-02", "", "high"), with_at("2026-11-10T01:00:00Z")]);
+    assert_eq!(code(&triage(&t, W47, &[])), 0);
+    assert_eq!(last_status(&t, "g-1"), "resolved");
+}
+
+#[test]
+fn a_state_file_of_the_older_binary_is_read() {
+    let t = Tmp::new();
+    five(&t);
+    let line = "{\"group\":\"g-1\",\"status\":\"resolved\",\"ticket_file\":\"2026-w45-1.json\",\"proposed_week\":\"2026-w45\",\"task_id\":\"4242\",\"task_session\":\"s-fake\",\"resolved_pr\":\"owner/repo#77\",\"resolved_date\":\"2026-11-10\",\"attempts\":\"0\"}\n{\"group\":\"g-2\",\"status\":\"proposed\",\"ticket_file\":\"2026-w45-2.json\",\"proposed_week\":\"2026-w45\",\"task_id\":\"\",\"task_session\":\"\",\"resolved_pr\":\"\",\"resolved_date\":\"\",\"attempts\":\"0\"}\n";
+    fs::write(t.state(), line).unwrap();
+    let cfg = t.config();
+    let page = t.0.join("page.md");
+    let o = run(&["friction", "page", "--week", W46, "--state", p(&t.state()), "--out", p(&page), "--config", p(&cfg)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(fs::read_to_string(&page).unwrap().contains("## g-2"));
+    assert_eq!(code(&triage(&t, W46, &["--top", "1"])), 0);
 }
 
 #[test]
