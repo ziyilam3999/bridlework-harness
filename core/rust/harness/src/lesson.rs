@@ -72,6 +72,17 @@ fn split_list(v: &str) -> Vec<&str> {
     inner.split(',').map(|t| t.trim()).collect()
 }
 
+/// A control character or a blank other than a plain space is written `\u{hex}` in a printed line.
+fn esc(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() || (c.is_whitespace() && c != ' ') {
+            format!("\\u{{{:x}}}", c as u32)
+        } else {
+            c.to_string()
+        })
+        .collect()
+}
+
 /// Add a page unless an equal one (compared by canonical path) was already added: the same page reached twice in
 /// one run (the same file given twice, or a file and the directory that holds it) is checked and counted once.
 fn push_page(pages: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, p: PathBuf) {
@@ -160,8 +171,12 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
     let mut keys: HashMap<&str, &str> = HashMap::new();
     for (i, &l) in lines[1..close].iter().enumerate() {
         match l.split_once(':') {
-            Some((k, v)) if !k.trim().is_empty() => {
-                keys.insert(k.trim(), v.trim());
+            // Only ASCII spaces and tabs are trimmed around the key and the value.
+            Some((k, v)) if !k.trim_matches([' ', '\t']).is_empty() => {
+                let (k, v) = (k.trim_matches([' ', '\t']), v.trim_matches([' ', '\t']));
+                if keys.insert(k, v).is_some() {
+                    out.push(format!("FRONT-MATTER line {} repeats the key {}", i + 2, k));
+                }
             }
             _ => out.push(format!("FRONT-MATTER line {} is not key: value", i + 2)),
         }
@@ -387,12 +402,12 @@ pub fn lesson_cmd(a: &[String]) -> i32 {
         }
         Ok((_, problems)) => {
             for line in problems {
-                println!("{}", line);
+                println!("{}", esc(&line));
             }
             1
         }
         Err(m) => {
-            eprintln!("harness: error: {}", m);
+            eprintln!("harness: error: {}", esc(&m));
             2
         }
     }
