@@ -636,6 +636,22 @@ struct Statvfs {
 }
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
+impl Statvfs {
+    /// `f_bavail * f_frsize` as bytes with a checked product. macOS: `f_bavail` is 32-bit and `f_frsize` an
+    /// `unsigned long`.
+    #[cfg(target_os = "macos")]
+    fn avail_bytes(&self) -> Option<u64> {
+        (self.f_bavail as u64).checked_mul(self.f_frsize)
+    }
+
+    /// The same product on 64-bit Linux: both fields are 64-bit, so no cast is needed.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn avail_bytes(&self) -> Option<u64> {
+        self.f_bavail.checked_mul(self.f_frsize)
+    }
+}
+
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
 extern "C" {
     fn statvfs(path: *const std::ffi::c_char, buf: *mut Statvfs) -> std::ffi::c_int;
 }
@@ -655,7 +671,7 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     if v.f_frsize == 0 {
         return None;
     }
-    u64::from(v.f_bavail).checked_mul(u64::from(v.f_frsize))
+    v.avail_bytes()
 }
 
 /// The same reading on a target the crate declares no `statvfs` struct for: fail closed.
