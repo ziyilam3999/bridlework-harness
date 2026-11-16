@@ -24,6 +24,8 @@ shadow:
 
 lanes:
   count: 4
+  # min_free_gb is the optional disk floor of a claim: under this many GB free on the lanes dir file system a claim is refused; absent means no floor.
+  min_free_gb: 50
 
 # The friction inbox (docs/friction-inbox.md) lives only in the private overlay; this path is a placeholder.
 # pattern_threshold (ticket 192) is the ONE OPTIONAL key in the contract: absent means 3. It is the N a

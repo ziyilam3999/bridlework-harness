@@ -15,8 +15,8 @@
 //! together) that frees a lane appends one line to `<records-dir>/<ticket-id>.release`; the records dir and the record are checked before the lane
 //! file is removed, and a write error after it is exit 2 with the lane freed.
 //! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
-//! field, and `clash` also names the live ticket and the overlapping pair of entries); 2 usage error, unreadable or refused input, or a lanes
-//! dir in a bad state.
+//! field, `clash` also names the live ticket and the overlapping pair of entries, and `low-disk` also names the free GB and the floor); 2 usage
+//! error, unreadable or refused input, free disk space that cannot be read, or a lanes dir in a bad state.
 
 use crate::config::Config;
 use crate::repo_id::RepoId;
@@ -58,6 +58,8 @@ enum Refusal {
     /// A claim whose scope overlaps the scope of a live ticket of the same repo; the string names the live ticket and the overlapping pair
     /// (`ticket=<id> live=<entry> new=<entry>`, the entries as stored).
     Clash(String),
+    /// A claim under the config disk floor; the string gives `free_gb=<n> min_free_gb=<floor>` (the free bytes rounded down to GB).
+    LowDisk(String),
 }
 
 impl Refusal {
@@ -69,6 +71,7 @@ impl Refusal {
             Refusal::NoAdmission => "no-admission",
             Refusal::Admission(_) => "bad-admission",
             Refusal::Clash(_) => "clash",
+            Refusal::LowDisk(_) => "low-disk",
         }
     }
 }
@@ -594,6 +597,99 @@ fn nearest_existing_ancestor(p: &Path) -> PathBuf {
     a
 }
 
+// `statvfs(2)` free-space reading (the `quarantine.rs` pattern): one `#[repr(C)]` struct per target, laid out as
+// the platform header declares it. Unread fields carry a leading underscore. A target with no struct fails the
+// build here; the same gate keeps `free_bytes` to macOS and 64-bit Linux.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+struct Statvfs {
+    _f_bsize: std::ffi::c_ulong,
+    f_frsize: std::ffi::c_ulong,
+    _f_blocks: u32,
+    _f_bfree: u32,
+    f_bavail: u32,
+    _f_files: u32,
+    _f_ffree: u32,
+    _f_favail: u32,
+    _f_fsid: std::ffi::c_ulong,
+    _f_flag: std::ffi::c_ulong,
+    _f_namemax: std::ffi::c_ulong,
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[repr(C)]
+#[derive(Default)]
+struct Statvfs {
+    _f_bsize: std::ffi::c_ulong,
+    f_frsize: std::ffi::c_ulong,
+    _f_blocks: u64,
+    _f_bfree: u64,
+    f_bavail: u64,
+    _f_files: u64,
+    _f_ffree: u64,
+    _f_favail: u64,
+    _f_fsid: std::ffi::c_ulong,
+    _f_flag: std::ffi::c_ulong,
+    _f_namemax: std::ffi::c_ulong,
+    _spare: [std::ffi::c_uint; 6],
+}
+
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
+extern "C" {
+    fn statvfs(path: *const std::ffi::c_char, buf: *mut Statvfs) -> std::ffi::c_int;
+}
+
+/// The free bytes of the file system that holds `path` (the `f_bavail * f_frsize` of `statvfs(2)`, with a
+/// checked product). `None` when the path holds a NUL byte, the call fails, `f_frsize` is 0, the product
+/// overflows, or the target is not macOS or 64-bit Linux.
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_pointer_width = "64")))]
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut v = Statvfs::default();
+    // One `statvfs(2)` call on `c`: it only reads the path and fills `v`, a plain struct of integers.
+    if unsafe { statvfs(c.as_ptr(), &mut v) } != 0 {
+        return None;
+    }
+    if v.f_frsize == 0 {
+        return None;
+    }
+    u64::from(v.f_bavail).checked_mul(u64::from(v.f_frsize))
+}
+
+/// The same reading on a target the crate declares no `statvfs` struct for: fail closed.
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_pointer_width = "64"))))]
+pub fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// The outcome of the disk-floor check of a claim.
+#[derive(Debug, PartialEq, Eq)]
+enum FloorCheck {
+    /// No floor is set, or the free space reaches the floor: the claim goes on.
+    Ok,
+    /// The free space is under the floor; the string is `free_gb=<n> min_free_gb=<floor>` (n is the free bytes
+    /// rounded down to GB).
+    LowDisk(String),
+    /// A floor is set and the free space cannot be read (exit 2).
+    Unreadable,
+}
+
+/// The disk floor of a claim: with a floor set, the free bytes of the file system of the lanes dir (its nearest
+/// existing ancestor when it is missing) must reach `floor * 1000000000`, compared in `u128` so the product
+/// cannot wrap. `read` reads the free bytes, a parameter so a test can supply its own; with no floor set the
+/// reader is not called and the disk is not read. `release`, `list` and `admission-check` run no check: a
+/// running job is not stopped, and its lane can be freed on a full disk.
+fn check_disk_floor(dir: &Path, floor: Option<u64>, read: &dyn Fn(&Path) -> Option<u64>) -> FloorCheck {
+    let Some(floor) = floor else { return FloorCheck::Ok };
+    let Some(free) = read(&nearest_existing_ancestor(dir)) else { return FloorCheck::Unreadable };
+    if (free as u128) < (floor as u128) * 1000000000 {
+        return FloorCheck::LowDisk(format!("free_gb={} min_free_gb={floor}", free / 1000000000));
+    }
+    FloorCheck::Ok
+}
+
 /// Must `p` be read as the lanes dir or inside it, by `fs::canonicalize` of both? A canonicalize that fails is
 /// the safe side.
 fn inside_lanes(p: &Path, lanes: &Path) -> bool {
@@ -657,6 +753,7 @@ fn refused(r: Refusal) -> i32 {
     match r {
         Refusal::Admission(detail) => eprintln!("lane: refused reason=bad-admission {detail}"),
         Refusal::Clash(detail) => eprintln!("lane: refused reason=clash {detail}"),
+        Refusal::LowDisk(detail) => eprintln!("lane: refused reason=low-disk {detail}"),
         other => eprintln!("lane: refused reason={}", other.token()),
     }
     1
@@ -723,24 +820,26 @@ pub fn lane_cmd(a: &[String]) -> i32 {
                 Err(e) => return fail(&e),
             };
             let rec = Record { lane: 0, ticket: ticket.id.clone(), repo_id: ticket.repo_id.as_str().to_string(), scope };
-            match admitted {
-                Err(r) => refused(r),
-                Ok(None) => match claim(&dir, rec, claim_cap(None, &cfg), name_cap(&cfg), false) {
-                    Ok(Ok(n)) => {
-                        println!("ticket={} lane={}", ticket.id, n);
-                        0
-                    }
-                    Ok(Err(r)) => refused(r),
-                    Err(e) => fail(&e),
-                },
-                Ok(Some(n)) => match claim(&dir, rec, claim_cap(Some(n), &cfg), name_cap(&cfg), true) {
-                    Ok(Ok(n2)) => {
-                        println!("ticket={} lane={}", ticket.id, n2);
-                        0
-                    }
-                    Ok(Err(r)) => refused(r),
-                    Err(e) => fail(&e),
-                },
+            // The disk floor comes after every input check (bad-admission included, the match just below) and
+            // before the lanes dir is touched: a refused or unreadable claim leaves nothing behind, and a missing
+            // lanes dir stays missing.
+            let (cap, from_admission) = match admitted {
+                Err(r) => return refused(r),
+                Ok(None) => (claim_cap(None, &cfg), false),
+                Ok(Some(n)) => (claim_cap(Some(n), &cfg), true),
+            };
+            match check_disk_floor(&dir, cfg.min_free_gb(), &free_bytes) {
+                FloorCheck::Ok => {}
+                FloorCheck::LowDisk(detail) => return refused(Refusal::LowDisk(detail)),
+                FloorCheck::Unreadable => return fail("the free disk space cannot be read"),
+            }
+            match claim(&dir, rec, cap, name_cap(&cfg), from_admission) {
+                Ok(Ok(n)) => {
+                    println!("ticket={} lane={}", ticket.id, n);
+                    0
+                }
+                Ok(Err(r)) => refused(r),
+                Err(e) => fail(&e),
             }
         }
         "release" => {
@@ -1043,5 +1142,22 @@ mod tests {
         assert_eq!(claim_cap(Some(2), &cfg(4)), 2);
         assert_eq!(claim_cap(Some(4), &cfg(4)), 4);
         assert_eq!(claim_cap(Some(4), &cfg(3)), 3);
+    }
+
+    #[test]
+    fn the_disk_floor_check_reads_the_disk_only_with_a_floor_set() {
+        let d = std::env::temp_dir().join(format!("lane-floor-unit-{}", std::process::id()));
+        // no floor: the reader is not called (it panics) and the check passes
+        assert_eq!(check_disk_floor(&d, None, &|_| panic!("the disk must not be read without a floor")), FloorCheck::Ok);
+        // a floor and an unreadable reading: the exit-2 case
+        assert_eq!(check_disk_floor(&d, Some(50), &|_| None), FloorCheck::Unreadable);
+        // floor 50: exactly 50000000000 free claims, 49999999999 is refused with free_gb=49
+        assert_eq!(check_disk_floor(&d, Some(50), &|_| Some(50000000000)), FloorCheck::Ok);
+        assert_eq!(check_disk_floor(&d, Some(50), &|_| Some(49999999999)), FloorCheck::LowDisk("free_gb=49 min_free_gb=50".to_string()));
+        // floor 999999999999999 with a reading of u64::MAX: refused (a u64 product would wrap to about 0.09 GB and pass)
+        assert_eq!(
+            check_disk_floor(&d, Some(999999999999999), &|_| Some(u64::MAX)),
+            FloorCheck::LowDisk(format!("free_gb={} min_free_gb=999999999999999", u64::MAX / 1000000000))
+        );
     }
 }

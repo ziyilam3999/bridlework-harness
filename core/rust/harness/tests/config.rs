@@ -2,7 +2,7 @@
 //! and scratch repos under the system temp folder. The config source is set only on the child (`.env`, `.env_remove`); this file never reads one.
 //! Each refusal has a planted failing twin: the same run with one thing changed that a wrong implementation would get wrong.
 #![cfg(unix)]
-use harness::config::{Config, DESIGN_TIER_KEY, INBOX_KEY, KEYS, PATTERN_THRESHOLD_KEY};
+use harness::config::{Config, DESIGN_TIER_KEY, INBOX_KEY, KEYS, MIN_FREE_GB_KEY, PATTERN_THRESHOLD_KEY};
 use harness::repo_id::RepoId;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -320,6 +320,24 @@ fn the_lanes_section_is_required_and_count_is_a_positive_whole_number() {
 }
 
 #[test]
+fn min_free_gb_is_optional_shape_checked_and_read() {
+    // absent: no floor
+    assert_eq!(Config::parse(&valid()).unwrap().min_free_gb(), None);
+    // present: read from the text, not compiled in
+    let with = |v: &str| valid().replace("  count: 4", &format!("  count: 4\n  min_free_gb: {v}"));
+    assert_eq!(Config::parse(&with("50")).unwrap().min_free_gb(), Some(50));
+    // 0, a negative, a fraction, a 16-digit number, a quoted value: refused naming the section and the key, not the value
+    for bad in ["0", "-1", "1.5", "1234567890123456", "\"50\""] {
+        let e = Config::parse(&with(bad)).unwrap_err();
+        assert!(e.contains("`lanes`") && e.contains("`min_free_gb`"), "{bad}: {e}");
+        assert!(!e.contains(bad), "{bad}: the refusal carried the value: {e}");
+    }
+    // a repeated key is refused as a duplicate, naming the section and the key
+    let e = Config::parse(&valid().replace("  count: 4", "  count: 4\n  min_free_gb: 50\n  min_free_gb: 7")).unwrap_err();
+    assert!(e.contains("`lanes`") && e.contains("`min_free_gb`") && e.contains("duplicate key"), "{e}");
+}
+
+#[test]
 fn two_different_absolute_folders_load_as_the_twin_of_the_map_rules() {
     let t = Tmp::new();
     let o = check(&t.file("ok.yaml", make("  a: /x\n  b: /y", "1")), &[]);
@@ -447,7 +465,11 @@ fn pin(text: &str) -> Result<(), String> {
                     return Err(format!("shadow {k} is not {want}"));
                 }
             }
-            "lanes" if v != "4" => return Err(format!("lanes {k} is not 4")),
+            "lanes" => match (k, v) {
+                ("count", "4") => {}
+                ("min_free_gb", "50") => {}
+                _ => return Err(format!("lanes {k} is not the shipped count 4 or floor 50")),
+            },
             "friction" => match (k, v) {
                 ("inbox", "/placeholder/friction-inbox.jsonl") => {}
                 ("pattern_threshold", "3") => {}
@@ -466,6 +488,8 @@ fn pin(text: &str) -> Result<(), String> {
     want.push(PATTERN_THRESHOLD_KEY.to_string());
     // the second optional key (ticket 3601), also shipped at its default
     want.push(harness::config::TRIAGE_TOP_KEY.to_string());
+    // the third optional key (the lanes disk floor), shipped as the operator floor 50
+    want.push(MIN_FREE_GB_KEY.to_string());
     want.push(DESIGN_TIER_KEY.to_string());
     want.sort();
     if keys != want {
@@ -486,6 +510,8 @@ fn the_public_example_is_placeholders_only_and_each_twin_breaks_the_pin() {
         ("shadow token budget 2", text.replace("  p4a_token_budget: 1", "  p4a_token_budget: 2")),
         ("p1a cap 6", text.replace("  p1a_cap: 5", "  p1a_cap: 6")),
         ("lanes count 9", text.replace("  count: 4", "  count: 9")),
+        ("min_free_gb 49", text.replace("  min_free_gb: 50", "  min_free_gb: 49")),
+        ("missing min_free_gb", text.replace("  min_free_gb: 50\n", "")),
         ("inbox not the placeholder", text.replace("/placeholder/friction-inbox.jsonl", "/real/inbox.jsonl")),
         ("missing inbox", text.replace("\nfriction:\n  inbox: /placeholder/friction-inbox.jsonl", "")),
         ("pattern_threshold 2", text.replace("  pattern_threshold: 3", "  pattern_threshold: 2")),

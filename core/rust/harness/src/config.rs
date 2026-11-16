@@ -47,6 +47,11 @@ pub const TRIAGE_TOP_KEY: &str = "friction.triage_top";
 /// The default K when `friction.triage_top` is absent.
 pub const TRIAGE_TOP_DEFAULT: u64 = 3;
 
+/// The third OPTIONAL key (the lanes disk floor): `lanes.min_free_gb`, the floor in GB (1 GB = 1000000000 bytes)
+/// under whose free space `harness lane claim` refuses a new job. Absent means no floor, and the disk is not
+/// read. Not in `KEYS`: it is not required.
+pub const MIN_FREE_GB_KEY: &str = "lanes.min_free_gb";
+
 /// The config v4 string key (ticket 190): the tier the factory designs new fixes at (G8.3). One of
 /// `T1`, `T2`, `T3` — a tier, never a brand; `T4` is refused (the design tier is never the top of the
 /// ladder). A refusal over it never carries the value.
@@ -91,6 +96,8 @@ pub struct Config {
     pattern_threshold: u64,
     /// The optional `friction.triage_top` (default 3 when absent).
     triage_top: u64,
+    /// The optional `lanes.min_free_gb` (no floor when absent).
+    min_free_gb: Option<u64>,
     /// The `factory.design_tier` tier (v4, ticket 190): the tier the factory designs new fixes at.
     design_tier: Tier,
     /// The optional `builder_state` entries (ticket 3703), file order: (entry name, text). Never printed.
@@ -166,6 +173,7 @@ impl Config {
         let mut inbox: Option<String> = None;
         let mut pattern_threshold: Option<u64> = None;
         let mut triage_top: Option<u64> = None;
+        let mut min_free_gb: Option<u64> = None;
         let mut design_tier: Option<Tier> = None;
         for (i, line) in text.split('\n').enumerate() {
             let n = i + 1;
@@ -276,6 +284,17 @@ impl Config {
                 } else {
                     return Err(refuse(n, &at, "unknown key"));
                 }
+} else if sec == "lanes" && key == "min_free_gb" {
+                // The third OPTIONAL key (the lanes disk floor): the same grammar as every numeric key, but a
+                // file may omit it (absent = no floor, the disk is not read).
+                let at = format!("section `{sec}` key `{}`", shown(key));
+                if min_free_gb.is_some() {
+                    return Err(refuse(n, &at, "duplicate key"));
+                }
+                if quoted {
+                    return Err(refuse(n, &at, "a number must not be quoted"));
+                }
+                min_free_gb = Some(number(val).ok_or_else(|| refuse(n, &at, "must be a positive whole number (digits only, no leading zero, at most 15 digits)"))?);
 } else if sec == "factory" {
                 let at = format!("section `{sec}` key `{}`", shown(key));
                 if key != "design_tier" {
@@ -328,6 +347,7 @@ impl Config {
             inbox: inbox.ok_or_else(|| format!("config: missing key `{INBOX_KEY}`"))?,
             pattern_threshold: pattern_threshold.unwrap_or(PATTERN_THRESHOLD_DEFAULT),
             triage_top: triage_top.unwrap_or(TRIAGE_TOP_DEFAULT),
+            min_free_gb,
             design_tier: design_tier.ok_or_else(|| format!("config: missing key `{DESIGN_TIER_KEY}`"))?,
             builder_state,
         })
@@ -394,6 +414,12 @@ impl Config {
     /// The configured K for `friction rank` / `friction triage` (`friction.triage_top`, optional; default 3).
     pub fn triage_top(&self) -> u64 {
         self.triage_top
+    }
+
+    /// The configured disk floor of a claim (`lanes.min_free_gb`, optional; absent means no floor and the disk
+    /// is not read). Read by `harness lane claim`.
+    pub fn min_free_gb(&self) -> Option<u64> {
+        self.min_free_gb
     }
 
     /// The configured design tier (`factory.design_tier`, v4): one of T1, T2, T3. Read by the G8.3
@@ -623,7 +649,7 @@ mod tests {
         let c = Config::parse(&valid().replace("count: 4", "count: 9")).unwrap();
         assert_eq!(c.lane_count(), 9);
         assert_eq!(Config::parse(&valid()).unwrap().lane_count(), 4);
-        // lanes holds exactly one key
+        // an unknown key under lanes is refused
         let e = refused(&valid().replace("  count: 4", "  count: 4\n  extra: 1"));
         assert!(e.contains("unknown key"), "{e}");
     }
