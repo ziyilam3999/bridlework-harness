@@ -50,12 +50,13 @@ Init declares the ticket's roots. Every path entry must resolve inside one of th
 
 ## Reading and writing
 
-Same rules as the event log:
+Same line and torn-tail rules as the event log (the event log locks no reader and cuts back no failed write; the rest here is the manifest's own):
 
 - A final fragment with **no trailing newline** is a **torn tail**: reported, never parsed, even when it happens to be valid JSON.
 - A **complete line that is not a valid line of this ticket's manifest** is **corruption**; the read stops at that line. Corruption wins over a torn tail. A line that breaks a state invariant (an `add` before init, a root line after another operation, a duplicate live id, the same path/pid/port twice live, a `remove` of a dead id, a path entry that resolves outside every root, a `ticket` that differs from the file's) is corruption too: such a file was not written by this writer, and the read fails closed.
 - The file itself is capped at 1 MiB (1,048,576 bytes): a larger file is refused as corrupt — fail closed, never a slow read of an unbounded file.
-- The writer takes the exclusive lock FIRST, then reads and validates the file through the locked handle and writes the whole line with ONE write, then calls `sync_all`: read, validate and append are ONE critical section, so concurrent writers of one ticket serialise and every file-state refusal (a duplicate live id, the same path/pid/port twice live, a non-live remove, a second init) sees the state it decides on. Init is the only op that creates the file, and its empty-file check runs under the same lock. It refuses to append onto a torn tail and never repairs one. A line on disk means the operation happened; the manifest file IS the durable record (no event kind is added for it).
+- The writer takes the exclusive lock FIRST, then reads and validates the file through the locked handle and writes the whole line with ONE write, then calls `sync_all`: read, validate and append are ONE critical section, so concurrent writers of one ticket serialise and every file-state refusal (a duplicate live id, the same path/pid/port twice live, a non-live remove, a second init) sees the state it decides on. Init is the only op that creates the file, and its empty-file check runs under the same lock. It refuses to append onto a torn tail and does not repair one it did not write. A write that fails part way — a short write, a write error, a failed sync after a full write — cuts back the bytes that write put on disk, before the lock is released, so the file holds either the whole line or the bytes it held before; init cuts back to an empty file, so re-running the same init succeeds. A cut back that itself fails says so on stderr: after a short write the file may hold a torn tail (the next write refuses as damaged), after a failed sync the whole line may be on disk (it reads as live); both need a check by hand. After its lines are synced, init syncs the manifest dir and the parent of each folder level it made, so a power loss right after init does not lose the file. A line on disk means the operation happened; the manifest file IS the durable record (no event kind is added for it).
+- A read opens the file for reading only and takes a shared lock before it reads, so a reader waits while a writer of the module holds the exclusive lock — up to 10 seconds — and past that refuses as busy, reading nothing. A torn tail or corrupt line still present under the lock is reported exactly as before.
 
 ## Refused, writing nothing
 
@@ -86,5 +87,8 @@ Exit codes: `0` ok / owned; `1` a torn tail or corruption on a read (`list`, `ve
 - Local disk only; no network filesystem is supported or tested.
 - No tamper evidence: a hand edit that stays schema-valid AND state-valid is not detected. A hash chain is deferred.
 - The lock is advisory: it binds writers that use this module.
+- A crash or power loss in the middle of a write can still leave a torn tail: the cut back runs only in a live process, and after a failed sync the cut back is not proven on disk.
+- A writer that holds the lock past 10 seconds (a stuck disk, a stopped process) makes the readers of that ticket refuse as busy; a very slow disk can give a false busy, and `process stop` then signals nothing.
+- Writers wait for the lock without a limit, and so can `process stop`: at the supervisor lock (`<ticket>.proc.lock`, shared with `start`, `check`, `step` and `claim`) and at its own remove step.
 - Containers are not a class at v1 (a later ticket adds them with a `v` bump); screenshots, browser profiles and temp databases are recorded as `temp_dir` or `evidence` paths.
 - Two `init`s under two different `--dir`s both succeed (each file fences only itself) and split one ticket's record; callers that own a ticket's lifecycle always pass an explicit `--dir`.
