@@ -458,7 +458,7 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   no side lock file, no path built for locking and nothing canonicalized. The kernel releases the lock the moment
   the holder exits — return, panic, or a kill -9 — so a crashed writer can never leave the inbox locked: there is
   NO steal rule and no stale-lock age at all. A file or folder named `<inbox>.lock` is not a lock and is simply
-  ignored (never read, locked, renamed or deleted: the harness never deletes anything it did not create). A
+  ignored (never read, locked, renamed or deleted: the friction verbs delete nothing they did not create). A
   lock held longer than 10 seconds by a live writer fails the verb closed (exit 2, `the inbox is busy`, no
   path). The lock call (`File::try_lock`) needs Rust 1.89 or newer; the workspace pins 1.99.1. `lint` and
   `close-check` only read and take no lock; the lock is advisory, so it protects against other harness writers,
