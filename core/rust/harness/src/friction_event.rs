@@ -123,7 +123,7 @@ fn day_of_year(y: i64, m: u32, d: u32) -> u32 {
 
 /// The civil date of a day-from-the-epoch (the standard civil-calendar arithmetic; `days_from_civil`'s
 /// inverse, the same algorithm `friction::today_utc` uses).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     // Days since 0000-03-01, the calendar the arithmetic below is written against.
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
