@@ -11,7 +11,8 @@
 //! checked before the lanes dir is touched, while a path where nothing exists means no admission (cap 1). A claim whose scope overlaps the scope
 //! of a live ticket of the same repo is refused with `clash`: checked after `already-live` and the cap, before anything is written (`scope_entry_parts`
 //! is the normal form of that comparison). No directory fsync is done, so a claim or release is not guaranteed to survive a crash. Release is
-//! explicit: a lane is not freed by a dead process.
+//! explicit: a lane is not freed by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
+//! together) appends one line to `<records-dir>/<ticket-id>.release`, checked fail closed before the lane file is removed.
 //! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
 //! field, and `clash` also names the live ticket and the overlapping pair of entries); 2 usage error, unreadable or refused input, or a lanes
 //! dir in a bad state.
@@ -23,7 +24,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file>";
+const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file>";
 const MAX_FILE: u64 = 1024 * 1024;
 const HEADER: &str = "lane-record v1";
 
@@ -494,15 +495,120 @@ fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Resul
     Ok(Ok(n))
 }
 
-/// Free the lane of `ticket`, as one critical section, reading the dir under the config name bound.
-fn release(dir: &Path, ticket: &str, cap: u32) -> Result<Result<(), Refusal>, String> {
+/// Free the lane of `ticket`, as one critical section, reading the dir under the config name bound. With `spec`
+/// one release record line is appended after the lane file is removed, fail closed (`docs/lanes.md` gives the order).
+fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Result<Result<(), Refusal>, String> {
     if !check_dir(dir, false)? {
         return Ok(Err(Refusal::NotLive));
     }
     let _guard = lock(dir)?;
     let Some(r) = list_records(dir, cap)?.into_iter().find(|r| r.ticket == ticket) else { return Ok(Err(Refusal::NotLive)) };
+    let inside = || "--records-dir must not be the lanes dir or inside it".to_string();
+    // The record steps run before the lane file is removed, so a refusal leaves the lane held.
+    let mut rec: Option<(fs::File, u64)> = None;
+    if let Some(s) = spec {
+        // Before anything is created: the nearest existing ancestor, resolved, must lie outside the lanes dir
+        // (a ticket id such as `lane-1` would put its record among the lane records, which `list_records` refuses).
+        if inside_lanes(&nearest_existing_ancestor(&s.records_dir), dir) {
+            return Err(inside());
+        }
+        let created = prep_records_dir(&s.records_dir)?;
+        if inside_lanes(&s.records_dir, dir) {
+            if created {
+                let _ = fs::remove_dir_all(&s.records_dir);
+            }
+            return Err(inside());
+        }
+        let path = s.records_dir.join(format!("{ticket}.release"));
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err("the release record is not a regular file".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("the release record cannot be opened".to_string()),
+        }
+        let mut f = open_record(&path)?;
+        // Re-check through the open handle, so a path swapped for a link between the two calls is still caught.
+        let meta = f.metadata().map_err(|_| "the release record cannot be opened".to_string())?;
+        if !meta.file_type().is_file() {
+            return Err("the release record is not a regular file".to_string());
+        }
+        let mut bytes = Vec::new();
+        (&mut f).take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|_| "the release record cannot be opened".to_string())?;
+        if bytes.len() as u64 > MAX_FILE {
+            return Err("the release record is over 1 MiB".to_string());
+        }
+        let text = String::from_utf8(bytes).map_err(|_| "the release record is not utf-8".to_string())?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            return Err("the release record does not end with a newline".to_string());
+        }
+        rec = Some((f, meta.len()));
+    }
     fs::remove_file(lane_path(dir, r.lane)).map_err(|_| "the lane record cannot be removed".to_string())?;
+    if let (Some(s), Some((mut f, old_len))) = (spec, rec) {
+        // `reason=` runs to the line end; a later field goes before it.
+        let line = format!("{} lane={} reason={}\n", s.at, r.lane, s.reason);
+        if f.write_all(line.as_bytes()).and_then(|_| f.sync_all()).is_err() {
+            let _ = f.set_len(old_len);
+            return Err("the lane was freed and the release record cannot be written".to_string());
+        }
+    }
     Ok(Ok(()))
+}
+
+/// What a release with the record options writes: the line parts, all checked before the lanes dir is touched.
+struct ReleaseSpec<'a> {
+    at: &'a str,
+    reason: &'a str,
+    records_dir: PathBuf,
+}
+
+// `open(2)` flags std exposes no constants for (the `quarantine.rs` pattern): the values differ per platform and
+// are not guessable, so only the two platforms this crate is built on are listed, each value read from its own
+// `fcntl.h`. Any other platform fails the build here rather than opening without the flags.
+#[cfg(target_os = "linux")]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
+
+/// Open the release record for reading and appending, create allowed, without following a link and without
+/// blocking (a fifo fails the open at once).
+fn open_record(p: &Path) -> Result<fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new().read(true).append(true).create(true).custom_flags(OPEN_NOFOLLOW_NONBLOCK).open(p).map_err(|_| "the release record cannot be opened".to_string())
+}
+
+/// The nearest ancestor of `p` that exists on disk (`p` itself when it exists; the root when nothing does).
+fn nearest_existing_ancestor(p: &Path) -> PathBuf {
+    let mut a = p.to_path_buf();
+    while fs::symlink_metadata(&a).is_err() {
+        match a.parent() {
+            Some(up) if up != a => a = up.to_path_buf(),
+            _ => break,
+        }
+    }
+    a
+}
+
+/// Must `p` be read as the lanes dir or inside it, by `fs::canonicalize` of both? A canonicalize that fails is
+/// the safe side.
+fn inside_lanes(p: &Path, lanes: &Path) -> bool {
+    match (fs::canonicalize(p), fs::canonicalize(lanes)) {
+        (Ok(a), Ok(l)) => a.starts_with(&l),
+        _ => true,
+    }
+}
+
+/// The records dir: a real folder (a link or a non-folder is refused), created with its parents when missing.
+/// Ok(true) when this call created it.
+fn prep_records_dir(dir: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => Ok(false),
+        Ok(_) => Err("the records dir is not a folder or is a symbolic link".to_string()),
+        Err(_) => {
+            fs::create_dir_all(dir).map_err(|_| "the records dir cannot be created".to_string())?;
+            Ok(true)
+        }
+    }
 }
 
 fn parse_args(rest: &[String], allowed: &[&str]) -> Result<(Option<String>, std::collections::HashMap<String, String>), String> {
@@ -633,7 +739,7 @@ pub fn lane_cmd(a: &[String]) -> i32 {
             }
         }
         "release" => {
-            let (pos, m) = match run(&["lanes-dir", "config"]) {
+            let (pos, m) = match run(&["lanes-dir", "config", "reason", "at", "records-dir"]) {
                 Ok(v) => v,
                 Err(e) => return fail(&e),
             };
@@ -652,7 +758,39 @@ pub fn lane_cmd(a: &[String]) -> i32 {
                 Ok(c) => c,
                 Err(e) => return fail(&e),
             };
-            match release(&dir, &id, name_cap(&cfg)) {
+            // The record options go together and are checked, in this order, before the lanes dir is touched.
+            let mut spec = None;
+            let given = ["reason", "at", "records-dir"].iter().filter(|k| m.contains_key(**k)).count();
+            if given != 0 {
+                if given != 3 {
+                    return fail("--reason, --at and --records-dir go together");
+                }
+                let (reason, at, rd) = (&m["reason"], &m["at"], &m["records-dir"]);
+                if reason.trim().is_empty() {
+                    return fail("--reason must not be empty or only white space");
+                }
+                if reason.contains('\n') {
+                    return fail("--reason must be one line");
+                }
+                if reason.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+                    return fail("--reason must hold no control character");
+                }
+                if reason.len() > 1024 {
+                    return fail("--reason is over 1024 bytes");
+                }
+                if !crate::friction::at_ok(at) {
+                    return fail("--at must be a UTC time written YYYY-MM-DDTHH:MM:SSZ");
+                }
+                let rdp = PathBuf::from(rd);
+                if !rdp.is_absolute() {
+                    return fail("--records-dir must be an absolute path");
+                }
+                if rd.split('/').any(|p| p == "." || p == "..") || rdp.starts_with(&dir) {
+                    return fail("--records-dir must not be the lanes dir or inside it");
+                }
+                spec = Some(ReleaseSpec { at, reason, records_dir: rdp });
+            }
+            match release(&dir, &id, name_cap(&cfg), spec.as_ref()) {
                 Ok(Ok(())) => {
                     println!("ticket={id} released");
                     0
