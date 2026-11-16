@@ -1151,3 +1151,324 @@ fn a_journal_file_with_another_name_exits_3() {
     assert!(err(&o).contains("nothing was moved"), "stderr: {}", err(&o));
     assert_eq!(snap(&b), b_before);
 }
+
+// ---------------------------------------------------------------- the completed-label settle
+
+/// The bytes and the inode (a no-follow stat) of `label.json`: the settle of a completed label keeps both.
+fn label_state(p: &Path) -> (Vec<u8>, u64) {
+    (fs::read(p).unwrap(), fs::symlink_metadata(p).unwrap().ino())
+}
+
+/// The hostile settle shape: exit 3 with `want` and `nothing was moved` on stderr, `label.json` of hand-1
+/// byte-unchanged, each journal file byte-unchanged, no entry hand-2, the second source byte-unchanged.
+fn hostile(
+    f: &Fix,
+    o: &Output,
+    want: &str,
+    label_bytes: &[u8],
+    j_before: &[(String, Option<Vec<u8>>)],
+    b: &Path,
+    b_before: &[(String, Option<Vec<u8>>)],
+) {
+    refused(f, o, 3);
+    let e = err(o);
+    assert!(e.contains(want) && e.contains("nothing was moved"), "stderr holds {want}: {e}");
+    assert_eq!(fs::read(entry_dir(f, "hand-1").join("label.json")).unwrap(), label_bytes, "label.json is byte-unchanged");
+    assert_eq!(snap(&f.q.join("@shelf/journal")), j_before.to_vec(), "the journal files are byte-unchanged");
+    assert_eq!(snap(b), b_before.to_vec(), "the second source is byte-unchanged");
+    assert!(!entry_dir(f, "hand-2").exists(), "no entry hand-2");
+}
+
+/// Stop the put with the source moved away inside the step, at the void label (the shape of a crash between the
+/// void label replace and the void line).
+fn stop_void(f: &Fix, a: &Path) {
+    let moved_away = f.t.raw.join("moved-away");
+    let step = |pt: Point| -> Result<(), Stop> {
+        if pt == Point::AfterIntent {
+            fs::rename(a, &moved_away).unwrap();
+        } else if pt == Point::AfterVoidLabel {
+            return Err(Stop(3, "halt".to_string()));
+        }
+        Ok(())
+    };
+    match put::put_with_step(&pargs(f, a), &dev_of, &step) {
+        Err(Stop(3, line)) => assert_eq!(line, "halt"),
+        Err(Stop(c, line)) => panic!("exit {c}: {line}"),
+        Ok(line) => panic!("done: {line}"),
+    }
+}
+
+#[test]
+fn a_put_stopped_after_its_moved_label_is_settled_by_the_next_put() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, ino) = label_state(&label);
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert!(out(&o).contains("entry=20260101/hand-2"), "stdout: {}", out(&o));
+    no_leak(&f, &o);
+    assert_eq!(label_state(&label), (bytes.clone(), ino), "label.json is byte-unchanged with the same inode");
+    assert!(String::from_utf8_lossy(&bytes).contains("\"state\":\"moved\""));
+    let journal = read(&journal1(&f));
+    let want = format!("{{\"v\":1,\"op\":\"moved\",\"entry\":\"20260101/hand-1\",\"label_sha\":\"{}\"}}", sha256_hex(&bytes));
+    assert!(journal.lines().any(|l| l == want), "journal: {journal}");
+    assert!(!a.exists() && entry_dir(&f, "hand-1").join("item/a.txt").exists());
+}
+
+#[test]
+fn a_put_stopped_after_its_void_label_is_settled_by_the_next_put() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    let moved_away = f.t.raw.join("moved-away");
+    stop_void(&f, &a);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, ino) = label_state(&label);
+    let away_before = snap(&moved_away);
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    assert_eq!(label_state(&label), (bytes.clone(), ino), "label.json is byte-unchanged with the same inode");
+    assert!(String::from_utf8_lossy(&bytes).contains("\"state\":\"void\""));
+    let journal = read(&journal1(&f));
+    let want = format!("{{\"v\":1,\"op\":\"void\",\"entry\":\"20260101/hand-1\",\"label_sha\":\"{}\"}}", sha256_hex(&bytes));
+    assert!(journal.lines().any(|l| l == want), "journal: {journal}");
+    assert_eq!(snap(&moved_away), away_before, "the moved-away source is byte-unchanged");
+}
+
+#[test]
+fn a_torn_moved_line_after_the_final_label_is_settled() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let bytes = fs::read(&label).unwrap();
+    let mut fh = fs::OpenOptions::new().append(true).open(journal1(&f)).unwrap();
+    fh.write_all(b"{\"v\":1,\"op\":\"mov").unwrap();
+    drop(fh);
+    let first_bytes = fs::read(journal1(&f)).unwrap();
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    assert_eq!(fs::read(journal1(&f)).unwrap(), first_bytes, "the first file is byte-unchanged");
+    assert_eq!(fs::read(&label).unwrap(), bytes, "label.json is byte-unchanged");
+    let second = read(&f.q.join("@shelf/journal/20260101-2.jsonl"));
+    let want = format!("{{\"v\":1,\"op\":\"moved\",\"entry\":\"20260101/hand-1\",\"label_sha\":\"{}\"}}", sha256_hex(&bytes));
+    assert!(second.lines().any(|l| l == want), "journal: {second}");
+}
+
+#[test]
+fn a_changed_during_put_label_is_settled_as_found() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    let moved = entry_dir(&f, "hand-1").join("item/a.txt");
+    let step = |pt: Point| -> Result<(), Stop> {
+        if pt == Point::AfterMove {
+            let mut x = fs::OpenOptions::new().append(true).open(&moved).unwrap();
+            x.write_all(b" and more").unwrap();
+        } else if pt == Point::AfterFinalLabel {
+            return Err(Stop(3, "halt".to_string()));
+        }
+        Ok(())
+    };
+    match put::put_with_step(&pargs(&f, &a), &dev_of, &step) {
+        Err(Stop(3, line)) => assert_eq!(line, "halt"),
+        Err(Stop(c, line)) => panic!("exit {c}: {line}"),
+        Ok(line) => panic!("done: {line}"),
+    }
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let bytes = fs::read(&label).unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    assert!(text.contains("\"judgeable\":\"no\"") && text.contains("\"reason\":\"changed-during-put\""), "label: {text}");
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    assert_eq!(fs::read(&label).unwrap(), bytes, "label.json is byte-unchanged");
+    let journal = read(&journal1(&f));
+    let want = format!("{{\"v\":1,\"op\":\"moved\",\"entry\":\"20260101/hand-1\",\"label_sha\":\"{}\"}}", sha256_hex(&bytes));
+    assert!(journal.lines().any(|l| l == want), "journal: {journal}");
+}
+
+#[test]
+fn a_moved_label_whose_item_changed_since_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    let mut x = fs::OpenOptions::new().append(true).open(entry_dir(&f, "hand-1").join("item/a.txt")).unwrap();
+    x.write_all(b" more").unwrap();
+    drop(x);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+}
+
+#[test]
+fn a_moved_label_whose_item_is_gone_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    fs::rename(entry_dir(&f, "hand-1").join("item"), f.t.raw.join("item-out")).unwrap();
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+}
+
+#[test]
+fn a_moved_label_whose_item_has_another_inode_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    let item = entry_dir(&f, "hand-1").join("item");
+    fs::rename(&item, f.t.raw.join("item-out")).unwrap();
+    // a new folder with the same files plus a .git folder: another inode, so the identity check fires first
+    fs::create_dir_all(item.join("sub")).unwrap();
+    fs::write(item.join("a.txt"), b"hello").unwrap();
+    fs::write(item.join("sub/b.txt"), b"world!").unwrap();
+    fs::create_dir_all(item.join(".git")).unwrap();
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    refused(&f, &o, 3);
+    assert!(err(&o).contains("cannot be decided"), "stderr: {}", err(&o));
+    assert!(!err(&o).contains("cannot be walked"), "stderr: {}", err(&o));
+    hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+}
+
+#[test]
+fn a_void_label_with_an_item_in_the_entry_exits_3() {
+    for case in ["folder", "link", "moved-label"] {
+        let f = fixture();
+        let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+        let label = entry_dir(&f, "hand-1").join("label.json");
+        let item = entry_dir(&f, "hand-1").join("item");
+        match case {
+            "folder" => {
+                stop_void(&f, &a);
+                fs::create_dir_all(&item).unwrap();
+            }
+            "link" => {
+                stop_void(&f, &a);
+                symlink(f.t.raw.join("nowhere"), &item).unwrap();
+            }
+            _ => {
+                // the item with the intent dev and ino sits under a label turned into the void shape
+                stop_at(&f, &a, Point::AfterFinalLabel);
+                let text = read(&label);
+                let (head, _) = text.split_once("\",\"fingerprint_after\":\"").unwrap();
+                fs::write(&label, format!("{head}\",\"fingerprint_after\":\"\",\"state\":\"void\",\"judgeable\":\"yes\",\"reason\":\"\",\"git\":\"none\"}}\n")).unwrap();
+            }
+        }
+        let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+        let o = put_cmd(&f, &b, &[]);
+        hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+    }
+}
+
+#[test]
+fn a_completed_label_with_another_field_edited_exits_3() {
+    for case in ["files", "why"] {
+        let f = fixture();
+        let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+        stop_at(&f, &a, Point::AfterFinalLabel);
+        let label = entry_dir(&f, "hand-1").join("label.json");
+        let text = read(&label);
+        let edited = match case {
+            "files" => text.replacen("\"files\":4,", "\"files\":5,", 1),
+            _ => text.replacen("a test item", "b test item", 1),
+        };
+        assert_ne!(edited, text, "{case}: the edit took");
+        fs::write(&label, &edited).unwrap();
+        let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+        let o = put_cmd(&f, &b, &[]);
+        hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+    }
+}
+
+#[test]
+fn a_moved_label_with_judgeable_not_matching_its_fingerprints_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let text = read(&label);
+    assert!(text.contains("\"judgeable\":\"yes\",\"reason\":\"\""), "label: {text}");
+    let edited = text.replacen("\"judgeable\":\"yes\",\"reason\":\"\"", "\"judgeable\":\"no\",\"reason\":\"changed-during-put\"", 1);
+    fs::write(&label, &edited).unwrap();
+    let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+}
+
+#[test]
+fn a_completed_label_of_another_shape_exits_3() {
+    for case in ["state-done", "moved-empty-after", "void-with-f", "void-judgeable-no", "space", "upper", "link"] {
+        let f = fixture();
+        let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+        stop_at(&f, &a, Point::AfterFinalLabel);
+        let label = entry_dir(&f, "hand-1").join("label.json");
+        let text = read(&label);
+        let (head, rest) = text.split_once("\",\"fingerprint_after\":\"").unwrap();
+        let fp = rest.split_once('"').unwrap().0.to_string();
+        let tail = |after: &str, state: &str, judgeable: &str, reason: &str| {
+            format!("{head}\",\"fingerprint_after\":\"{after}\",\"state\":\"{state}\",\"judgeable\":\"{judgeable}\",\"reason\":\"{reason}\",\"git\":\"none\"}}\n")
+        };
+        match case {
+            "state-done" => fs::write(&label, text.replacen("\"state\":\"moved\"", "\"state\":\"done\"", 1)).unwrap(),
+            "moved-empty-after" => fs::write(&label, tail("", "moved", "yes", "")).unwrap(),
+            "void-with-f" | "void-judgeable-no" => {
+                // the item is moved out first, so only the shape of the void label refuses
+                fs::rename(entry_dir(&f, "hand-1").join("item"), f.t.raw.join("item-out")).unwrap();
+                if case == "void-with-f" {
+                    fs::write(&label, tail(&fp, "void", "yes", "")).unwrap();
+                } else {
+                    fs::write(&label, tail("", "void", "no", "")).unwrap();
+                }
+            }
+            "space" => fs::write(&label, format!("{} \n", tail(&fp, "moved", "yes", "").trim_end())).unwrap(),
+            "upper" => fs::write(&label, tail(&fp.to_uppercase(), "moved", "yes", "")).unwrap(),
+            _ => {
+                let copy = entry_dir(&f, "hand-1").join("label-copy.json");
+                fs::write(&copy, text.as_bytes()).unwrap();
+                fs::remove_file(&label).unwrap();
+                symlink(&copy, &label).unwrap();
+            }
+        }
+        let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+        let o = put_cmd(&f, &b, &[]);
+        hostile(&f, &o, "cannot be decided", &bytes, &j, &b, &b_before);
+    }
+}
+
+#[test]
+fn a_moved_label_whose_item_now_holds_git_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    fs::create_dir_all(entry_dir(&f, "hand-1").join("item/.git")).unwrap();
+    fs::write(entry_dir(&f, "hand-1").join("item/.git/HEAD"), b"ref").unwrap();
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, j, b_before) = (fs::read(&label).unwrap(), snap(&f.q.join("@shelf/journal")), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    hostile(&f, &o, "cannot be walked", &bytes, &j, &b, &b_before);
+}
+
+#[test]
+fn a_failed_journal_write_in_the_settle_exits_3() {
+    if !modes_enforced() {
+        eprintln!("skipped: folder modes are not enforced for this user");
+        return;
+    }
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterFinalLabel);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let (bytes, ino) = label_state(&label);
+    fs::set_permissions(journal1(&f), fs::Permissions::from_mode(0o400)).unwrap();
+    let (j, b_before) = (snap(&f.q.join("@shelf/journal")), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    hostile(&f, &o, "could not be settled", &bytes, &j, &b, &b_before);
+    assert_eq!(fs::symlink_metadata(&label).unwrap().ino(), ino, "label.json keeps its inode");
+}
