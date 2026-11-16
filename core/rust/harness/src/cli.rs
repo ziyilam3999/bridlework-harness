@@ -653,6 +653,10 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "friction" {
         return crate::friction::friction_cmd(&args[1..], testmode);
     }
+    #[cfg(unix)]
+    if !args.is_empty() && args[0] == "owed" {
+        return crate::owed::owed_cmd(&args[1..], testmode);
+    }
     if !args.is_empty() && args[0] == "lesson" {
         return crate::lesson::lesson_cmd(&args[1..]);
     }
@@ -660,7 +664,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         return crate::lane::lane_cmd(&args[1..]);
     }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ... | lesson lint <path> ... | lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file> | lane claim|release|list|admission-check ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ... | lesson lint <path> ... | lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file> | lane claim|release|list|admission-check ... | owed add|list|close ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";

@@ -125,7 +125,7 @@ fn pointer_problem(p: &str) -> Option<&'static str> {
 }
 
 /// `proof` is `; `-separated pointers; the first refused one is the answer.
-fn proof_problem(proof: &str) -> Option<&'static str> {
+pub(crate) fn proof_problem(proof: &str) -> Option<&'static str> {
     if proof.len() > PROOF_CAP {
         return Some("proof is over its 2000-byte cap");
     }
