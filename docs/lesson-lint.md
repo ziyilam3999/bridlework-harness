@@ -75,7 +75,7 @@ inside a code fence is never a heading.
 harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>
 ```
 
-Lists the lesson pages that match a ticket. Every file is read before anything is printed.
+Lists the lesson pages that match a ticket. No lesson line and no refusal line is printed before each page is read.
 
 Output (exit 0): one line `lesson: <id> <heading> <file name>` per matching page, in byte order of the file names, then
 `lessons: scanned=<n> matched=<ids joined by a comma>` (`matched=none` when no page matches). `<id>` is the

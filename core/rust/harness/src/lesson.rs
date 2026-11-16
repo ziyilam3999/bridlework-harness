@@ -527,8 +527,8 @@ fn heading(lines: &[&str], close: usize, name: &str) -> String {
     }
 }
 
-/// `harness lesson lookup <lessons-dir> --ticket <file> --scope-file <file>`. Exit 0 the matching pages (stdout), 1 a page or the ticket is
-/// refused, 2 usage or read error. Every file is read before anything is printed.
+/// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`. Exit 0 the matching pages (stdout), 1 a page or the ticket is
+/// refused, 2 usage or read error. No lesson line and no refusal line is printed before each page is read.
 fn lookup_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", esc(m));
