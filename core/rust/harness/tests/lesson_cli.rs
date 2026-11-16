@@ -1176,6 +1176,40 @@ fn several_bad_entries_come_in_name_order() {
 }
 
 #[test]
+fn bad_entries_are_sorted_not_given_in_folder_order() {
+    // APFS lists these names out of byte order (ISSUE-005-f.md second), so a missing sort goes red on macOS too
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-003-d.md", &fm("match: [example]"))]);
+    let names = ["ISSUE-005-f.md", "ISSUE-004-e.md", "ISSUE-002-c.md", "ISSUE-001-a.md", "ISSUE-0001-b.md"];
+    for n in names {
+        link(&d.join("nowhere.md"), &d.join("lessons").join(n));
+    }
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    let mut want: Vec<&str> = names.to_vec();
+    want.sort();
+    let want: String = want
+        .iter()
+        .map(|n| if n.starts_with("ISSUE-0001") { format!("{}\n", digit_line(n)) } else { format!("harness: error: the entry {} is a symbolic link\n", n) })
+        .collect();
+    assert_eq!(stderr(&o), want);
+}
+
+#[test]
+fn bad_entries_sort_by_the_raw_name_not_the_escaped_text() {
+    // raw: the byte 0x0a sorts before '0'; escaped: the text \u{a} sorts after '0'
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-a0.md"));
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-a\nb.md"));
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        "harness: error: the entry ISSUE-002-a\\u{a}b.md is a symbolic link\nharness: error: the entry ISSUE-002-a0.md is a symbolic link\n"
+    );
+}
+
+#[test]
 fn only_bad_entries_give_no_no_page_line() {
     let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[]);
     link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-001-a.md"));
