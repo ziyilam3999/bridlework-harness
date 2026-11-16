@@ -773,7 +773,7 @@ fn parse_line(raw: &[u8]) -> Option<Rec> {
     (sha_ok && entry_ok(&rec.entry) && rec.text() == line).then_some(rec)
 }
 
-/// Read every journal file in k order per date. A fragment at the end of a file (no newline) is skipped; the intents
+/// Read each journal file, in k order per date. A fragment at the end of a file (no newline) is skipped; the intents
 /// with no later moved or void line come back in journal order.
 fn unsettled_intents(journal: &Path) -> Result<Vec<Rec>, Stop> {
     let bad_name = || err3("the journal folder holds a name that is not a journal file; nothing was moved; fix it by hand");

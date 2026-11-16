@@ -1085,6 +1085,7 @@ fn a_change_before_the_stop_is_labelled_by_the_settle() {
     }
     let o = put_cmd(&f, &b, &[]);
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
     let text = read(&entry_dir(&f, "hand-1").join("label.json"));
     assert!(
         text.contains("\"state\":\"moved\"") && text.contains("\"judgeable\":\"no\"") && text.contains("\"reason\":\"changed-during-put\""),
