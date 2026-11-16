@@ -1551,7 +1551,7 @@ fn the_spawn_gate_closes_the_inherited_lock_window() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     // The rounds stop at the count cap or the time cap, whichever comes first: wait_for_spawns also waits out the
-    // children of the other tests of this file, so a busy host slows a round, and load must not fail the test.
+    // children of the other tests of this file, so a busy host slows a round. The test asks for 50 rounds, not the full count.
     let rounds_begin = std::time::Instant::now();
     let rounds_limit = std::time::Duration::from_secs(30);
     let mut blocked = 0;
