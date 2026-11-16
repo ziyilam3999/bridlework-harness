@@ -1012,7 +1012,7 @@ fn sync(f: &File) -> std::io::Result<()> {
     #[cfg(test)]
     {
         if SEAM.with(|s| std::mem::take(&mut s.borrow_mut().fail_sync)) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "sync failed (test seam)"));
+            return Err(std::io::Error::other("sync failed (test seam)"));
         }
     }
     #[cfg(test)]
@@ -1031,7 +1031,7 @@ fn sync_dir(p: &Path) -> std::io::Result<()> {
             std::mem::take(&mut b.fail_dir_sync)
         });
         if fail {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "dir sync failed (test seam)"));
+            return Err(std::io::Error::other("dir sync failed (test seam)"));
         }
     }
     File::open(p)?.sync_all()
@@ -1936,10 +1936,10 @@ mod tests {
         let root = PathBuf::from("/short-a");
         // the dir already existed: one sync, of the manifest dir itself
         fs::create_dir_all(base.join("man0")).unwrap();
-        write_init(&base.join("man0"), "t-1", &[root.clone()], 1).unwrap();
+        write_init(&base.join("man0"), "t-1", std::slice::from_ref(&root), 1).unwrap();
         assert_eq!(SEAM.with(|s| s.borrow().dir_syncs), 1, "an existing dir syncs only the manifest dir");
         // one level created: the manifest dir and its parent
-        write_init(&base.join("one"), "t-2", &[root.clone()], 1).unwrap();
+        write_init(&base.join("one"), "t-2", std::slice::from_ref(&root), 1).unwrap();
         assert_eq!(SEAM.with(|s| s.borrow().dir_syncs), 3, "one created level adds its parent");
         // two levels created: the manifest dir and both parents
         write_init(&base.join("two/deep"), "t-3", &[root], 1).unwrap();
