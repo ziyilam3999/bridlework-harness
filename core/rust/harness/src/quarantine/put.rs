@@ -877,7 +877,7 @@ fn settle_one(p: &Rec, journal: &Path, entries: &Path) -> Result<(), Stop> {
     let line = format!("{{\"v\":1,\"op\":\"{op}\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}\n", p.entry, sha256_hex(&done));
     replace_label(&entry_path, &done)
         .and_then(|()| journal_append(journal, date, &line))
-        .map_err(|_| err3("a stopped put could not be settled; nothing was moved; the next put settles it again"))
+        .map_err(|_| err3("a stopped put could not be settled; nothing was moved; fix the entry by hand"))
 }
 
 #[cfg(test)]
