@@ -1,6 +1,6 @@
 # Lanes
 
-`harness lane claim | release | list | park | admission-check` keeps the live tickets and their lane under a cap. The cap is 1 without a valid admission record; with one it is the smaller of the record's admitted lane count and the config `lanes.count`. No constant is edited to raise the cap: the same code runs at 1, 2, 4 or any admitted count. A lane may also be freed by `park`, which keeps the ticket's file list reserved (see *The parked file list*).
+`harness lane claim | release | list | park | admission-check | stale` keeps the live tickets and their lane under a cap (`stale` only reports; see *The stale check*). The cap is 1 without a valid admission record; with one it is the smaller of the record's admitted lane count and the config `lanes.count`. No constant is edited to raise the cap: the same code runs at 1, 2, 4 or any admitted count. A lane may also be freed by `park`, which keeps the ticket's file list reserved (see *The parked file list*).
 
 ```
 harness lane claim <ticket-file> --lanes-dir <abs dir> --config <file> --scope-file <file> [--admission <file>]
@@ -8,6 +8,7 @@ harness lane release <ticket-id> --lanes-dir <abs dir> --config <file> [--reason
 harness lane list --lanes-dir <abs dir> --config <file> [--admission <file>]
 harness lane admission-check <file> --config <file>
 harness lane park <ticket-id> --lanes-dir <abs dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
+harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...]
 ```
 
 - `claim` prints `ticket=<id> lane=<n>` (the lowest free lane from 1 to the cap, when fewer tickets are live than the cap and no live ticket of the same repo holds a scope entry that overlaps one of the claim's — see *The scope clash*; a clash refuses the claim even when a lane is free, and so does an overlapping parked record of another ticket of the same repo, with `parked`). The ticket goes through the strict ticket reader. `--admission <path>` names an admission record: with no option, or with a path where nothing exists, the cap is 1; with a record that exists and is not valid the claim is refused with `bad-admission` and nothing is recorded, even when no ticket is live. When the config sets the disk floor `lanes.min_free_gb` (`docs/config-contract.md`) and the free space of the lanes dir file system is under it, the claim is refused with `low-disk` before the lanes dir is touched.
@@ -115,6 +116,95 @@ When several match, the line names the first in this order: the parked tickets b
 
 `list`, `claim`, `release` and `park` exit 2 with one `lane: error: ...` line, and change nothing in the dir, when the lanes dir is a symbolic link or not a directory, or holds an entry named `lane-...` that is not a regular file, cannot be read, does not parse, is not named `lane-<n>` with n from 1 to the config `lanes.count` (so `lane-0`, `lane-01`, `lane-99` are refused under a count of 4), or repeats a ticket held by another record. A record whose `repo_id` is not a plain repo id is a bad record the same way (so `repo_id=R`, `repo_id=r ` with its trailing space, or an empty `repo_id=` each exit 2): the clash is decided by the repo id, and a record that spells another repo id must not read as another repo. An entry named `parked-<rest>` is read as a parked record with the rules of *The parked file list* (its `<rest>` must be byte-equal to the `ticket=` value inside it); other names (such as a stale `.claim.tmp`) are ignored.
 
+## The stale check
+
+`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints; it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it (no stop, no rm, no fetch, no network call). A later ticket adds the parking (`--apply`); nothing calls the verb yet.
+
+```
+harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...]
+```
+
+- `--repo-map` is given 1 to 16 times, one repo id at most once; the id is a plain repo id.
+- `--allow` is given at most 16 times (see *The `--allow` rule*).
+- Each path value is absolute, does not end with `/`, and holds no `.` or `..` part, else exit 2 before anything is read. `--lanes-dir`, `--manifest-dir` and each `--repo-map` dir are real directories (a link or a non-directory is refused; a missing lanes dir holds no record, as in `list`). `--launch-records` is a regular file and not a link. `--host` may be a link and must resolve to a regular file.
+- An unknown option, a missing required option, or a non-repeatable option given twice is exit 2.
+
+### The facts
+
+The lanes dir is read as `list` reads it, under its lock; the lock is released before the host or git runs. The host is called once, as `<host> agents --json --all` (10 second limit). Parked records are not judged. For each live record in lane order, the first rule that matches gives the verdict and the reason. The slug is the lower-cased ticket id with every character outside `a-z0-9` dropped. A session name is read with the session name check at any lane number (the bound is the 15-digit cap of a lane number, so a number above `lanes.count` counts).
+
+An exec launch is a launch row whose name reads back the role `exec` (or the long form `execution`) and the ticket equal to the slug. An exec entry is a listing entry whose name reads back the same way. An entry is ended when its state is `done` or `stopped`; any other state, or no state field, is running.
+
+1. Two or more distinct ticket ids among the live and parked records share the slug (`a-b` and `ab`, `Foo` and `foo`): `unknown slug-shared`.
+2. The ticket also has a parked record of its own (its `ticket=` value byte-equal): `unknown live-and-parked`.
+3. An exec launch is in state `pending`: `alive launch-pending`.
+4. No exec launch is in state `bound`: `hand no-exec-launch` (failed and refused launch rows are not sessions; the tree is not read).
+5. The lane record file was last modified after the `ts_ms` of the newest bound exec launch: `alive claimed-after-launch` (a start whose seat is not listed yet).
+6. A running exec entry: `alive listed-running`.
+7. A running entry whose name holds a `-` separated part equal, ignoring ASCII case, to `t<slug>` and that does not read back the ticket `<slug>` in any role, or whose hyphenated read-back equals the slug once its `-` are removed: `unknown name-unclear`.
+8. Otherwise the session is gone (no exec entry, or ended ones only); an entry of another role for the slug, such as a reviewer, does not hold the lane. Then the tree is judged: no `--repo-map` for the record repo id is `unknown no-repo-map`. The clean check is `harness workspace check <ticket> --manifest-dir <dir>`, run as a child of the same binary: exit 0 with stdout exactly `workspace=clean ticket=<ticket>` is clean; exit 2 whose stdout is `stray <kind> <path>` lines then `workspace=stray ticket=<ticket> count=<n>` is clean when each stray line has the kind `untracked` or `ignored` and a path byte-equal to an `--allow` value, else `unsaved stray`; any other result (exit 3, another code, the time limit, a cap, output not in that form) is `unknown clean-check-failed`. Then the pushed check, the same command with `--pushed --repo <map dir>`: exit 0 is `stale gone-clean-pushed`; exit 4 is `unsaved unpushed`; exit 3 whose stderr is the line `harness: error: the ticket branch has no upstream` is `unknown no-upstream`; anything else is `unknown pushed-check-failed`.
+
+Each check child has a 30 second limit with stdin closed and stdout and stderr each read under a 1 MiB cap; past the limit or a cap the child and its process group are killed and the call counts as failed.
+
+### Verdicts and reasons
+
+| verdict | reason | meaning |
+| --- | --- | --- |
+| `unknown` | `slug-shared` | two tickets share the slug; sessions cannot be told apart |
+| `unknown` | `live-and-parked` | the ticket is live and parked at once (`park` refuses it; `release` ends both) |
+| `alive` | `launch-pending` | an exec launch row is still pending |
+| `hand` | `no-exec-launch` | no bound exec launch row: started by hand, left out |
+| `alive` | `claimed-after-launch` | the lane file is newer than the newest bound exec launch |
+| `alive` | `listed-running` | a running exec entry is listed |
+| `unknown` | `name-unclear` | a running entry may belong to the ticket but its name does not say so |
+| `unknown` | `no-repo-map` | no `--repo-map` for the record repo id |
+| `unknown` | `clean-check-failed` | the clean check gave no usable answer |
+| `unsaved` | `stray` | the tree holds a path that is not allowed |
+| `unsaved` | `unpushed` | a commit of the ticket branch is not pushed |
+| `unknown` | `no-upstream` | the ticket branch has no upstream (decided by the apply ticket) |
+| `unknown` | `pushed-check-failed` | the pushed check gave no usable answer |
+| `stale` | `gone-clean-pushed` | the session is gone and nothing is unsaved |
+
+### Output and exit codes
+
+Stdout holds one line per live record in lane order:
+
+```
+stale ticket=<id> lane=<n> verdict=<hand|alive|unknown|unsaved|stale> reason=<token> action=none
+```
+
+then one line `stale checked=<n> parked=0 unknown=<u>`, where n is the number of live records printed and u the number with verdict `unknown`. With no live record only the last line is printed. Exit 0 when no verdict is `unknown`; exit 3 when one or more are (the other lanes are still judged and printed); exit 2 for a usage error or a whole-run failure.
+
+### Whole-run failures
+
+Each is exit 2 with one stderr line `lane: error: <cause>` and empty stdout, before any lane is judged:
+
+- bad options or paths;
+- a config that cannot be read or is invalid (a fifo at the config path is refused at once);
+- launch records that are missing, not a regular file, a link, unreadable, over the reader cap, torn or corrupt (the file is opened without following a link and without blocking, and the open handle must be a regular file before the records are read; they are then read through that handle);
+- a host listing that fails: it cannot run, exits non-zero, passes the time limit, is not JSON, is not an array, is over the entry cap, holds an entry with no string id and name, or holds an entry id that is not a plain token (output past the 1 MiB read cap is cut and then reads as not JSON);
+- a lanes dir that `list` refuses, a parked record that `list` refuses, or a lane record that cannot be inspected.
+
+### The `--allow` rule
+
+An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not starting or ending with `/`, with no empty, `.` or `..` part. A stray path is allowed only when its kind is `untracked` or `ignored` and the path is byte-equal to an `--allow` value: a modified, deleted, staged, hidden or submodule path is not covered, and an `--allow` of `a` does not cover `a/b`. Nothing is deleted.
+
+### Limits of this version
+
+- A killed seat that the host lists as running is kept. In one probe run on 2026-11-16 (one session started outside the launcher) the host listed a seat as `working` with no pid right after `kill -9`, restarted it under a new pid within 30 seconds, and it later read `done`. A reboot, a host service crash, a seat started through the launcher and a second kill were not measured.
+- A `done` entry counts as ended, though in that probe a `done` session kept a live idle process.
+- A launch row left pending by a crashed launch keeps the lane.
+- Launch rows and listing entries are tied to a ticket by its slug only, so the rows of a finished ticket with the same slug count.
+- Listing entries are matched by name, so a session started by hand under a seat name counts.
+- The name-unclear rule looks at the `t<slug>` part of the launcher form only.
+- A file inside an allowed folder goes unseen (nothing is deleted).
+- The pushed answer reads local tracking refs only (no fetch).
+- A branch with no upstream is `unknown` in this version.
+- Reviewer sessions do not hold a lane.
+- Jobs with no exec launch are not checked.
+- Lanes dir entries whose names are not UTF-8 are skipped, as in `list`.
+- Nothing calls the verb yet.
+
 ## Exit codes
 
 | code | meaning |
@@ -122,6 +212,7 @@ When several match, the line names the first in this order: the parked tickets b
 | 0 | done |
 | 1 | policy refusal: exactly one stderr line starting `lane: refused reason=<token>` |
 | 2 | usage error, unreadable or refused input, free disk space that cannot be read (with a floor set), or a lanes dir in a bad state (see above) |
+| 3 | `stale` only: the report is printed and one or more verdicts are `unknown` |
 
 ## Refusal tokens
 
