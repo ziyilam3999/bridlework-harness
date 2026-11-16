@@ -361,7 +361,7 @@ through the same reader as `triage --controls` (setup errors exit 2, a refused l
 `rank` (exit 2 for an unreadable inbox, exit 1 for a lint, torn-tail or privacy problem); (7) the grouping (exit 1,
 the `rank: breaks cycle through <id>` line); (8) the check.
 
-**The rule.** A repeat group is a group `rank` lists whose `occurrences` is 2 or more (a group rooted at a
+**The rule.** A repeat group is a ranked group (one that `rank` counts in `groups=`) whose `occurrences` is 2 or more (a group rooted at a
 `kind: pattern` row counts its breaks, not its root; a pattern nothing broke is not ranked). It is covered when at
 least one valid controls line has a first part byte-equal to the group id. A valid line that names a member row that
 is not the root, an event row id, or no row covers nothing and is not reported.
@@ -378,7 +378,7 @@ Exit 1 and 2 leave stdout empty. When repeat groups are not covered the exit is 
 harness: friction refused: repeat groups with no valid line: <ids in byte order, joined by a comma and a blank>. Add one line per group to the controls file: <the line shape of the triage section>
 ```
 
-It holds no line text and no path. `lines=` counts every valid line, so two equal lines
+It holds no line text and no path. `lines=` counts the valid lines, so two equal lines
 count twice.
 
 Where the private wrapper's python check and this verb differ (the wrapper is not edited here):
@@ -392,7 +392,7 @@ Where the private wrapper's python check and this verb differ (the wrapper is no
    ids and fixed text, and no controls line text and no controls path.
 5. A controls file over 1 MiB is exit 2 here and has no cap in the wrapper (stricter); a missing lessons folder is
    exit 2 here and exit 1 in the wrapper; a missing inbox file is exit 2 here and exit 1 in the wrapper.
-6. A file that is not UTF-8 is a named exit 1 here and a python traceback with exit 1 in the wrapper.
+6. A controls file that is not UTF-8 is a named exit 1 here and a python traceback with exit 1 in the wrapper.
 7. The wrapper refuses past 100000 ranked groups (its `--top`); the verb has no limit. The 4 MiB inbox cap holds fewer
    than 47000 rows, so the bound is not reachable.
 8. The line shape, the three-digit lesson number and the lesson page rule (a regular file `ISSUE-NNN-*.md` directly in
