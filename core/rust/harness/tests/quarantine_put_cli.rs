@@ -517,11 +517,29 @@ fn a_torn_manifest_exits_2() {
 fn a_manifest_that_is_not_a_regular_file_exits_2() {
     let f = fixture();
     let item = plain_item(&f, "p");
-    // A socket needs no shell command and reading it fails at once; a FIFO is covered by the same
-    // stat (it is refused before any open, so it cannot block).
-    let _listener = std::os::unix::net::UnixListener::bind(f.md.join("t-3.jsonl")).unwrap();
+    // A FIFO blocks a read, so put must refuse it from the stat alone; the deadline turns a block into a failure.
+    let mk = Command::new("mkfifo").arg(f.md.join("t-3.jsonl")).status().unwrap();
+    assert!(mk.success(), "mkfifo failed");
     let before = snap(&item);
-    let o = put_cmd(&f, &item, &[]);
+    let mut c = Command::new(BIN);
+    c.args(put_args(&f, Some(&s(&item)), &[])).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for k in ["HARNESS_RUN_ID", "HARNESS_ROLE", "HARNESS_MODEL", "HARNESS_CONFIG"] {
+        c.env_remove(k);
+    }
+    let mut child = c.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("put blocked on the FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let o = child.wait_with_output().unwrap();
     refused(&f, &o, 2);
     assert!(err(&o).contains("t-3"), "stderr names the ticket id: {}", err(&o));
     assert_eq!(snap(&item), before);
