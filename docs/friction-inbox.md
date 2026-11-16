@@ -335,7 +335,7 @@ the standing groups. A second run for the same week proposes 0. Every check prec
 leaves the state and the hand-off folder byte-identical.
 
 **The `--as-of` numbers.** `--as-of <YYYY-MM-DDTHH:MM:SSZ>` (a UTC instant; a bad value is exit 2 and a value
-given twice is exit 2) appends the hand-over numbers after the `triage week=` line, ids and numbers only:
+given twice is exit 2) appends the hand-over numbers after the `triage week=` line (ids, counts, status words and the `--as-of` value; no row text):
 one `unsettled group=<id> rows=<n> rows_over_24h=<k> age_hours=<h>` line per ranked group with no state row
 (a group seeded or proposed in the same run has a state row), one `after group=<id> status=<s>
 bound=<yes|no> rows_after=<n>` line per group with a non-empty `resolved_date` anywhere in its history

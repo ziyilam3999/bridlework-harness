@@ -976,7 +976,7 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         }
     }
     // Step (2): lint + rank. The row-later check runs after the sweep (a swept row lands in the inbox first)
-    // and before the state lock, so nothing is written.
+    // and before the state lock, so the state file and the hand-off folder stay as they were.
     let rows = match lint_rows(&cfg, &ctx) {
         Ok(r) => r,
         Err(c) => return c,
