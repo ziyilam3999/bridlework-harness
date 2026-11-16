@@ -1170,7 +1170,7 @@ mod tests {
         // floor 50: exactly 50000000000 free claims, 49999999999 is refused with free_gb=49
         assert_eq!(check_disk_floor(&d, Some(50), &|_| Some(50000000000)), FloorCheck::Ok);
         assert_eq!(check_disk_floor(&d, Some(50), &|_| Some(49999999999)), FloorCheck::LowDisk("free_gb=49 min_free_gb=50".to_string()));
-        // floor 999999999999999 with a reading of u64::MAX: refused (a u64 product would wrap to about 2.0 GB and pass)
+        // floor 999999999999999 with a reading of u64::MAX: refused (a u64 product would wrap to about 2.0e18 bytes, under u64::MAX, and pass)
         assert_eq!(
             check_disk_floor(&d, Some(999999999999999), &|_| Some(u64::MAX)),
             FloorCheck::LowDisk(format!("free_gb={} min_free_gb=999999999999999", u64::MAX / 1000000000))
