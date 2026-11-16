@@ -2,8 +2,8 @@
 
 A promise made to the operator in a report — "I owe you a lesson page", "I will re-run that gate" — is
 chat text that no store holds, so a promised item can be lost when the session ends. The owed store is
-the small ledger that fixes that: one row per promised item, added when the promise is made, closed when
-it is kept (`done`, with proof pointers) or set aside (`dropped`, with a reason).
+the small ledger that fixes that: an add row when the promise is made, and a close row when it is kept
+(`done`, with proof pointers) or set aside (`dropped`, with a reason).
 
 **The store file is not in this repo.** It lives in the private overlay, like the friction inbox. It is
 named by `--store <absolute-file>` on each verb (a relative value is exit 2); there is no config key. The

@@ -291,7 +291,7 @@ fn read_store_locked(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<Item>, 
             }
         }
     }
-    // The first bad line wins; one line holds a field problem or a cross problem, never both.
+    // The first bad line wins; a line with a field problem holds no cross problem (it is not a row).
     problems.sort_by_key(|(n, _)| *n);
     if let Some((n, m)) = problems.first() {
         return Err(format!("the owed store has a bad row at line {n}: {m}"));

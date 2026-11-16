@@ -143,12 +143,12 @@ fn planted_close(id: &str, at: &str, status: &str, r: &str, reason: &str) -> Str
     format!("{{\"op\":\"close\",\"id\":\"{id}\",\"at\":\"{at}\",\"by\":\"orch-a\",\"status\":\"{status}\",\"ref\":\"{r}\",\"reason\":\"{reason}\"}}\n")
 }
 
-/// A home-path shape, assembled at run time so this file never spells it out.
+/// A home-path shape, assembled at run time so the file holds no literal one.
 fn home_path() -> String {
     ["/Us", "ers/", "zztester", "/proj"].concat()
 }
 
-/// An email shape, assembled at run time so this file never spells it out.
+/// An email shape, assembled at run time so the file holds no literal one.
 fn email_shape() -> String {
     ["zz", "@", "example", ".", "invalid"].concat()
 }
@@ -237,6 +237,8 @@ fn store_is_dangling_symlink() {
     let o = run(&add_args(&link, "ow-1", "2026-11-16T00:00:00Z", "orch-a", "must not create the target"));
     refused2(&o, "harness: error: the owed store is not a regular file");
     assert!(!target.exists(), "no file is created at the link target");
+    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link itself is unchanged");
+    assert_eq!(fs::read_link(&link).unwrap(), target, "the link still points at its target");
 }
 
 #[test]
@@ -464,6 +466,29 @@ fn store_empty_object_and_no_op() {
     fs::write(&store, &planted).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, line);
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
+}
+
+#[test]
+fn store_keys_not_the_key_set_of_its_op() {
+    let t = Tmp::new();
+    // an add row with one key too many
+    let store = t.store();
+    let extra = r#"{"op":"add","id":"ow-1","at":"2026-11-16T00:00:00Z","by":"orch-a","what":"t","home":"","x":""}"#;
+    let planted = format!("{extra}\n").into_bytes();
+    fs::write(&store, &planted).unwrap();
+    let o = run(&list_args(&store));
+    refused2(&o, "harness: error: the owed store has a bad row at line 1: the keys are not the key set of its op");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
+    // a close row with the reason key missing
+    let store = t.store();
+    let no_reason = planted_add("ow-1", "2026-11-16T00:00:00Z", "a row")
+        + r#"{"op":"close","id":"ow-1","at":"2026-11-16T01:00:00Z","by":"orch-a","status":"done","ref":"pr:owner/repo#7"}"#;
+    let planted = format!("{no_reason}\n").into_bytes();
+    fs::write(&store, &planted).unwrap();
+    let o = run(&list_args(&store));
+    refused2(&o, "harness: error: the owed store has a bad row at line 2: the keys are not the key set of its op");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -859,12 +884,15 @@ fn flag_errors_exit_2() {
 
 #[test]
 fn a_relative_store_is_refused() {
-    let t = Tmp::new();
+    let line = "harness: error: --store must be an absolute path";
     let o = run(&[s("owed"), s("add"), s("--store"), s("owed.jsonl"), s("--id"), s("a"), s("--at"), s("2026-11-16T00:00:00Z"), s("--by"), s("b"), s("--what"), s("t")]);
-    refused2(&o, "harness: error: --store must be an absolute path");
+    refused2(&o, line);
     let o = run(&[s("owed"), s("list"), s("--store"), s("owed.jsonl")]);
-    refused2(&o, "harness: error: --store must be an absolute path");
-    assert!(!t.0.join("owed.jsonl").exists());
+    refused2(&o, line);
+    let o = run(&[s("owed"), s("close"), s("--store"), s("owed.jsonl"), s("--id"), s("a"), s("--at"), s("2026-11-16T00:00:00Z"), s("--by"), s("b"), s("--status"), s("done"), s("--ref"), s("pr:owner/repo#7")]);
+    refused2(&o, line);
+    // The child runs in this folder: no store file is created there.
+    assert!(!std::env::current_dir().unwrap().join("owed.jsonl").exists());
 }
 
 /// A value that starts with `--` is taken as the value, so `--what --by` stores the text `--by`.
