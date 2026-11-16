@@ -368,7 +368,7 @@ fn a_relative_root_exits_2() {
     refused_2_unchanged(&f, &o);
 }
 
-/// `--root /` is refused (the filesystem root has no parent, so the beside-the-manifests rule refuses it).
+/// `--root /` is refused (refused by the explicit filesystem-root check).
 #[test]
 fn the_root_slash_exits_2() {
     let f = fixture();

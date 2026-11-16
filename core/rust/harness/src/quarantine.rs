@@ -6,7 +6,7 @@
 //! Deleting a listed `temp_dir` is a SEPARATE, explicit verb that names exactly one id, and its library function
 //! `delete_listed` is the ONE delete path P1B-14 teardown must call, never a second one.
 //! `drop-build` deletes only cache-tagged build output (a `target` folder holding the cache tag) of a ticket whose
-//! manifest shows it closed, reached through the same component walk.
+//! manifest shows it closed, reached by a component walk of the same kind.
 //! Symlinks are never followed anywhere in this module: a link found in a root is a leftover like any other and is
 //! moved as the link itself (its target is never read or touched), a listed link is unlinked as the link only, and
 //! the recursive delete unlinks a link inside a listed folder without following it. The walk is read-only and
@@ -1167,8 +1167,9 @@ struct DropWalk {
     matches: Vec<DropMatch>,
 }
 
-/// One examined `target` folder inside a ticket folder: a real directory on the root's device holding the
-/// cache tag is a match; anything else is kept (counted) or skipped (a link, a file).
+/// Walk one folder inside a ticket folder (read only): a `target` that is a real directory on the root's device
+/// holding the cache tag is a match; any other `target` is kept (counted) or skipped (a link, a file); links
+/// and `.git` are not entered.
 fn drop_walk_inside(
     dir: &Path,
     child_depth: usize,
@@ -1319,7 +1320,8 @@ fn remove_target(root: &Path, comps: &[std::ffi::OsString], root_dev: u64) -> Re
 /// overlap), the per-ticket caps lock (Busy: exit 3 — a run for this ticket is in progress), the closed
 /// proof (the manifest reads, is clean, holds no live entry and a remove line for the id `worktree`), then
 /// the read-only walk, then the removals. A `--dry-run` runs the same walk and removes nothing. The first
-/// failing step is one stderr line (no folder on either stream) and stops with nothing removed.
+/// failing step before the removals is one stderr line (no folder on either stream) and stops with nothing
+/// removed; a failure inside the removals stops the run with what it already removed kept.
 pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
     refuse_unless_single_thread()?;
     if a.roots.is_empty() {
@@ -1442,7 +1444,8 @@ pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
 
 // ---------------------------------------------------------------- the verb
 
-/// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ...` (the arguments after `quarantine`). Exit 0
+/// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ... | drop-build <ticket> ...` (the arguments
+/// after `quarantine`). The exit lines here are those of sweep and delete-listed; drop-build's are at `drop_build`. Exit 0
 /// done (one stdout line of fixed fields, no folder); 2 refused (usage, bad or misplaced folders, a root that is a
 /// symlink or outside the base, a damaged manifest, wrong class or id); 3 cannot proceed (cross-device, over a cap,
 /// an undecidable journal intent, an event log that cannot be read whole by reconcile, a rename/journal/event write
