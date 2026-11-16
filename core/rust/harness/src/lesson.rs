@@ -1,4 +1,5 @@
-//! `harness lesson lint <path> [<path> ...]`: checks the shape of lesson pages (see `docs/lesson-lint.md`). The lint
+//! `harness lesson lint <path> [<path> ...]`: checks the shape of lesson pages (see `docs/lesson-lint.md`).
+//! `harness lesson lookup` lists the pages that match a ticket (same docs page). The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
 
@@ -416,7 +417,8 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
 }
 
 /// `harness lesson lint <path> [<path> ...]`. Exit 0 all pages pass (one stdout line); 1 one stdout line per problem;
-/// 2 usage or read error (nothing on stdout). Any other verb, or no path, prints the usage and exits 2.
+/// 2 usage or read error (nothing on stdout). `lookup` goes to `lookup_cmd`. Any verb but `lint` and `lookup`, or
+/// no path, prints the usage and exits 2.
 pub fn lesson_cmd(a: &[String]) -> i32 {
     if a.first().map(|s| s.as_str()) == Some("lookup") {
         return lookup_cmd(&a[1..]);
