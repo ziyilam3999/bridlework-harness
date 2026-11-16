@@ -18,12 +18,12 @@
 //! is the normal form of that comparison); a claim that overlaps a parked record of another ticket of the same repo is refused with `parked`
 //! right after it. A `--lanes-dir` or `--records-dir` value that ends with `/` or holds a `.` or `..` part is exit 2 before anything is touched.
 //! No directory fsync is done, so a claim, release or park is not guaranteed to survive a crash. Release is
-//! explicit: a lane is freed by `release` and by `park` (which keeps the file list reserved), not by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
+//! explicit: a lane is freed by `release`, by `park` (which keeps the file list reserved) and by `stale --apply` through the park body, not by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
 //! together) that frees a lane appends one line to `<records-dir>/<ticket-id>.release`; the records dir and the record are checked before the lane
 //! file is removed, and a write error after it is exit 2 with the lane freed. `park` takes the same record options and appends its line the same way.
 //! Exit 0 done; 3 (`stale` only) at least one verdict is `unknown`; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
 //! field, `clash` also names the live ticket and the overlapping pair of entries, `parked` the parked ticket and the pair, and `low-disk` also names the free GB and the floor); 2 usage
-//! error, unreadable or refused input, free disk space that cannot be read, or a lanes dir in a bad state.
+//! error, unreadable or refused input, free disk space that cannot be read, a lanes dir in a bad state, or (with `stale --apply`) a park body error.
 
 use crate::config::Config;
 use crate::repo_id::RepoId;

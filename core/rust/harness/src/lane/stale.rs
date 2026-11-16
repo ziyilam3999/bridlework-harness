@@ -1,6 +1,6 @@
 //! `harness lane stale` (std only, Unix): the stale-lane check. It reads the live lane records, the launch records and the host session
 //! list, and prints one verdict per live record; it runs no stop, rm or fetch (`docs/lanes.md`, *The stale check*). Without `--apply` it
-//! writes nothing, calls the host once (`agents --json --all`) and the lock is released before the host or git runs. With `--apply` each
+//! writes nothing, calls the host once (`agents --json --all`) and the lock is released before the host or git runs. With `--apply` a
 //! record judged `stale gone-clean-pushed` goes through the park step: one critical section under the lanes dir lock that reads the lanes
 //! dir, the host listing, the launch records and the tree again, and parks the lane only when the verdict is still that one. The clean and
 //! pushed answers are the child runs `harness workspace check` and `harness workspace check --pushed` of this same binary, each under a
@@ -393,7 +393,7 @@ fn exec_launches<'a>(ls: &'a [Launch], slug: &str) -> Vec<(&'a str, &'static str
 /// What the park step gave for one record.
 enum Step {
     Parked,
-    /// The ticket is judged again and not parked.
+    /// Not parked: the line shows this verdict instead.
     Seen(Out),
     /// A re-read failed: nothing is parked.
     Recheck,

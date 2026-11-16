@@ -1,6 +1,6 @@
 # Lanes
 
-`harness lane claim | release | list | park | admission-check | stale` keeps the live tickets and their lane under a cap (`stale` reports which lanes belong to a gone session with nothing unsaved and, with `--apply`, parks them; see *The stale check*). The cap is 1 without a valid admission record; with one it is the smaller of the record's admitted lane count and the config `lanes.count`. No constant is edited to raise the cap: the same code runs at 1, 2, 4 or any admitted count. A lane may also be freed by `park`, which keeps the ticket's file list reserved (see *The parked file list*).
+`harness lane claim | release | list | park | admission-check | stale` keeps the live tickets and their lane under a cap (`stale` reports which lanes belong to a gone session with nothing unsaved and, with `--apply`, parks them when its park step still says so; see *The stale check*). The cap is 1 without a valid admission record; with one it is the smaller of the record's admitted lane count and the config `lanes.count`. No constant is edited to raise the cap: the same code runs at 1, 2, 4 or any admitted count. A lane may also be freed by `park`, which keeps the ticket's file list reserved (see *The parked file list*).
 
 ```
 harness lane claim <ticket-file> --lanes-dir <abs dir> --config <file> --scope-file <file> [--admission <file>]
@@ -118,7 +118,7 @@ When several match, the line names the first in this order: the parked tickets b
 
 ## The stale check
 
-`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` it parks the lane of each record judged `stale gone-clean-pushed` and writes nothing else (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
+`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` each record judged `stale gone-clean-pushed` goes to the park step, which parks its lane only when the verdict still holds there; nothing else is written (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
 
 ```
 harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...] [--apply --reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
