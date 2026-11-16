@@ -149,7 +149,7 @@ pub fn put_with_device_probe(a: &PutArgs, device_of: &dyn Fn(&Path) -> Option<u6
 }
 
 /// TEST SEAM: `step` runs at each `Point`; an `Err` ends put there with that stop and nothing more is written
-/// (the shape of a crash). No product caller uses it.
+/// (the shape of a crash). `put` calls it with a step that does nothing.
 pub fn put_with_step(
     a: &PutArgs,
     device_of: &dyn Fn(&Path) -> Option<u64>,
@@ -279,7 +279,7 @@ fn void_exit(label: &mut Label, entry_path: &Path, journal: &Path, date: &str) -
 
 // ---------------------------------------------------------------- steps 2 to 5
 
-/// The raw bytes hold no `.` or `..` component and do not end in `/` (so `/.` is refused too).
+/// The raw bytes hold no `.` or `..` component and do not end in `/` (a trailing `/.` is a `.` component).
 fn spelled_ok(raw: &[u8]) -> bool {
     !raw.ends_with(b"/") && !raw.split(|b| *b == b'/').any(|s| s == b"." || s == b"..")
 }
@@ -351,7 +351,7 @@ fn refuse_manifest(stem: &str) -> Stop {
     ))
 }
 
-/// Step 5: every `*.jsonl` file in the manifest dir is a manifest; the source must not equal, lie inside or hold a
+/// Step 5: each `*.jsonl` file in the manifest dir is a manifest; the source must not equal, lie inside or hold a
 /// live path entry of any of them.
 fn live_check(md: &Path, src: &Src, src_id: Id, src_up: &[Id]) -> Result<(), Stop> {
     let rd = fs::read_dir(md).map_err(|_| err3("the manifest dir cannot be read; nothing was written"))?;

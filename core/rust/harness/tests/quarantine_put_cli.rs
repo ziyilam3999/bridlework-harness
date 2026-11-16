@@ -1,5 +1,5 @@
 //! Process-level tests for `harness quarantine put` (ticket quarantine-put): one item moves onto the shelf under
-//! `<quarantine-dir>/@shelf` with a label written before the move, or put refuses. Every check runs the real binary
+//! `<quarantine-dir>/@shelf` with a label written before the move, or put refuses. Most checks run the real binary
 //! against a scratch layout under the system temp folder; the seam tests call the library (`put_with_step`,
 //! `put_with_device_probe`). Fixtures are synthetic: the `.git` entries and cache tags are plain folders and files
 //! made by the test. No folder path may appear on either stream.
@@ -188,7 +188,7 @@ fn snap(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
     v
 }
 
-/// A refusal at `want`: stdout empty, one `harness: error:` line, no leaked path.
+/// A refusal at `want`: stdout empty, stderr starting `harness: error:`, no leaked path.
 fn refused(f: &Fix, o: &Output, want: i32) {
     assert_eq!(code(o), want, "exit {want}: {}{}", out(o), err(o));
     assert_eq!(out(o), "", "stdout stays empty on a refusal");
