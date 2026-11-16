@@ -213,7 +213,7 @@ fn run_child(args: &[&OsStr]) -> Option<ChildOut> {
     Some(ChildOut { code: status.code()?, stdout, stderr })
 }
 
-enum Clean {
+enum Answer {
     Clean,
     Stray,
     Failed,
@@ -221,34 +221,34 @@ enum Clean {
 
 /// The clean answer: exit 0 with exactly `workspace=clean ticket=<t>`; exit 2 with `stray <kind> <path>` lines then
 /// `workspace=stray ticket=<t> count=<n>`, clean only when every line is an untracked or ignored path byte-equal to an `--allow` value.
-fn clean_answer(ticket: &str, o: &ChildOut, allow: &[String]) -> Clean {
-    let Ok(text) = std::str::from_utf8(&o.stdout) else { return Clean::Failed };
+fn clean_answer(ticket: &str, o: &ChildOut, allow: &[String]) -> Answer {
+    let Ok(text) = std::str::from_utf8(&o.stdout) else { return Answer::Failed };
     if o.code == 0 {
-        return if text == format!("workspace=clean ticket={ticket}\n") { Clean::Clean } else { Clean::Failed };
+        return if text == format!("workspace=clean ticket={ticket}\n") { Answer::Clean } else { Answer::Failed };
     }
     if o.code != 2 {
-        return Clean::Failed;
+        return Answer::Failed;
     }
-    let Some(body) = text.strip_suffix('\n') else { return Clean::Failed };
+    let Some(body) = text.strip_suffix('\n') else { return Answer::Failed };
     let mut lines: Vec<&str> = body.split('\n').collect();
-    let Some(last) = lines.pop() else { return Clean::Failed };
+    let Some(last) = lines.pop() else { return Answer::Failed };
     if lines.is_empty() || last != format!("workspace=stray ticket={ticket} count={}", lines.len()) {
-        return Clean::Failed;
+        return Answer::Failed;
     }
     let mut all_allowed = true;
     for l in lines {
-        let Some((kind, path)) = l.strip_prefix("stray ").and_then(|r| r.split_once(' ')) else { return Clean::Failed };
+        let Some((kind, path)) = l.strip_prefix("stray ").and_then(|r| r.split_once(' ')) else { return Answer::Failed };
         if !["untracked", "ignored", "modified", "hidden", "submodule", "missing"].contains(&kind) {
-            return Clean::Failed;
+            return Answer::Failed;
         }
         if !(matches!(kind, "untracked" | "ignored") && allow.iter().any(|a| a == path)) {
             all_allowed = false;
         }
     }
     if all_allowed {
-        Clean::Clean
+        Answer::Clean
     } else {
-        Clean::Stray
+        Answer::Stray
     }
 }
 
@@ -259,8 +259,8 @@ fn tree_verdict(o: &Opts, r: &Record) -> Out {
     let ticket = OsStr::new(r.ticket.as_str());
     let clean = run_child(&[OsStr::new("workspace"), OsStr::new("check"), ticket, OsStr::new("--manifest-dir"), md]);
     match clean.map(|c| clean_answer(&r.ticket, &c, &o.allow)) {
-        Some(Clean::Clean) => {}
-        Some(Clean::Stray) => return ("unsaved", "stray"),
+        Some(Answer::Clean) => {}
+        Some(Answer::Stray) => return ("unsaved", "stray"),
         _ => return ("unknown", "clean-check-failed"),
     }
     let pushed = run_child(&[OsStr::new("workspace"), OsStr::new("check"), ticket, OsStr::new("--manifest-dir"), md, OsStr::new("--pushed"), OsStr::new("--repo"), repo.as_os_str()]);

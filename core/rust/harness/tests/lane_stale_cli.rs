@@ -695,7 +695,7 @@ fn path_spellings_are_refused() {
     let fx = Fx::basic();
     let link = fx.root.join("dir-link");
     symlink(&fx.root, &link).unwrap();
-    let cases: Vec<(&str, PathBuf, bool)> = vec![
+    let cases: [(&str, PathBuf, bool); 6] = [
         ("--lanes-dir", fx.lanes.clone(), true),
         ("--manifest-dir", fx.md.clone(), true),
         ("--repo-map", fx.repo.clone(), true),
