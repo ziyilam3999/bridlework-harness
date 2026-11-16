@@ -4,7 +4,7 @@
 
 ```
 harness lane claim <ticket-file> --lanes-dir <abs dir> --config <file> --scope-file <file> [--admission <file>]
-harness lane release <ticket-id> --lanes-dir <abs dir> --config <file>
+harness lane release <ticket-id> --lanes-dir <abs dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
 harness lane list --lanes-dir <abs dir> --config <file> [--admission <file>]
 harness lane admission-check <file> --config <file>
 ```
@@ -12,7 +12,7 @@ harness lane admission-check <file> --config <file>
 - `claim` prints `ticket=<id> lane=<n>` (the lowest free lane from 1 to the cap, when fewer tickets are live than the cap and no live ticket of the same repo holds a scope entry that overlaps one of the claim's — see *The scope clash*; a clash refuses the claim even when a lane is free). The ticket goes through the strict ticket reader. `--admission <path>` names an admission record: with no option, or with a path where nothing exists, the cap is 1; with a record that exists and is not valid the claim is refused with `bad-admission` and nothing is recorded, even when no ticket is live.
 - The scope file holds one relative path per line. A truly empty line is skipped; a line of only whitespace is refused. A missing or empty file, an entry starting with `/` or `\`, a `..` part (split on `/` and `\`), an empty part (`a//b`) or a control character is refused with exit 2 and nothing is recorded. One trailing `/` is allowed (a folder, `a/`). Entries are stored as given (`./a`, `a/`).
 - `list` prints one line per live ticket, `ticket=<id> lane=<n> repo_id=<id> scope=<entries>`, then a last line `live=<n> cap=<n>`, where the cap is computed as for a claim (1 without `--admission`, the smaller of the admitted count and `lanes.count` with a valid record; a record that exists and is not valid refuses the list with `bad-admission`). When more tickets are live than the cap, `list` still prints them and exits 0 (a claim is what gets refused).
-- `release` prints `ticket=<id> released`. It takes `--config <file>` (required, like `list`): the legal record names follow the config, not the admission, so a release works for a ticket in lane 2 whether or not an admission is around.
+- `release` prints `ticket=<id> released`. It takes `--config <file>` (required, like `list`): the legal record names follow the config, not the admission, so a release works for a ticket in lane 2 whether or not an admission is around. It also takes `--reason <text>`, `--at <YYYY-MM-DDTHH:MM:SSZ>` and `--records-dir <absolute-dir>` — all three or none — and appends one release record line (see *The release record*); the printed line stays `ticket=<id> released`.
 - `admission-check` checks one admission record against the config: a valid record exits 0 and prints one line `admission ok lanes=<n> cap=<c>` with c the smaller of n and the config `lanes.count`; a record that exists and is not valid exits 1 with one `lane: refused reason=bad-admission` line; a path that does not exist exits 2, and so does an admission file that exists but cannot be read, or a path that cannot be inspected (for example a path that runs through a regular file, a folder on it that cannot be searched, or a link loop). A usage error (a missing or repeated file argument, an unknown option) and a missing, empty or unreadable `--config` exit 2 as well. This list names the main exit-2 cases of the verb; it does not claim to be complete.
 
 ## The admission record
@@ -109,6 +109,34 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 - `already-live`: the ticket already holds a lane. Checked before the cap and the clash.
 - `clash`: a claim whose scope overlaps the scope of a live ticket of the same repo (see *The scope clash*). The line names the live ticket and the overlapping pair as stored. Checked after the cap; the lanes dir is unchanged.
 - `not-live`: `release` for a ticket that holds no lane.
+
+## The release record
+
+`release` takes three options that go together — `--reason <text>`, `--at <YYYY-MM-DDTHH:MM:SSZ>` and `--records-dir <absolute-dir>`; one or two of them without the rest is exit 2. The lane code reads no clock, so the record time is the `--at` value, a real UTC instant in the shape the `friction` inbox checks. The record is one file per ticket, `<records-dir>/<ticket-id>.release`, and one line is appended per release:
+
+```
+<at> lane=<n> reason=<reason>
+```
+
+`<n>` is the lane number of the record the release removed. `reason=` is the last field and runs to the line end. Lines already in the file are kept byte for byte; their content is not checked, only the file as a whole (step (d)).
+
+`--reason` is checked before the lanes dir is touched, in this order: not empty or only white space; no newline; no control character and no U+2028 / U+2029; at most 1024 bytes. Each refusal is exit 2 with one `lane: error:` line, the lane stays held, no record is written and the records dir is not created. `--reason --at <ts>` takes `--at` as the reason text, so the timestamp becomes a second positional argument and the call is exit 2 as well.
+
+Under the lane lock (a missing lanes dir is `not-live` before the lock), in this order: (a) the ticket's record is looked up — `not-live` (exit 1) writes no record and creates no records dir; (b) the records dir is created with its parents when missing, and a link or a non-folder is exit 2; (c) a record path that is there and is not a regular file (a link, a folder, a fifo) is exit 2; (d) the record is opened without following a link and without blocking, and an existing record over 1 MiB, not utf-8, or without a final newline is exit 2 (an empty file is accepted); (e) the lane file is removed; (f) the line is written and synced — on a write or sync error the file is cut back to its old length (a failure of the cut is ignored) and the exit is 2 with `lane: error: the lane was freed and the release record cannot be written`, with the lane freed. A failure before (e) leaves the lane held.
+
+The records dir must not be the lanes dir or inside it. A given path with a `.` or `..` part, or one whose leading parts are the given `--lanes-dir`, is exit 2 before the lock. Under the lock the check runs on resolved paths (a link counts): after (a) and before anything is created, on the nearest part of the path that exists (the path itself when it exists; a link counts as existing); and again after (b) on the records dir. When that second check refuses and this call created the records dir, the call removes it (folders it created above it stay). In both checks a path that cannot be resolved counts as inside, so a records dir that is a dangling link gets this message. A ticket id such as `lane-1` would put its record among the lane records, which the dir reader refuses. Exit 2, nothing freed.
+
+Stricter than the wrapper writer it replaces:
+
+- a reason over 1024 bytes is refused;
+- U+0085 and other C1 characters are refused (the wrapper result depends on its locale);
+- U+2028 and U+2029 are refused (the wrapper accepts them on macOS and in the C locale);
+- a reason of only no-break or other Unicode spaces is blank here (the C-locale wrapper accepts it);
+- an existing record over 1 MiB, not UTF-8, or without a final newline is refused;
+- a records dir that is the lanes dir or inside it is refused;
+- a records dir or record problem is exit 2, where the wrapper exits 1.
+
+`not-live` is checked before the records dir and the record, while the wrapper checks its logs folder and the record first. The record gains `lane=<n>`; the wrapper line has no lane number.
 
 ## Release is explicit
 
