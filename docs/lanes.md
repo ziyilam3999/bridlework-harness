@@ -135,6 +135,8 @@ The lanes dir is read as `list` reads it, under its lock; the lock is released b
 
 An exec launch is a launch row whose name reads back the role `exec` (or the long form `execution`) and the ticket equal to the slug. An exec entry is a listing entry whose name reads back the same way. An entry is ended when its state is `done` or `stopped`; any other state, or no state field, is running.
 
+A ticket id with no letter or digit (`_` or `-`) has an empty slug. No launcher name can carry it, so it gets `hand no-exec-launch` before the rules below, with no other rule read.
+
 1. Two or more distinct ticket ids among the live and parked records share the slug (`a-b` and `ab`, `Foo` and `foo`): `unknown slug-shared`.
 2. The ticket also has a parked record of its own (its `ticket=` value byte-equal): `unknown live-and-parked`.
 3. An exec launch is in state `pending`: `alive launch-pending`.
@@ -153,7 +155,7 @@ Each check child has a 30 second limit with stdin closed and stdout and stderr e
 | `unknown` | `slug-shared` | two tickets share the slug; sessions cannot be told apart |
 | `unknown` | `live-and-parked` | the ticket is live and parked at once (`park` refuses it; `release` ends both) |
 | `alive` | `launch-pending` | an exec launch row is still pending |
-| `hand` | `no-exec-launch` | no bound exec launch row: started by hand, left out |
+| `hand` | `no-exec-launch` | no bound exec launch row, or a ticket id with no letter or digit: left out |
 | `alive` | `claimed-after-launch` | the lane file is newer than the newest bound exec launch |
 | `alive` | `listed-running` | a running exec entry is listed |
 | `unknown` | `name-unclear` | a running entry may belong to the ticket but its name does not say so |

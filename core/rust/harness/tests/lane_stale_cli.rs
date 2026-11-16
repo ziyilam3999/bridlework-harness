@@ -7,6 +7,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
@@ -23,6 +24,39 @@ static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn spawn(c: &mut Command) -> std::process::Child {
     let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     c.spawn().unwrap()
+}
+
+/// The one stub host script of this process, written once. Each fixture links to it (`--host` may be a link) and sets what it does by
+/// its own `mode` and `list.json` files next to the link: a fresh executable is checked by the OS on its first run and the checks
+/// queue, so one script per test would pass the 10 second listing limit on a busy machine.
+fn shared_host() -> &'static Path {
+    static HOST: OnceLock<PathBuf> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("lstale-host-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.canonicalize().unwrap().join("host.sh");
+        let body = format!(
+            "#!/bin/sh\n\
+             d=$(dirname \"$0\")\n\
+             case $(cat \"$d/mode\" 2>/dev/null) in\n\
+             fail) exit 3 ;;\n\
+             hang) sleep 60 ;;\n\
+             junk) echo nope ;;\n\
+             lock)\n\
+             '{BIN}' lane list --lanes-dir \"$d/lanes\" --config \"$d/config.yaml\" > /dev/null\n\
+             echo \"list-exit=$?\" >> \"$d/calls\"\n\
+             cat \"$d/list.json\" ;;\n\
+             *)\n\
+             echo \"$@\" >> \"$d/calls\"\n\
+             cat \"$d/list.json\" ;;\n\
+             esac\n"
+        );
+        let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    })
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -119,7 +153,7 @@ impl Fx {
         fs::write(&fx.records, "").unwrap();
         fs::write(&fx.calls, "").unwrap();
         fx.entries(&[]);
-        fx.stub(&format!("echo \"$@\" >> '{}'\ncat '{}'\n", fx.calls.display(), fx.list.display()));
+        symlink(shared_host(), &fx.host).unwrap();
         fx
     }
 
@@ -131,10 +165,9 @@ impl Fx {
         fx
     }
 
-    fn stub(&self, body: &str) {
-        let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-        fs::write(&self.host, format!("#!/bin/sh\n{body}")).unwrap();
-        fs::set_permissions(&self.host, fs::Permissions::from_mode(0o755)).unwrap();
+    /// What the shared host script does for this fixture: `fail`, `hang`, `junk` or `lock` (the default prints `list.json`).
+    fn mode(&self, m: &str) {
+        fs::write(self.root.join("mode"), m).unwrap();
     }
 
     fn entries(&self, e: &[String]) {
@@ -457,6 +490,15 @@ fn parked_records_are_not_judged() {
     fx.expect(&[], 0, &stale_one());
 }
 
+#[test]
+fn a_ticket_id_with_no_letter_or_digit_is_hand() {
+    // the id has an empty slug: `hand no-exec-launch` before the slug-shared and live-and-parked rules
+    let fx = Fx::new();
+    fx.lane(1, "_", "r");
+    fx.park("_");
+    fx.expect(&[], 0, &[line("_", 1, "hand", "no-exec-launch"), tail(1, 0)]);
+}
+
 // ---------------------------------------------------------------------------------------------- the tree
 
 #[test]
@@ -580,17 +622,13 @@ fn the_run_calls_the_host_for_the_listing_only() {
 fn the_lanes_dir_lock_is_free_while_the_host_runs() {
     let fx = Fx::basic();
     fx.ws("stale", true);
-    fx.stub(&format!(
-        "'{BIN}' lane list --lanes-dir '{}' --config '{}' > /dev/null\necho \"list-exit=$?\" >> '{}'\ncat '{}'\n",
-        fx.lanes.display(),
-        fx.cfg.display(),
-        fx.calls.display(),
-        fx.list.display()
-    ));
+    fx.mode("lock");
+    let before = snapshot(&fx.lanes);
     let o = run_bounded(&fx.args(), 20);
     assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(String::from_utf8_lossy(&o.stdout).lines().collect::<Vec<_>>(), stale_one());
     assert_eq!(fs::read_to_string(&fx.calls).unwrap(), "list-exit=0\n");
+    assert_eq!(snapshot(&fx.lanes), before, "the lanes dir changed");
 }
 
 // ---------------------------------------------------------------------------------------------- whole-run failures
@@ -605,21 +643,21 @@ fn host_missing() {
 #[test]
 fn listing_exits_non_zero() {
     let fx = Fx::basic();
-    fx.stub("exit 3\n");
+    fx.mode("fail");
     fx.refuse(&fx.args(), "exited non-zero", 30);
 }
 
 #[test]
 fn listing_hangs() {
     let fx = Fx::basic();
-    fx.stub("sleep 60\n");
+    fx.mode("hang");
     fx.refuse(&fx.args(), "timed out", 30);
 }
 
 #[test]
 fn listing_not_json() {
     let fx = Fx::basic();
-    fx.stub("echo nope\n");
+    fx.mode("junk");
     fx.refuse(&fx.args(), "not JSON", 30);
 }
 
@@ -688,6 +726,25 @@ fn lanes_dir_symlink() {
     let p = fx.root.join("lanes-link");
     symlink(&fx.lanes, &p).unwrap();
     fx.refuse(&fx.with("--lanes-dir", p.to_str().unwrap()), "lanes dir", 30);
+}
+
+#[test]
+fn manifest_dir_symlink() {
+    let fx = Fx::basic();
+    let p = fx.root.join("md-link");
+    symlink(&fx.md, &p).unwrap();
+    fx.refuse(&fx.with("--manifest-dir", p.to_str().unwrap()), "--manifest-dir must be an existing real directory", 30);
+}
+
+#[test]
+fn repo_map_dir_symlink() {
+    let fx = Fx::basic();
+    let p = fx.root.join("repo-link");
+    symlink(&fx.repo, &p).unwrap();
+    let mut a = fx.args();
+    let i = a.iter().position(|x| x == "--repo-map").unwrap();
+    a[i + 1] = format!("r={}", p.display());
+    fx.refuse(&a, "--repo-map must be an existing real directory", 30);
 }
 
 #[test]
@@ -773,7 +830,9 @@ fn host_given_as_a_link_is_accepted() {
     let mut a = fx.with("--host", p.to_str().unwrap());
     a.push("--allow".to_string());
     a.push("x".to_string());
+    let before = snapshot(&fx.lanes);
     let o = run_bounded(&a, 120);
     assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(String::from_utf8_lossy(&o.stdout).lines().collect::<Vec<_>>(), stale_one());
+    assert_eq!(snapshot(&fx.lanes), before, "the lanes dir changed");
 }
