@@ -4,7 +4,7 @@
 # (nothing in it comes from the repo under test), runs `harness ticket gate` on repo-dir (default: this repo) with
 # --base = the first parent of its HEAD (the merge commit's base), and exits with the runner's exit code, unchanged.
 # After a PASS it prints the written result's message line (gate ids only), read from its own fresh result folder.
-# After a non-zero engine exit it prints the kept check output (last 40 lines) from that result file, or one line saying why none is shown.
+# After a non-zero engine exit it prints the last 40 lines of the failing result's message (a failing check's kept output, or the engine's own reason when no check ran) from that result file, or one line saying why none is shown.
 # Fails closed when the base cannot be resolved (a shallow checkout): it never falls back to an empty diff.
 # --print-ticket prints the ticket this script would write and exits 0 (used by ci/final-gate-smoke.sh).
 # Exit: the runner's code (0 PASS only, 1 FAIL, 2 error); 2 on a missing base or any setup error.
@@ -58,8 +58,9 @@ if [ "$rc" -eq 0 ]; then
   # printf adds the final newline the result file lacks, so a following line never joins this one.
   [ -z "$msg" ] || printf '%s\n' "$msg"
 fi
-# A FAIL's kept output lives only in the result file's message. Its last 40 lines are printed to stderr, each line
-# prefixed "| " and cut at 300 bytes (control characters other than tab become "?", so no line begins with "::").
+# A FAIL's message (the failing check's kept output, or the engine's own reason when no check ran) lives only in the result
+# file. Its last 40 lines are printed to stderr, each line prefixed "| "; a line longer than 300 bytes is cut to at most
+# 299 bytes ending in [cut]; ASCII control characters other than tab, and DEL, become "?" (C1 controls pass through), so no printed line begins with "::".
 # Anything else (no file, unexpected shape, python3 missing) prints one reason line instead; the exit code stays the engine's.
 if [ "$rc" -ne 0 ]; then
   res="$work/result/ci-pr.json"
