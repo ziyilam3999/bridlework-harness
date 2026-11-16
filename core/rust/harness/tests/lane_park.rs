@@ -364,7 +364,7 @@ fn release_of_a_parked_only_ticket_removes_it() {
 #[test]
 fn release_of_a_live_and_parked_ticket_removes_both() {
     let (d, lanes) = held("relboth");
-    // a crash in the middle of a park move can leave the ticket both live and parked
+    // a claim of the parked ticket whose parked-file removal failed leaves it both live and parked; here that state is planted by hand
     plant(&lanes, "parked-t-one", &rec_text("t-one", "synthetic-repo", &["other/"]));
     let o = release("t-one", &lanes);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
@@ -500,6 +500,19 @@ fn parked_file_that_is_a_folder() {
     fs::create_dir_all(lanes.join("parked-t-x")).unwrap();
     all_verbs_refuse_parked(&d, &lanes, "not a regular file");
     assert!(lanes.join("parked-t-x").is_dir());
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn parked_file_that_is_a_fifo() {
+    use std::os::unix::fs::FileTypeExt;
+    let d = tmp("pk-fifo");
+    let lanes = d.join("lanes");
+    live_t_x(&lanes);
+    let mk = Command::new("mkfifo").arg(lanes.join("parked-t-x")).output().unwrap();
+    assert!(mk.status.success(), "mkfifo: {}", String::from_utf8_lossy(&mk.stderr));
+    all_verbs_refuse_parked(&d, &lanes, "not a regular file");
+    assert!(fs::symlink_metadata(lanes.join("parked-t-x")).unwrap().file_type().is_fifo());
     let _ = fs::remove_dir_all(&d);
 }
 

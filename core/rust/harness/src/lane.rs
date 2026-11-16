@@ -472,8 +472,8 @@ pub fn list_records(dir: &Path, cap: u32) -> Result<Vec<Record>, String> {
 
 /// The parked records, by ticket id in byte order, read strictly (the caller holds the lock). A missing dir holds nothing. An entry named
 /// `parked-<rest>` must be a regular file (a link is refused), at most 1 MiB, utf-8, parse as a lane record, and `<rest>` must be byte-equal
-/// to its `ticket=` value; anything else is an error and nothing is changed. A ticket that is live and parked at once (a crash in the middle
-/// of a park move) is accepted.
+/// to its `ticket=` value; anything else is an error and nothing is changed. A ticket that is live and parked at once (a claim of the parked
+/// ticket whose parked-file removal failed, or a file put there by hand) is accepted.
 pub fn read_parked(dir: &Path) -> Result<Vec<Record>, String> {
     if !check_dir(dir, false)? {
         return Ok(Vec::new());
@@ -494,8 +494,10 @@ pub fn read_parked(dir: &Path) -> Result<Vec<Record>, String> {
             Ok(_) => return Err("a parked record is not a regular file".to_string()),
             Err(_) => return Err("a parked record cannot be inspected".to_string()),
         }
-        let mut f = fs::File::open(&path).map_err(|_| "a parked record cannot be read".to_string())?;
-        // Re-check through the open handle, so a path swapped for a link between the two calls is still caught.
+        // Opened like `open_record` (its `custom_flags`: no link follow, no blocking), so a path swapped for a link or a fifo between
+        // the stat and this open fails the open or the handle check below and cannot block.
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new().read(true).custom_flags(OPEN_NOFOLLOW_NONBLOCK).open(&path).map_err(|_| "a parked record cannot be read".to_string())?;
         if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
             return Err("a parked record is not a regular file".to_string());
         }
@@ -657,7 +659,8 @@ fn append_line(f: &mut fs::File, old_len: u64, s: &ReleaseSpec, lane: &str, lost
 /// Free the lane of `ticket` and end its reservation, as one critical section, reading the dir under the config name bound. A ticket with
 /// neither a live record nor a parked file is `not-live`. With `spec` the records dir and the record are checked before anything is removed
 /// (a refusal leaves the lane held), the lane file goes first, then the parked file, then one record line is appended (its lane value is
-/// `parked` for a ticket that held only a parked file); a write error after the removals is exit 2 with the lane freed.
+/// `parked` for a ticket that held only a parked file); a write error after the removals is exit 2 naming what was removed (`the lane was
+/// freed`, or `the parked file was removed` for a parked-only ticket).
 fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Result<Result<(), Refusal>, String> {
     if !check_dir(dir, false)? {
         return Ok(Err(Refusal::NotLive));
@@ -679,7 +682,8 @@ fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Re
         fs::remove_file(parked_path(dir, ticket)).map_err(|_| lost.to_string())?;
     }
     if let (Some(s), Some((mut f, old_len))) = (spec, rec) {
-        append_line(&mut f, old_len, s, &r.map(|r| r.lane.to_string()).unwrap_or_else(|| "parked".to_string()), "the lane was freed")?;
+        let lost = if r.is_some() { "the lane was freed" } else { "the parked file was removed" };
+        append_line(&mut f, old_len, s, &r.map(|r| r.lane.to_string()).unwrap_or_else(|| "parked".to_string()), lost)?;
     }
     Ok(Ok(()))
 }
