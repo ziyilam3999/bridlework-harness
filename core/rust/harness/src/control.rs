@@ -13,17 +13,22 @@ pub const OWNERS: [&str; 6] =
     ["orchestration_portfolio", "execution_verification", "risk_review", "friction_learning", "knowledge_lessons", "harness_governance"];
 pub const EVENTS: [&str; 9] =
     ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "Notification", "PreCompact"];
+pub const SEAT: &str = "seat";
+pub const ORCHESTRATOR: &str = "orchestrator";
+pub const PROFILES: [&str; 2] = [SEAT, ORCHESTRATOR];
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_DEPTH: usize = 8;
 const HOOK_DIR: &str = "plugins/claude";
+const ORCH_DIR: &str = "plugins/claude/orchestrator";
 
-/// The hook part of a row: what P11-03 turns into one hooks.json entry.
+/// The hook part of a row: what P11-03 turns into one hooks.json entry, of one profile (seat by default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hook {
     pub script: String,
     pub manifest: String,
     pub event: String,
     pub tools: Vec<String>,
+    pub profile: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,28 +257,45 @@ fn no_unknown(kv: &[(String, V)], allowed: &[&str], what: &str) -> Result<(), St
     }
 }
 
+/// A plain tool name: ASCII letters, digits, `_` and `-`, starting with a letter.
+fn plain_tool(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic()) && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn parse_hook(v: &V) -> Result<Hook, String> {
     let kv = match v {
         V::O(kv) => kv,
         _ => return Err("`hook`: must be an object".to_string()),
     };
     let inner = |e: String| format!("`hook`: {}", e);
-    no_unknown(kv, &["script", "manifest", "event", "tools"], " in `hook`")?;
+    no_unknown(kv, &["script", "manifest", "event", "tools", "profile"], " in `hook`")?;
+    let profile = match take(kv, "profile") {
+        None => SEAT.to_string(),
+        Some(_) => enum_of(kv, "profile", &PROFILES).map_err(inner)?,
+    };
     let script = str_of(kv, "script").map_err(inner)?;
+    let folder = if profile == ORCHESTRATOR { ORCH_DIR } else { HOOK_DIR };
     let ok_script = script
-        .strip_prefix("plugins/claude/")
+        .strip_prefix(&format!("{}/", folder))
         .map(|n| n.ends_with("-hook.sh") && !n.contains('/') && path_ok(&script))
         .unwrap_or(false);
     if !ok_script {
-        return Err("`hook`: `script` must be plugins/claude/<name>-hook.sh".to_string());
+        return Err(format!("`hook`: `script` must be {}/<name>-hook.sh", folder));
     }
     let manifest = str_of(kv, "manifest").map_err(inner)?;
     if !path_ok(&manifest) {
         return Err("`hook`: `manifest` must be a plain repo-relative path".to_string());
     }
     let event = enum_of(kv, "event", &EVENTS).map_err(inner)?;
+    if profile == ORCHESTRATOR && event != "PreToolUse" {
+        return Err(format!("`hook`: `event` `{}` is not allowed for profile {} (PreToolUse only)", event, profile));
+    }
     let tools = tools_of(take(kv, "tools")).map_err(|e| format!("`hook`: `tools`: {}", e))?;
-    Ok(Hook { script, manifest, event, tools })
+    if profile == ORCHESTRATOR && tools.iter().any(|t| !plain_tool(t)) {
+        return Err(format!("`hook`: `tools`: profile {} takes plain tool names only", profile));
+    }
+    Ok(Hook { script, manifest, event, tools, profile })
 }
 
 fn tools_of(v: Option<&V>) -> Result<Vec<String>, String> {
@@ -442,9 +464,10 @@ fn is_file(root: &Path, rel: &str) -> bool {
     std::fs::symlink_metadata(root.join(rel)).map(|m| m.is_file()).unwrap_or(false)
 }
 
-/// The registry check. Every `*-hook.sh` regular file directly under `plugins/claude/` needs exactly one hook row naming it; every hook
-/// row's script, manifest and test must exist; and its event and tools must equal its manifest's. The first failure is returned and
-/// names the file or the row. Files are read as data only; nothing under `plugins/` is a crate dependency.
+/// The registry check. A `*-hook.sh` regular file directly under `plugins/claude/` needs exactly one hook row naming it; the
+/// orchestrator folder `plugins/claude/orchestrator/` is listed the same way, but a non-regular entry named `*-hook.sh` there is
+/// refused; a hook row's script, manifest and test must exist, with its event and tools equal to its manifest's. The first
+/// failure is returned and names the file or the row. Files are read as data only; nothing under `plugins/` is a crate dependency.
 pub fn check_hooks(repo_root: &Path, reg: &Registry) -> Result<(), String> {
     let mut names: Vec<String> = Vec::new();
     for e in std::fs::read_dir(repo_root.join(HOOK_DIR)).map_err(|_| format!("{}: missing or unreadable", HOOK_DIR))? {
@@ -464,6 +487,7 @@ pub fn check_hooks(repo_root: &Path, reg: &Registry) -> Result<(), String> {
             _ => return Err(format!("{}: hook has more than one registry row", name)),
         }
     }
+    check_orch_hooks(repo_root, reg)?;
     for r in &reg.rows {
         let h = match &r.hook {
             Some(h) => h,
@@ -480,6 +504,40 @@ pub fn check_hooks(repo_root: &Path, reg: &Registry) -> Result<(), String> {
         }
         if tools != h.tools {
             return Err(format!("row {}: `tools` differ from {}", r.id, h.manifest));
+        }
+    }
+    Ok(())
+}
+
+/// The orchestrator folder half of the check. Unlike the seat folder, which skips a non-regular `*-hook.sh` entry, an entry named
+/// `*-hook.sh` there must be a regular file, and the folder itself must exist and not be a symbolic link (`symlink_metadata`, so a
+/// link is seen as one even when it points at a good folder).
+fn check_orch_hooks(repo_root: &Path, reg: &Registry) -> Result<(), String> {
+    match std::fs::symlink_metadata(repo_root.join(ORCH_DIR)) {
+        Err(_) => return Err(format!("{}: missing or unreadable", ORCH_DIR)),
+        Ok(m) if !m.is_dir() => return Err(format!("{}: not a regular folder", ORCH_DIR)),
+        Ok(_) => {}
+    }
+    let mut names: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(repo_root.join(ORCH_DIR)).map_err(|_| format!("{}: missing or unreadable", ORCH_DIR))? {
+        let e = e.map_err(|_| format!("{}: unreadable", ORCH_DIR))?;
+        let name = e.file_name().into_string().map_err(|_| format!("{}: an entry name is not utf-8", ORCH_DIR))?;
+        if !name.ends_with("-hook.sh") {
+            continue;
+        }
+        if !e.path().symlink_metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Err(format!("{}/{}: not a regular file", ORCH_DIR, name));
+        }
+        names.push(name);
+    }
+    names.sort();
+    for name in &names {
+        let rel = format!("{}/{}", ORCH_DIR, name);
+        let n = reg.rows.iter().filter(|r| r.hook.as_ref().map(|h| h.script == rel).unwrap_or(false)).count();
+        match n {
+            1 => {}
+            0 => return Err(format!("{}: hook has no registry row", rel)),
+            _ => return Err(format!("{}: hook has more than one registry row", rel)),
         }
     }
     Ok(())
@@ -514,7 +572,19 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
     }
 
-    /// A temp copy of the two inputs the check reads: `controls/` and the flat `plugins/claude/` folder.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            if e.path().is_dir() {
+                copy_tree(&e.path(), &to.join(e.file_name()));
+            } else {
+                std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// A temp copy of the inputs the check reads: `controls/`, the flat `plugins/claude/` folder and `plugins/claude/orchestrator/`.
     fn copy_repo(name: &str) -> Scratch {
         let s = Scratch::new(name);
         for d in ["controls", "plugins/claude"] {
@@ -526,6 +596,7 @@ mod tests {
                 }
             }
         }
+        copy_tree(&repo().join(ORCH_DIR), &s.0.join(ORCH_DIR));
         s
     }
 
@@ -544,6 +615,45 @@ mod tests {
         let r = row();
         assert!(r.contains(from), "row holds {}", from);
         doc(&[r.replacen(from, to, 1)])
+    }
+
+    const ORCH_SCRIPT: &str = "plugins/claude/orchestrator/x-hook.sh";
+
+    fn orch_row() -> String {
+        format!(
+            r#"{},"hook":{{"script":"{}","manifest":"plugins/claude/x-manifest.json","event":"PreToolUse","tools":["AskUserQuestion"],"profile":"orchestrator"}}}}"#,
+            HEAD, ORCH_SCRIPT
+        )
+    }
+
+    fn orch_mutate(from: &str, to: &str) -> String {
+        let r = orch_row();
+        assert!(r.contains(from), "orchestrator row holds {}", from);
+        doc(&[r.replacen(from, to, 1)])
+    }
+
+    /// Write an orchestrator hook script and its manifest into a scratch tree.
+    fn orch_files(root: &Path, script: &str, manifest: &str) {
+        std::fs::write(root.join(script), "HARNESS_BIN\n[bin_path, \"orch\"\n").unwrap();
+        std::fs::write(root.join(manifest), r#"{"event":"PreToolUse","tools":["AskUserQuestion"]}"#).unwrap();
+    }
+
+    /// Registry text rows (orchestrator profile) naming the given script and manifest.
+    fn orch_rows_text(ids: &[&str], script: &str, manifest: &str) -> Vec<String> {
+        ids.iter()
+            .map(|id| {
+                format!(
+                    r#"{{"id":"{}","kind":"hook","class":"policy","enabled":true,"failure":"f","test":"plugins/claude/text-rule-smoke.sh","retirement_test":"r","owner":"execution_verification","hook":{{"script":"{}","manifest":"{}","event":"PreToolUse","tools":["AskUserQuestion"],"profile":"orchestrator"}}}}"#,
+                    id, script, manifest
+                )
+            })
+            .collect()
+    }
+
+    /// The committed scratch registry plus the given extra rows.
+    fn reg_with(root: &Path, extra: &[String]) -> Registry {
+        let text = std::fs::read_to_string(root.join("controls/registry.json")).unwrap();
+        Registry::parse(&text.replacen("\"controls\": [", &format!("\"controls\": [{},", extra.join(",")), 1)).unwrap()
     }
 
     #[test]
@@ -612,6 +722,16 @@ mod tests {
         w
     }
 
+    /// The string value of the first `"pattern"` after the first `"<key>":` at or after `from`.
+    fn pattern_after(schema: &str, from: usize, key: &str) -> String {
+        let k = from + schema[from..].find(&format!("\"{}\":", key)).unwrap_or_else(|| panic!("schema names {}", key));
+        let at = k + schema[k..].find("\"pattern\"").expect("key has a pattern");
+        let colon = at + schema[at..].find(':').unwrap();
+        let o = colon + schema[colon..].find('"').unwrap() + 1;
+        let e = o + schema[o..].find('"').unwrap();
+        schema[o..e].to_string()
+    }
+
     #[test]
     fn the_committed_schema_matches_the_loader() {
         let schema = std::fs::read_to_string(repo().join("schemas/control.schema.json")).expect("the schema is committed and utf-8");
@@ -628,9 +748,17 @@ mod tests {
         let mut got = enum_after(&schema, hook, "event");
         got.sort();
         assert_eq!(got, sorted(&EVENTS), "the schema's event enum equals the loader's");
+        let mut got = enum_after(&schema, hook, "profile");
+        got.sort();
+        assert_eq!(got, sorted(&PROFILES), "the schema's profile enum equals the loader's");
         let mut got = required_after(&schema, hook);
         got.sort();
         assert_eq!(got, sorted(&["script", "manifest", "event", "tools"]));
+        assert_eq!(
+            pattern_after(&schema, hook, "script"),
+            r"^plugins/claude/(orchestrator/)?[a-z0-9._-]+-hook\\.sh$",
+            "the schema's hook script pattern"
+        );
     }
 
     #[test]
@@ -682,5 +810,183 @@ mod tests {
         let reg = Registry::load(&s.0).unwrap();
         let e = check_hooks(&s.0, &reg).unwrap_err();
         assert!(e.contains("text-rule-smoke.sh"), "{}", e);
+    }
+
+    #[test]
+    fn a_bad_profile_is_refused_naming_row_and_field() {
+        let cases: Vec<(String, &str)> = vec![
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":"Orchestrator""#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":"admin""#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":""#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":7"#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":true"#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":["seat"]"#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":{"a":"b"}"#), "profile"),
+            // a duplicate key is refused by the JSON parser before rows are named, as for `enabled`
+            (mutate(r#""tools":["Bash"]"#, r#""tools":["Bash"],"profile":"seat","profile":"seat""#), "profile"),
+            (mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profil":"seat""#), "profil"),
+        ];
+        for (text, field) in cases {
+            let e = Registry::parse(&text).expect_err(&format!("a bad profile must be refused: {}", text));
+            assert!(e.contains(field), "`{}` must name `{}`: {}", e, field, text);
+            if e.starts_with("row ") {
+                assert!(e.contains("x-hook"), "`{}` must name the row", e);
+            }
+        }
+        let typo = Registry::parse(&mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profil":"seat""#)).unwrap_err();
+        assert!(typo.starts_with("row ") && typo.contains("x-hook") && typo.contains("profil"), "the typo key names the row: {}", typo);
+    }
+
+    #[test]
+    fn a_missing_profile_is_seat() {
+        let none = Registry::parse(&doc(&[row()])).unwrap();
+        let seat = Registry::parse(&mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profile":"seat""#)).unwrap();
+        assert_eq!(none.rows[0].hook, seat.rows[0].hook, "no profile and profile seat load to equal Hook values");
+        assert_eq!(seat.rows[0].hook.as_ref().unwrap().profile, "seat");
+    }
+
+    #[test]
+    fn an_orchestrator_row_loads() {
+        let text = orch_mutate(r#""tools":["AskUserQuestion"]"#, r#""tools":["AskUserQuestion","mcp__a__b"]"#);
+        let reg = Registry::parse(&text).unwrap();
+        let h = reg.rows[0].hook.as_ref().unwrap();
+        assert_eq!(h.profile, "orchestrator");
+        assert_eq!(h.script, ORCH_SCRIPT);
+        assert_eq!(h.event, "PreToolUse");
+        assert_eq!(h.tools, vec!["AskUserQuestion".to_string(), "mcp__a__b".to_string()]);
+    }
+
+    #[test]
+    fn an_orchestrator_row_with_a_seat_folder_script_is_refused() {
+        let text = orch_mutate(&format!(r#""script":"{}""#, ORCH_SCRIPT), r#""script":"plugins/claude/x-hook.sh""#);
+        let e = Registry::parse(&text).unwrap_err();
+        assert!(e.contains("script") && e.contains("x-hook"), "{}", e);
+    }
+
+    #[test]
+    fn an_orchestrator_script_outside_the_orchestrator_folder_is_refused() {
+        for bad in [
+            "plugins/claude/orchestrator/sub/x-hook.sh",
+            "plugins/claude/orchestrator/../x-hook.sh",
+            "plugins/claude/orchestrator//x-hook.sh",
+            "plugins/claude/orchestrator/x.sh",
+            "plugins/other/x-hook.sh",
+        ] {
+            let text = orch_mutate(&format!(r#""script":"{}""#, ORCH_SCRIPT), &format!(r#""script":"{}""#, bad));
+            let e = Registry::parse(&text).expect_err(&format!("{} must be refused", bad));
+            assert!(e.contains("script") && e.contains("x-hook"), "{}: {}", bad, e);
+        }
+    }
+
+    #[test]
+    fn an_orchestrator_row_on_another_event_is_refused() {
+        for ev in ["PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "Notification", "PreCompact"] {
+            let text = orch_mutate(r#""event":"PreToolUse""#, &format!(r#""event":"{}""#, ev));
+            let e = Registry::parse(&text).expect_err(&format!("{} must be refused", ev));
+            assert!(e.contains("event"), "{}: {}", ev, e);
+            assert!(e.starts_with("row ") && e.contains("x-hook"), "{}: the Err names the row: {}", ev, e);
+        }
+    }
+
+    #[test]
+    fn an_orchestrator_row_with_a_pattern_tool_is_refused() {
+        for bad in [r#""*""#, r#"".*""#, r#""Bash|Read""#, r#""Bash.*""#, r#""Bash ""#, r#""Bas.h""#] {
+            let text = orch_mutate(r#""tools":["AskUserQuestion"]"#, &format!(r#""tools":[{}]"#, bad));
+            let e = Registry::parse(&text).expect_err(&format!("{} must be refused", bad));
+            assert!(e.contains("tools"), "{}: {}", bad, e);
+            assert!(e.starts_with("row ") && e.contains("x-hook"), "{}: the Err names the row: {}", bad, e);
+        }
+    }
+
+    #[test]
+    fn a_seat_row_with_an_orchestrator_folder_script_is_refused() {
+        // a neighbour pin: the `/` rule of today already refuses this
+        let text = mutate(r#""script":"plugins/claude/x-hook.sh""#, r#""script":"plugins/claude/orchestrator/x-hook.sh""#);
+        let e = Registry::parse(&text).unwrap_err();
+        assert!(e.contains("script"), "{}", e);
+    }
+
+    #[test]
+    fn an_orchestrator_hook_with_no_registry_row_fails_the_check() {
+        let s = copy_repo("orchnorow");
+        std::fs::write(s.0.join("plugins/claude/orchestrator/n-hook.sh"), "#!/bin/sh\n").unwrap();
+        let reg = Registry::load(&s.0).unwrap();
+        let e = check_hooks(&s.0, &reg).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator/n-hook.sh"), "{}", e);
+    }
+
+    #[test]
+    fn two_rows_naming_one_orchestrator_script_fail_the_check() {
+        let s = copy_repo("orchtwo");
+        orch_files(&s.0, "plugins/claude/orchestrator/n-hook.sh", "plugins/claude/orchestrator/n-manifest.json");
+        let reg = reg_with(&s.0, &orch_rows_text(&["a-hook", "b-hook"], "plugins/claude/orchestrator/n-hook.sh", "plugins/claude/orchestrator/n-manifest.json"));
+        let e = check_hooks(&s.0, &reg).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator/n-hook.sh") && e.contains("more than one"), "{}", e);
+    }
+
+    #[test]
+    fn a_non_regular_hook_entry_in_the_orchestrator_folder_is_refused() {
+        // a symbolic link, also one to a good hook file
+        let s = copy_repo("orchlink");
+        std::fs::write(s.0.join("good.sh"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(s.0.join("good.sh"), s.0.join("plugins/claude/orchestrator/l-hook.sh")).unwrap();
+        let e = check_hooks(&s.0, &Registry::load(&s.0).unwrap()).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator/l-hook.sh"), "{}", e);
+        // a folder
+        let s = copy_repo("orchdir");
+        std::fs::create_dir_all(s.0.join("plugins/claude/orchestrator/f-hook.sh")).unwrap();
+        let e = check_hooks(&s.0, &Registry::load(&s.0).unwrap()).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator/f-hook.sh"), "{}", e);
+        // a FIFO
+        let s = copy_repo("orchfifo");
+        let st = std::process::Command::new("mkfifo").arg(s.0.join("plugins/claude/orchestrator/p-hook.sh")).status().unwrap();
+        assert!(st.success());
+        let e = check_hooks(&s.0, &Registry::load(&s.0).unwrap()).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator/p-hook.sh"), "{}", e);
+    }
+
+    #[test]
+    fn a_missing_orchestrator_folder_fails_the_check() {
+        let s = copy_repo("orchmissing");
+        std::fs::remove_dir_all(s.0.join("plugins/claude/orchestrator")).unwrap();
+        let reg = Registry::load(&s.0).unwrap();
+        let e = check_hooks(&s.0, &reg).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator") && e.contains("missing or unreadable"), "{}", e);
+    }
+
+    #[test]
+    fn a_linked_orchestrator_folder_fails_the_check() {
+        let s = copy_repo("orchlinked");
+        let p = s.0.join("plugins/claude/orchestrator");
+        let copy = s.0.join("orchestrator-copy");
+        copy_tree(&p, &copy);
+        std::fs::remove_dir_all(&p).unwrap();
+        std::os::unix::fs::symlink(&copy, &p).unwrap();
+        let reg = Registry::load(&s.0).unwrap();
+        let e = check_hooks(&s.0, &reg).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator") && e.contains("not a regular folder"), "{}", e);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_orchestrator_entry_name_that_is_not_utf8_is_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let s = copy_repo("orchutf8");
+        std::fs::write(s.0.join("plugins/claude/orchestrator").join(OsStr::from_bytes(b"\xff-hook.sh")), "x").unwrap();
+        let reg = Registry::load(&s.0).unwrap();
+        let e = check_hooks(&s.0, &reg).unwrap_err();
+        assert!(e.contains("plugins/claude/orchestrator") && e.contains("not utf-8"), "{}", e);
+    }
+
+    #[test]
+    fn a_dangling_orchestrator_row_fails_the_check() {
+        // a neighbour pin: the script-exists loop of today covers it
+        let s = copy_repo("orchdangling");
+        orch_files(&s.0, "plugins/claude/orchestrator/n-hook.sh", "plugins/claude/orchestrator/n-manifest.json");
+        std::fs::remove_file(s.0.join("plugins/claude/orchestrator/n-hook.sh")).unwrap();
+        let reg = reg_with(&s.0, &orch_rows_text(&["n-hook"], "plugins/claude/orchestrator/n-hook.sh", "plugins/claude/orchestrator/n-manifest.json"));
+        let e = check_hooks(&s.0, &reg).unwrap_err();
+        assert!(e.contains("n-hook.sh") && e.contains("does not exist"), "{}", e);
     }
 }

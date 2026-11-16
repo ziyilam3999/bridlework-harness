@@ -12,8 +12,9 @@ The release notes are a fixed template. Both tarballs are reproducible: the same
 
 ## Steps
 
-1. In one PR, bump `version` in `core/rust/harness/Cargo.toml` and regenerate `plugins/claude/.claude-plugin/plugin.json`
-   with `harness plugin plugin-json`. Merge it.
+1. In one PR, bump `version` in `core/rust/harness/Cargo.toml` and regenerate both plugin.json files with
+   `harness plugin plugin-json` and `harness plugin plugin-json --profile orchestrator` (they print the text of
+   `plugins/claude/.claude-plugin/plugin.json` and `plugins/claude/orchestrator/.claude-plugin/plugin.json`). Merge it.
 2. From a worktree at `origin/master` (never the primary clone), tag and push:
 
        git tag -a vX.Y.Z -m vX.Y.Z
