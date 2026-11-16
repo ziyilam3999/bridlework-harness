@@ -457,6 +457,43 @@ fn usage_names_the_provider_flag_and_the_verb() {
     }
 }
 
+#[test]
+fn a_provider_name_with_an_upper_case_letter_after_the_first_byte_is_refused() {
+    let e = Env::new();
+    let f = e.p("r.jsonl");
+    let mut r = Rows::default();
+    r.bound(&exec_r1(), "exec", Some("zai"));
+    r.save(&f);
+    let before = fs::read(&f).unwrap();
+    let o = e.launch(&["--records", f.to_str().unwrap(), "--provider", "zAi"]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(err(&o).contains("ASCII"), "{}", err(&o));
+    assert_eq!(fs::read(&f).unwrap(), before);
+    assert!(!e.marker());
+    for l in ["zAi", "zai,zAi"] {
+        let o = e.next(&f, l);
+        assert_eq!(code(&o), 2, "list {l:?}: {}", err(&o));
+    }
+    let mut r = Rows::default();
+    r.bound(&exec_r1(), "exec", Some("zAi"));
+    r.save(&f);
+    assert_eq!(code(&e.next(&f, "zai,claude")), 3);
+    assert_eq!(code(&e.launches(&f)), 2);
+}
+
+#[test]
+fn a_provider_name_with_a_digit_is_accepted() {
+    let e = Env::new();
+    let f = e.p("r.jsonl");
+    let mut r = Rows::default();
+    r.bound(&exec_r1(), "exec", Some("gpt5"));
+    r.save(&f);
+    want(&e.next(&f, "gpt5"), "next_provider=gpt5 last_provider=gpt5 last_run_id=run0 basis=single");
+    want(&e.next(&f, "zai,gpt5"), "next_provider=zai last_provider=gpt5 last_run_id=run0 basis=turn");
+    let o = e.launch(&["--records", f.to_str().unwrap(), "--provider", "gpt5"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+}
+
 // ---- hostile ----
 
 #[test]
