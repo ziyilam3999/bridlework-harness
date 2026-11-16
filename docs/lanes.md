@@ -135,7 +135,7 @@ The lanes dir is read as `list` reads it, under its lock; the lock is released b
 
 An exec launch is a launch row whose name reads back the role `exec` (or the long form `execution`) and the ticket equal to the slug. An exec entry is a listing entry whose name reads back the same way. An entry is ended when its state is `done` or `stopped`; any other state, or no state field, is running.
 
-A ticket id with no letter or digit (`_` or `-`) has an empty slug. No launcher name can carry it, so it gets `hand no-exec-launch` before the rules below, with no other rule read.
+A ticket id with no letter or digit (such as `_` or `--`) has an empty slug. No launcher name can carry it, so it gets `hand no-exec-launch` before the rules below, with no other rule read.
 
 1. Two or more distinct ticket ids among the live and parked records share the slug (`a-b` and `ab`, `Foo` and `foo`): `unknown slug-shared`.
 2. The ticket also has a parked record of its own (its `ticket=` value byte-equal): `unknown live-and-parked`.
