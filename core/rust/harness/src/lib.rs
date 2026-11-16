@@ -38,6 +38,8 @@ pub mod launcher;
 pub mod lesson;
 pub mod manifest;
 #[cfg(unix)]
+pub mod merge_text;
+#[cfg(unix)]
 pub mod owed;
 pub mod overlay;
 pub mod permission;
