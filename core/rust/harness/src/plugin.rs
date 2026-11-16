@@ -13,7 +13,7 @@ pub const ORCH_PLUGIN_NAME: &str = "bridlework-harness-orchestrator";
 pub const DESCRIPTION: &str = "Fail-closed Claude Code hooks for the bridlework harness; every hook calls the harness CLI.";
 pub const ORCH_DESCRIPTION: &str = "Fail-closed Claude Code hooks for the bridlework Orchestrator session; every hook calls the harness CLI.";
 /// The host timeout the generator writes into each orchestrator hook entry (seconds). A host timeout lets the tool call through, so
-/// this is only a far backstop: the hook itself stops and exits 2 before it is up.
+/// this is only a far backstop: an orchestrator hook script is to stop and exit 2 before it is up.
 pub const ORCH_HOOK_TIMEOUT_S: u64 = 120;
 pub const LICENSE: &str = "Apache-2.0";
 const PLUGIN_ROOT: &str = "plugins/claude";
@@ -74,7 +74,7 @@ fn orch_hooks_json_with(repo_root: &Path, reg: &Registry, table: Table) -> Resul
     gen_hooks(repo_root, reg, table, control::ORCHESTRATOR)
 }
 
-/// The hooks.json of one profile. The CLI_VERBS cross-check runs over all enabled rows of both profiles; the entries then hold
+/// The hooks.json of one profile. The table cross-check runs over all enabled rows of both profiles; the entries then hold
 /// only the rows of this profile, in EVENTS order then registry order. An orchestrator entry carries the host timeout; an empty
 /// orchestrator output is the four-line form with an empty hooks object (the seat formatter keeps its own shape).
 fn gen_hooks(repo_root: &Path, reg: &Registry, table: Table, profile: &str) -> Result<String, String> {
@@ -490,10 +490,11 @@ mod tests {
         let root = &s.0;
         let (reg, table) = with_orch_row(root, r#"["AskUserQuestion"]"#, true);
         let orch = orch_hooks_json_with(root, &reg, &table).unwrap();
-        assert_eq!(orch.matches(&format!("\"timeout\": {}", ORCH_HOOK_TIMEOUT_S)).count(), 1, "{}", orch);
+        assert_eq!(ORCH_HOOK_TIMEOUT_S, 120);
+        assert_eq!(orch.matches("\"timeout\": 120").count(), 1, "{}", orch);
         let doc = control::parse_doc(&orch).unwrap();
         let hook = first_of(get(first_of(get(get(&doc, "hooks"), "PreToolUse")), "hooks"));
-        assert!(matches!(get(hook, "timeout"), control::V::N(n) if *n == ORCH_HOOK_TIMEOUT_S), "{}", orch);
+        assert!(matches!(get(hook, "timeout"), control::V::N(n) if *n == 120), "{}", orch);
         let seat = hooks_json_with(root, &reg, &table).unwrap();
         assert!(!seat.contains("timeout"), "{}", seat);
     }
@@ -540,6 +541,9 @@ mod tests {
     fn orchestrator_hooks_with_no_row_have_an_empty_hooks_object() {
         let root = repo();
         let orch = orch_hooks_json_with(&root, &load(&root), &CLI_VERBS).unwrap();
+        let literal = "{\n  \"description\": \"Fail-closed Claude Code hooks for the bridlework Orchestrator session; every hook calls the harness CLI.\",\n  \"hooks\": {}\n}\n";
+        assert_eq!(orch, literal);
+        assert_eq!(orch.lines().count(), 4);
         assert_eq!(orch, empty_orch_hooks());
         let doc = control::parse_doc(&orch).unwrap();
         assert!(matches!(get(&doc, "hooks"), control::V::O(kv) if kv.is_empty()), "{}", orch);
@@ -576,7 +580,8 @@ mod tests {
         assert!(e.contains(ORCH_HOOKS_REL) && e.contains("differs"), "{}", e);
         // one extra entry
         let s = copy_repo("orchstale");
-        edit(&s.0, ORCH_HOOKS_REL, "\"hooks\": {}", "\"hooks\": {\n    \"PreToolUse\": []\n  }");
+        let entry = "\"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"bash \\\"${CLAUDE_PLUGIN_ROOT}/x-hook.sh\\\"\",\n            \"timeout\": 120\n          }\n        ]\n      }\n    ]\n  }";
+        edit(&s.0, ORCH_HOOKS_REL, "\"hooks\": {}", entry);
         let e = check(&s.0).unwrap_err();
         assert!(e.contains(ORCH_HOOKS_REL) && e.contains("differs"), "{}", e);
         // emptied

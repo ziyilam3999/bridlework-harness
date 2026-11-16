@@ -464,9 +464,9 @@ fn is_file(root: &Path, rel: &str) -> bool {
     std::fs::symlink_metadata(root.join(rel)).map(|m| m.is_file()).unwrap_or(false)
 }
 
-/// The registry check. Every `*-hook.sh` regular file directly under `plugins/claude/` needs exactly one hook row naming it; the
+/// The registry check. A `*-hook.sh` regular file directly under `plugins/claude/` needs exactly one hook row naming it; the
 /// orchestrator folder `plugins/claude/orchestrator/` is listed the same way, but a non-regular entry named `*-hook.sh` there is
-/// refused; and every hook row's script, manifest and test must exist, with its event and tools equal to its manifest's. The first
+/// refused; a hook row's script, manifest and test must exist, with its event and tools equal to its manifest's. The first
 /// failure is returned and names the file or the row. Files are read as data only; nothing under `plugins/` is a crate dependency.
 pub fn check_hooks(repo_root: &Path, reg: &Registry) -> Result<(), String> {
     let mut names: Vec<String> = Vec::new();
@@ -833,6 +833,8 @@ mod tests {
                 assert!(e.contains("x-hook"), "`{}` must name the row", e);
             }
         }
+        let typo = Registry::parse(&mutate(r#""event":"PreToolUse""#, r#""event":"PreToolUse","profil":"seat""#)).unwrap_err();
+        assert!(typo.starts_with("row ") && typo.contains("x-hook") && typo.contains("profil"), "the typo key names the row: {}", typo);
     }
 
     #[test]
@@ -882,6 +884,7 @@ mod tests {
             let text = orch_mutate(r#""event":"PreToolUse""#, &format!(r#""event":"{}""#, ev));
             let e = Registry::parse(&text).expect_err(&format!("{} must be refused", ev));
             assert!(e.contains("event"), "{}: {}", ev, e);
+            assert!(e.starts_with("row ") && e.contains("x-hook"), "{}: the Err names the row: {}", ev, e);
         }
     }
 
@@ -891,6 +894,7 @@ mod tests {
             let text = orch_mutate(r#""tools":["AskUserQuestion"]"#, &format!(r#""tools":[{}]"#, bad));
             let e = Registry::parse(&text).expect_err(&format!("{} must be refused", bad));
             assert!(e.contains("tools"), "{}: {}", bad, e);
+            assert!(e.starts_with("row ") && e.contains("x-hook"), "{}: the Err names the row: {}", bad, e);
         }
     }
 

@@ -141,7 +141,7 @@ A second generated plugin lives in `plugins/claude/orchestrator`. It holds no ho
 
 Each hook entry the generator writes there carries a host timeout of 120 s. A hook the host stops for its timeout **lets the
 tool call through**, so an Orchestrator hook must bound its own run time and exit 2 by itself before the 120 s are up. A
-refusing Orchestrator hook also stops the tool calls of that session's subagents; the way back is a relaunch without that
+refusing Orchestrator hook also refuses the matching tool calls of that session's subagents; the way back is a relaunch without that
 `--plugin-dir`.
 
 ## First run on the example ticket
