@@ -508,3 +508,455 @@ fn usage_errors_print_the_usage_text() {
     assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("lesson lint"), "{}", stderr(&o));
 }
+
+// ---- harness lesson lookup ----
+
+fn ticket_json(repo: &str, title: &str, criteria: &[&str], objective: &str, group: &str) -> String {
+    let crit: Vec<String> = criteria.iter().map(|c| format!("\"{}\"", c)).collect();
+    format!(
+        "{{\"id\":\"T-1\",\"repo_id\":\"{}\",\"title\":\"{}\",\"group\":\"{}\",\"size\":\"S\",\"objective\":\"{}\",\"acceptance_criteria\":[{}],\"dependencies\":[],\"risk\":\"normal\",\"owner_role\":\"execution_verification\",\"evidence_links\":[]}}",
+        repo,
+        title,
+        group,
+        objective,
+        crit.join(",")
+    )
+}
+
+fn default_ticket(title: &str) -> String {
+    ticket_json("example", title, &["checks/hello.sh passes"], "obj", "grp")
+}
+
+/// A scratch folder with `lessons/`, `ticket.json`, `scope.txt` and the given pages.
+fn setup(ticket: &[u8], scope: &[u8], pages: &[(&str, &str)]) -> PathBuf {
+    let d = tmp("look");
+    fs::create_dir_all(d.join("lessons")).unwrap();
+    fs::write(d.join("ticket.json"), ticket).unwrap();
+    fs::write(d.join("scope.txt"), scope).unwrap();
+    for (n, t) in pages {
+        fs::write(d.join("lessons").join(n), t).unwrap();
+    }
+    d
+}
+
+fn look(d: &std::path::Path) -> Output {
+    let (l, t, s) = (d.join("lessons"), d.join("ticket.json"), d.join("scope.txt"));
+    run(&["lesson", "lookup", l.to_str().unwrap(), "--ticket", t.to_str().unwrap(), "--scope-file", s.to_str().unwrap()])
+}
+
+fn fm(body: &str) -> String {
+    format!("---\n{}\n---\n", body)
+}
+
+/// One page `match: [<token>]` under a ticket with the given title: does it match?
+fn hit_in(title: &str, token: &str) -> bool {
+    hit_with(&default_ticket(title), token)
+}
+
+/// Same, with a title only: the one criterion is `zzz`.
+fn hit_title(title: &str, token: &str) -> bool {
+    hit_with(&ticket_json("example", title, &["zzz"], "obj", "grp"), token)
+}
+
+fn hit_with(ticket: &str, token: &str) -> bool {
+    let d = setup(ticket.as_bytes(), b"src/\n",&[("ISSUE-001-a.md", &fm(&format!("match: [{}]", token)))]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}: {}", token, stderr(&o));
+    let out = stdout(&o);
+    let _ = fs::remove_dir_all(&d);
+    match out.as_str() {
+        "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n" => true,
+        "lessons: scanned=1 matched=none\n" => false,
+        other => panic!("{}: {:?}", token, other),
+    }
+}
+
+fn hit(token: &str) -> bool {
+    hit_in("Say hello", token)
+}
+
+#[test]
+fn heading_line_is_printed_trimmed() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a-b.md", &(fm("match: [example]") + "text\n# \u{a0} My head \u{3000}\n"))]);
+    let o = look(&d);
+    assert_eq!(stdout(&o), "lesson: ISSUE-001 My head ISSUE-001-a-b.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn heading_comes_from_the_name_when_there_is_no_heading_line() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a-b-c.md", &(fm("match: [example]") + "## sub\n#nospace\n"))]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a b c ISSUE-001-a-b-c.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn heading_of_only_hash_and_blank_comes_from_the_name() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-x-y.md", &(fm("match: [example]") + "# \n# later\n"))]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 x y ISSUE-001-x-y.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn the_first_heading_line_wins() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &(fm("match: [example]") + "# first\n# second\n"))]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 first ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn a_heading_line_inside_a_code_fence_is_the_heading() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &(fm("match: [example]") + "```\n# fenced\n```\n# real\n"))]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 fenced ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn a_hash_line_in_the_front_matter_refuses_the_page() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]\n# head"))]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-a.md: FRONT-MATTER line 3 is not key: value\n");
+}
+
+#[test]
+fn a_ticket_that_is_not_utf8_is_refused() {
+    let d = setup(b"\xff\xfe{}", b"src/\n", &[("ISSUE-001-a.md", &fm("match: [x]"))]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).starts_with("harness: ticket refused: ticket is not utf-8"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_ticket_over_the_reader_limit_is_refused() {
+    let big = vec![b' '; 1024 * 1024 + 8];
+    let d = setup(&big, b"src/\n", &[("ISSUE-001-a.md", &fm("match: [x]"))]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).starts_with("harness: ticket refused: ticket is over 1 MiB"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_ticket_file_that_cannot_be_read_exits_2() {
+    let d = setup(b"", b"src/\n", &[("ISSUE-001-a.md", &fm("match: [x]"))]);
+    fs::remove_file(d.join("ticket.json")).unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).starts_with("harness: error: "), "{}", stderr(&o));
+}
+
+#[test]
+fn objective_and_group_are_not_looked_at() {
+    let t = ticket_json("example", "Say hello", &["checks/hello.sh passes"], "tokenword", "tokenword");
+    let d = setup(t.as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [tokenword]"))]);
+    assert_eq!(stdout(&look(&d)), "lessons: scanned=1 matched=none\n");
+}
+
+#[test]
+fn a_bad_scope_file_exits_2() {
+    let page = fm("match: [x]");
+    for (tag, bytes) in [("empty", &b""[..]), ("not utf8", b"\xff\n"), ("blank line", b"src/\n   \n"), ("dotdot", b"a/../b\n")] {
+        let d = setup(default_ticket("t").as_bytes(), bytes, &[("ISSUE-001-a.md", &page)]);
+        let o = look(&d);
+        assert_eq!(o.status.code(), Some(2), "{}", tag);
+        assert!(stdout(&o).is_empty(), "{}", tag);
+        assert!(stderr(&o).starts_with("harness: error: "), "{}: {}", tag, stderr(&o));
+    }
+    let d = setup(default_ticket("t").as_bytes(), b"", &[("ISSUE-001-a.md", &page)]);
+    fs::remove_file(d.join("scope.txt")).unwrap();
+    assert_eq!(look(&d).status.code(), Some(2));
+}
+
+#[test]
+fn the_scope_reader_message_is_shown() {
+    let d = setup(default_ticket("t").as_bytes(), b"   \n", &[("ISSUE-001-a.md", &fm("match: [x]"))]);
+    assert!(stderr(&look(&d)).contains("a scope line holds only whitespace"));
+}
+
+#[test]
+fn other_entries_are_skipped_and_not_counted() {
+    let page = fm("match: [example]");
+    let d = setup(
+        default_ticket("t").as_bytes(),
+        b"src/\n",
+        &[("ISSUE-001-a.md", &page), ("README.md", &page), ("notes.md", &page), ("ISSUE-02-b.md", &page), ("ISSUE-0003-c.md", &page)],
+    );
+    fs::create_dir_all(d.join("lessons/tests")).unwrap();
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn two_pages_with_one_id_are_both_listed() {
+    let page = fm("match: [example]");
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-b.md", &page), ("ISSUE-001-a.md", &page)]);
+    assert_eq!(
+        stdout(&look(&d)),
+        "lesson: ISSUE-001 a ISSUE-001-a.md\nlesson: ISSUE-001 b ISSUE-001-b.md\nlessons: scanned=2 matched=ISSUE-001,ISSUE-001\n"
+    );
+}
+
+#[test]
+fn a_missing_lessons_folder_exits_2() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[]);
+    fs::remove_dir_all(d.join("lessons")).unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).contains("does not exist"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_file_given_as_the_lessons_folder_exits_2() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[]);
+    fs::remove_dir_all(d.join("lessons")).unwrap();
+    fs::write(d.join("lessons"), "x").unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).contains("is a file"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_page_that_is_not_utf8_exits_2() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[]);
+    fs::write(d.join("lessons/ISSUE-001-a.md"), b"---\n\xff\n---\n").unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).contains("ISSUE-001-a.md is not valid UTF-8"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_folder_with_no_page_exits_2() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("README.md", "x")]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).contains("no lesson page"), "{}", stderr(&o));
+}
+
+#[test]
+fn a_control_character_in_a_file_name_is_escaped() {
+    let page = fm("match: [example]");
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a\u{1b}b.md", &page)]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), "lesson: ISSUE-001 a\\u{1b}b ISSUE-001-a\\u{1b}b.md\nlessons: scanned=1 matched=ISSUE-001\n");
+    fs::write(d.join("lessons/ISSUE-001-a\u{1b}b.md"), "no front matter\n").unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-a\\u{1b}b.md: FRONT-MATTER line 1 is not ---\n");
+    // a newline in the name is a page too
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a\nb.md", &page)]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a\\u{a}b ISSUE-001-a\\u{a}b.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn a_page_whose_line_1_is_not_the_front_matter_start_is_refused() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", "match: [example]\n---\n")]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-a.md: FRONT-MATTER line 1 is not ---\n");
+}
+
+#[test]
+fn a_repeated_match_key_is_refused() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [nothing]\nmatch: [example]"))]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-a.md: FRONT-MATTER line 3 repeats the key match\n");
+}
+
+#[test]
+fn a_page_with_no_match_key_is_counted_and_matches_nothing() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("title: example"))]);
+    assert_eq!(stdout(&look(&d)), "lessons: scanned=1 matched=none\n");
+}
+
+#[test]
+fn only_the_front_matter_rules_are_checked() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", "---\nmatch: [example]\n---\n")]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn an_empty_token_after_the_quotes_are_removed_is_refused() {
+    for m in ["[\"\"]", "[example, '']"] {
+        let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm(&format!("match: {}", m)))]);
+        let o = look(&d);
+        assert_eq!(o.status.code(), Some(1), "{}", m);
+        assert!(stdout(&o).is_empty());
+        assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-a.md: MATCH match has a token with no text between its quotes\n");
+    }
+}
+
+#[test]
+fn word_boundary_hello_matches_the_title_hellox_hello() {
+    assert!(hit_title("hellox hello", "hello"));
+    assert!(!hit_title("hellox", "hello"));
+}
+
+#[test]
+fn word_matches_overlapping_starts() {
+    assert!(hit_title("xab ab ab", "ab ab"));
+}
+
+#[test]
+fn a_letter_before_the_token_is_a_word_character() {
+    assert!(!hit_title("\u{e9}hello", "hello"));
+    assert!(hit_title("-hello-", "hello"));
+}
+
+#[test]
+fn letter_case_is_ignored_beyond_ascii() {
+    assert!(hit_title("un \u{e9}t\u{e9}", "\u{c9}T\u{c9}"));
+}
+
+#[test]
+fn token_hell_does_not_match() {
+    assert!(!hit("hell"));
+}
+#[test]
+fn token_quoted_upper_hello_matches() {
+    assert!(hit("\"HELLO\""));
+}
+#[test]
+fn token_hello_sh_matches() {
+    assert!(hit("hello.sh"));
+}
+#[test]
+fn token_sr_does_not_match() {
+    assert!(!hit("sr"));
+}
+#[test]
+fn token_upper_src_does_not_match() {
+    assert!(!hit("SRC"));
+}
+#[test]
+fn token_capital_example_does_not_match() {
+    assert!(!hit("Example"));
+    assert!(hit("example"));
+}
+#[test]
+fn token_src_matches_by_path() {
+    assert!(hit("src"));
+}
+#[test]
+fn token_src_lib_does_not_match() {
+    assert!(!hit("src/lib"));
+}
+#[test]
+fn token_slash_does_not_match() {
+    assert!(!hit("/"));
+}
+#[test]
+fn one_letter_token_s_needs_a_word_of_its_own() {
+    assert!(!hit("s"));
+    assert!(hit_in("Say s hello", "s"));
+}
+#[test]
+fn token_say_hello_matches_as_one_phrase() {
+    assert!(hit("say hello"));
+}
+#[test]
+fn a_match_line_below_the_closing_marker_is_not_read() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", "---\ntitle: x\n---\nmatch: [example]\n")]);
+    assert_eq!(stdout(&look(&d)), "lessons: scanned=1 matched=none\n");
+}
+#[test]
+fn an_indented_match_line_is_read() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("  match: [example]"))]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+#[test]
+fn a_match_key_with_a_blank_before_the_colon_is_read() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match : [example]"))]);
+    assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+}
+
+#[test]
+fn the_worked_case() {
+    let pages = [
+        ("ISSUE-901-alpha.md", fm("match: [nosuch-repo, example]")),
+        ("ISSUE-902-beta.md", fm("match: [src/]") + "# ISSUE-902: beta page\n"),
+        ("ISSUE-903-gamma.md", fm("match: [\"HELLO\"]")),
+        ("ISSUE-904-delta.md", fm("match: [hell]")),
+        ("ISSUE-906-zeta.md", fm("match: [sr, che, other-repo]")),
+        ("ISSUE-907-eta.md", "---\ntitle: x\n---\nmatch: [example]\n".to_string()),
+        ("ISSUE-908-theta.md", fm("match: [passes]")),
+        ("ISSUE-909-iota-two.md", fm("match: [example]")),
+        ("notes.md", fm("match: [example]")),
+        ("README.md", "readme\n".to_string()),
+    ];
+    let refs: Vec<(&str, &str)> = pages.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let d = setup(default_ticket("Say hello").as_bytes(), b"src/\n", &refs);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "lesson: ISSUE-901 alpha ISSUE-901-alpha.md\nlesson: ISSUE-902 ISSUE-902: beta page ISSUE-902-beta.md\nlesson: ISSUE-903 gamma ISSUE-903-gamma.md\nlesson: ISSUE-908 theta ISSUE-908-theta.md\nlesson: ISSUE-909 iota two ISSUE-909-iota-two.md\nlessons: scanned=8 matched=ISSUE-901,ISSUE-902,ISSUE-903,ISSUE-908,ISSUE-909\n"
+    );
+    assert!(stderr(&o).is_empty());
+    fs::write(d.join("ticket.json"), ticket_json("example", "Nothing here", &["zzz"], "o", "g")).unwrap();
+    fs::write(d.join("scope.txt"), "docs/\n").unwrap();
+    let o = look(&d);
+    assert_eq!(
+        stdout(&o),
+        "lesson: ISSUE-901 alpha ISSUE-901-alpha.md\nlesson: ISSUE-909 iota two ISSUE-909-iota-two.md\nlessons: scanned=8 matched=ISSUE-901,ISSUE-909\n"
+    );
+}
+
+#[test]
+fn exit_2_wins_over_exit_1() {
+    let no_fm = "no front matter\n";
+    // a bad page and a missing scope file
+    let d = setup(default_ticket("t").as_bytes(), b"", &[("ISSUE-001-a.md", no_fm)]);
+    fs::remove_file(d.join("scope.txt")).unwrap();
+    // a ticket the reader refuses and a missing scope file
+    let e = setup(b"{}", b"", &[("ISSUE-001-a.md", &fm("match: [x]"))]);
+    fs::remove_file(e.join("scope.txt")).unwrap();
+    // a page with line 1 not --- and a page that is not UTF-8
+    let f = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", no_fm)]);
+    fs::write(f.join("lessons/ISSUE-002-b.md"), b"\xff\xfe").unwrap();
+    for (tag, dir) in [("page+scope", d), ("ticket+scope", e), ("page+utf8", f)] {
+        let o = look(&dir);
+        assert_eq!(o.status.code(), Some(2), "{}", tag);
+        assert!(stdout(&o).is_empty(), "{}", tag);
+        let err = stderr(&o);
+        assert!(err.starts_with("harness: error: ") && !err.contains("refused"), "{}: {}", tag, err);
+    }
+}
+
+#[test]
+fn lookup_usage_errors_exit_2() {
+    let cases: [(&[&str], &str); 8] = [
+        (&["--ticket", "t", "--scope-file", "s"], "usage: harness lesson"),
+        (&["a", "b", "--ticket", "t", "--scope-file", "s"], "folder"),
+        (&["a", "--scope-file", "s"], "--ticket"),
+        (&["a", "--ticket", "t"], "--scope-file"),
+        (&["a", "--ticket", "t", "--ticket", "u", "--scope-file", "s"], "--ticket given twice"),
+        (&["a", "--ticket", "t", "--scope-file", "s", "--scope-file", "s"], "--scope-file given twice"),
+        (&["a", "--ticket", "t", "--scope-file"], "--scope-file needs a value"),
+        (&["a", "--ticket", "t", "--scope-file", "s", "--bogus", "x"], "--bogus"),
+    ];
+    for (args, want) in cases {
+        let mut full = vec!["lesson", "lookup"];
+        full.extend_from_slice(args);
+        let o = run(&full);
+        assert_eq!(o.status.code(), Some(2), "{:?}", args);
+        assert!(stdout(&o).is_empty(), "{:?}", args);
+        assert!(stderr(&o).contains(want), "{:?}: {}", args, stderr(&o));
+    }
+}
+
+#[test]
+fn usage_names_both_verbs() {
+    let o = run(&["lesson"]);
+    let err = stderr(&o);
+    assert!(err.starts_with("usage: harness lesson"), "{}", err);
+    assert!(err.contains("lesson lint <path>") && err.contains("lesson lookup <lessons-dir>"), "{}", err);
+    let o = run(&[]);
+    let err = stderr(&o);
+    assert!(err.contains("lesson lint") && err.contains("lesson lookup") && err.contains("lane claim|release|list|admission-check"), "{}", err);
+}
