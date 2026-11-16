@@ -172,6 +172,11 @@ def setup():
     if pj.returncode != 0:
         raise Setup("plugin-json failed")
     open(pjson, "wb").write(pj.stdout)
+    opjson = os.path.join(repo, "plugins/claude/orchestrator/.claude-plugin/plugin.json")
+    opj = run([os.path.join(repo, "core/rust/target/release/harness"), "plugin", "plugin-json", "--profile", "orchestrator"])
+    if opj.returncode != 0:
+        raise Setup("orchestrator plugin-json failed")
+    open(opjson, "wb").write(opj.stdout)
     git("add", "-A")
     git("commit", "-q", "-m", "bump")
     git("tag", "v" + NEW)

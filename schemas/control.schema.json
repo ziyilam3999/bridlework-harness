@@ -32,10 +32,11 @@
           "required": ["script", "manifest", "event", "tools"],
           "description": "Required when the kind is hook, forbidden otherwise.",
           "properties": {
-            "script": { "type": "string", "pattern": "^plugins/claude/[a-z0-9._-]+-hook\\.sh$" },
+            "script": { "type": "string", "pattern": "^plugins/claude/(orchestrator/)?[a-z0-9._-]+-hook\\.sh$" },
             "manifest": { "type": "string", "minLength": 1, "description": "Repo-relative path of the hook's manifest; its event and tools must equal this row's." },
             "event": { "type": "string", "enum": ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "Notification", "PreCompact"] },
-            "tools": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "Joined with a pipe into the hook matcher." }
+            "tools": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "Joined with a pipe into the hook matcher." },
+            "profile": { "type": "string", "enum": ["seat", "orchestrator"], "description": "Which generated plugin loads the hook. Absent means seat; the loader holds the stricter per-profile rules." }
           }
         }
       },

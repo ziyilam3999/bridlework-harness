@@ -133,6 +133,17 @@ The hooks read these variables. Each is an absolute path, except `HARNESS_REPO_M
 - `HARNESS_PUBLIC_REPO`: the public repository as `owner/name`. The `gh` text hook reads it.
 - `HARNESS_EVENT_LOG`: the event log. The session-start hook reads it.
 
+## The Orchestrator plugin
+
+A second generated plugin lives in `plugins/claude/orchestrator`. It holds no hook yet: its `hooks/hooks.json` names an empty
+`hooks` object. Only an Orchestrator session loads it, started with `claude --plugin-dir <clone>/plugins/claude/orchestrator`
+(`<clone>` is your clone of the repository) — not a seat session and not the global settings.
+
+Each hook entry the generator writes there carries a host timeout of 120 s. A hook the host stops for its timeout **lets the
+tool call through**, so an Orchestrator hook must bound its own run time and exit 2 by itself before the 120 s are up. A
+refusing Orchestrator hook also stops the tool calls of that session's subagents; the way back is a relaunch without that
+`--plugin-dir`.
+
 ## First run on the example ticket
 
 Copy the example project and ticket, and make the project a git repository with one commit.
