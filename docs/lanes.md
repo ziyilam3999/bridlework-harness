@@ -1,6 +1,6 @@
 # Lanes
 
-`harness lane claim | release | list | park | admission-check | stale` keeps the live tickets and their lane under a cap (`stale` only reports; see *The stale check*). The cap is 1 without a valid admission record; with one it is the smaller of the record's admitted lane count and the config `lanes.count`. No constant is edited to raise the cap: the same code runs at 1, 2, 4 or any admitted count. A lane may also be freed by `park`, which keeps the ticket's file list reserved (see *The parked file list*).
+`harness lane claim | release | list | park | admission-check | stale` keeps the live tickets and their lane under a cap (`stale` reports which lanes belong to a gone session with nothing unsaved and, with `--apply`, parks them when its park step still says so; see *The stale check*). The cap is 1 without a valid admission record; with one it is the smaller of the record's admitted lane count and the config `lanes.count`. No constant is edited to raise the cap: the same code runs at 1, 2, 4 or any admitted count. A lane may also be freed by `park`, which keeps the ticket's file list reserved (see *The parked file list*).
 
 ```
 harness lane claim <ticket-file> --lanes-dir <abs dir> --config <file> --scope-file <file> [--admission <file>]
@@ -8,7 +8,7 @@ harness lane release <ticket-id> --lanes-dir <abs dir> --config <file> [--reason
 harness lane list --lanes-dir <abs dir> --config <file> [--admission <file>]
 harness lane admission-check <file> --config <file>
 harness lane park <ticket-id> --lanes-dir <abs dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
-harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...]
+harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...] [--apply --reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
 ```
 
 - `claim` prints `ticket=<id> lane=<n>` (the lowest free lane from 1 to the cap, when fewer tickets are live than the cap and no live ticket of the same repo holds a scope entry that overlaps one of the claim's — see *The scope clash*; a clash refuses the claim even when a lane is free, and so does an overlapping parked record of another ticket of the same repo, with `parked`). The ticket goes through the strict ticket reader. `--admission <path>` names an admission record: with no option, or with a path where nothing exists, the cap is 1; with a record that exists and is not valid the claim is refused with `bad-admission` and nothing is recorded, even when no ticket is live. When the config sets the disk floor `lanes.min_free_gb` (`docs/config-contract.md`) and the free space of the lanes dir file system is under it, the claim is refused with `low-disk` before the lanes dir is touched.
@@ -110,7 +110,7 @@ When several match, the line names the first in this order: the parked tickets b
 
 ## Concurrency
 
-`claim`, `release`, `park` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then the cap (`no-admission` when no valid admission is given, else `cap-full`), then `clash`, then `parked`, then writes the record to `.claim.tmp` and renames it onto `lane-<n>`, and after that removes the ticket's own parked file; a park checks the dir, refuses `not-live` and `already-parked`, then renames the record onto the parked name; a release removes only the records it just read. So with any cap a ticket never holds two lanes, a claim never makes live exceed the cap that claim runs under (a later call given a different admission, or none, may see live above its own cap), and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim, release or park is not guaranteed to survive a crash of the machine.
+`claim`, `release`, `park` and `list` each run as one critical section under an exclusive lock (`flock`) on the lanes dir itself; no lock file is created. Under the lock a claim checks `already-live`, then the cap (`no-admission` when no valid admission is given, else `cap-full`), then `clash`, then `parked`, then writes the record to `.claim.tmp` and renames it onto `lane-<n>`, and after that removes the ticket's own parked file; a park checks the dir, refuses `not-live` and `already-parked`, then renames the record onto the parked name; a release removes only the records it just read. The park step of `stale --apply` is one such section too: it holds the lock from the lanes dir re-read to the park (see *The apply step*). So with any cap a ticket never holds two lanes, a claim never makes live exceed the cap that claim runs under (a later call given a different admission, or none, may see live above its own cap), and a release never removes a record that now belongs to another ticket, whatever number of `harness` processes run at once. A `.claim.tmp` left by a killed claim is removed under the lock by the next claim that takes a lane (a claim that is refused leaves it), so at most one is left. No directory fsync is done: a claim, release or park is not guaranteed to survive a crash of the machine.
 
 ## Reading the lanes dir (fail closed)
 
@@ -118,20 +118,21 @@ When several match, the line names the first in this order: the parked tickets b
 
 ## The stale check
 
-`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints; it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it (no stop, no rm, no fetch, no network call). A later ticket adds the parking (`--apply`); nothing calls the verb yet.
+`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` each record judged `stale gone-clean-pushed` goes to the park step, which parks its lane only when the verdict still holds there; nothing else is written (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
 
 ```
-harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...]
+harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...] [--apply --reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
 ```
 
 - `--repo-map` is given 1 to 16 times, one repo id at most once; the id is a plain repo id.
 - `--allow` is given at most 16 times (see *The `--allow` rule*).
 - Each path value is absolute, does not end with `/`, and holds no `.` or `..` part, else exit 2 before anything is read. `--lanes-dir`, `--manifest-dir` and each `--repo-map` dir are real directories (a link or a non-directory is refused; a missing lanes dir holds no record, as in `list`). `--launch-records` is a regular file and not a link. `--host` may be a link and must resolve to a regular file.
 - An unknown option, a missing required option, or a non-repeatable option given twice is exit 2.
+- `--apply` is a flag with no value. It and `--reason`, `--at` and `--records-dir` go together or none is given (else exit 2 before anything is read); each is given once. See *The apply step* for their checks.
 
 ### The facts
 
-The lanes dir is read as `list` reads it, under its lock; the lock is released before the host or git runs. The host is called once, as `<host> agents --json --all` (10 second limit). Parked records are not judged. For each live record in lane order, the first rule that matches gives the verdict and the reason. The slug is the lower-cased ticket id with each character outside `a-z0-9` dropped. A session name is read with the session name check at any lane number (the bound is the 15-digit cap of a lane number, so a number above `lanes.count` counts).
+The lanes dir is read as `list` reads it, under its lock. In a run without `--apply` the lock is released before the host or git runs and the host is called once; with `--apply` the park step reads again under the lock (see *The apply step*). The host is called as `<host> agents --json --all` (10 second limit). Parked records are not judged. For each live record in lane order, the first rule that matches gives the verdict and the reason. The slug is the lower-cased ticket id with each character outside `a-z0-9` dropped. A session name is read with the session name check at any lane number (the bound is the 15-digit cap of a lane number, so a number above `lanes.count` counts).
 
 An exec launch is a launch row whose name reads back the role `exec` (or the long form `execution`) and the ticket equal to the slug. An exec entry is a listing entry whose name reads back the same way. An entry is ended when its state is `done` or `stopped`; any other state, or no state field, is running.
 
@@ -163,19 +164,48 @@ Each check child has a 30 second limit with stdin closed and stdout and stderr e
 | `unknown` | `clean-check-failed` | the clean check gave no usable answer |
 | `unsaved` | `stray` | the tree holds a path that is not allowed |
 | `unsaved` | `unpushed` | a commit of the ticket branch is not pushed |
-| `unknown` | `no-upstream` | the ticket branch has no upstream (decided by the apply ticket) |
+| `unknown` | `no-upstream` | the ticket branch has no upstream (not decided in this version; not parked) |
 | `unknown` | `pushed-check-failed` | the pushed check gave no usable answer |
 | `stale` | `gone-clean-pushed` | the session is gone and nothing is unsaved |
+| `unknown` | `record-changed` | `--apply` only: the record, the launch rows or the lane changed between the report and the park step |
+| `unknown` | `recheck-failed` | `--apply` only: the lock, the lanes dir, the host listing or the launch records could not be read again; nothing is parked after it |
+| `unknown` | `park-refused` | `--apply` only: the park body refused (`not-live` or `already-parked`); nothing changed |
 
 ### Output and exit codes
 
 Stdout holds one line per live record in lane order:
 
 ```
-stale ticket=<id> lane=<n> verdict=<hand|alive|unknown|unsaved|stale> reason=<token> action=none
+stale ticket=<id> lane=<n> verdict=<hand|alive|unknown|unsaved|stale> reason=<token> action=<none|parked>
 ```
 
-then one line `stale checked=<n> parked=0 unknown=<u>`, where n is the number of live records printed and u the number with verdict `unknown`. With no live record only the last line is printed. Exit 0 when no verdict is `unknown`; exit 3 when one or more are (the other lanes are still judged and printed); exit 2 for a usage error or a whole-run failure.
+then one line `stale checked=<n> parked=<k> unknown=<u>`, where n is the number of live records printed, k the number of parks done in this run (0 without `--apply`) and u the number with verdict `unknown`. A parked record prints `verdict=stale reason=gone-clean-pushed action=parked`; each other line has `action=none`. With no live record only the last line is printed. Exit 0 when no printed verdict is `unknown`; exit 3 when one or more are (the other lanes are still judged and printed); exit 2 for a usage error, a whole-run failure or, with `--apply`, a park body error.
+
+### The apply step
+
+`--apply` takes `--reason <text>`, `--at <YYYY-MM-DDTHH:MM:SSZ>` and `--records-dir <absolute-dir>`: the four go together or none is given, else exit 2 with one `lane: error:` line and empty stdout before anything is read. `--apply` and each of the three given twice is exit 2. The three values take the checks of the release record options (*The release record*, with the same messages), and `--reason` is at most 900 bytes. Without `--apply` the output and the exit code are those of the report.
+
+Only a live record whose verdict is `stale gone-clean-pushed` goes to the park step. Each other verdict is printed with `action=none` and its lane is untouched; a branch with no upstream stays `unknown no-upstream`. For each live record in lane order the verdict is judged on the first read; for a stale one the park step runs at once, then its line is printed. The park step is one critical section under the lanes dir lock, taken once and held from (a) to (g):
+
+1. (a) take the lock;
+2. (b) read the lanes dir (live and parked records, under the config name bound) and the mtime of the ticket's lane file;
+3. (c) the ticket must be live in the same lane with the same repo id and scope as in the first read, else `unknown record-changed`;
+4. (d) call the host listing again;
+5. (e) read the launch records again, after the listing;
+6. (f) judge the ticket again on the facts of (b), (d) and (e), the clean and pushed checks run again; when the verdict is again `stale`, the exec launches of the slug are compared with the first read, and a launch that was not there or a changed state is `unknown record-changed`;
+7. (g) only when the verdict of (f) is `stale gone-clean-pushed`, park the record with the body of `lane park` (run under the held lock) and the record options, then release the lock.
+
+When (f) gives another verdict nothing is written and the line shows that verdict with `action=none`. A failure of (a), (b), (d) or (e) parks nothing: that record and each later record whose first verdict is `stale` print `unknown recheck-failed` with `action=none`, no later park step runs, the other records are still judged and printed, and the exit is 3. A park body refusal prints `unknown park-refused` and changes nothing. The config is loaded once per run.
+
+A park renames `<lanes-dir>/lane-<n>` onto `<lanes-dir>/parked-<ticket-id>` with its bytes unchanged and appends one line to `<records-dir>/<ticket-id>.release` (the records dir is created when missing, as in `park`):
+
+```
+<at> lane=<n> reason=stale-check listed=<none|stopped|done>: <given reason>
+```
+
+`listed` is `done` when an exec entry of the slug in state `done` was listed in (d), else `stopped` when one in state `stopped` was listed, else `none`. Nothing else is written: no other file in the lanes dir, no tree, branch, ref, manifest or launch record, and no host session.
+
+A park body error stops the run: exit 2, one stderr line `lane: error: ticket=<id>: <cause>`, stdout holds the lines of the records handled before it and no last line, and the parks done before it stay. A failed park leaves what `park` leaves (*The release record*): an error before the rename leaves the lane held (a records dir or an empty record file it created may stay); an append error after the rename leaves the ticket parked with the record cut back, and its text says the ticket was parked.
 
 ### Whole-run failures
 
@@ -206,6 +236,12 @@ An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not startin
 - Jobs with no exec launch are not checked.
 - Lanes dir entries whose names are not UTF-8 are skipped, as in `list`.
 - Nothing calls the verb yet.
+- With `--apply` the lock is held through the park step, which runs the host listing (10 second limit) and two workspace checks (30 seconds each): `claim`, `release`, `park` and `list` wait up to about 80 seconds per lane being parked (the lock wait has no time limit of its own).
+- A commit, a file or a woken session after the tree check of (f) and before the rename of (g) is not seen: git and the host take no lanes dir lock, so the window narrows and does not close. A launch that writes its launch row after (e) starts its seat after the re-check.
+- A session in state `done` can be woken and work while its lane is free (operator-accepted, 2026-11-16 11:58 UTC). A seat stopped on purpose counts as gone.
+- The cap counts live records only, so a parked job is not counted and jobs in flight can exceed the cap (operator-accepted, 2026-11-16 09:47 and 10:00 UTC).
+- The file list of a parked job stays reserved by the claim check `parked`. A parked job takes a lane again only by a claim of the same ticket, which the cap can refuse (the job then waits with its file list reserved), and is ended by `release`. Nothing in this verb un-parks.
+- The park lines of the stale check go to `<records-dir>/<ticket-id>.release`, beside the `release` and `park` lines.
 
 ## Exit codes
 
@@ -213,7 +249,7 @@ An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not startin
 | --- | --- |
 | 0 | done |
 | 1 | policy refusal: exactly one stderr line starting `lane: refused reason=<token>` |
-| 2 | usage error, unreadable or refused input, free disk space that cannot be read (with a floor set), or a lanes dir in a bad state (see above) |
+| 2 | usage error, unreadable or refused input, free disk space that cannot be read (with a floor set), or a lanes dir in a bad state (see above); with `stale --apply` also a park body error, with the lines printed before it |
 | 3 | `stale` only: the report is printed and one or more verdicts are `unknown` |
 
 ## Refusal tokens
@@ -258,4 +294,4 @@ Stricter than the wrapper writer it replaces:
 
 ## Release is explicit
 
-A lane is freed by `harness lane release` and by `harness lane park` (which keeps the ticket's file list reserved until the ticket claims a lane again or is released; a claim whose removal of the parked file fails leaves the reservation — see *The parked file list*). A dead process frees neither in this slice.
+A lane is freed by `harness lane release` and by `harness lane park` (which keeps the ticket's file list reserved until the ticket claims a lane again or is released; a claim whose removal of the parked file fails leaves the reservation — see *The parked file list*). `harness lane stale --apply` frees a lane through the park body. A dead process frees none in this slice.

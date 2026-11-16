@@ -1,11 +1,17 @@
-//! `harness lane stale` (std only, Unix): the report half of the stale-lane check. It reads the live lane records, the launch records and
-//! the host session list, and prints one verdict per live record; it writes nothing and runs no stop, rm or fetch (`docs/lanes.md`,
-//! *The stale check*). The host is called once (`agents --json --all`). The clean and pushed answers are the child runs
-//! `harness workspace check` and `harness workspace check --pushed` of this same binary, each under a 30 second limit and a 1 MiB cap
-//! per stream. The lanes dir is read under its lock, and the lock is released before the host or git runs.
-//! Exit 0: no verdict is `unknown`; 3: one or more are; 2: a usage error or a whole-run failure (`lane: error: <cause>`, empty stdout).
+//! `harness lane stale` (std only, Unix): the stale-lane check. It reads the live lane records, the launch records and the host session
+//! list, and prints one verdict per live record; it runs no stop, rm or fetch (`docs/lanes.md`, *The stale check*). Without `--apply` it
+//! writes nothing, calls the host once (`agents --json --all`) and the lock is released before the host or git runs. With `--apply` a
+//! record judged `stale gone-clean-pushed` goes through the park step: one critical section under the lanes dir lock that reads the lanes
+//! dir, the host listing, the launch records and the tree again, and parks the lane only when the verdict is still that one. The clean and
+//! pushed answers are the child runs `harness workspace check` and `harness workspace check --pushed` of this same binary, each under a
+//! 30 second limit and a 1 MiB cap per stream.
+//! Exit 0: no verdict is `unknown`; 3: one or more are; 2: a usage error, a whole-run failure (`lane: error: <cause>`, empty stdout) or a
+//! park body error (the lines of the records handled before it stay on stdout).
 
-use super::{check_dir, fail, lane_path, name_cap, path_spelling_ok, state_locked, Record, OPEN_NOFOLLOW_NONBLOCK};
+use super::{
+    check_dir, fail, lane_path, list_records, lock, name_cap, park_locked, path_spelling_ok, read_parked, record_spec, state_locked, Record, ReleaseSpec,
+    OPEN_NOFOLLOW_NONBLOCK,
+};
 use crate::config::Config;
 use crate::launcher::{kill_group, read_launches, Launch};
 use crate::repo_id::RepoId;
@@ -31,10 +37,19 @@ const CHILD_CAP: usize = 1 << 20;
 const MAX_MAPS: usize = 16;
 const MAX_ALLOW: usize = 16;
 const NO_UPSTREAM: &str = "harness: error: the ticket branch has no upstream";
+const MAX_REASON: usize = 900;
 
 type Out = (&'static str, &'static str);
 
+/// The `--apply` options: the park line parts and the records dir (checked by `record_spec`).
+struct Apply {
+    reason: String,
+    at: String,
+    records_dir: PathBuf,
+}
+
 struct Opts {
+    apply: Option<Apply>,
     lanes_dir: PathBuf,
     config: PathBuf,
     host: PathBuf,
@@ -61,11 +76,19 @@ fn allow_ok(v: &str) -> bool {
 fn parse(a: &[String]) -> Result<Opts, String> {
     let mut one: Vec<(&str, String)> = Vec::new();
     let (mut maps, mut allow): (Vec<(String, PathBuf)>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut apply = false;
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         let Some(k) = arg.strip_prefix("--") else { return Err(format!("unexpected argument {arg}")) };
-        if !["lanes-dir", "config", "host", "launch-records", "manifest-dir", "repo-map", "allow"].contains(&k) {
+        if !["lanes-dir", "config", "host", "launch-records", "manifest-dir", "repo-map", "allow", "apply", "reason", "at", "records-dir"].contains(&k) {
             return Err(format!("unknown option {arg}"));
+        }
+        if k == "apply" {
+            if apply {
+                return Err("--apply was given twice".to_string());
+            }
+            apply = true;
+            continue;
         }
         let v = it.next().ok_or_else(|| format!("{arg} is missing its value"))?;
         match k {
@@ -106,7 +129,21 @@ fn parse(a: &[String]) -> Result<Opts, String> {
     if maps.is_empty() {
         return Err("--repo-map is required".to_string());
     }
-    Ok(Opts { lanes_dir, config, host, launch_records, manifest_dir, maps, allow })
+    let val = |k: &str| one.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+    let given = [apply, val("reason").is_some(), val("at").is_some(), val("records-dir").is_some()];
+    let apply = if given.iter().all(|g| !g) {
+        None
+    } else if given.iter().all(|g| *g) {
+        let m: std::collections::HashMap<String, String> = ["reason", "at", "records-dir"].iter().map(|k| (k.to_string(), val(k).unwrap_or_default())).collect();
+        record_spec(&m, &lanes_dir)?;
+        if m["reason"].len() > MAX_REASON {
+            return Err(format!("--reason is over {MAX_REASON} bytes"));
+        }
+        Some(Apply { reason: m["reason"].clone(), at: m["at"].clone(), records_dir: PathBuf::from(&m["records-dir"]) })
+    } else {
+        return Err("--apply, --reason, --at and --records-dir go together".to_string());
+    };
+    Ok(Opts { apply, lanes_dir, config, host, launch_records, manifest_dir, maps, allow })
 }
 
 fn real_dir(opt: &str, p: &Path) -> Result<(), String> {
@@ -337,6 +374,76 @@ fn judge(f: &Facts, i: usize) -> Out {
     tree_verdict(f.o, r)
 }
 
+/// The launch records, read through the validated handle.
+fn read_launch_records(p: &Path) -> Result<Vec<Launch>, String> {
+    let handle = open_launch_records(p)?;
+    // Read through the validated handle when /dev/fd exists, so a path swapped after the check is not opened again.
+    let fd_path = PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd()));
+    let read_from = if fd_path.exists() { fd_path } else { p.to_path_buf() };
+    let launches = read_launches(&read_from).map_err(|e| format!("the launch records cannot be used: {e}"))?;
+    drop(handle);
+    Ok(launches)
+}
+
+/// The exec launches of `slug` as (run_id, state), to compare two reads of the launch records.
+fn exec_launches<'a>(ls: &'a [Launch], slug: &str) -> Vec<(&'a str, &'static str)> {
+    ls.iter().filter(|l| is_exec_name(&l.name, slug)).map(|l| (l.run_id.as_str(), l.state)).collect()
+}
+
+/// What the park step gave for one record.
+enum Step {
+    Parked,
+    /// Not parked: the line shows this verdict instead.
+    Seen(Out),
+    /// A re-read failed: nothing is parked.
+    Recheck,
+    /// The park body failed.
+    Failed(String),
+}
+
+/// The park step for the live record `r` judged `stale` on the first read (`first` are its launch records): one critical section, the lock
+/// held from the first line to the return. It calls neither `park` nor `state_locked`, which take the lock again.
+fn park_step(o: &Opts, ap: &Apply, bound: u32, r: &Record, first: &[Launch]) -> Step {
+    // The lock is held until this function returns.
+    let Ok(_guard) = lock(&o.lanes_dir) else { return Step::Recheck };
+    let (Ok(live), Ok(parked)) = (list_records(&o.lanes_dir, bound), read_parked(&o.lanes_dir)) else { return Step::Recheck };
+    let Some(i) = live.iter().position(|x| x.ticket == r.ticket) else { return Step::Seen(("unknown", "record-changed")) };
+    let Ok(mtime) = fs::symlink_metadata(lane_path(&o.lanes_dir, live[i].lane)).and_then(|m| m.modified()) else { return Step::Recheck };
+    if live[i] != *r {
+        return Step::Seen(("unknown", "record-changed"));
+    }
+    let Ok(entries) = listing(&o.host) else { return Step::Recheck };
+    let Ok(launches) = read_launch_records(&o.launch_records) else { return Step::Recheck };
+    // Only the index `i` is read by `judge`.
+    let mut mtimes = vec![0; live.len()];
+    mtimes[i] = now_ms(mtime);
+    let facts = Facts { o, live: &live, parked: &parked, launches: &launches, entries: &entries, mtimes: &mtimes };
+    let verdict = judge(&facts, i);
+    if verdict != ("stale", "gone-clean-pushed") {
+        return Step::Seen(verdict);
+    }
+    let Some(slug) = slug_of(&r.ticket) else { return Step::Seen(("unknown", "record-changed")) };
+    let before = exec_launches(first, &slug);
+    if exec_launches(&launches, &slug).iter().any(|l| !before.contains(l)) {
+        return Step::Seen(("unknown", "record-changed"));
+    }
+    let of_state = |s: &str| entries.iter().any(|e| e.state.as_deref() == Some(s) && is_exec_name(&e.name, &slug));
+    let listed = if of_state("done") {
+        "done"
+    } else if of_state("stopped") {
+        "stopped"
+    } else {
+        "none"
+    };
+    let reason = format!("stale-check listed={listed}: {}", ap.reason);
+    let spec = ReleaseSpec { at: &ap.at, reason: &reason, records_dir: ap.records_dir.clone() };
+    match park_locked(&o.lanes_dir, &r.ticket, bound, Some(&spec)) {
+        Ok(Ok(_)) => Step::Parked,
+        Ok(Err(_)) => Step::Seen(("unknown", "park-refused")),
+        Err(e) => Step::Failed(e),
+    }
+}
+
 /// Entry point for `harness lane stale ...` (the arguments after `stale`).
 pub fn stale_cmd(a: &[String]) -> i32 {
     let o = match parse(a) {
@@ -350,18 +457,10 @@ pub fn stale_cmd(a: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    let handle = match open_launch_records(&o.launch_records) {
-        Ok(h) => h,
+    let launches = match read_launch_records(&o.launch_records) {
+        Ok(l) => l,
         Err(e) => return fail(&e),
     };
-    // Read through the validated handle when /dev/fd exists, so a path swapped after the check is not opened again.
-    let fd_path = PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd()));
-    let read_from = if fd_path.exists() { fd_path } else { o.launch_records.clone() };
-    let launches = match read_launches(&read_from) {
-        Ok(l) => l,
-        Err(e) => return fail(&format!("the launch records cannot be used: {e}")),
-    };
-    drop(handle);
     let (live, parked) = match state_locked(&o.lanes_dir, name_cap(&cfg)) {
         Ok(v) => v,
         Err(e) => return fail(&e),
@@ -378,15 +477,31 @@ pub fn stale_cmd(a: &[String]) -> i32 {
         Err(e) => return fail(&e),
     };
     let facts = Facts { o: &o, live: &live, parked: &parked, launches: &launches, entries: &entries, mtimes: &mtimes };
-    let mut unknown = 0;
+    let (mut unknown, mut parks, mut recheck_failed) = (0, 0, false);
     for (i, r) in live.iter().enumerate() {
-        let (verdict, reason) = judge(&facts, i);
+        let (mut verdict, mut reason) = judge(&facts, i);
+        let mut action = "none";
+        if let (Some(ap), true) = (&o.apply, verdict == "stale") {
+            let step = if recheck_failed { Step::Recheck } else { park_step(&o, ap, name_cap(&cfg), r, &launches) };
+            match step {
+                Step::Parked => {
+                    action = "parked";
+                    parks += 1;
+                }
+                Step::Seen(v) => (verdict, reason) = v,
+                Step::Recheck => {
+                    recheck_failed = true;
+                    (verdict, reason) = ("unknown", "recheck-failed");
+                }
+                Step::Failed(e) => return fail(&format!("ticket={}: {e}", r.ticket)),
+            }
+        }
         if verdict == "unknown" {
             unknown += 1;
         }
-        println!("stale ticket={} lane={} verdict={verdict} reason={reason} action=none", r.ticket, r.lane);
+        println!("stale ticket={} lane={} verdict={verdict} reason={reason} action={action}", r.ticket, r.lane);
     }
-    println!("stale checked={} parked=0 unknown={unknown}", live.len());
+    println!("stale checked={} parked={parks} unknown={unknown}", live.len());
     if unknown > 0 {
         3
     } else {

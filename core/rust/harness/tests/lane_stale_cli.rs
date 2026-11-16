@@ -39,17 +39,23 @@ fn shared_host() -> &'static Path {
         let body = format!(
             "#!/bin/sh\n\
              d=$(dirname \"$0\")\n\
-             case $(cat \"$d/mode\" 2>/dev/null) in\n\
+             n=$(cat \"$d/count\" 2>/dev/null)\n\
+             k=$((n + 1))\n\
+             echo $k > \"$d/count\"\n\
+             m=mode; [ -f \"$d/mode$k\" ] && m=mode$k\n\
+             l=list.json; [ -f \"$d/list$k.json\" ] && l=list$k.json\n\
+             [ -f \"$d/act$k\" ] && sh \"$d/act$k\" > /dev/null 2>&1 < /dev/null\n\
+             case $(cat \"$d/$m\" 2>/dev/null) in\n\
              fail) exit 3 ;;\n\
              hang) sleep 60 ;;\n\
              junk) echo nope ;;\n\
              lock)\n\
              '{BIN}' lane list --lanes-dir \"$d/lanes\" --config \"$d/config.yaml\" > /dev/null\n\
              echo \"list-exit=$?\" >> \"$d/calls\"\n\
-             cat \"$d/list.json\" ;;\n\
+             cat \"$d/$l\" ;;\n\
              *)\n\
              echo \"$@\" >> \"$d/calls\"\n\
-             cat \"$d/list.json\" ;;\n\
+             cat \"$d/$l\" ;;\n\
              esac\n"
         );
         let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,6 +132,7 @@ struct Fx {
     calls: PathBuf,
     cfg: PathBuf,
     repo: PathBuf,
+    rec: PathBuf,
 }
 
 impl Fx {
@@ -144,6 +151,7 @@ impl Fx {
             calls: root.join("calls"),
             cfg: root.join("config.yaml"),
             repo: root.join("R"),
+            rec: root.join("rec"),
             root,
         };
         for d in [&fx.lanes, &fx.md, &fx.wroot, &fx.repo] {
@@ -313,6 +321,106 @@ impl Fx {
         let st = spawn(Command::new("mkfifo").arg(p)).wait().unwrap();
         assert!(st.success());
     }
+
+    /// The `sh` text the stub runs on its call `k`, before it prints the listing.
+    fn act(&self, k: u32, lines: &[String]) {
+        fs::write(self.root.join(format!("act{k}")), lines.join("\n") + "\n").unwrap();
+    }
+
+    fn list_k(&self, k: u32, e: &[String]) {
+        fs::write(self.root.join(format!("list{k}.json")), format!("[{}]\n", e.join(","))).unwrap();
+    }
+
+    fn mode_k(&self, k: u32, m: &str) {
+        fs::write(self.root.join(format!("mode{k}")), m).unwrap();
+    }
+
+    /// The host calls so far (the stub's own counter).
+    fn count(&self) -> String {
+        fs::read_to_string(self.root.join("count")).unwrap_or_default().trim().to_string()
+    }
+
+    fn calls_log(&self) -> String {
+        fs::read_to_string(&self.calls).unwrap()
+    }
+
+    fn apply_opts(&self) -> Vec<String> {
+        ["--apply", "--reason", REASON, "--at", AT, "--records-dir", self.rec.to_str().unwrap()].iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Run with the apply options; check the exact stdout lines and the exit code.
+    fn apply(&self, code: i32, want: &[String]) -> Output {
+        let mut a = self.args();
+        a.extend(self.apply_opts());
+        let o = run_bounded(&a, 180);
+        let out = String::from_utf8_lossy(&o.stdout).to_string();
+        assert_eq!(out.lines().collect::<Vec<_>>(), want.iter().map(|s| s.as_str()).collect::<Vec<_>>(), "stdout (stderr: {})", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(o.status.code(), Some(code), "exit code (stderr: {})", String::from_utf8_lossy(&o.stderr));
+        o
+    }
+
+    /// An apply run that parks nothing: the lanes dir is byte-unchanged and no records dir exists after it.
+    fn apply_no_write(&self, code: i32, want: &[String]) {
+        let before = snapshot(&self.lanes);
+        self.apply(code, want);
+        assert_eq!(snapshot(&self.lanes), before, "the lanes dir changed");
+        assert!(!self.rec.exists(), "the records dir was created");
+    }
+
+    fn lane_list(&self) -> Vec<String> {
+        let o = run_bounded(&["lane".to_string(), "list".into(), "--lanes-dir".into(), self.lanes.to_str().unwrap().into(), "--config".into(), self.cfg.to_str().unwrap().into()], 30);
+        assert_eq!(o.status.code(), Some(0));
+        String::from_utf8_lossy(&o.stdout).lines().map(|s| s.to_string()).collect()
+    }
+
+    fn release_line(&self, ticket: &str) -> String {
+        fs::read_to_string(self.rec.join(format!("{ticket}.release"))).unwrap()
+    }
+}
+
+const REASON: &str = "gone and clean";
+const AT: &str = "2026-11-17T01:02:03Z";
+
+fn aline(ticket: &str, lane: u32, verdict: &str, reason: &str, action: &str) -> String {
+    format!("stale ticket={ticket} lane={lane} verdict={verdict} reason={reason} action={action}")
+}
+
+fn atail(checked: u32, parked: u32, unknown: u32) -> String {
+    format!("stale checked={checked} parked={parked} unknown={unknown}")
+}
+
+fn rel_line(lane: u32, listed: &str) -> String {
+    format!("{AT} lane={lane} reason=stale-check listed={listed}: {REASON}\n")
+}
+
+fn parked_line(ticket: &str, lane: u32) -> String {
+    aline(ticket, lane, "stale", "gone-clean-pushed", "parked")
+}
+
+fn q(p: &Path) -> String {
+    format!("'{}'", p.display())
+}
+
+fn lane_text(ticket: &str) -> String {
+    format!("lane-record v1\nticket={ticket}\nrepo_id=r\nscope=a\n")
+}
+
+fn mtime_ms(p: &Path) -> u64 {
+    fs::metadata(p).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// The rows of one launch as `sh` text lines that append them to the launch records.
+fn launch_act(fx: &Fx, name: &str, ts: u64, run: &str, bound: bool) -> Vec<String> {
+    let sha = "a".repeat(64);
+    let mut rows = vec![format!("{{\"v\":1,\"kind\":\"launch\",\"ts_ms\":{ts},\"run_id\":\"{run}\",\"name\":\"{name}\",\"role\":\"exec\",\"brief_sha256\":\"{sha}\",\"owner\":\"orchestration\"}}")];
+    if bound {
+        rows.push(format!("{{\"v\":1,\"kind\":\"launch_ids\",\"ts_ms\":{ts},\"run_id\":\"{run}\",\"short_id\":\"sx1\",\"session_id\":\"7a345678-abcd-4123-8456-000000000001\"}}"));
+    }
+    rows.iter().map(|r| format!("printf '%s\\n' '{r}' >> {}", q(&fx.records))).collect()
+}
+
+fn ticket_json(ticket: &str) -> String {
+    format!("{{\"id\":\"{ticket}\",\"repo_id\":\"r\",\"title\":\"A title\",\"group\":\"grp\",\"size\":\"M\",\"objective\":\"An objective\",\"acceptance_criteria\":[\"one\"],\"dependencies\":[],\"risk\":\"normal\",\"owner_role\":\"execution_verification\",\"evidence_links\":[]}}")
 }
 
 impl Drop for Fx {
@@ -835,4 +943,433 @@ fn host_given_as_a_link_is_accepted() {
     assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(String::from_utf8_lossy(&o.stdout).lines().collect::<Vec<_>>(), stale_one());
     assert_eq!(snapshot(&fx.lanes), before, "the lanes dir changed");
+}
+
+// ---------------------------------------------------------------------------------------------- --apply: the park
+
+#[test]
+fn apply_parks_a_gone_clean_pushed_lane() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    let old = fs::read(fx.lanes.join("lane-1")).unwrap();
+    assert!(!fx.rec.exists());
+    fx.apply(0, &[parked_line("stale", 1), atail(1, 1, 0)]);
+    assert_eq!(snapshot(&fx.lanes), vec![("parked-stale".to_string(), old)]);
+    assert_eq!(snapshot(&fx.rec), vec![("stale.release".to_string(), rel_line(1, "none").into_bytes())]);
+    assert_eq!(fx.lane_list(), ["parked ticket=stale repo_id=r scope=1", "live=0 cap=1"]);
+}
+
+#[test]
+fn apply_records_listed_done_and_stopped() {
+    for (entries, listed) in [
+        (vec![ent("a1", &exec_name(1, "stale"), Some("done"))], "done"),
+        (vec![ent("a1", &exec_name(1, "stale"), Some("stopped"))], "stopped"),
+        (vec![ent("a1", &exec_name(1, "stale"), Some("stopped")), ent("a2", &exec_name(1, "stale"), Some("done"))], "done"),
+    ] {
+        let fx = Fx::basic();
+        fx.ws("stale", true);
+        fx.entries(&entries);
+        fx.apply(0, &[parked_line("stale", 1), atail(1, 1, 0)]);
+        assert_eq!(fx.release_line("stale"), rel_line(1, listed));
+    }
+}
+
+#[test]
+fn apply_leaves_other_verdicts() {
+    let fx = Fx::new();
+    let text = fs::read_to_string(&fx.cfg).unwrap().replace("  count: 4", "  count: 8");
+    fs::write(&fx.cfg, text).unwrap();
+    for (n, t) in [(1, "stale"), (2, "hand"), (3, "alive"), (4, "unsaved")] {
+        fx.lane(n, t, "r");
+    }
+    fx.lane(5, "unk", "zzz");
+    for (n, t) in [(1, "stale"), (3, "alive"), (4, "unsaved"), (5, "unk")] {
+        fx.bound(n, t, FAR);
+    }
+    fx.ws("stale", true);
+    let tree = fx.ws("unsaved", true);
+    fs::write(tree.join("f.txt"), "changed").unwrap();
+    fx.entries(&[ent("a1", &exec_name(3, "alive"), Some("working"))]);
+    let before = snapshot(&fx.lanes);
+    fx.apply(
+        3,
+        &[
+            parked_line("stale", 1),
+            aline("hand", 2, "hand", "no-exec-launch", "none"),
+            aline("alive", 3, "alive", "listed-running", "none"),
+            aline("unsaved", 4, "unsaved", "stray", "none"),
+            aline("unk", 5, "unknown", "no-repo-map", "none"),
+            atail(5, 1, 1),
+        ],
+    );
+    let mut want: Vec<(String, Vec<u8>)> = before.into_iter().map(|(n, b)| if n == "lane-1" { ("parked-stale".to_string(), b) } else { (n, b) }).collect();
+    want.sort();
+    assert_eq!(snapshot(&fx.lanes), want);
+    assert_eq!(snapshot(&fx.rec).len(), 1);
+}
+
+#[test]
+fn apply_with_no_stale_lane_writes_nothing() {
+    let fx = Fx::new();
+    fx.lane(1, "stale", "r");
+    fx.apply_no_write(0, &[aline("stale", 1, "hand", "no-exec-launch", "none"), atail(1, 0, 0)]);
+    assert_eq!(fx.calls_log(), "agents --json --all\n");
+}
+
+#[test]
+fn apply_calls_the_host_for_listings_only() {
+    let fx = Fx::basic();
+    let tree = fx.ws("stale", true);
+    let state = |p: &Path| (git(p, &["rev-parse", "HEAD"]), git(p, &["for-each-ref"]), git(p, &["status", "--porcelain"]));
+    let (tree_before, repo_before) = (state(&tree), state(&fx.repo));
+    fx.apply(0, &[parked_line("stale", 1), atail(1, 1, 0)]);
+    assert_eq!(fx.calls_log(), "agents --json --all\nagents --json --all\n");
+    assert_eq!(state(&tree), tree_before);
+    assert_eq!(state(&fx.repo), repo_before);
+}
+
+#[test]
+fn parked_job_coming_back_to_a_full_cap_is_refused_and_keeps_its_files() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.apply(0, &[parked_line("stale", 1), atail(1, 1, 0)]);
+    let floor = fx.root.join("floor-1.yaml");
+    fs::write(&floor, fs::read_to_string(EXAMPLE).unwrap().replace("  min_free_gb: 50", "  min_free_gb: 1")).unwrap();
+    let claim = |id: &str, scope: &str| {
+        let (tf, sf) = (fx.root.join(format!("claim-{id}.json")), fx.root.join(format!("claim-{id}.scope")));
+        fs::write(&tf, ticket_json(id)).unwrap();
+        fs::write(&sf, format!("{scope}\n")).unwrap();
+        let a: Vec<String> = ["lane", "claim", tf.to_str().unwrap(), "--lanes-dir", fx.lanes.to_str().unwrap(), "--config", floor.to_str().unwrap(), "--scope-file", sf.to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        run_bounded(&a, 60)
+    };
+    let text = |o: &Output| (String::from_utf8_lossy(&o.stdout).to_string(), String::from_utf8_lossy(&o.stderr).to_string(), o.status.code());
+    let parked = fs::read(fx.lanes.join("parked-stale")).unwrap();
+    assert_eq!(text(&claim("other", "b")), ("ticket=other lane=1\n".to_string(), String::new(), Some(0)));
+    assert_eq!(text(&claim("stale", "a")), (String::new(), "lane: refused reason=no-admission\n".to_string(), Some(1)));
+    assert_eq!(fs::read(fx.lanes.join("parked-stale")).unwrap(), parked);
+    let rel: Vec<String> = ["lane", "release", "other", "--lanes-dir", fx.lanes.to_str().unwrap(), "--config", EXAMPLE].iter().map(|s| s.to_string()).collect();
+    assert_eq!(run_bounded(&rel, 30).status.code(), Some(0));
+    assert_eq!(text(&claim("third", "a")), (String::new(), "lane: refused reason=parked ticket=stale parked=a new=a\n".to_string(), Some(1)));
+    assert_eq!(fs::read(fx.lanes.join("parked-stale")).unwrap(), parked);
+    assert_eq!(text(&claim("stale", "a")), ("ticket=stale lane=1\n".to_string(), String::new(), Some(0)));
+    assert!(!fx.lanes.join("parked-stale").exists());
+}
+
+// ---------------------------------------------------------------------------------------------- --apply: between the report and the park
+
+#[test]
+fn lane_reclaimed_before_park_is_not_parked() {
+    let fx = Fx::new();
+    fx.lane(1, "stale", "r");
+    let ms = mtime_ms(&fx.lanes.join("lane-1"));
+    fx.bound(1, "stale", ms);
+    fx.ws("stale", true);
+    let (l, t) = (fx.lanes.join("lane-1"), fx.lanes.join(".swap"));
+    fx.act(1, &[format!("cat {} > {}", q(&l), q(&t)), format!("mv {} {}", q(&t), q(&l))]);
+    fx.apply_no_write(0, &[aline("stale", 1, "alive", "claimed-after-launch", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn lane_taken_by_another_ticket_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    let l = fx.lanes.join("lane-1");
+    fx.act(1, &[format!("{} lane release stale --lanes-dir {} --config {}", q(Path::new(BIN)), q(&fx.lanes), q(&fx.cfg)), format!("printf '%s' '{}' > {}", lane_text("other"), q(&l))]);
+    let o = fx.apply(3, &[aline("stale", 1, "unknown", "record-changed", "none"), atail(1, 0, 1)]);
+    assert!(o.stderr.is_empty());
+    assert_eq!(snapshot(&fx.lanes), vec![("lane-1".to_string(), lane_text("other").into_bytes())]);
+    assert!(!fx.rec.exists());
+}
+
+#[test]
+fn ticket_moved_to_another_lane_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.act(1, &[format!("mv {} {}", q(&fx.lanes.join("lane-1")), q(&fx.lanes.join("lane-2")))]);
+    fx.apply(3, &[aline("stale", 1, "unknown", "record-changed", "none"), atail(1, 0, 1)]);
+    assert_eq!(snapshot(&fx.lanes), vec![("lane-2".to_string(), lane_text("stale").into_bytes())]);
+    assert!(!fx.rec.exists());
+}
+
+#[test]
+fn release_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.act(1, &[format!("{} lane release stale --lanes-dir {} --config {}", q(Path::new(BIN)), q(&fx.lanes), q(&fx.cfg))]);
+    fx.apply(3, &[aline("stale", 1, "unknown", "record-changed", "none"), atail(1, 0, 1)]);
+    assert!(snapshot(&fx.lanes).is_empty());
+    assert!(!fx.rec.exists());
+}
+
+#[test]
+fn parked_file_appearing_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.act(1, &[format!("printf '%s' '{}' > {}", lane_text("stale"), q(&fx.lanes.join("parked-stale")))]);
+    fx.apply(3, &[aline("stale", 1, "unknown", "live-and-parked", "none"), atail(1, 0, 1)]);
+    assert_eq!(snapshot(&fx.lanes), vec![("lane-1".to_string(), lane_text("stale").into_bytes()), ("parked-stale".to_string(), lane_text("stale").into_bytes())]);
+    assert!(!fx.rec.exists());
+    // the same with the parked file there before the run
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.park("stale");
+    fx.apply_no_write(3, &[aline("stale", 1, "unknown", "live-and-parked", "none"), atail(1, 0, 1)]);
+}
+
+#[test]
+fn seat_launched_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.act(2, &launch_act(&fx, &exec_name(1, "stale"), FAR + 1000, "hostile1", false));
+    fx.apply_no_write(0, &[aline("stale", 1, "alive", "launch-pending", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn relaunch_bound_after_the_listing_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.act(2, &launch_act(&fx, &exec_name(1, "stale"), FAR + 1000, "hostile1", true));
+    fx.apply_no_write(3, &[aline("stale", 1, "unknown", "record-changed", "none"), atail(1, 0, 1)]);
+}
+
+#[test]
+fn session_listed_again_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.list_k(2, &[ent("a1", &exec_name(1, "stale"), Some("working"))]);
+    fx.apply_no_write(0, &[aline("stale", 1, "alive", "listed-running", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn commit_before_park_is_not_parked() {
+    let fx = Fx::basic();
+    let tree = fx.ws("stale", true);
+    let contact = format!("user.email=t{}scratch", '@');
+    fx.act(
+        2,
+        &[
+            format!("cd {}", q(&tree)),
+            "echo two > g.txt".to_string(),
+            "git add g.txt".to_string(),
+            format!("git -c core.hooksPath=/dev/null -c user.name=t -c {contact} commit -q -m two"),
+        ],
+    );
+    fx.apply_no_write(0, &[aline("stale", 1, "unsaved", "unpushed", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn untracked_file_before_park_is_not_parked() {
+    for stage in [false, true] {
+        let fx = Fx::basic();
+        let tree = fx.ws("stale", true);
+        let mut act = vec![format!("cd {}", q(&tree)), "echo x > new.txt".to_string()];
+        if stage {
+            act.push("git add new.txt".to_string());
+        }
+        fx.act(2, &act);
+        fx.apply_no_write(0, &[aline("stale", 1, "unsaved", "stray", "none"), atail(1, 0, 0)]);
+    }
+}
+
+#[test]
+fn recheck_failure_parks_nothing_after_it() {
+    let fx = Fx::basic();
+    fx.lane(2, "other", "r");
+    fx.bound(2, "other", FAR);
+    fx.ws("stale", true);
+    fx.ws("other", true);
+    fx.mode_k(2, "fail");
+    fx.apply_no_write(3, &[aline("stale", 1, "unknown", "recheck-failed", "none"), aline("other", 2, "unknown", "recheck-failed", "none"), atail(2, 0, 2)]);
+    assert_eq!(fx.count(), "2");
+}
+
+#[test]
+fn host_hangs_on_the_second_call() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.mode_k(2, "hang");
+    let started = std::time::Instant::now();
+    fx.apply_no_write(3, &[aline("stale", 1, "unknown", "recheck-failed", "none"), atail(1, 0, 1)]);
+    assert!(started.elapsed() < Duration::from_secs(40));
+}
+
+#[test]
+fn lane_record_swapped_for_a_link_before_park() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    let (l, copy) = (fx.lanes.join("lane-1"), fx.root.join("valid-copy"));
+    fx.act(1, &[format!("cp {} {}", q(&l), q(&copy)), format!("rm {}", q(&l)), format!("ln -s {} {}", q(&copy), q(&l))]);
+    fx.apply(3, &[aline("stale", 1, "unknown", "recheck-failed", "none"), atail(1, 0, 1)]);
+    assert!(fs::symlink_metadata(&l).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(&copy).unwrap(), lane_text("stale").into_bytes());
+    assert!(!fx.rec.exists());
+}
+
+#[test]
+fn launch_records_swapped_for_a_fifo_before_park() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fx.act(2, &[format!("rm {}", q(&fx.records)), format!("mkfifo {}", q(&fx.records))]);
+    let started = std::time::Instant::now();
+    fx.apply_no_write(3, &[aline("stale", 1, "unknown", "recheck-failed", "none"), atail(1, 0, 1)]);
+    assert!(started.elapsed() < Duration::from_secs(30));
+}
+
+#[test]
+fn the_lock_is_held_from_the_reread_to_the_park() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    let (out, err, state) = (fx.root.join("bg.out"), fx.root.join("bg.err"), fx.root.join("bg.state"));
+    fx.act(
+        2,
+        &[
+            format!("{} lane list --lanes-dir {} --config {} > {} 2> {} < /dev/null &", q(Path::new(BIN)), q(&fx.lanes), q(&fx.cfg), q(&out), q(&err)),
+            "sleep 2".to_string(),
+            format!("if [ -s {} ]; then echo ended > {}; else echo not-ended > {}; fi", q(&out), q(&state), q(&state)),
+        ],
+    );
+    fx.apply(0, &[parked_line("stale", 1), atail(1, 1, 0)]);
+    assert_eq!(fs::read_to_string(&state).unwrap(), "not-ended\n");
+    let started = std::time::Instant::now();
+    while !fs::read_to_string(&out).unwrap_or_default().contains("live=") {
+        assert!(started.elapsed() < Duration::from_secs(20), "the list did not end within 20 seconds");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(fs::read_to_string(&out).unwrap(), "parked ticket=stale repo_id=r scope=1\nlive=0 cap=1\n");
+}
+
+#[test]
+fn park_failure_stops_the_run_and_keeps_earlier_parks() {
+    let fx = Fx::basic();
+    fx.lane(2, "other", "r");
+    fx.bound(2, "other", FAR);
+    fx.ws("stale", true);
+    fx.ws("other", true);
+    fs::create_dir_all(fx.rec.join("other.release")).unwrap();
+    let o = fx.apply(2, &[parked_line("stale", 1)]);
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    assert_eq!(err, "lane: error: ticket=other: the release record is not a regular file\n");
+    assert_eq!(snapshot(&fx.lanes), vec![("lane-2".to_string(), lane_text("other").into_bytes()), ("parked-stale".to_string(), lane_text("stale").into_bytes())]);
+    assert_eq!(fx.release_line("stale"), rel_line(1, "none"));
+}
+
+#[test]
+fn release_record_that_is_a_link_stops_before_the_move() {
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    fs::create_dir_all(&fx.rec).unwrap();
+    let target = fx.root.join("target");
+    fs::write(&target, "keep\n").unwrap();
+    symlink(&target, fx.rec.join("stale.release")).unwrap();
+    let before = snapshot(&fx.lanes);
+    let o = fx.apply(2, &[]);
+    assert!(String::from_utf8_lossy(&o.stderr).starts_with("lane: error: ticket=stale: "));
+    assert_eq!(snapshot(&fx.lanes), before);
+    assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+    // the records dir itself a link
+    let fx = Fx::basic();
+    fx.ws("stale", true);
+    let real = fx.root.join("real-rec");
+    fs::create_dir_all(&real).unwrap();
+    symlink(&real, &fx.rec).unwrap();
+    let before = snapshot(&fx.lanes);
+    let o = fx.apply(2, &[]);
+    assert!(String::from_utf8_lossy(&o.stderr).starts_with("lane: error: ticket=stale: "));
+    assert_eq!(snapshot(&fx.lanes), before);
+    assert!(snapshot(&real).is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------- --apply: options
+
+#[test]
+fn apply_options_one_to_three_of_four_exit_2() {
+    let fx = Fx::basic();
+    let all = fx.apply_opts();
+    let parts: Vec<Vec<String>> = vec![all[..1].to_vec(), all[1..3].to_vec(), all[3..5].to_vec(), all[5..].to_vec()];
+    for mask in 1..15u32 {
+        let mut a = fx.args();
+        for (i, p) in parts.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                a.extend(p.iter().cloned());
+            }
+        }
+        fx.refuse(&a, "go together", 30);
+    }
+    assert!(!fx.rec.exists());
+    assert_eq!(fx.calls_log(), "");
+}
+
+#[test]
+fn apply_option_values_are_checked() {
+    let fx = Fx::basic();
+    let rec = fx.rec.to_str().unwrap().to_string();
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("--reason", String::new(), "--reason must not be empty"),
+        ("--reason", "a\nb".to_string(), "--reason must be one line"),
+        ("--reason", "a\u{7}b".to_string(), "--reason must hold no control character"),
+        ("--reason", "x".repeat(901), "over 900 bytes"),
+        ("--at", "2026-11-17".to_string(), "--at must be"),
+        ("--records-dir", "rel/dir".to_string(), "must be an absolute path"),
+        ("--records-dir", format!("{rec}/"), "must not end with a slash"),
+        ("--records-dir", format!("{rec}/."), "must not be the lanes dir or inside it"),
+        ("--records-dir", format!("{}/x", fx.lanes.display()), "must not be the lanes dir or inside it"),
+    ];
+    for (opt, val, cause) in cases {
+        let mut a = fx.args();
+        a.extend(fx.apply_opts());
+        let i = a.iter().position(|x| x == opt).unwrap();
+        a[i + 1] = val;
+        fx.refuse(&a, cause, 30);
+    }
+    let mut a = fx.args();
+    a.extend(fx.apply_opts());
+    a.push("--apply".to_string());
+    fx.refuse(&a, "twice", 30);
+    for (opt, val) in [("--reason", "x"), ("--at", AT), ("--records-dir", rec.as_str())] {
+        let mut a = fx.args();
+        a.extend(fx.apply_opts());
+        a.extend([opt.to_string(), val.to_string()]);
+        fx.refuse(&a, "twice", 30);
+    }
+    assert!(!fx.rec.exists());
+    assert_eq!(fx.calls_log(), "");
+}
+
+#[test]
+fn two_applies_at_once_park_each_lane_once() {
+    let fx = Fx::basic();
+    fx.bound(2, "other", FAR);
+    fx.ws("stale", true);
+    fx.ws("other", true);
+    let mut a = fx.args();
+    a.extend(fx.apply_opts());
+    for round in 0..5 {
+        let _ = fs::remove_dir_all(&fx.rec);
+        for n in ["parked-stale", "parked-other"] {
+            let _ = fs::remove_file(fx.lanes.join(n));
+        }
+        fx.lane(1, "stale", "r");
+        fx.lane(2, "other", "r");
+        let runs: Vec<_> = (0..2).map(|_| {
+            let a = a.clone();
+            std::thread::spawn(move || run_bounded(&a, 240))
+        }).collect();
+        let outs: Vec<Output> = runs.into_iter().map(|h| h.join().unwrap()).collect();
+        let lines: Vec<String> = outs.iter().flat_map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|s| s.to_string()).collect::<Vec<_>>()).filter(|l| l.starts_with("stale ticket=")).collect();
+        let names: Vec<String> = snapshot(&fx.lanes).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["parked-other", "parked-stale"], "round {round}");
+        for (t, lane) in [("stale", 1), ("other", 2)] {
+            assert_eq!(fx.release_line(t), rel_line(lane, "none"), "round {round}");
+            let mine: Vec<String> = lines.iter().filter(|l| l.starts_with(&format!("stale ticket={t} "))).cloned().collect();
+            let (done, rest): (Vec<String>, Vec<String>) = mine.iter().cloned().partition(|l| *l == parked_line(t, lane));
+            assert_eq!(done.len(), 1, "round {round}: {mine:?}");
+            assert!(rest.len() <= 1, "round {round}: {mine:?}");
+            for l in rest {
+                assert_eq!(l, aline(t, lane, "unknown", "record-changed", "none"), "round {round}");
+            }
+        }
+    }
 }
