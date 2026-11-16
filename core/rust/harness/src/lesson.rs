@@ -5,6 +5,7 @@
 
 use crate::fix_tier::{PROVEN_ABSENT, TIERS};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>";
@@ -452,28 +453,78 @@ fn is_lookup_page(n: &str) -> bool {
     b.len() >= 7 && b[..3].iter().all(|c| c.is_ascii_digit()) && b[3] == b'-' && n.ends_with(".md")
 }
 
-/// The pages of the lookup: regular files directly inside `dir` (a link is skipped), by file name in byte order.
-fn walk(dir: &str) -> Result<Vec<(String, PathBuf)>, String> {
-    let p = Path::new(dir);
-    let md = std::fs::metadata(p).map_err(|_| "the lessons folder does not exist or cannot be read".to_string())?;
-    if !md.is_dir() {
-        return Err("the lessons argument is a file, not a folder".to_string());
+/// What a directory entry name is to the lookup.
+#[derive(Debug, PartialEq)]
+enum NameKind {
+    /// Not `ISSUE-<digits>-<anything>.md`: skipped.
+    NotPage,
+    /// Page-shaped and a good page name.
+    Page,
+    /// Page-shaped (by its lossy form) but not valid UTF-8.
+    NotUtf8,
+    /// Page-shaped but not exactly 3 digits.
+    Digits,
+}
+
+/// Checks (a) and (b) of the lookup walk, over the raw name.
+fn name_kind(n: &OsStr) -> NameKind {
+    let lossy = n.to_string_lossy();
+    if !is_page_name(&lossy) {
+        NameKind::NotPage
+    } else if n.to_str().is_none() {
+        NameKind::NotUtf8
+    } else if !is_lookup_page(&lossy) {
+        NameKind::Digits
+    } else {
+        NameKind::Page
     }
-    let rd = std::fs::read_dir(p).map_err(|_| "the lessons folder cannot be read".to_string())?;
+}
+
+/// The pages of the lookup: regular files directly inside `dir`, by file name in byte order. Err holds the
+/// messages for exit 2: one, or one per page-shaped entry that is not a page and not a folder (raw name byte order).
+fn walk(dir: &str) -> Result<Vec<(String, PathBuf)>, Vec<String>> {
+    let one = |m: &str| vec![m.to_string()];
+    let p = Path::new(dir);
+    let md = std::fs::metadata(p).map_err(|_| one("the lessons folder does not exist or cannot be read"))?;
+    if !md.is_dir() {
+        return Err(one("the lessons argument is a file, not a folder"));
+    }
+    let rd = std::fs::read_dir(p).map_err(|_| one("the lessons folder cannot be read"))?;
     let mut pages: Vec<(String, PathBuf)> = Vec::new();
+    let mut bad: Vec<(OsString, String)> = Vec::new();
     for ent in rd {
-        let ent = ent.map_err(|_| "the lessons folder cannot be read".to_string())?;
-        let Ok(n) = ent.file_name().into_string() else { continue };
-        if !is_lookup_page(&n) {
+        let ent = ent.map_err(|_| one("the lessons folder cannot be read"))?;
+        let raw = ent.file_name();
+        let kind = name_kind(&raw);
+        if kind == NameKind::NotPage {
             continue;
         }
-        let ft = ent.file_type().map_err(|_| format!("the entry {} cannot be inspected", esc(&n)))?;
-        if ft.is_file() {
-            pages.push((n, ent.path()));
+        let n = esc(&raw.to_string_lossy());
+        let ft = ent.file_type().map_err(|_| vec![format!("the entry {} cannot be inspected", n)])?;
+        if ft.is_dir() {
+            continue;
         }
+        let why = if kind == NameKind::NotUtf8 {
+            "has a name that is not valid UTF-8"
+        } else if kind == NameKind::Digits {
+            "does not have exactly 3 digits after ISSUE-"
+        } else if ft.is_symlink() {
+            "is a symbolic link"
+        } else if !ft.is_file() {
+            "is not a regular file"
+        } else {
+            let Ok(s) = raw.into_string() else { continue };
+            pages.push((s, ent.path()));
+            continue;
+        };
+        bad.push((raw, format!("the entry {} {}", n, why)));
+    }
+    if !bad.is_empty() {
+        bad.sort();
+        return Err(bad.into_iter().map(|(_, m)| m).collect());
     }
     if pages.is_empty() {
-        return Err("the lessons folder holds no lesson page".to_string());
+        return Err(one("the lessons folder holds no lesson page"));
     }
     pages.sort();
     Ok(pages)
@@ -528,7 +579,7 @@ fn heading(lines: &[&str], close: usize, name: &str) -> String {
 }
 
 /// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`. Exit 0 the matching pages (stdout), 1 a page or the ticket is
-/// refused, 2 usage or read error. No lesson line and no refusal line is printed before each page is read.
+/// refused, 2 usage or read error or a page-shaped entry that is not a page and not a folder. The exit 1 lines are printed after all pages are read.
 fn lookup_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", esc(m));
@@ -577,7 +628,12 @@ fn lookup_cmd(a: &[String]) -> i32 {
     };
     let names = match walk(dir) {
         Ok(n) => n,
-        Err(m) => return fail(&m),
+        Err(ms) => {
+            for m in &ms {
+                fail(m);
+            }
+            return 2;
+        }
     };
     let mut texts: Vec<String> = Vec::new();
     for (n, p) in &names {
@@ -642,4 +698,23 @@ fn lookup_cmd(a: &[String]) -> i32 {
     let matched = if ids.is_empty() { "none".to_string() } else { ids.join(",") };
     println!("lessons: scanned={} matched={}", names.len(), matched);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_kind_checks_utf8_and_digits() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(name_kind(OsStr::from_bytes(b"ISSUE-002-\xff.md")), NameKind::NotUtf8);
+        assert_eq!(name_kind(OsStr::from_bytes(b"\xff.md")), NameKind::NotPage);
+        assert_eq!(name_kind(OsStr::new("ISSUE-002-a.md")), NameKind::Page);
+        for n in ["ISSUE-1-a.md", "ISSUE-02-a.md", "ISSUE-0002-a.md"] {
+            assert_eq!(name_kind(OsStr::new(n)), NameKind::Digits, "{}", n);
+        }
+        for n in ["README.md", "ISSUE-001.md", "ISSUE-001-a.txt", "issue-001-a.md", "ISSUE-001-a.MD", ".ISSUE-001-a.md"] {
+            assert_eq!(name_kind(OsStr::new(n)), NameKind::NotPage, "{}", n);
+        }
+    }
 }

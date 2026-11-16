@@ -678,7 +678,7 @@ fn other_entries_are_skipped_and_not_counted() {
     let d = setup(
         default_ticket("t").as_bytes(),
         b"src/\n",
-        &[("ISSUE-001-a.md", &page), ("README.md", &page), ("notes.md", &page), ("ISSUE-02-b.md", &page), ("ISSUE-0003-c.md", &page)],
+        &[("ISSUE-001-a.md", &page), ("README.md", &page), ("notes.md", &page)],
     );
     fs::create_dir_all(d.join("lessons/tests")).unwrap();
     assert_eq!(stdout(&look(&d)), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
@@ -959,4 +959,516 @@ fn usage_names_both_verbs() {
     let o = run(&[]);
     let err = stderr(&o);
     assert!(err.contains("lesson lint") && err.contains("lesson lookup") && err.contains("lane claim|release|list|admission-check"), "{}", err);
+}
+
+// ---- lookup refusals: walk ----
+
+fn link(target: &std::path::Path, at: &std::path::Path) {
+    std::os::unix::fs::symlink(target, at).unwrap();
+}
+
+fn mkfifo(p: &std::path::Path) {
+    let st = Command::new("mkfifo").arg(p).status().unwrap();
+    assert!(st.success());
+}
+
+/// `look`, but the child is killed after 10 seconds and the test fails (a FIFO must not be opened).
+fn look_timed(d: &std::path::Path) -> Output {
+    let (l, t, s) = (d.join("lessons"), d.join("ticket.json"), d.join("scope.txt"));
+    let mut c = Command::new(BIN)
+        .args(["lesson", "lookup", l.to_str().unwrap(), "--ticket", t.to_str().unwrap(), "--scope-file", s.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while c.try_wait().unwrap().is_none() {
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            let _ = c.kill();
+            let _ = c.wait();
+            panic!("lookup did not finish in 10 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    c.wait_with_output().unwrap()
+}
+
+/// A folder with the good page ISSUE-001-a.md; `make` adds the bad entry; exit 2, stdout empty, stderr is `line`.
+fn refused_entry(make: impl FnOnce(&std::path::Path), line: &str) {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    make(&d);
+    let o = look_timed(&d);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    assert_eq!(stderr(&o), format!("{}\n", line));
+    let _ = fs::remove_dir_all(&d);
+}
+
+const GOOD_OUT: &str = "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n";
+
+fn digit_line(n: &str) -> String {
+    format!("harness: error: the entry {} does not have exactly 3 digits after ISSUE-", n)
+}
+
+#[test]
+fn a_link_to_a_page_file_is_refused() {
+    refused_entry(
+        |d| {
+            fs::write(d.join("outside.md"), fm("match: [example]")).unwrap();
+            link(&d.join("outside.md"), &d.join("lessons/ISSUE-002-b.md"));
+        },
+        "harness: error: the entry ISSUE-002-b.md is a symbolic link",
+    );
+}
+
+#[test]
+fn a_dangling_link_is_refused() {
+    refused_entry(|d| link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-b.md")), "harness: error: the entry ISSUE-002-b.md is a symbolic link");
+}
+
+#[test]
+fn a_link_to_a_folder_is_refused() {
+    refused_entry(
+        |d| {
+            fs::create_dir_all(d.join("sub")).unwrap();
+            link(&d.join("sub"), &d.join("lessons/ISSUE-002-b.md"));
+        },
+        "harness: error: the entry ISSUE-002-b.md is a symbolic link",
+    );
+}
+
+#[test]
+fn a_name_with_one_digit_is_refused() {
+    refused_entry(|d| fs::write(d.join("lessons/ISSUE-1-b.md"), "x").unwrap(), &digit_line("ISSUE-1-b.md"));
+}
+
+#[test]
+fn a_name_with_two_digits_is_refused() {
+    refused_entry(|d| fs::write(d.join("lessons/ISSUE-02-b.md"), "x").unwrap(), &digit_line("ISSUE-02-b.md"));
+}
+
+#[test]
+fn a_name_with_four_digits_is_refused() {
+    refused_entry(|d| fs::write(d.join("lessons/ISSUE-0003-c.md"), "x").unwrap(), &digit_line("ISSUE-0003-c.md"));
+}
+
+#[test]
+fn a_fifo_is_refused_without_a_hang() {
+    refused_entry(|d| mkfifo(&d.join("lessons/ISSUE-002-b.md")), "harness: error: the entry ISSUE-002-b.md is not a regular file");
+}
+
+#[test]
+fn a_control_character_in_a_bad_entry_name_is_escaped() {
+    refused_entry(
+        |d| link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-a\u{1b}b.md")),
+        "harness: error: the entry ISSUE-002-a\\u{1b}b.md is a symbolic link",
+    );
+}
+
+#[test]
+fn a_newline_in_a_bad_entry_name_is_escaped() {
+    refused_entry(
+        |d| link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-a\nb.md")),
+        "harness: error: the entry ISSUE-002-a\\u{a}b.md is a symbolic link",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_is_not_utf8_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    refused_entry(
+        |d| fs::write(d.join("lessons").join(OsStr::from_bytes(b"ISSUE-002-\xff.md")), "x").unwrap(),
+        "harness: error: the entry ISSUE-002-\u{fffd}.md has a name that is not valid UTF-8",
+    );
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    fs::write(d.join("lessons").join(OsStr::from_bytes(b"\xff.md")), "x").unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), GOOD_OUT);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_link_with_four_digits_gives_the_digit_line() {
+    refused_entry(|d| link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-0002-b.md")), &digit_line("ISSUE-0002-b.md"));
+}
+
+#[test]
+fn a_link_to_a_fifo_is_refused_without_a_hang() {
+    refused_entry(
+        |d| {
+            mkfifo(&d.join("fifo"));
+            link(&d.join("fifo"), &d.join("lessons/ISSUE-002-b.md"));
+        },
+        "harness: error: the entry ISSUE-002-b.md is a symbolic link",
+    );
+}
+
+#[test]
+fn a_link_loop_is_refused() {
+    refused_entry(
+        |d| link(std::path::Path::new("ISSUE-002-b.md"), &d.join("lessons/ISSUE-002-b.md")),
+        "harness: error: the entry ISSUE-002-b.md is a symbolic link",
+    );
+}
+
+#[test]
+fn a_bad_entry_next_to_a_page_that_is_not_utf8_gives_only_the_entry_line() {
+    refused_entry(
+        |d| {
+            fs::write(d.join("lessons/ISSUE-003-c.md"), b"---\n\xff\n---\n").unwrap();
+            link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-b.md"));
+        },
+        "harness: error: the entry ISSUE-002-b.md is a symbolic link",
+    );
+}
+
+#[test]
+fn a_page_named_folder_is_skipped() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    fs::create_dir_all(d.join("lessons/ISSUE-002-dir.md")).unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), GOOD_OUT);
+}
+
+#[test]
+fn a_folder_with_a_two_digit_name_is_skipped() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    fs::create_dir_all(d.join("lessons/ISSUE-02-x.md")).unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), GOOD_OUT);
+}
+
+#[test]
+fn names_that_are_not_page_shaped_stay_skipped() {
+    // one folder per name: a case-insensitive file system would merge issue-001-x.md and ISSUE-001-x.MD
+    for n in ["README.md", "notes.md", "ISSUE-001.md", "ISSUE-001-a.txt", "ISSUE-abc-x.md", "issue-001-x.md", "ISSUE-001-x.MD", ".ISSUE-001-x.md"] {
+        let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+        link(&d.join("nowhere.md"), &d.join("lessons").join(n));
+        let o = look(&d);
+        assert_eq!(o.status.code(), Some(0), "{}: {}", n, stderr(&o));
+        assert_eq!(stdout(&o), GOOD_OUT, "{}", n);
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn several_bad_entries_come_in_name_order() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-003-d.md", &fm("match: [example]"))]);
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-001-a.md"));
+    fs::write(d.join("lessons/ISSUE-0001-b.md"), "x").unwrap();
+    mkfifo(&d.join("lessons/ISSUE-002-c.md"));
+    let o = look_timed(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        format!(
+            "{}\nharness: error: the entry ISSUE-001-a.md is a symbolic link\nharness: error: the entry ISSUE-002-c.md is not a regular file\n",
+            digit_line("ISSUE-0001-b.md")
+        )
+    );
+}
+
+#[test]
+fn bad_entries_are_sorted_not_given_in_folder_order() {
+    // APFS lists these names out of byte order (ISSUE-005-f.md second), so a missing sort goes red on macOS too
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-003-d.md", &fm("match: [example]"))]);
+    let names = ["ISSUE-005-f.md", "ISSUE-004-e.md", "ISSUE-002-c.md", "ISSUE-001-a.md", "ISSUE-0001-b.md"];
+    for n in names {
+        link(&d.join("nowhere.md"), &d.join("lessons").join(n));
+    }
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    let mut want: Vec<&str> = names.to_vec();
+    want.sort();
+    let want: String = want
+        .iter()
+        .map(|n| if n.starts_with("ISSUE-0001") { format!("{}\n", digit_line(n)) } else { format!("harness: error: the entry {} is a symbolic link\n", n) })
+        .collect();
+    assert_eq!(stderr(&o), want);
+}
+
+#[test]
+fn bad_entries_sort_by_the_raw_name_not_the_escaped_text() {
+    // raw: the byte 0x0a sorts before '0'; escaped: the text \u{a} sorts after '0'
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-a0.md"));
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-a\nb.md"));
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        "harness: error: the entry ISSUE-002-a\\u{a}b.md is a symbolic link\nharness: error: the entry ISSUE-002-a0.md is a symbolic link\n"
+    );
+}
+
+#[test]
+fn only_bad_entries_give_no_no_page_line() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[]);
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-001-a.md"));
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: error: the entry ISSUE-001-a.md is a symbolic link\n");
+}
+
+#[test]
+fn a_bad_entry_wins_over_a_bad_front_matter() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", "no front matter\n")]);
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-b.md"));
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: error: the entry ISSUE-002-b.md is a symbolic link\n");
+}
+
+#[test]
+fn a_missing_scope_file_wins_over_a_bad_entry() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    link(&d.join("nowhere.md"), &d.join("lessons/ISSUE-002-b.md"));
+    fs::remove_file(d.join("scope.txt")).unwrap();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stdout(&o).is_empty());
+    assert!(stderr(&o).starts_with("harness: error: "), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("ISSUE-002-b"), "{}", stderr(&o));
+}
+
+// ---- lookup refusals: front matter ----
+
+/// One page ISSUE-001-a.md: exit 1, stdout empty, stderr is exactly one refusal line per detail.
+fn refused_page(page: &str, details: &[&str]) {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", page)]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    let want: String = details.iter().map(|x| format!("harness: lesson lookup refused: ISSUE-001-a.md: {}\n", x)).collect();
+    assert_eq!(stderr(&o), want);
+    let _ = fs::remove_dir_all(&d);
+}
+
+const NOT_OPEN: &str = "FRONT-MATTER line 1 is not ---";
+
+#[test]
+fn an_empty_page_is_refused() {
+    refused_page("", &[NOT_OPEN]);
+}
+
+#[test]
+fn a_page_of_only_body_text_is_refused() {
+    refused_page("# a\ntext\n", &[NOT_OPEN]);
+}
+
+#[test]
+fn a_first_line_with_a_trailing_blank_is_refused() {
+    refused_page("--- \nmatch: [example]\n---\n", &[NOT_OPEN]);
+}
+
+#[test]
+fn a_byte_order_mark_before_the_first_line_is_refused() {
+    refused_page("\u{feff}---\nmatch: [example]\n---\n", &[NOT_OPEN]);
+}
+
+#[test]
+fn a_page_with_no_closing_line_is_refused() {
+    refused_page("---\nmatch: [example]\n", &["FRONT-MATTER no closing ---"]);
+}
+
+#[test]
+fn a_closing_line_with_a_trailing_blank_is_refused() {
+    refused_page("---\nmatch: [example]\n--- \n", &["FRONT-MATTER no closing ---"]);
+}
+
+#[test]
+fn a_blank_line_inside_the_front_matter_is_refused() {
+    refused_page("---\nmatch: [example]\n\n---\n", &["FRONT-MATTER line 3 is not key: value"]);
+}
+
+#[test]
+fn a_key_with_a_blank_inside_is_refused() {
+    refused_page("---\nma tch: [example]\n---\n", &["FRONT-MATTER line 2 is not key: value"]);
+}
+
+#[test]
+fn a_repeated_other_key_is_refused() {
+    refused_page("---\ntitle: a\ntitle: b\nmatch: [example]\n---\n", &["FRONT-MATTER line 3 repeats the key title"]);
+}
+
+#[test]
+fn a_match_value_that_is_not_a_list_is_refused() {
+    refused_page("---\nmatch: example\n---\n", &["MATCH match example is not an inline list [..]"]);
+}
+
+#[test]
+fn an_empty_match_list_is_refused() {
+    refused_page("---\nmatch: []\n---\n", &["MATCH match is an empty list"]);
+}
+
+#[test]
+fn a_match_list_with_an_empty_part_is_refused() {
+    refused_page("---\nmatch: [a,,b]\n---\n", &["MATCH match has an empty token"]);
+}
+
+#[test]
+fn two_problems_on_one_page_give_two_lines() {
+    refused_page("---\nmatch: [a,,b]\n\n---\n", &["FRONT-MATTER line 3 is not key: value", "MATCH match has an empty token"]);
+}
+
+#[test]
+fn bad_pages_come_in_name_order_after_the_ticket_line() {
+    let d = setup(b"{}", b"src/\n", &[("ISSUE-002-b.md", "x\n"), ("ISSUE-001-a.md", "y\n")]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    let err = stderr(&o);
+    let l: Vec<&str> = err.lines().collect();
+    assert_eq!(l.len(), 3, "{}", err);
+    assert!(l[0].starts_with("harness: ticket refused: "), "{}", err);
+    assert_eq!(l[1], format!("harness: lesson lookup refused: ISSUE-001-a.md: {}", NOT_OPEN));
+    assert_eq!(l[2], format!("harness: lesson lookup refused: ISSUE-002-b.md: {}", NOT_OPEN));
+}
+
+#[test]
+fn a_good_page_next_to_a_bad_page_prints_nothing_on_stdout() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]")), ("ISSUE-002-b.md", "x\n")]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    assert_eq!(stderr(&o), format!("harness: lesson lookup refused: ISSUE-002-b.md: {}\n", NOT_OPEN));
+}
+
+#[test]
+fn a_crlf_front_matter_is_read() {
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", "---\r\nmatch: [example]\r\n---\r\n")]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), GOOD_OUT);
+}
+
+// ---- lookup refusals: lint comparison, nothing written, nothing printed ----
+
+#[test]
+fn lint_and_lookup_agree_on_the_front_matter() {
+    let bad: [(&str, &str); 13] = [
+        ("ISSUE-001-empty.md", ""),
+        ("ISSUE-002-body.md", "# a\ntext\n"),
+        ("ISSUE-003-trail.md", "--- \nmatch: [example]\n---\n"),
+        ("ISSUE-004-bom.md", "\u{feff}---\nmatch: [example]\n---\n"),
+        ("ISSUE-005-noclose.md", "---\nmatch: [example]\n"),
+        ("ISSUE-006-closetrail.md", "---\nmatch: [example]\n--- \n"),
+        ("ISSUE-007-blankline.md", "---\nmatch: [example]\n\n---\n"),
+        ("ISSUE-008-keyblank.md", "---\nma tch: [example]\n---\n"),
+        ("ISSUE-009-repeat.md", "---\ntitle: a\ntitle: b\nmatch: [example]\n---\n"),
+        ("ISSUE-010-notlist.md", "---\nmatch: example\n---\n"),
+        ("ISSUE-011-emptylist.md", "---\nmatch: []\n---\n"),
+        ("ISSUE-012-emptytok.md", "---\nmatch: [a,,b]\n---\n"),
+        ("ISSUE-013-two.md", "---\nmatch: [a,,b]\n\n---\n"),
+    ];
+    let keep = |l: &&str| {
+        let rest = l.split_once(": ").map(|x| x.1).unwrap_or("");
+        rest.starts_with("FRONT-MATTER") || rest.starts_with("MATCH")
+    };
+    let mut pages: Vec<(&str, &str)> = bad.to_vec();
+    pages.push(("ISSUE-014-good.md", "---\nmatch: [example]\n---\n"));
+    let d = setup(default_ticket("t").as_bytes(), b"src/\n", &pages);
+    let lint = run(&["lesson", "lint", d.join("lessons").to_str().unwrap()]);
+    let so = stdout(&lint);
+    let lint_lines: Vec<&str> = so.lines().filter(keep).collect();
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    let se = stderr(&o);
+    let look_lines: Vec<&str> = se.lines().map(|l| l.strip_prefix("harness: lesson lookup refused: ").unwrap()).collect();
+    assert!(!look_lines.is_empty());
+    assert_eq!(lint_lines, look_lines);
+    // the two empty-token pages: lint prints no FRONT-MATTER or MATCH line, lookup refuses each
+    let d = setup(
+        default_ticket("t").as_bytes(),
+        b"src/\n",
+        &[("ISSUE-001-dq.md", "---\nmatch: [\"\"]\n---\n"), ("ISSUE-002-sq.md", "---\nmatch: ['']\n---\n")],
+    );
+    let lint = run(&["lesson", "lint", d.join("lessons").to_str().unwrap()]);
+    let so = stdout(&lint);
+    assert!(!so.lines().any(|l| keep(&l)), "{}", so);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(1));
+    let want = "harness: lesson lookup refused: ISSUE-001-dq.md: MATCH match has a token with no text between its quotes\nharness: lesson lookup refused: ISSUE-002-sq.md: MATCH match has a token with no text between its quotes\n";
+    assert_eq!(stderr(&o), want);
+}
+
+/// One line per path under `p`: its type, and for a file its size and bytes, for a link its target.
+fn listing(p: &std::path::Path, out: &mut Vec<String>) {
+    let md = fs::symlink_metadata(p).unwrap();
+    if md.file_type().is_symlink() {
+        out.push(format!("{} link -> {:?}", p.display(), fs::read_link(p).unwrap()));
+    } else if md.is_dir() {
+        out.push(format!("{} dir", p.display()));
+        let mut kids: Vec<PathBuf> = fs::read_dir(p).unwrap().map(|e| e.unwrap().path()).collect();
+        kids.sort();
+        for k in kids {
+            listing(&k, out);
+        }
+    } else {
+        out.push(format!("{} file {} {:?}", p.display(), md.len(), fs::read(p).unwrap()));
+    }
+}
+
+#[test]
+fn lookup_writes_nothing() {
+    let cases: [(&str, i32); 3] = [("good", 0), ("nofm", 1), ("link", 2)];
+    for (tag, code) in cases {
+        let page = if tag == "nofm" { "no front matter\n".to_string() } else { fm("match: [example]") };
+        let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &page)]);
+        fs::create_dir_all(d.join("cwd")).unwrap();
+        if tag == "link" {
+            link(&d.join("lessons/ISSUE-001-a.md"), &d.join("lessons/ISSUE-002-b.md"));
+        }
+        let snap = |d: &std::path::Path| {
+            let mut v = Vec::new();
+            listing(d, &mut v);
+            v
+        };
+        let before = snap(&d);
+        let (l, t, s) = (d.join("lessons"), d.join("ticket.json"), d.join("scope.txt"));
+        let o = Command::new(BIN)
+            .args(["lesson", "lookup", l.to_str().unwrap(), "--ticket", t.to_str().unwrap(), "--scope-file", s.to_str().unwrap()])
+            .current_dir(d.join("cwd"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(code), "{}: {}", tag, stderr(&o));
+        assert_eq!(before, snap(&d), "{}", tag);
+        assert_eq!(fs::read_dir(d.join("cwd")).unwrap().count(), 0, "{}", tag);
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn nothing_of_a_page_or_the_ticket_is_printed() {
+    const M: &str = "zqmarkword";
+    let ticket = ticket_json("example", &format!("{} title", M), &[&format!("{} criterion", M), "checks/x"], &format!("{} obj", M), &format!("{} grp", M));
+    let page = fm(&format!("title: {m}\nsources: {m}\nmatch: [example]", m = M)) + &format!("# head\n{m} body\n```\n{m} fenced\n```\n## {m} section\n", m = M);
+    let d = setup(ticket.as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &page)]);
+    let check = |tag: &str, code: i32| {
+        let o = look(&d);
+        assert_eq!(o.status.code(), Some(code), "{}: {}", tag, stderr(&o));
+        assert!(!stdout(&o).contains(M) && !stderr(&o).contains(M), "{}: {}{}", tag, stdout(&o), stderr(&o));
+        o
+    };
+    let o = check("exit 0", 0);
+    assert!(stdout(&o).starts_with("lesson: ISSUE-001 head ISSUE-001-a.md\n"), "{}", stdout(&o));
+    fs::write(d.join("lessons/ISSUE-002-b.md"), fm(&format!("{} has no colon\nmatch: [example]", M))).unwrap();
+    fs::write(d.join("lessons/ISSUE-003-c.md"), fm(&format!("sources: {m}\nsources: {m}\nmatch: [example]", m = M))).unwrap();
+    let o = check("exit 1", 1);
+    assert_eq!(stderr(&o).lines().count(), 2, "{}", stderr(&o));
+    fs::write(d.join("target.md"), format!("{} target\n", M)).unwrap();
+    link(&d.join("target.md"), &d.join("lessons/ISSUE-004-d.md"));
+    let o = check("exit 2", 2);
+    assert_eq!(stderr(&o), "harness: error: the entry ISSUE-004-d.md is a symbolic link\n");
 }
