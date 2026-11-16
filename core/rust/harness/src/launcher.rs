@@ -11,8 +11,8 @@
 //! no short id, E2BIG, timeout); 4 the id could not be mapped and the session was stopped; 5 the id
 //! could not be mapped and the stop FAILED (stop it by hand); 6 a signer launch was refused because its
 //! brief names a builder-state entry from the config (a `launch_refused` row is written, nothing started);
-//! 7 a `--turn` launch is refused because its provider is not the turn and no `--turn-reason` was given
-//! (no row is written, nothing started).
+//! 7 a `--turn` launch is refused as out of turn with no `--turn-reason` given (no row is written,
+//! nothing started).
 use crate::events::{self, Field, Kind, Record};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

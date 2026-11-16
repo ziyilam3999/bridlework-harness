@@ -248,7 +248,7 @@ fn launch_turn_with_reason_records_turn_next_and_reason() {
     let l = out(&e.launches(&f));
     let last = l.lines().last().unwrap();
     assert!(last.ends_with("state=bound provider=zai turn_next=claude"), "{last}");
-    // a reason with the provider equal to the turn is written too
+    // a reason on a launch that follows a reasoned row is written too
     let o = e.launch(&["--records", rec(&f), "--provider", "zai", "--turn", "claude,zai", "--turn-reason", "again"]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     let t = text(&f);

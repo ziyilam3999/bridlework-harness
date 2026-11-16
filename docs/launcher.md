@@ -13,8 +13,8 @@ harness session next-provider --providers <name>[,<name>] [--records <file>]
 `--provider <name>` records which provider ran the seat. A name is 1 to 16 bytes: a lowercase ASCII letter, then
 lowercase ASCII letters or digits (`claude`, `zai` and `gpt5` pass; `Zai`, `zAi`, `z-ai`, an empty value and a 17-byte name do not).
 A refused name, the flag given twice or the flag with no value is exit 2 before any write; the host is not run.
-Any role may carry a provider. The launch does not read or parse earlier rows (the torn-tail check of the append step
-still runs) and prints the same stdout line as without it.
+Any role may carry a provider. A launch without `--turn` does not read or parse earlier rows (the torn-tail check of
+the append step still runs) and prints the same stdout line as without it.
 
 `--turn <name>[,<name>]` (the list form of `--providers`) asks for a turn check on a builder launch, and
 `--turn-reason <text>` (1 to 200 bytes, no control character, not only blanks) lets a launch out of turn go on; see step 3c.
@@ -40,7 +40,7 @@ still runs) and prints the same stdout line as without it.
 3c. Turn check, for a launch given `--turn`; the same lock and handle as step 4. The launcher takes the exclusive lock
    on the records file, reads the whole file through that handle (a file that did not exist is empty), computes the next
    provider as `next-provider` does for the `--turn` list, and appends the `launch` row through the same handle before the
-   lock is let go. No second lock is taken, so two launches at once cannot both take the same turn. The launch goes on
+   lock is let go. No second lock is taken, so with two names, two launches at once cannot both take the turn. The launch goes on
    when the provider equals the next provider, or when `--turn-reason` is given. Otherwise it exits 7 with no row written
    and nothing started; stderr starts with `launch refused: turn:` and names the case: `provider <p> is not the turn, next
    is <q>`, `the last counted launch <run id> carries no provider`, or `the last counted launch <run id> carries provider
@@ -156,7 +156,7 @@ host's working directory); `.harness/` is created when missing.
 | 4 | the id could not be mapped; the session was stopped (`<host> stop <short-id>` exited 0) |
 | 5 | the id could not be mapped and the stop failed; stderr names the short id, stop it by hand |
 | 6 | a signer launch was refused: its brief names a `builder_state` entry (a `launch_refused` row is written, nothing started) |
-| 7 | a `--turn` launch was refused: its provider is not the turn and no `--turn-reason` was given (step 3c; no row is written, nothing started) |
+| 7 | a `--turn` launch was refused as out of turn with no `--turn-reason` given (step 3c; no row is written, nothing started) |
 
 ## Brief cap
 
