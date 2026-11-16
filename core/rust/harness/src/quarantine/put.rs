@@ -272,7 +272,7 @@ pub fn put_with_step(
 
 /// The move did not happen: label state void, one void line, and the stop. The step runs right after a void label
 /// replace that succeeded; its `Err` ends put there with that stop and nothing more is written (a failed replace
-/// keeps the stop of today).
+/// ends with the stop that says the label or journal line may not say void).
 fn void_exit(
     label: &mut Label,
     entry_path: &Path,
@@ -859,7 +859,7 @@ fn settle_stopped(journal: &Path, entries: &Path) -> Result<(), Stop> {
 }
 
 /// One entry of an unsettled intent: the label is read once; a label whose sha256 equals the intent `label_sha` is
-/// settled as today, a label whose sha differs goes to the completed-label rule.
+/// settled as the intent label, a label whose sha differs goes to the completed-label rule.
 fn settle_one(p: &Rec, journal: &Path, entries: &Path) -> Result<(), Stop> {
     let undecided = || err3("a stopped put cannot be decided; nothing was moved; fix the entry by hand");
     let (date, name) = p.entry.split_once('/').ok_or_else(undecided)?;
@@ -907,7 +907,7 @@ fn settle_intent_label(p: &Rec, bytes: &[u8], date: &str, entry_path: &Path, jou
         .map_err(|_| err3("a stopped put could not be settled; nothing was moved; fix the entry by hand"))
 }
 
-/// The tail of a label as `Label::bytes` writes it: `head` is each byte before the `fingerprint_after` field,
+/// The tail of a label as `Label::bytes` writes it: `head` is each byte up to the quote that closes the field before `fingerprint_after`,
 /// then the four values of `fingerprint_after`, `state`, `judgeable` and `reason` (the `git` tail was checked).
 fn label_tail(text: &str) -> Option<(&str, &str, &str, &str, &str)> {
     let body = text.strip_suffix(",\"git\":\"none\"}\n")?.strip_suffix('"')?;
@@ -921,7 +921,8 @@ fn label_tail(text: &str) -> Option<(&str, &str, &str, &str, &str)> {
 /// A label whose sha differs from the intent `label_sha`: it is a completed label when it is the intent label with
 /// only `fingerprint_after`, `state`, `judgeable` and `reason` set as put sets them, proven by rebuilding the intent
 /// label and comparing its sha with the intent `label_sha`. A completed label is checked against the disk and kept
-/// byte-unchanged, with one journal line carrying the sha of the bytes as found; anything else is undecided.
+/// byte-unchanged, with one journal line carrying the sha of the bytes as found; a label that is not a completed
+/// label, or whose disk check fails, is undecided (a walk refusal and a failed journal write have their own stops).
 fn settle_completed_label(p: &Rec, bytes: &[u8], date: &str, entry_path: &Path, journal: &Path) -> Result<(), Stop> {
     let undecided = || err3("a stopped put cannot be decided; nothing was moved; fix the entry by hand");
     let text = std::str::from_utf8(bytes).map_err(|_| undecided())?;
