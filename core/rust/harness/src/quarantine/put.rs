@@ -14,7 +14,7 @@ use crate::launcher::sha256_hex;
 use crate::manifest::{self, Target};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -190,6 +190,7 @@ pub fn put_with_step(
     let before = walk_item(&src.full, true)?;
     // (7) the shelf
     let shelf = open_shelf(&qd, &date)?;
+    settle_stopped(&shelf.journal, &shelf.entries)?;
     // (8) entry, label, journal intent
     let (n, entry_path) = make_entry(&shelf.date_dir, &a.kind)?;
     let entry = format!("{date}/{}-{n}", a.kind);
@@ -507,6 +508,7 @@ fn visit(w: &mut W, p: &Path, name: &[u8], rel: &[u8], depth: usize, m: &fs::Met
 struct Shelf {
     _lock: File,
     journal: PathBuf,
+    entries: PathBuf,
     date_dir: PathBuf,
 }
 
@@ -568,7 +570,7 @@ fn open_shelf(qd: &Path, date: &str) -> Result<Shelf, Stop> {
     let _date_handle = shelf_dir(&date_dir)?;
     let journal = shelf.join("journal");
     let _journal_dir = shelf_dir(&journal)?;
-    Ok(Shelf { _lock: lock, journal, date_dir })
+    Ok(Shelf { _lock: lock, journal, entries, date_dir })
 }
 
 // ---------------------------------------------------------------- step 8: entry, label, journal
@@ -699,6 +701,183 @@ fn journal_append(dir: &Path, date: &str, line: &str) -> std::io::Result<()> {
         return Err(std::io::Error::other("a journal line was written in part"));
     }
     f.sync_all()
+}
+
+// ---------------------------------------------------------------- the settle of a stopped put
+
+#[derive(PartialEq, Clone, Copy)]
+enum JOp {
+    Intent,
+    Moved,
+    Void,
+}
+
+/// One journal line as put writes it.
+struct Rec {
+    op: JOp,
+    entry: String,
+    dev: u64,
+    ino: u64,
+    sha: String,
+}
+
+impl Rec {
+    /// The exact bytes the writer makes for this record (no newline).
+    fn text(&self) -> String {
+        match self.op {
+            JOp::Intent => format!(
+                "{{\"v\":1,\"op\":\"intent\",\"entry\":\"{}\",\"src_dev\":{},\"src_ino\":{},\"label_sha\":\"{}\"}}",
+                self.entry, self.dev, self.ino, self.sha
+            ),
+            JOp::Moved => format!("{{\"v\":1,\"op\":\"moved\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}", self.entry, self.sha),
+            JOp::Void => format!("{{\"v\":1,\"op\":\"void\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}", self.entry, self.sha),
+        }
+    }
+}
+
+/// `<YYYYMMDD>/<kind>-<n>` as the writer makes it.
+fn entry_ok(e: &str) -> bool {
+    let Some((date, rest)) = e.split_once('/') else { return false };
+    let Some((kind, n)) = rest.rsplit_once('-') else { return false };
+    date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && KINDS.contains(&kind)
+        && num_ok(n)
+        && n.parse::<u32>().is_ok_and(|n| n >= 1)
+        && !n.starts_with('0')
+}
+
+/// One complete line: one of the three shapes, exact bytes, or `None`.
+fn parse_line(raw: &[u8]) -> Option<Rec> {
+    let line = std::str::from_utf8(raw).ok()?;
+    let rec = if let Some(r) = line.strip_prefix("{\"v\":1,\"op\":\"intent\",\"entry\":\"") {
+        let (entry, r) = r.split_once("\",\"src_dev\":")?;
+        let (dev, r) = r.split_once(",\"src_ino\":")?;
+        let (ino, r) = r.split_once(",\"label_sha\":\"")?;
+        let sha = r.strip_suffix("\"}")?;
+        if !num_ok(dev) || !num_ok(ino) {
+            return None;
+        }
+        Rec { op: JOp::Intent, entry: entry.to_string(), dev: dev.parse().ok()?, ino: ino.parse().ok()?, sha: sha.to_string() }
+    } else {
+        let (op, r) = if let Some(r) = line.strip_prefix("{\"v\":1,\"op\":\"moved\",\"entry\":\"") {
+            (JOp::Moved, r)
+        } else {
+            (JOp::Void, line.strip_prefix("{\"v\":1,\"op\":\"void\",\"entry\":\"")?)
+        };
+        let (entry, r) = r.split_once("\",\"label_sha\":\"")?;
+        let sha = r.strip_suffix("\"}")?;
+        Rec { op, entry: entry.to_string(), dev: 0, ino: 0, sha: sha.to_string() }
+    };
+    let sha_ok = rec.sha.len() == 64 && rec.sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (sha_ok && entry_ok(&rec.entry) && rec.text() == line).then_some(rec)
+}
+
+/// Read each journal file, in k order per date. A fragment at the end of a file (no newline) is skipped; the intents
+/// with no later moved or void line come back in journal order.
+fn unsettled_intents(journal: &Path) -> Result<Vec<Rec>, Stop> {
+    let bad_name = || err3("the journal folder holds a name that is not a journal file; nothing was moved; fix it by hand");
+    let unreadable = || err3("a journal file cannot be read; nothing was moved");
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for ent in fs::read_dir(journal).map_err(|_| unreadable())? {
+        let name = ent.map_err(|_| unreadable())?.file_name();
+        let n = name.to_str().ok_or_else(bad_name)?;
+        let (date, k) = n.strip_suffix(".jsonl").and_then(|r| r.split_once('-')).ok_or_else(bad_name)?;
+        let kn = if num_ok(k) { k.parse::<u64>().ok() } else { None };
+        match kn {
+            Some(kn) if kn >= 1 && date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && n == format!("{date}-{kn}.jsonl") => {
+                files.push((date.to_string(), kn))
+            }
+            _ => return Err(bad_name()),
+        }
+    }
+    files.sort();
+    let mut pending: Vec<Rec> = Vec::new();
+    for (date, k) in files {
+        let mut f = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(journal.join(format!("{date}-{k}.jsonl")))
+            .map_err(|_| unreadable())?;
+        if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Err(unreadable());
+        }
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).map_err(|_| unreadable())?;
+        for (i, chunk) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+            let Some(line) = chunk.strip_suffix(b"\n") else { continue };
+            let Some(rec) = parse_line(line) else {
+                return Err(err3(&format!(
+                    "journal file {date} line {} is not a line put wrote; nothing was moved; fix it by hand",
+                    i + 1
+                )));
+            };
+            if rec.op == JOp::Intent {
+                pending.push(rec);
+            } else {
+                pending.retain(|p| p.entry != rec.entry);
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// `label.json` of an entry: no link follow, a regular file, at most 64 KiB.
+fn read_label(entry_path: &Path) -> Option<Vec<u8>> {
+    let f = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK).open(entry_path.join("label.json")).ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut v = Vec::new();
+    f.take(65_537).read_to_end(&mut v).ok()?;
+    (v.len() <= 65_536).then_some(v)
+}
+
+/// Under the shelf lock: settle each intent with no later moved or void line from what is on disk, or refuse.
+/// Moves nothing, removes nothing, does not look at the old source path.
+fn settle_stopped(journal: &Path, entries: &Path) -> Result<(), Stop> {
+    for p in unsettled_intents(journal)? {
+        settle_one(&p, journal, entries)?;
+    }
+    Ok(())
+}
+
+fn settle_one(p: &Rec, journal: &Path, entries: &Path) -> Result<(), Stop> {
+    let undecided = || err3("a stopped put cannot be decided; nothing was moved; fix the entry by hand");
+    let (date, name) = p.entry.split_once('/').ok_or_else(undecided)?;
+    let entry_path = entries.join(date).join(name);
+    let text = read_label(&entry_path).filter(|b| sha256_hex(b) == p.sha).ok_or_else(undecided)?;
+    let text = String::from_utf8(text).map_err(|_| undecided())?;
+    let marks = ["\"state\":\"intent\"", "\"fingerprint_after\":\"\"", "\"judgeable\":\"yes\",\"reason\":\"\""];
+    if !text.starts_with(&format!("{{\"v\":1,\"entry\":\"{}\",", p.entry)) || marks.iter().any(|m| !text.contains(m)) {
+        return Err(undecided());
+    }
+    let item = entry_path.join("item");
+    let (op, done) = match fs::symlink_metadata(&item) {
+        Ok(m) if m.dev() == p.dev && m.ino() == p.ino => {
+            let before = text
+                .split_once("\"fingerprint_before\":\"")
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(f, _)| f.to_string())
+                .ok_or_else(undecided)?;
+            let w = walk_item(&item, true).map_err(|_| err3("the item of a stopped put cannot be walked; nothing was moved"))?;
+            let mut done = text
+                .replacen("\"fingerprint_after\":\"\"", &format!("\"fingerprint_after\":\"{}\"", w.fingerprint), 1)
+                .replacen("\"state\":\"intent\"", "\"state\":\"moved\"", 1);
+            if w.fingerprint != before {
+                done = done.replacen("\"judgeable\":\"yes\",\"reason\":\"\"", "\"judgeable\":\"no\",\"reason\":\"changed-during-put\"", 1);
+            }
+            ("moved", done)
+        }
+        Ok(_) => return Err(undecided()),
+        Err(e) if e.kind() == ErrorKind::NotFound => ("void", text.replacen("\"state\":\"intent\"", "\"state\":\"void\"", 1)),
+        Err(_) => return Err(undecided()),
+    };
+    let done = done.into_bytes();
+    let line = format!("{{\"v\":1,\"op\":\"{op}\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}\n", p.entry, sha256_hex(&done));
+    replace_label(&entry_path, &done)
+        .and_then(|()| journal_append(journal, date, &line))
+        .map_err(|_| err3("a stopped put could not be settled; nothing was moved; fix the entry by hand"))
 }
 
 #[cfg(test)]

@@ -952,3 +952,202 @@ fn a_torn_journal_tail_starts_a_new_journal_file() {
     assert!(lines[0].contains("\"op\":\"intent\"") && lines[1].contains("\"op\":\"moved\""), "journal: {second}");
     assert!(lines[0].contains("20260101/hand-2"));
 }
+
+// ---------------------------------------------------------------- the settle of a stopped put
+
+fn journal1(f: &Fix) -> PathBuf {
+    f.q.join("@shelf/journal/20260101-1.jsonl")
+}
+
+/// Put `item` in process and stop at `at` (the shape of a crash there).
+fn stop_at(f: &Fix, item: &Path, at: Point) {
+    let step = move |pt: Point| -> Result<(), Stop> {
+        if pt == at {
+            Err(Stop(3, "halt".to_string()))
+        } else {
+            Ok(())
+        }
+    };
+    match put::put_with_step(&pargs(f, item), &dev_of, &step) {
+        Err(Stop(3, line)) => assert_eq!(line, "halt"),
+        Err(Stop(c, line)) => panic!("exit {c}: {line}"),
+        Ok(line) => panic!("done: {line}"),
+    }
+}
+
+#[test]
+fn a_put_stopped_after_the_intent_is_voided_by_the_next_put() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    let a_before = snap(&a);
+    stop_at(&f, &a, Point::AfterIntent);
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert!(out(&o).contains("entry=20260101/hand-2"), "stdout: {}", out(&o));
+    no_leak(&f, &o);
+    let label = fs::read(entry_dir(&f, "hand-1").join("label.json")).unwrap();
+    assert!(String::from_utf8_lossy(&label).contains("\"state\":\"void\""));
+    let journal = read(&journal1(&f));
+    let want = format!("{{\"v\":1,\"op\":\"void\",\"entry\":\"20260101/hand-1\",\"label_sha\":\"{}\"}}", sha256_hex(&label));
+    assert!(journal.lines().any(|l| l == want), "journal: {journal}");
+    assert_eq!(snap(&a), a_before, "the first source is byte-unchanged");
+    assert!(!entry_dir(&f, "hand-1").join("item").exists());
+}
+
+#[test]
+fn a_put_stopped_after_the_move_is_finished_by_the_next_put() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterMove);
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    let label = fs::read(entry_dir(&f, "hand-1").join("label.json")).unwrap();
+    let text = String::from_utf8_lossy(&label).to_string();
+    assert!(
+        text.contains("\"state\":\"moved\"") && text.contains("\"judgeable\":\"yes\"") && !text.contains("\"fingerprint_after\":\"\""),
+        "label: {text}"
+    );
+    let journal = read(&journal1(&f));
+    let want = format!("{{\"v\":1,\"op\":\"moved\",\"entry\":\"20260101/hand-1\",\"label_sha\":\"{}\"}}", sha256_hex(&label));
+    assert!(journal.lines().any(|l| l == want), "journal: {journal}");
+    assert!(entry_dir(&f, "hand-1").join("item/a.txt").exists());
+}
+
+#[test]
+fn a_new_folder_at_the_old_source_path_does_not_change_the_settle() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterMove);
+    assert!(!a.exists());
+    plain_item(&f, "a");
+    fs::write(a.join("new.txt"), b"later").unwrap();
+    let a_before = snap(&a);
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    let text = read(&entry_dir(&f, "hand-1").join("label.json"));
+    assert!(text.contains("\"state\":\"moved\"") && text.contains("\"judgeable\":\"yes\""), "label: {text}");
+    assert_eq!(snap(&a), a_before, "the new folder is byte-unchanged");
+}
+
+#[test]
+fn an_item_with_another_inode_in_an_unsettled_entry_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterIntent);
+    let other = entry_dir(&f, "hand-1").join("item");
+    fs::create_dir_all(other.join("x")).unwrap();
+    fs::write(other.join("x/k.txt"), b"keep").unwrap();
+    let (other_before, b_before) = (snap(&other), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    refused(&f, &o, 3);
+    assert!(err(&o).contains("cannot be decided") && err(&o).contains("nothing was moved"), "stderr: {}", err(&o));
+    assert_eq!(snap(&other), other_before);
+    assert_eq!(snap(&b), b_before);
+    assert!(a.exists() && !entry_dir(&f, "hand-2").exists());
+}
+
+#[test]
+fn a_label_that_does_not_match_its_intent_sha_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterIntent);
+    let label = entry_dir(&f, "hand-1").join("label.json");
+    let mut bytes = fs::read(&label).unwrap();
+    bytes.pop();
+    bytes.extend_from_slice(b" \n");
+    fs::write(&label, &bytes).unwrap();
+    let (a_before, b_before) = (snap(&a), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    refused(&f, &o, 3);
+    assert!(err(&o).contains("cannot be decided"), "stderr: {}", err(&o));
+    assert_eq!(fs::read(&label).unwrap(), bytes);
+    assert_eq!((snap(&a), snap(&b)), (a_before, b_before));
+}
+
+#[test]
+fn a_change_before_the_stop_is_labelled_by_the_settle() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    let moved = entry_dir(&f, "hand-1").join("item/a.txt");
+    let step = |pt: Point| -> Result<(), Stop> {
+        if pt == Point::AfterMove {
+            let mut x = fs::OpenOptions::new().append(true).open(&moved).unwrap();
+            x.write_all(b" and more").unwrap();
+            return Err(Stop(3, "halt".to_string()));
+        }
+        Ok(())
+    };
+    match put::put_with_step(&pargs(&f, &a), &dev_of, &step) {
+        Err(Stop(3, line)) => assert_eq!(line, "halt"),
+        _ => panic!("not stopped"),
+    }
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    let text = read(&entry_dir(&f, "hand-1").join("label.json"));
+    assert!(
+        text.contains("\"state\":\"moved\"") && text.contains("\"judgeable\":\"no\"") && text.contains("\"reason\":\"changed-during-put\""),
+        "label: {text}"
+    );
+}
+
+#[test]
+fn a_stale_label_tmp_does_not_block_the_settle() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterIntent);
+    let stale = entry_dir(&f, "hand-1").join(format!("label.json.{}-1.tmp", std::process::id()));
+    fs::write(&stale, b"stale").unwrap();
+    match put::put(&pargs(&f, &b)) {
+        Ok(line) => assert!(line.contains("entry=20260101/hand-2"), "line: {line}"),
+        Err(Stop(c, line)) => panic!("exit {c}: {line}"),
+    }
+    assert!(read(&entry_dir(&f, "hand-1").join("label.json")).contains("\"state\":\"void\""));
+    assert_eq!(fs::read(&stale).unwrap(), b"stale");
+}
+
+#[test]
+fn a_torn_journal_tail_is_skipped_by_the_reader() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterIntent);
+    let mut fh = fs::OpenOptions::new().append(true).open(journal1(&f)).unwrap();
+    fh.write_all(b"{\"v\":1,\"op\":\"vo").unwrap();
+    drop(fh);
+    let o = put_cmd(&f, &b, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    no_leak(&f, &o);
+    assert!(read(&entry_dir(&f, "hand-1").join("label.json")).contains("\"state\":\"void\""));
+}
+
+#[test]
+fn a_bad_complete_journal_line_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterIntent);
+    let mut fh = fs::OpenOptions::new().append(true).open(journal1(&f)).unwrap();
+    fh.write_all(b"{\"v\":1,\"op\":\"void\",\"entry\":\"20260101/hand-1\"}\n").unwrap();
+    drop(fh);
+    let (j_before, b_before) = (fs::read(journal1(&f)).unwrap(), snap(&b));
+    let o = put_cmd(&f, &b, &[]);
+    refused(&f, &o, 3);
+    assert!(err(&o).contains("20260101") && err(&o).contains("line 2"), "stderr: {}", err(&o));
+    assert_eq!(fs::read(journal1(&f)).unwrap(), j_before);
+    assert_eq!(snap(&b), b_before);
+    assert!(read(&entry_dir(&f, "hand-1").join("label.json")).contains("\"state\":\"intent\""));
+}
+
+#[test]
+fn a_journal_file_with_another_name_exits_3() {
+    let f = fixture();
+    let (a, b) = (plain_item(&f, "a"), plain_item(&f, "b"));
+    stop_at(&f, &a, Point::AfterIntent);
+    fs::write(f.q.join("@shelf/journal/notes.txt"), b"n").unwrap();
+    let b_before = snap(&b);
+    let o = put_cmd(&f, &b, &[]);
+    refused(&f, &o, 3);
+    assert!(err(&o).contains("nothing was moved"), "stderr: {}", err(&o));
+    assert_eq!(snap(&b), b_before);
+}
