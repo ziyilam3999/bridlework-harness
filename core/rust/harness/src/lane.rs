@@ -12,7 +12,8 @@
 //! of a live ticket of the same repo is refused with `clash`: checked after `already-live` and the cap, before anything is written (`scope_entry_parts`
 //! is the normal form of that comparison). No directory fsync is done, so a claim or release is not guaranteed to survive a crash. Release is
 //! explicit: a lane is not freed by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
-//! together) appends one line to `<records-dir>/<ticket-id>.release`, checked fail closed before the lane file is removed.
+//! together) that frees a lane appends one line to `<records-dir>/<ticket-id>.release`; the records dir and the record are checked before the lane
+//! file is removed, and a write error after it is exit 2 with the lane freed.
 //! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
 //! field, and `clash` also names the live ticket and the overlapping pair of entries); 2 usage error, unreadable or refused input, or a lanes
 //! dir in a bad state.
@@ -496,7 +497,8 @@ fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Resul
 }
 
 /// Free the lane of `ticket`, as one critical section, reading the dir under the config name bound. With `spec`
-/// one release record line is appended after the lane file is removed, fail closed (`docs/lanes.md` gives the order).
+/// the records dir and the record are checked before the lane file is removed (a refusal leaves the lane held), then one release record
+/// line is appended; a write error then is exit 2 with the lane freed (`docs/lanes.md` gives the order).
 fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Result<Result<(), Refusal>, String> {
     if !check_dir(dir, false)? {
         return Ok(Err(Refusal::NotLive));
@@ -527,7 +529,8 @@ fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Re
             Err(_) => return Err("the release record cannot be opened".to_string()),
         }
         let mut f = open_record(&path)?;
-        // Re-check through the open handle, so a path swapped for a link between the two calls is still caught.
+        // Re-check through the open handle, so a path swapped for a fifo or other non-regular file between the two calls is still caught
+        // (a swapped-in link already fails the open).
         let meta = f.metadata().map_err(|_| "the release record cannot be opened".to_string())?;
         if !meta.file_type().is_file() {
             return Err("the release record is not a regular file".to_string());
@@ -555,7 +558,8 @@ fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Re
     Ok(Ok(()))
 }
 
-/// What a release with the record options writes: the line parts, all checked before the lanes dir is touched.
+/// What a release with the record options writes: the line parts `at` and `reason` (checked before the lanes dir is touched) and the folder
+/// `records_dir` (the given path is checked before it, the resolved path under the lock).
 struct ReleaseSpec<'a> {
     at: &'a str,
     reason: &'a str,
@@ -571,7 +575,7 @@ const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
 const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
 
 /// Open the release record for reading and appending, create allowed, without following a link and without
-/// blocking (a fifo fails the open at once).
+/// blocking (a fifo does not block the open; the regular-file checks before and after it refuse it).
 fn open_record(p: &Path) -> Result<fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new().read(true).append(true).create(true).custom_flags(OPEN_NOFOLLOW_NONBLOCK).open(p).map_err(|_| "the release record cannot be opened".to_string())

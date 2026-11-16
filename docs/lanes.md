@@ -118,20 +118,21 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 <at> lane=<n> reason=<reason>
 ```
 
-`<n>` is the lane number of the record the release removed. `reason=` is the last field and runs to the line end. Lines already in the file are kept byte for byte and are not checked.
+`<n>` is the lane number of the record the release removed. `reason=` is the last field and runs to the line end. Lines already in the file are kept byte for byte; their content is not checked, only the file as a whole (step (d)).
 
 `--reason` is checked before the lanes dir is touched, in this order: not empty or only white space; no newline; no control character and no U+2028 / U+2029; at most 1024 bytes. Each refusal is exit 2 with one `lane: error:` line, the lane stays held, no record is written and the records dir is not created. `--reason --at <ts>` takes `--at` as the reason text, so the timestamp becomes a second positional argument and the call is exit 2 as well.
 
-Under the lane lock, in this order: (a) the ticket's record is looked up — `not-live` (exit 1) writes no record and creates no records dir; (b) the records dir is created with its parents when missing, and a link or a non-folder is exit 2; (c) a record path that is there and is not a regular file (a link, a folder, a fifo) is exit 2; (d) the record is opened without following a link and without blocking, and an existing record over 1 MiB, not utf-8, or without a final newline is exit 2 (an empty file is accepted); (e) the lane file is removed; (f) the line is written and synced — on a write error the file is cut back to its old length and the exit is 2, with the lane freed. A failure before (e) leaves the lane held.
+Under the lane lock (a missing lanes dir is `not-live` before the lock), in this order: (a) the ticket's record is looked up — `not-live` (exit 1) writes no record and creates no records dir; (b) the records dir is created with its parents when missing, and a link or a non-folder is exit 2; (c) a record path that is there and is not a regular file (a link, a folder, a fifo) is exit 2; (d) the record is opened without following a link and without blocking, and an existing record over 1 MiB, not utf-8, or without a final newline is exit 2 (an empty file is accepted); (e) the lane file is removed; (f) the line is written and synced — on a write or sync error the file is cut back to its old length (a failure of the cut is ignored) and the exit is 2 with `lane: error: the lane was freed and the release record cannot be written`, with the lane freed. A failure before (e) leaves the lane held.
 
-The records dir must not be the lanes dir or inside it, also through a symbolic link (checked on the resolved paths): a ticket id such as `lane-1` would put its record among the lane records, which the dir reader refuses. Exit 2, nothing freed.
+The records dir must not be the lanes dir or inside it. A given path with a `.` or `..` part, or one that starts with the given `--lanes-dir`, is exit 2 before the lock. Under the lock the check runs on resolved paths (a link counts): after (a) and before anything is created, on the nearest existing folder of the path; and again after (b) on the records dir, which this call removes again when it created it (folders it created above it stay; a path that cannot be resolved counts as inside). A ticket id such as `lane-1` would put its record among the lane records, which the dir reader refuses. Exit 2, nothing freed.
 
 Stricter than the wrapper writer it replaces:
 
 - a reason over 1024 bytes is refused;
-- U+0085 and other C1 characters, and U+2028 / U+2029, are refused (the wrapper result depends on its locale);
+- U+0085 and other C1 characters are refused (the wrapper result depends on its locale);
+- U+2028 and U+2029 are refused (the wrapper accepts them);
 - a reason of only no-break or other Unicode spaces is blank here (the C-locale wrapper accepts it);
-- an existing record over 1 MiB, not UTF-8, or with a torn tail is refused;
+- an existing record over 1 MiB, not UTF-8, or without a final newline is refused;
 - a records dir that is the lanes dir or inside it is refused;
 - a records dir or record problem is exit 2, where the wrapper exits 1.
 
