@@ -1,11 +1,11 @@
 //! Resource manifest core (std only): the per-ticket append-only JSON Lines file that lists what a ticket owns.
 //! One operation per line, compact, fixed key order, every key present, `v` (schema version) on every line.
 //! Same LINE rules as the event log (`events.rs`): a final fragment with no trailing newline is a TORN TAIL, reported and
-//! never parsed; a complete bad line is CORRUPTION and stops the read. The reader and writer discipline is the manifest's
-//! own (the event log locks no reader and cuts back no failed write): the writer appends under an exclusive lock, one
+//! not parsed; a complete bad line is CORRUPTION and stops the read. The manifest's reader and writer differ from the
+//! event log's (the event log locks no reader and cuts back no failed write): the writer appends under an exclusive lock, one
 //! write per line, then `sync_all`, and refuses to append onto a torn tail or repair one it did not write; a write that
 //! fails part way (a short write, a write error, a failed sync) cuts back its own bytes before the lock is released, so
-//! a later write to the same ticket is not refused for good — init cuts back to an empty file and syncs the manifest dir
+//! a later write to the same ticket is not refused for good (a cut back that fails says so) — init cuts back to an empty file and syncs the manifest dir
 //! plus the parent of each folder level it made; a read opens the file for reading only and takes a shared lock first,
 //! waiting for a writer up to `READ_LOCK_WAIT_MS` (10 s) and then refusing as busy, reading nothing.
 //! On top of that the manifest adds a fence: the first line(s) name the ticket's roots (existing folders),
@@ -1021,7 +1021,7 @@ fn sync(f: &File) -> std::io::Result<()> {
 }
 
 /// Open the folder and sync it, so an entry created inside it (the manifest file, a new folder level)
-/// survives a power loss. A folder that cannot be opened or synced is an `Err`.
+/// is on disk. A folder that cannot be opened or synced is an `Err`.
 fn sync_dir(p: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     {
@@ -1038,7 +1038,7 @@ fn sync_dir(p: &Path) -> std::io::Result<()> {
 }
 
 /// Cut the file back to `keep` bytes: the length it held when this call's lock was taken, before this
-/// call wrote. Runs before the lock is released and removes only bytes this call wrote, so what later
+/// call wrote. Runs before the lock is released and removes only bytes this call wrote, so when it succeeds what later
 /// writers and readers see is either the whole new line or the bytes that were there before.
 fn cut_back_locked(f: &mut File, keep: u64) -> Result<(), ManifestError> {
     #[cfg(test)]
@@ -1161,8 +1161,8 @@ fn write_text_locked(f: &mut File, text: &str, keep: u64) -> Result<(), Manifest
 
 /// The write half of init, for roots already validated and resolved. Every root line is encoded BEFORE anything is
 /// created or written (N-f), so an over-long or invalid later root returns its error with nothing on disk. A write or
-/// dir sync that fails after the first write was attempted leaves the file at 0 bytes — what a crash between create and
-/// write leaves today — so a fresh init of the same roots then succeeds. After the lines are synced the manifest dir is
+/// dir sync that fails after the first write was attempted cuts the file back to 0 bytes — what a crash between create and
+/// write leaves today — so a fresh init of the same roots then succeeds; a cut back that fails after a dir sync failure is not reported. After the lines are synced the manifest dir is
 /// synced, and so is the parent of each folder level this init created (create_dir_all can make several levels).
 fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Result<(), ManifestError> {
     let lines: Vec<String> = resolved
@@ -1179,7 +1179,7 @@ fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Res
         return Err(ManifestError::Invalid("second init: the manifest already holds lines".to_string()));
     }
     for text in &lines {
-        // init's cut back target is 0: the empty-file check above proved every byte in the file is this call's.
+        // init's cut back target is 0: the empty-file check above proved the file held 0 bytes, so only this call's bytes are cut.
         write_text_locked(&mut f, text, 0)?;
     }
     let abs = dir.canonicalize().map_err(|e| ManifestError::Io(e.kind().to_string()))?;
@@ -1193,7 +1193,7 @@ fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Res
     Ok(())
 }
 
-/// One init dir sync: a dir that cannot be opened or synced fails init with the file left at 0 bytes.
+/// One init dir sync: a dir that cannot be opened or synced fails init after the file is cut back to 0 bytes (a failed cut back here is not reported).
 fn sync_init_dir(p: &Path, f: &mut File) -> Result<(), ManifestError> {
     sync_dir(p).map_err(|e| {
         let _ = cut_back_locked(f, 0);
@@ -1837,7 +1837,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// One case per remaining write op through `apply`: each short write leaves the file byte-identical.
+    /// One case each for limit, session and remove through `apply`: the short write leaves the file byte-identical.
     #[test]
     fn a_short_write_on_limit_session_and_remove_leaves_the_file_byte_identical() {
         let (base, dir) = fault_base("ops");

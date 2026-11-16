@@ -1,7 +1,7 @@
 //! Durability and lock tests for the manifest reader/writer (ticket manifest-writer-fix). A reader waits
 //! for a writer holding the exclusive lock instead of reading a half-written line; a locked read fails
 //! closed (a missing file stays missing, a folder at the manifest path is an Err, a 0444 file still reads);
-//! a torn tail left by an older binary refuses every write through the CLI; a busy manifest refuses
+//! a torn tail left by an older binary refuses add, remove and a second init through the CLI; a busy manifest refuses
 //! verify/owns/stop through the CLI, and a stop whose read was busy signals nothing.
 #![cfg(unix)]
 use harness::manifest::{apply, read_manifest, Line, Op};
@@ -112,7 +112,7 @@ fn a_locked_read_fails_closed() {
 /// after a short write — refuses add (path, pid, port), remove and a second init through the CLI, each
 /// leaving the file byte-identical; verify exits 1.
 #[test]
-fn an_old_torn_tail_refuses_every_write_through_the_cli() {
+fn an_old_torn_tail_refuses_each_write_through_the_cli() {
     let t = Tmp::new();
     let (r, d) = t.fence();
     let dir = d.to_str().unwrap();
