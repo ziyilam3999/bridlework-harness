@@ -1160,10 +1160,12 @@ fn write_text_locked(f: &mut File, text: &str, keep: u64) -> Result<(), Manifest
 }
 
 /// The write half of init, for roots already validated and resolved. Every root line is encoded BEFORE anything is
-/// created or written (N-f), so an over-long or invalid later root returns its error with nothing on disk. A write or
-/// dir sync that fails after the first write was attempted cuts the file back to 0 bytes — what a crash between create and
-/// write leaves today — so a fresh init of the same roots then succeeds; a cut back that fails after a dir sync failure is not reported. After the lines are synced the manifest dir is
-/// synced, and so is the parent of each folder level this init created (create_dir_all can make several levels).
+/// created or written (N-f), so an over-long or invalid later root returns its error with nothing on disk. The dir is
+/// resolved before the first write, so a resolve failure cannot land after one. A write or dir sync that fails after
+/// the first write was attempted cuts the file back to 0 bytes — what a crash between create and write leaves today —
+/// so a fresh init of the same roots then succeeds; a cut back that fails says so. After the lines are synced the
+/// manifest dir is synced, and so is the parent of each folder level this init created (create_dir_all can make
+/// several levels).
 fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Result<(), ManifestError> {
     let lines: Vec<String> = resolved
         .iter()
@@ -1172,6 +1174,8 @@ fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Res
     // How many levels of `dir` are missing: each level create_dir_all makes is synced in its parent afterwards.
     let missing = missing_levels(dir);
     fs::create_dir_all(dir).map_err(|e| ManifestError::Io(e.kind().to_string()))?;
+    // Resolved before the lock and the writes: this failure comes with no line on disk.
+    let abs = dir.canonicalize().map_err(|e| ManifestError::Io(e.kind().to_string()))?;
     // ONE critical section (B5): the lock is taken first, then the empty-file check runs on bytes read
     // through the locked handle, so two concurrent inits of one fresh manifest leave exactly one.
     let mut f = open_locked(&manifest_file(dir, ticket), ticket, true)?;
@@ -1182,7 +1186,6 @@ fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Res
         // init's cut back target is 0: the empty-file check above proved the file held 0 bytes, so only this call's bytes are cut.
         write_text_locked(&mut f, text, 0)?;
     }
-    let abs = dir.canonicalize().map_err(|e| ManifestError::Io(e.kind().to_string()))?;
     sync_init_dir(&abs, &mut f)?;
     let mut lvl = abs.as_path();
     for _ in 0..missing {
@@ -1193,11 +1196,17 @@ fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Res
     Ok(())
 }
 
-/// One init dir sync: a dir that cannot be opened or synced fails init after the file is cut back to 0 bytes (a failed cut back here is not reported).
+/// One init dir sync: a dir that cannot be opened or synced fails init after the file is cut back to 0 bytes;
+/// a cut back that also fails says so, keeping the dir sync cause.
 fn sync_init_dir(p: &Path, f: &mut File) -> Result<(), ManifestError> {
     sync_dir(p).map_err(|e| {
-        let _ = cut_back_locked(f, 0);
-        ManifestError::Io(format!("cannot sync dir {}: {}", p.display(), e.kind()))
+        let cause = format!("cannot sync dir {}: {}", p.display(), e.kind());
+        match cut_back_locked(f, 0) {
+            Ok(()) => ManifestError::Io(cause),
+            Err(_) => ManifestError::Io(format!(
+                "{cause}; cutting the init lines back failed: the file may still hold the init lines and needs a check by hand"
+            )),
+        }
     })
 }
 
@@ -1956,6 +1965,26 @@ mod tests {
         let err = write_init(&dir, "t-1", &[PathBuf::from("/short-a")], 1).unwrap_err();
         assert!(err.to_string().contains("cannot sync dir"), "{err}");
         assert_eq!(fs::read(manifest_file(&dir, "t-1")).unwrap(), Vec::<u8>::new(), "the file is left at 0 bytes");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A failed dir sync whose cut back to 0 also fails is reported: the error keeps the dir sync cause and
+    /// says the file may still hold the init lines and needs a check by hand (the lines stay on disk).
+    #[test]
+    fn a_failed_cut_back_after_a_failed_dir_sync_says_check_by_hand() {
+        let base = std::env::temp_dir().join(format!("manifest-fault-dircut-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("man");
+        SEAM.with(|s| {
+            let mut b = s.borrow_mut();
+            b.fail_dir_sync = true;
+            b.fail_cut_back = true;
+        });
+        let err = write_init(&dir, "t-1", &[PathBuf::from("/short-a")], 1).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("cannot sync dir"), "the dir sync cause stays: {text}");
+        assert!(text.contains("check by hand") && text.contains("init lines"), "{text}");
+        assert!(!fs::read(manifest_file(&dir, "t-1")).unwrap().is_empty(), "the failed cut back left the init line on disk");
         let _ = fs::remove_dir_all(&base);
     }
 
