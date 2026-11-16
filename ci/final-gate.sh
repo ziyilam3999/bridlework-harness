@@ -4,6 +4,7 @@
 # (nothing in it comes from the repo under test), runs `harness ticket gate` on repo-dir (default: this repo) with
 # --base = the first parent of its HEAD (the merge commit's base), and exits with the runner's exit code, unchanged.
 # After a PASS it prints the written result's message line (gate ids only), read from its own fresh result folder.
+# After a non-zero engine exit it prints the kept check output (last 40 lines) from that result file, or one line saying why none is shown.
 # Fails closed when the base cannot be resolved (a shallow checkout): it never falls back to an empty diff.
 # --print-ticket prints the ticket this script would write and exits 0 (used by ci/final-gate-smoke.sh).
 # Exit: the runner's code (0 PASS only, 1 FAIL, 2 error); 2 on a missing base or any setup error.
@@ -56,5 +57,46 @@ if [ "$rc" -eq 0 ]; then
   msg=$(sed -n 's/.*"message":"\(checks passed: [^"]*\)".*/\1/p' "$work/result/ci-pr.json")
   # printf adds the final newline the result file lacks, so a following line never joins this one.
   [ -z "$msg" ] || printf '%s\n' "$msg"
+fi
+# A FAIL's kept output lives only in the result file's message. Its last 40 lines are printed to stderr, each line
+# prefixed "| " and cut at 300 bytes (control characters other than tab become "?", so no line begins with "::").
+# Anything else (no file, unexpected shape, python3 missing) prints one reason line instead; the exit code stays the engine's.
+if [ "$rc" -ne 0 ]; then
+  res="$work/result/ci-pr.json"
+  if [ -f "$res" ]; then
+    if python3 -I - "$res" >&2 2>/dev/null <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        r = json.loads(f.read().decode("utf-8"))
+except Exception:
+    sys.exit(1)
+if not isinstance(r, dict) or r.get("status") != "fail" or not isinstance(r.get("message"), str):
+    sys.exit(1)
+w = sys.stdout.buffer
+w.write(b"final-gate: check output (last 40 lines; the engine keeps only the first max_output_bytes of a longer output, so its end can be missing)\n")
+for ln in r["message"].rstrip("\n").split("\n")[-40:]:
+    ln = "".join(c if c == "\t" or 32 <= ord(c) != 127 else "?" for c in ln)
+    b = ln.encode("utf-8", "replace")
+    if len(b) > 300:
+        b = b[:294]
+        while True:
+            try:
+                b.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                b = b[:-1]
+        b += b"[cut]"
+    w.write(b"| " + b + b"\n")
+sys.exit(0)
+PY
+    then
+      :
+    else
+      echo "final-gate: no check output shown: the result file holds no failing-check message, or python3 failed" >&2
+    fi
+  else
+    echo "final-gate: no check output shown: no result file was written" >&2
+  fi
 fi
 exit "$rc"
