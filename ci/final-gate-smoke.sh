@@ -381,7 +381,8 @@ if [ "$rc" -eq 0 ] && ! has "$out" "final-gate: check output" && ! has "$out" "f
 printf '%s\n' '{"area-clean":["fixture-evil"],"area-fail":["fixture-clean"],"ci":["fixture-clean"],"gates":["fixture-clean"]}' > "$tmp/map-evil.json"
 mkrepo "$tmp/b12e" "$tmp/map-evil.json" fixture-evil && chg "$tmp/b12e" area-clean/f.txt || exit 2
 run_entry "$tmp/b12e"
-if [ "$rc" -eq 1 ] && has "$out" "| ::error::planted" && ! printf '%s\n' "$out" | grep -q '^::' && ! printf '%s\n' "$out" | grep -qE '^.{401}'; then ok B12-output-neutralised; else bad B12-output-neutralised; fi
+# no line of 401 or more characters: the repeat is split (200 then 201) because BSD grep caps one repeat at 255
+if [ "$rc" -eq 1 ] && has "$out" "| ::error::planted" && ! printf '%s\n' "$out" | grep -q '^::' && ! printf '%s\n' "$out" | grep -qE '^.{200}.{201}'; then ok B12-output-neutralised; else bad B12-output-neutralised; fi
 # a scratch python3 that exits 1, first on PATH for this one run only: fail closed, no check output.
 mkdir "$tmp/pybin" && printf '#!/bin/sh\nexit 1\n' > "$tmp/pybin/python3" && chmod +x "$tmp/pybin/python3"
 out=$(PATH="$tmp/pybin:$PATH" sh "$entry" "$tmp/b1f" 2>&1); rc=$?
