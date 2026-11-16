@@ -124,13 +124,13 @@ A ticket id is letters, digits, `.`, `_`, `-` (at most 128, not starting with `.
 
 Under the lane lock (a missing lanes dir is `not-live` before the lock), in this order: (a) the ticket's record is looked up — `not-live` (exit 1) writes no record and creates no records dir; (b) the records dir is created with its parents when missing, and a link or a non-folder is exit 2; (c) a record path that is there and is not a regular file (a link, a folder, a fifo) is exit 2; (d) the record is opened without following a link and without blocking, and an existing record over 1 MiB, not utf-8, or without a final newline is exit 2 (an empty file is accepted); (e) the lane file is removed; (f) the line is written and synced — on a write or sync error the file is cut back to its old length (a failure of the cut is ignored) and the exit is 2 with `lane: error: the lane was freed and the release record cannot be written`, with the lane freed. A failure before (e) leaves the lane held.
 
-The records dir must not be the lanes dir or inside it. A given path with a `.` or `..` part, or one that starts with the given `--lanes-dir`, is exit 2 before the lock. Under the lock the check runs on resolved paths (a link counts): after (a) and before anything is created, on the nearest existing folder of the path; and again after (b) on the records dir, which this call removes again when it created it (folders it created above it stay; a path that cannot be resolved counts as inside). A ticket id such as `lane-1` would put its record among the lane records, which the dir reader refuses. Exit 2, nothing freed.
+The records dir must not be the lanes dir or inside it. A given path with a `.` or `..` part, or one whose leading parts are the given `--lanes-dir`, is exit 2 before the lock. Under the lock the check runs on resolved paths (a link counts): after (a) and before anything is created, on the nearest part of the path that exists (the path itself when it exists; a link counts as existing); and again after (b) on the records dir. When that second check refuses and this call created the records dir, the call removes it (folders it created above it stay). In both checks a path that cannot be resolved counts as inside, so a records dir that is a dangling link gets this message. A ticket id such as `lane-1` would put its record among the lane records, which the dir reader refuses. Exit 2, nothing freed.
 
 Stricter than the wrapper writer it replaces:
 
 - a reason over 1024 bytes is refused;
 - U+0085 and other C1 characters are refused (the wrapper result depends on its locale);
-- U+2028 and U+2029 are refused (the wrapper accepts them);
+- U+2028 and U+2029 are refused (the wrapper accepts them on macOS and in the C locale);
 - a reason of only no-break or other Unicode spaces is blank here (the C-locale wrapper accepts it);
 - an existing record over 1 MiB, not UTF-8, or without a final newline is refused;
 - a records dir that is the lanes dir or inside it is refused;

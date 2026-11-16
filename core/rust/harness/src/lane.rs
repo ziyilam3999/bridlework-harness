@@ -506,7 +506,8 @@ fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Re
     let _guard = lock(dir)?;
     let Some(r) = list_records(dir, cap)?.into_iter().find(|r| r.ticket == ticket) else { return Ok(Err(Refusal::NotLive)) };
     let inside = || "--records-dir must not be the lanes dir or inside it".to_string();
-    // The record steps run before the lane file is removed, so a refusal leaves the lane held.
+    // The record checks run before the lane file is removed, so a refusal leaves the lane held; the line is written
+    // after it.
     let mut rec: Option<(fs::File, u64)> = None;
     if let Some(s) = spec {
         // Before anything is created: the nearest existing ancestor, resolved, must lie outside the lanes dir
@@ -566,9 +567,9 @@ struct ReleaseSpec<'a> {
     records_dir: PathBuf,
 }
 
-// `open(2)` flags std exposes no constants for (the `quarantine.rs` pattern): the values differ per platform and
-// are not guessable, so only the two platforms this crate is built on are listed, each value read from its own
-// `fcntl.h`. Any other platform fails the build here rather than opening without the flags.
+// `open(2)` flags std exposes no constants for (the `quarantine.rs` pattern): the values differ per OS and per CPU
+// family. Listed: macos, and linux with its x86_64 values (linux on arm64 has another O_NOFOLLOW and is not
+// handled). An OS with no listed value fails the build here.
 #[cfg(target_os = "linux")]
 const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
 #[cfg(target_os = "macos")]
@@ -603,7 +604,7 @@ fn inside_lanes(p: &Path, lanes: &Path) -> bool {
 }
 
 /// The records dir: a real folder (a link or a non-folder is refused), created with its parents when missing.
-/// Ok(true) when this call created it.
+/// Ok(true) when it was missing at the first look.
 fn prep_records_dir(dir: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(dir) {
         Ok(m) if m.file_type().is_dir() => Ok(false),

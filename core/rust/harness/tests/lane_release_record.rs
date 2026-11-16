@@ -467,14 +467,18 @@ fn record_is_symlink_to_file() {
 #[test]
 fn record_is_dangling_symlink() {
     use std::os::unix::fs::symlink;
-    let (d, _lanes, _rec) = record_refused(
+    let (d, _lanes, rec) = record_refused(
         "rec-dangling",
         |rec| {
             fs::create_dir_all(rec).unwrap();
-            symlink("/nonexistent-lane-release-target", rec.join("t-one.release")).unwrap();
+            symlink(rec.parent().unwrap().join("target"), rec.join("t-one.release")).unwrap();
         },
         "the release record is not a regular file",
     );
+    // no file is created at the link target; the planted link is unchanged
+    assert!(!d.join("target").exists());
+    assert!(fs::symlink_metadata(rec.join("t-one.release")).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_link(rec.join("t-one.release")).unwrap(), d.join("target"));
     let _ = fs::remove_dir_all(&d);
 }
 
@@ -516,6 +520,7 @@ fn records_dir_is_symlink() {
     assert_eq!(o.status.code(), Some(2));
     assert_eq!(err(&o), "lane: error: the records dir is not a folder or is a symbolic link\n");
     still_held(&lanes);
+    assert!(fs::symlink_metadata(&rec).unwrap().file_type().is_symlink());
     assert!(fs::read_dir(&real).unwrap().next().is_none());
     let _ = fs::remove_dir_all(&d);
 }
