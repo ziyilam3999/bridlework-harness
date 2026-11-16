@@ -1353,7 +1353,7 @@ fn lint_and_lookup_agree_on_the_front_matter() {
     let look_lines: Vec<&str> = se.lines().map(|l| l.strip_prefix("harness: lesson lookup refused: ").unwrap()).collect();
     assert!(!look_lines.is_empty());
     assert_eq!(lint_lines, look_lines);
-    // the two empty-token pages: lint is silent, lookup refuses each
+    // the two empty-token pages: lint prints no FRONT-MATTER or MATCH line, lookup refuses each
     let d = setup(
         default_ticket("t").as_bytes(),
         b"src/\n",
@@ -1368,7 +1368,7 @@ fn lint_and_lookup_agree_on_the_front_matter() {
     assert_eq!(stderr(&o), want);
 }
 
-/// Every path under `p` with its type, size, bytes and link target.
+/// One line per path under `p`: its type, and for a file its size and bytes, for a link its target.
 fn listing(p: &std::path::Path, out: &mut Vec<String>) {
     let md = fs::symlink_metadata(p).unwrap();
     if md.file_type().is_symlink() {

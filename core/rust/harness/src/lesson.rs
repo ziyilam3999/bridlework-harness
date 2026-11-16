@@ -481,7 +481,7 @@ fn name_kind(n: &OsStr) -> NameKind {
 }
 
 /// The pages of the lookup: regular files directly inside `dir`, by file name in byte order. Err holds the
-/// messages for exit 2: one, or one per page-shaped entry that is not a page (raw name byte order).
+/// messages for exit 2: one, or one per page-shaped entry that is not a page and not a folder (raw name byte order).
 fn walk(dir: &str) -> Result<Vec<(String, PathBuf)>, Vec<String>> {
     let one = |m: &str| vec![m.to_string()];
     let p = Path::new(dir);
@@ -579,7 +579,7 @@ fn heading(lines: &[&str], close: usize, name: &str) -> String {
 }
 
 /// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`. Exit 0 the matching pages (stdout), 1 a page or the ticket is
-/// refused, 2 usage or read error or a page-shaped entry that is not a page. No exit 1 line is printed before each page is read.
+/// refused, 2 usage or read error or a page-shaped entry that is not a page and not a folder. The exit 1 lines are printed after all pages are read.
 fn lookup_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", esc(m));

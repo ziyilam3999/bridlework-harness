@@ -75,7 +75,7 @@ inside a code fence is never a heading.
 harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>
 ```
 
-Lists the lesson pages that match a ticket. No exit 1 line (lesson line or refusal line) is printed before each page is read.
+Lists the lesson pages that match a ticket. The exit 1 lines are printed after all pages are read.
 
 Output (exit 0): one line `lesson: <id> <heading> <file name>` per matching page, in byte order of the file names, then
 `lessons: scanned=<n> matched=<ids joined by a comma>` (`matched=none` when no page matches). `<id>` is the
@@ -88,7 +88,7 @@ of the lint (a control character or a white-space character other than a plain s
 
 Exit codes: `0` done; `1` a page or the ticket is refused (stdout empty, one stderr line per refusal,
 `harness: ticket refused: <reader message>` or `harness: lesson lookup refused: <file name>: <RULE> <detail>`); `2` a usage
-or read error, or a page-shaped entry that is not a page (stdout empty; the usage text, or one or more
+or read error, or a page-shaped entry that is not a page and not a folder (stdout empty; the usage text, or one or more
 `harness: error: <message>` lines). When a cause of `2` and a cause of `1` are both present, the run exits `2`.
 
 Page rule: a page is a regular file directly inside `<lessons-dir>` whose name is `ISSUE-<exactly 3 digits>-<anything>.md`.
@@ -131,7 +131,7 @@ Where the verb is stricter than the wrapper lookup it replaces:
 
 - a page with no or a bad front matter, a bad or repeated `match` line, an empty token
 - a page that is not valid UTF-8, an empty folder
-- a symbolic link, another digit count, a FIFO or other non-regular file, a name that is not UTF-8 (the wrapper skips a
+- a symbolic link, another digit count, a FIFO or other non-regular file, a page-shaped name that is not UTF-8 (the wrapper skips a
   symbolic link, another digit count and a non-regular file; it reads a name that is not UTF-8 as a page)
 - a missing or empty scope file, and what `parse_scope` refuses (a blank-only line, a `..` part, a leading `/`, a control
   character, `a//b`)
@@ -141,7 +141,7 @@ Where the verb reads more than the wrapper:
 - an indented `match` line inside the block, and `match : [x]` with a blank before the colon
 - a file name that holds a newline (the wrapper skips it)
 
-The lint reads a name with any digit count and follows a link to a regular file, skips a link to a folder, and exits 2
+The lint reads a name with another digit count and follows a link to a regular file, skips a link to a folder, and exits 2
 with `the file <name> cannot be read` for a dangling link, a link loop, a FIFO and a socket; the lookup refuses each of these.
 
 Other differences: the escape writes a tab, a no-break space and other control characters of a heading or file name as
