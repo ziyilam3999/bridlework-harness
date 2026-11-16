@@ -811,6 +811,51 @@ fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, Stri
     Ok(out)
 }
 
+/// `harness friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]`: read only. Refuses
+/// (1) while a ranked group with 2 or more occurrences has no valid controls line naming its id.
+pub fn controls_check_cmd(rest: &[String], testmode: bool) -> i32 {
+    let flags = match parse_flags(rest, &["--controls", "--lessons-dir", "--config"], "controls-check") {
+        Ok(f) => f,
+        Err(m) => return fail(&m),
+    };
+    let Some(controls_path) = flag(&flags, "--controls") else { return fail("--controls is required") };
+    let Some(lessons) = flag(&flags, "--lessons-dir") else { return fail("--lessons-dir is required") };
+    let cfg = match load_cfg(flag(&flags, "--config")) {
+        Ok(c) => c,
+        Err(c) => return c,
+    };
+    let list = match load_list("an unscanned inbox is never checked") {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    let controls = match read_controls(Path::new(controls_path), Path::new(lessons)) {
+        Ok(v) => v,
+        Err((c, m)) => return if c == 1 { refuse(&m) } else { fail(&m) },
+    };
+    let rows = match lint_rows(&cfg, &ctx) {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
+    let all = match groups(&rows) {
+        Ok(g) => g,
+        Err(m) => {
+            eprintln!("{m}");
+            return 1;
+        }
+    };
+    let order = ranked(&all);
+    let named: HashSet<&str> = controls.iter().map(|c| c.id.as_str()).collect();
+    let repeat: Vec<&Group> = order.iter().copied().filter(|g| g.occurrences >= 2).collect();
+    let mut missing: Vec<&str> = repeat.iter().map(|g| g.id.as_str()).filter(|id| !named.contains(id)).collect();
+    missing.sort_unstable();
+    if !missing.is_empty() {
+        return refuse(&format!("repeat groups with no valid line: {}. Add one line per group to the controls file: {CONTROL_SHAPE}", missing.join(", ")));
+    }
+    println!("controls-check ok groups={} repeat={} lines={}", order.len(), repeat.len(), controls.len());
+    0
+}
+
 // ---------------------------------------------------------------- weeks
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {

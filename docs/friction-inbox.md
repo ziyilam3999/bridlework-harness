@@ -10,7 +10,7 @@ operational text, so it is private data. This repo holds the contract, the reade
 
 Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
 `repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
-`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), and the read-only `controls-check` verb. The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
@@ -347,6 +347,57 @@ a row is `--as-of` minus that instant in whole hours, and `rows_over_24h` counts
 more. `--as-of` is not compared with `--week` and writes nothing beyond the run's own writes. An inbox row
 whose instant is later than `--as-of` refuses the run (exit 1, `--as-of is before row <id>`, the state and the
 hand-off folder byte-identical; with `--log` the sweep runs first, so the swept row is in the inbox).
+
+### `harness friction controls-check`
+
+```
+harness friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]
+```
+
+Read only: nothing is written. It refuses while a repeat group has no valid line in the controls file. The first step
+that fails decides: (1) the flags (exit 2); (2) `--controls` or `--lessons-dir` missing (exit 2, one line naming the
+flag); (3) the config (exit 2); (4) the privacy list, as `rank` (exit 2); (5) the controls file and the lessons folder
+through the same reader as `triage --controls` (setup errors exit 2, a refused line exit 1); (6) the inbox lint, as
+`rank` (exit 2 for an unreadable inbox, exit 1 for a lint, torn-tail or privacy problem); (7) the grouping (exit 1,
+the `rank: breaks cycle through <id>` line); (8) the check.
+
+**The rule.** A repeat group is a group `rank` lists whose `occurrences` is 2 or more (a group rooted at a
+`kind: pattern` row counts its breaks, not its root; a pattern nothing broke is not ranked). It is covered when at
+least one valid controls line has a first part byte-equal to the group id. A valid line that names a member row that
+is not the root, an event row id, or no row covers nothing and is not reported.
+
+Output. Exit 0: stdout is one line, stderr is empty:
+
+```
+controls-check ok groups=<ranked groups> repeat=<repeat groups> lines=<valid controls lines>
+```
+
+Exit 1 and 2 leave stdout empty. When repeat groups are not covered the exit is 1 and stderr is one line,
+`harness: friction refused: repeat groups with no valid line: <ids in byte order, joined by a comma and a blank>. Add one
+line per group to the controls file: <the line shape of the triage section>`. It holds no line text and no path. `lines=` counts every valid line, so two equal lines
+count twice.
+
+Where the private wrapper's python check and this verb differ (the wrapper is not edited here):
+
+1. A bad line: the wrapper collects all bad lines and the missing groups in one message; the verb stops at the first
+   bad line, exit 1, also for a group seen once.
+2. A carriage return inside a line: the wrapper splits the line in two; the verb refuses the line (stricter). A CRLF
+   line end is read by both.
+3. A control character other than a tab: the wrapper reads it; the verb refuses (stricter).
+4. The error text: the wrapper echoes the line text and the controls path; the verb prints line numbers and group
+   ids only.
+5. A controls file over 1 MiB is exit 2 here and has no cap in the wrapper (stricter); a missing lessons folder is
+   exit 2 here and exit 1 in the wrapper; a missing inbox file is exit 2 here and exit 1 in the wrapper.
+6. A file that is not UTF-8 is a named exit 1 here and a python traceback with exit 1 in the wrapper.
+7. The wrapper refuses past 100000 ranked groups (its `--top`); the verb has no limit. The 4 MiB inbox cap holds fewer
+   than 47000 rows, so the bound is not reachable.
+8. The line shape, the three-digit lesson number and the lesson page rule (a regular file `ISSUE-NNN-*.md` directly in
+   the folder; a symbolic link or a folder does not count) are the same in both.
+9. A form feed or U+0085 inside a line: the wrapper reads it; the verb refuses the line as a control character
+   (stricter).
+
+Apart from item 7, none of these makes the verb pass where the wrapper refuses. A U+FEFF in front of the first line
+is part of the id in both, so that line covers no group.
 
 ### `harness friction bind`
 

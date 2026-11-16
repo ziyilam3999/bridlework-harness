@@ -707,7 +707,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -747,6 +747,7 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
         "triage" => crate::friction_loop::triage_cmd(rest, testmode),
         "bind" => crate::friction_loop::bind_cmd(rest, testmode),
         "page" => crate::friction_loop::page_cmd(rest, testmode),
+        "controls-check" => crate::friction_loop::controls_check_cmd(rest, testmode),
         _ => {
             eprintln!("{}", FRICTION_USAGE);
             2
