@@ -1123,7 +1123,7 @@ fn ticket_folder_ok(name: &str, t: &str) -> bool {
 
 /// Other ticket ids `name` also matches under the three forms: its own whole name (`a.1.2` is also ticket
 /// `a.1.2`), its `<id>.<d>.<d>` reading and its `<id>.old.<d>.<d>` reading (`foo.old.1.2` is also `foo.old`).
-/// Each is a plain token by construction of the split.
+/// Each is kept only if it passes `token_ok`.
 fn other_ticket_ids(name: &str, t: &str) -> Vec<String> {
     let parts: Vec<&str> = name.split('.').collect();
     let n = parts.len();
@@ -1273,8 +1273,9 @@ fn drop_chdir(comp: &OsStr) -> Result<DropIn, ()> {
 /// fails now is `Ok(false)`: the folder is kept. Inside `target`, each entry other than the tag is removed
 /// (a folder with `remove_dir_all`, a file or link with `remove_file`), then the tag, then `target` itself by
 /// `remove_dir` from its parent reached again from the root — so a removal that stops before the tag is
-/// removed leaves the tag in place and the next run finds the folder again, while a failure at the last step
-/// (removing the emptied `target` itself) leaves an empty `target` with no tag, which later runs keep.
+/// removed leaves the tag in place and the next run finds the folder again, while a failure after the tag is
+/// removed (re-reaching the parent or removing the emptied `target` itself) leaves an empty `target` with no
+/// tag, which later runs keep.
 /// `Err(())` is a mid-removal failure: the run stops at this match.
 fn remove_target(root: &Path, comps: &[std::ffi::OsString], root_dev: u64) -> Result<bool, ()> {
     let Some((final_name, mids)) = comps.split_last() else {
@@ -1356,7 +1357,7 @@ pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
             return Err(err2(&format!("{flag} must be an absolute path with no `.` or `..` component")));
         }
         // the no-follow stat runs on the path rebuilt from its components: lstat on a spelling with a trailing
-        // "/" or "/." resolves through a link at the final component (review r2, B2), which must be refused
+        // "/" or "/." resolves through a link at the final component (review r1, B2), which must be refused
         let spelled: PathBuf = r.components().collect();
         let meta = fs::symlink_metadata(&spelled).map_err(|_| err2(&format!("{flag} is missing or unreadable")))?;
         if meta.file_type().is_symlink() {
