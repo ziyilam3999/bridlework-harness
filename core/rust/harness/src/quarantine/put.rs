@@ -367,6 +367,11 @@ fn live_check(md: &Path, src: &Src, src_id: Id, src_up: &[Id]) -> Result<(), Sto
             .ok()
             .filter(|s| token_ok(s))
             .ok_or_else(|| err2("a file name in the manifest dir ends in .jsonl but is not a ticket id; fix the manifest dir by hand"))?;
+        // A following stat, no open: a FIFO would block the read.
+        match fs::metadata(ent.path()) {
+            Ok(m) if m.is_file() => {}
+            _ => return Err(refuse_manifest(stem)),
+        }
         let read = manifest::read_manifest(md, stem).map_err(|_| refuse_manifest(stem))?;
         if !read.is_clean() {
             return Err(refuse_manifest(stem));

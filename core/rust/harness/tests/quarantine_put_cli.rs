@@ -514,6 +514,21 @@ fn a_torn_manifest_exits_2() {
 }
 
 #[test]
+fn a_manifest_that_is_not_a_regular_file_exits_2() {
+    let f = fixture();
+    let item = plain_item(&f, "p");
+    // A socket needs no shell command and reading it fails at once; a FIFO is covered by the same
+    // stat (it is refused before any open, so it cannot block).
+    let _listener = std::os::unix::net::UnixListener::bind(f.md.join("t-3.jsonl")).unwrap();
+    let before = snap(&item);
+    let o = put_cmd(&f, &item, &[]);
+    refused(&f, &o, 2);
+    assert!(err(&o).contains("t-3"), "stderr names the ticket id: {}", err(&o));
+    assert_eq!(snap(&item), before);
+    assert!(snap(&f.q).is_empty());
+}
+
+#[test]
 fn a_manifest_name_that_is_not_a_token_exits_2() {
     let f = fixture();
     let item = plain_item(&f, "p");
