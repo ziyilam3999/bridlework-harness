@@ -1,5 +1,6 @@
-//! `harness lane claim | release | list | park | admission-check | stale` (std only; `docs/lanes.md` is the contract). `stale` only reports
-//! (`lane/stale.rs`): it prints a verdict per live lane, writes nothing, and exits 3 when a verdict is `unknown`. A lane holds one live ticket. The cap
+//! `harness lane claim | release | list | park | admission-check | stale` (std only; `docs/lanes.md` is the contract). `stale` prints a
+//! verdict per live lane (`lane/stale.rs`) and exits 3 when one is `unknown`; with `--apply` it parks the lane of a gone, clean, pushed job
+//! through the park body, under the lanes dir lock. A lane holds one live ticket. The cap
 //! on live tickets is 1 without a valid admission record and the smaller of the record's admitted lane count and the config `lanes.count` with
 //! one, so no constant is edited to raise the cap. One record file per held lane, `<lanes-dir>/lane-<n>` with n in 1..=the config `lanes.count`
 //! (the legal names follow the config, not the admission), and one parked file per reserved ticket, `<lanes-dir>/parked-<ticket-id>`: `park`
@@ -33,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 pub mod stale;
 
-const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file> | lane park <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane stale --lanes-dir <absolute-dir> --config <file> --host <absolute-file> --launch-records <absolute-file> --manifest-dir <absolute-dir> --repo-map <repo-id>=<absolute-dir> [--repo-map ...] [--allow <tree-relative-path> ...]";
+const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file> | lane park <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane stale --lanes-dir <absolute-dir> --config <file> --host <absolute-file> --launch-records <absolute-file> --manifest-dir <absolute-dir> --repo-map <repo-id>=<absolute-dir> [--repo-map ...] [--allow <tree-relative-path> ...] [--apply --reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>]";
 const MAX_FILE: u64 = 1024 * 1024;
 const HEADER: &str = "lane-record v1";
 
@@ -701,6 +702,11 @@ fn park(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Resul
         return Ok(Err(Refusal::NotLive));
     }
     let _guard = lock(dir)?;
+    park_locked(dir, ticket, cap, spec)
+}
+
+/// The body of `park`, for a caller that already holds the lock of `dir` (it takes none and calls neither `park` nor `state_locked`).
+fn park_locked(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Result<Result<u32, Refusal>, String> {
     let live = list_records(dir, cap)?;
     read_parked(dir)?;
     let Some(r) = live.iter().find(|r| r.ticket == ticket) else { return Ok(Err(Refusal::NotLive)) };
