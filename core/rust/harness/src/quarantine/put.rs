@@ -54,6 +54,10 @@ pub enum Point {
     AfterIntent,
     /// Right after the rename, before the second walk.
     AfterMove,
+    /// Right after the moved label replace, before the moved line.
+    AfterFinalLabel,
+    /// Right after a void label replace that succeeded, before the void line (in `void_exit`).
+    AfterVoidLabel,
 }
 
 /// Parse the argument list that follows `put` (no filesystem access).
@@ -233,14 +237,14 @@ pub fn put_with_step(
     step(Point::AfterIntent)?;
     // (d) the move: the verified parent, the same source, the name free in the entry, then the rename
     let Some(parent) = verified_parent(&src.chain) else {
-        return Err(void_exit(&mut label, &entry_path, &shelf.journal, &date));
+        return Err(void_exit(&mut label, &entry_path, &shelf.journal, &date, step));
     };
     let same = fs::symlink_metadata(&src.full).map(|m| m.dev() == src.dev && m.ino() == src.ino).unwrap_or(false);
     if !same || fs::symlink_metadata(entry_path.join("item")).is_ok() {
-        return Err(void_exit(&mut label, &entry_path, &shelf.journal, &date));
+        return Err(void_exit(&mut label, &entry_path, &shelf.journal, &date, step));
     }
     if rename_verified(&parent, &src.name, &entry_dir, "item").is_err() {
-        return Err(void_exit(&mut label, &entry_path, &shelf.journal, &date));
+        return Err(void_exit(&mut label, &entry_path, &shelf.journal, &date, step));
     }
     step(Point::AfterMove)?;
     // (e) the second walk and the final label, (f) the moved line
@@ -257,6 +261,7 @@ pub fn put_with_step(
     }
     let done = label.bytes();
     replace_label(&entry_path, &done).map_err(|_| moved_fail())?;
+    step(Point::AfterFinalLabel)?;
     let moved_line = format!("{{\"v\":1,\"op\":\"moved\",\"entry\":\"{entry}\",\"label_sha\":\"{}\"}}\n", sha256_hex(&done));
     journal_append(&shelf.journal, &date, &moved_line).map_err(|_| moved_fail())?;
     if changed {
@@ -265,17 +270,28 @@ pub fn put_with_step(
     Ok(format!("put=done entry={entry} files={} bytes={}", before.files, before.bytes))
 }
 
-/// The move did not happen: label state void, one void line, and the stop.
-fn void_exit(label: &mut Label, entry_path: &Path, journal: &Path, date: &str) -> Stop {
+/// The move did not happen: label state void, one void line, and the stop. The step runs right after a void label
+/// replace that succeeded; its `Err` ends put there with that stop and nothing more is written (a failed replace
+/// keeps the stop of today).
+fn void_exit(
+    label: &mut Label,
+    entry_path: &Path,
+    journal: &Path,
+    date: &str,
+    step: &dyn Fn(Point) -> Result<(), Stop>,
+) -> Stop {
     label.state = "void".to_string();
     let bytes = label.bytes();
     let line = format!("{{\"v\":1,\"op\":\"void\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}\n", label.entry, sha256_hex(&bytes));
-    let done = replace_label(entry_path, &bytes).and_then(|()| journal_append(journal, date, &line));
-    if done.is_ok() {
-        err3("the move did not happen; nothing was moved; the entry is marked void")
-    } else {
-        err3("the move did not happen; nothing was moved; the entry folder stays and its label or journal line may not say void")
+    if replace_label(entry_path, &bytes).is_ok() {
+        if let Err(stop) = step(Point::AfterVoidLabel) {
+            return stop;
+        }
+        if journal_append(journal, date, &line).is_ok() {
+            return err3("the move did not happen; nothing was moved; the entry is marked void");
+        }
     }
+    err3("the move did not happen; nothing was moved; the entry folder stays and its label or journal line may not say void")
 }
 
 // ---------------------------------------------------------------- steps 2 to 5
@@ -842,12 +858,23 @@ fn settle_stopped(journal: &Path, entries: &Path) -> Result<(), Stop> {
     Ok(())
 }
 
+/// One entry of an unsettled intent: the label is read once; a label whose sha256 equals the intent `label_sha` is
+/// settled as today, a label whose sha differs goes to the completed-label rule.
 fn settle_one(p: &Rec, journal: &Path, entries: &Path) -> Result<(), Stop> {
     let undecided = || err3("a stopped put cannot be decided; nothing was moved; fix the entry by hand");
     let (date, name) = p.entry.split_once('/').ok_or_else(undecided)?;
     let entry_path = entries.join(date).join(name);
-    let text = read_label(&entry_path).filter(|b| sha256_hex(b) == p.sha).ok_or_else(undecided)?;
-    let text = String::from_utf8(text).map_err(|_| undecided())?;
+    let bytes = read_label(&entry_path).ok_or_else(undecided)?;
+    if sha256_hex(&bytes) == p.sha {
+        return settle_intent_label(p, &bytes, date, &entry_path, journal);
+    }
+    settle_completed_label(p, &bytes, date, &entry_path, journal)
+}
+
+/// The label is the intent label: settled as it has been (a new label, then one journal line).
+fn settle_intent_label(p: &Rec, bytes: &[u8], date: &str, entry_path: &Path, journal: &Path) -> Result<(), Stop> {
+    let undecided = || err3("a stopped put cannot be decided; nothing was moved; fix the entry by hand");
+    let text = String::from_utf8(bytes.to_vec()).map_err(|_| undecided())?;
     let marks = ["\"state\":\"intent\"", "\"fingerprint_after\":\"\"", "\"judgeable\":\"yes\",\"reason\":\"\""];
     if !text.starts_with(&format!("{{\"v\":1,\"entry\":\"{}\",", p.entry)) || marks.iter().any(|m| !text.contains(m)) {
         return Err(undecided());
@@ -875,8 +902,81 @@ fn settle_one(p: &Rec, journal: &Path, entries: &Path) -> Result<(), Stop> {
     };
     let done = done.into_bytes();
     let line = format!("{{\"v\":1,\"op\":\"{op}\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}\n", p.entry, sha256_hex(&done));
-    replace_label(&entry_path, &done)
+    replace_label(entry_path, &done)
         .and_then(|()| journal_append(journal, date, &line))
+        .map_err(|_| err3("a stopped put could not be settled; nothing was moved; fix the entry by hand"))
+}
+
+/// The tail of a label as `Label::bytes` writes it: `head` is each byte before the `fingerprint_after` field,
+/// then the four values of `fingerprint_after`, `state`, `judgeable` and `reason` (the `git` tail was checked).
+fn label_tail(text: &str) -> Option<(&str, &str, &str, &str, &str)> {
+    let body = text.strip_suffix(",\"git\":\"none\"}\n")?.strip_suffix('"')?;
+    let (body, reason) = body.rsplit_once("\",\"reason\":\"")?;
+    let (body, judgeable) = body.rsplit_once("\",\"judgeable\":\"")?;
+    let (body, state) = body.rsplit_once("\",\"state\":\"")?;
+    let (head, after) = body.rsplit_once("\",\"fingerprint_after\":\"")?;
+    Some((head, after, state, judgeable, reason))
+}
+
+/// A label whose sha differs from the intent `label_sha`: it is a completed label when it is the intent label with
+/// only `fingerprint_after`, `state`, `judgeable` and `reason` set as put sets them, proven by rebuilding the intent
+/// label and comparing its sha with the intent `label_sha`. A completed label is checked against the disk and kept
+/// byte-unchanged, with one journal line carrying the sha of the bytes as found; anything else is undecided.
+fn settle_completed_label(p: &Rec, bytes: &[u8], date: &str, entry_path: &Path, journal: &Path) -> Result<(), Stop> {
+    let undecided = || err3("a stopped put cannot be decided; nothing was moved; fix the entry by hand");
+    let text = std::str::from_utf8(bytes).map_err(|_| undecided())?;
+    let Some((head, after, state, judgeable, reason)) = label_tail(text) else {
+        return Err(undecided());
+    };
+    let mut rebuilt = String::from(head);
+    rebuilt.push_str("\",\"fingerprint_after\":\"\",\"state\":\"intent\",\"judgeable\":\"yes\",\"reason\":\"\",\"git\":\"none\"}\n");
+    let marks = ["\"state\":\"intent\"", "\"fingerprint_after\":\"\"", "\"judgeable\":\"yes\",\"reason\":\"\""];
+    if sha256_hex(rebuilt.as_bytes()) != p.sha || !rebuilt.starts_with(&format!("{{\"v\":1,\"entry\":\"{}\",", p.entry)) || marks.iter().any(|m| !rebuilt.contains(m)) {
+        return Err(undecided());
+    }
+    let item = entry_path.join("item");
+    let op = match state {
+        "moved" => {
+            if after.len() != 64 || !after.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return Err(undecided());
+            }
+            let before = text
+                .split_once("\"fingerprint_before\":\"")
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(f, _)| f)
+                .ok_or_else(undecided)?;
+            let shape_ok = if after == before {
+                judgeable == "yes" && reason.is_empty()
+            } else {
+                judgeable == "no" && reason == "changed-during-put"
+            };
+            if !shape_ok {
+                return Err(undecided());
+            }
+            // the identity of the item is checked before the walk, as the intent settle does
+            let m = fs::symlink_metadata(&item).map_err(|_| undecided())?;
+            if m.dev() != p.dev || m.ino() != p.ino {
+                return Err(undecided());
+            }
+            let w = walk_item(&item, true).map_err(|_| err3("the item of a stopped put cannot be walked; nothing was moved"))?;
+            if w.fingerprint != after {
+                return Err(undecided());
+            }
+            "moved"
+        }
+        "void" => {
+            if !after.is_empty() || judgeable != "yes" || !reason.is_empty() {
+                return Err(undecided());
+            }
+            match fs::symlink_metadata(&item) {
+                Err(e) if e.kind() == ErrorKind::NotFound => "void",
+                _ => return Err(undecided()),
+            }
+        }
+        _ => return Err(undecided()),
+    };
+    let line = format!("{{\"v\":1,\"op\":\"{op}\",\"entry\":\"{}\",\"label_sha\":\"{}\"}}\n", p.entry, sha256_hex(bytes));
+    journal_append(journal, date, &line)
         .map_err(|_| err3("a stopped put could not be settled; nothing was moved; fix the entry by hand"))
 }
 
