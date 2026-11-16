@@ -70,7 +70,7 @@ All rows are one compact JSON line in an append-only file, taken under an exclus
 A corrupt line stops the read (exit 2, the line number named). `launcher::read_launches` is the same join as a function.
 
 A `--sign-off` launch writes `"sign_off":true` after `owner` in its `launch` row, before any `provider` field (a launch
-without the flag writes the row it always wrote). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
+without the flag writes the row it wrote before the flag). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
 (`false`, a string, a number) is a corrupt line. `harness session sign-off-check` reads the mark; see `docs/signoff.md`.
 
 A launch given `--provider` writes `"provider":"<name>"` after the fields it writes today (after `"sign_off":true` when
