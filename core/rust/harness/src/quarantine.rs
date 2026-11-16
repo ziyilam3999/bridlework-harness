@@ -1,19 +1,24 @@
-//! `harness quarantine sweep` and `harness quarantine delete-listed` (std only, Unix): P1B-13, ticket #156.
+//! `harness quarantine sweep`, `harness quarantine delete-listed` and `harness quarantine drop-build` (std only, Unix): P1B-13, ticket #156; drop-build: build-output-drop.
 //! The sweep NEVER deletes: anything left in the ticket's roots that the manifest does not own is carried, whole and
 //! untouched, to the quarantine shelf — `<quarantine-dir>/<ticket>/<batch>/<item>`, generated token names only, an
 //! original name is never reused as a quarantine name — with one journal line written BEFORE each move (the crash
 //! trace) and one `quarantined` event written AFTER it (through the library record writer, like every P1b kind).
 //! Deleting a listed `temp_dir` is a SEPARATE, explicit verb that names exactly one id, and its library function
 //! `delete_listed` is the ONE delete path P1B-14 teardown must call, never a second one.
+//! `drop-build` deletes only cache-tagged build output (a `target` folder holding the cache tag) of a ticket whose
+//! manifest shows it closed, reached by a component walk of the same kind.
 //! Symlinks are never followed anywhere in this module: a link found in a root is a leftover like any other and is
 //! moved as the link itself (its target is never read or touched), a listed link is unlinked as the link only, and
 //! the recursive delete unlinks a link inside a listed folder without following it. The walk is read-only and
-//! completes before the first move; every cap and every refusal fires before anything is written. No folder path is
-//! ever printed on stdout or stderr (the workspace privacy rule): fixed lines of fixed fields only.
+//! completes before the first move; in the sweep and delete-listed each cap and each refusal fires before
+//! anything is written, and drop-build holds that order from the caps lock file on (a ticket refused after the
+//! lock leaves an empty lock file). No folder path is ever printed on stdout or stderr (the workspace privacy
+//! rule): fixed lines of fixed fields only.
 
+use crate::caps::{Caps, LockError};
 use crate::events::{self, token_ok, Field, Kind, Record};
-use crate::manifest::{self, Class, Op, Target};
-use std::ffi::{c_char, c_int, CString};
+use crate::manifest::{self, Class, Line, Op, Target};
+use std::ffi::{c_char, c_int, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
@@ -22,7 +27,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness quarantine sweep <ticket> --manifest-dir <abs> --workspace-root <abs> --quarantine-dir <abs> --log <abs> --repo <token> --role <token> --model <token> [--max-items <n>] [--ts-ms <n>] | quarantine delete-listed <ticket> --id <id> --manifest-dir <abs> [--ts-ms <n>]";
+pub const USAGE: &str = "usage: harness quarantine sweep <ticket> --manifest-dir <abs> --workspace-root <abs> --quarantine-dir <abs> --log <abs> --repo <token> --role <token> --model <token> [--max-items <n>] [--ts-ms <n>] | quarantine delete-listed <ticket> --id <id> --manifest-dir <abs> [--ts-ms <n>] | quarantine drop-build <ticket> --root <abs> [--root <abs> ...] --manifest-dir <abs> --caps-dir <abs> [--dry-run]";
 
 /// Default cap on leftovers moved by one sweep. Over it the sweep fails closed: exit 3, nothing moved.
 pub const DEFAULT_MAX_ITEMS: u64 = 1000;
@@ -958,15 +963,16 @@ pub fn delete_listed(a: &DeleteArgs) -> Result<String, Stop> {
     Ok(format!("delete=done ticket={} id={}", a.ticket, a.id))
 }
 
-/// The single-thread guard (#185): the delete walk changes the process working directory, which every thread in the
-/// process shares, so before `delete_listed` reads anything or takes one step it proves THIS process holds exactly
-/// one thread, and refuses (exit 3, nothing deleted) when it does not or when it cannot tell. The proof is sound for
-/// the whole walk: a process holding exactly one thread cannot gain another while the walk runs, because only the
-/// running thread could spawn one. macOS: the one libSystem call `pthread_is_threaded_np` (no arguments), which is
-/// STICKY — any thread ever started, even one long joined, keeps answering threaded — stricter, still fail-closed.
-/// Every other Unix: the thread count is read from procfs; an unreadable answer (no procfs, an odd container) is a
-/// refusal, never a pass. The child verb `harness quarantine delete-listed` is single-threaded by construction, so
-/// the one delete path (P1B-14) is unaffected.
+/// The single-thread guard (#185): the delete and drop-build walks change the process working directory, which
+/// every thread in the process shares, so before `delete_listed` or `drop_build` reads anything or takes one step
+/// the guard proves THIS process holds exactly one thread, and refuses (exit 3, nothing deleted, nothing removed)
+/// when it does not or when it cannot tell. The proof is sound for the whole walk: a process holding exactly one
+/// thread cannot gain another while the walk runs, because only the running thread could spawn one. macOS: the one
+/// libSystem call `pthread_is_threaded_np` (no arguments), which is STICKY — any thread ever started, even one
+/// long joined, keeps answering threaded — stricter, still fail-closed. Every other Unix: the thread count is read
+/// from procfs; an unreadable answer (no procfs, an odd container) is a refusal, never a pass. The child verbs
+/// `harness quarantine delete-listed` and `harness quarantine drop-build` are single-threaded by construction, so
+/// the library callers (P1B-14 teardown, the later wrapper finish step) run them as their own processes.
 fn refuse_unless_single_thread() -> Result<(), Stop> {
     #[cfg(target_os = "macos")]
     let alone = {
@@ -997,14 +1003,478 @@ fn refuse_unless_single_thread() -> Result<(), Stop> {
         Ok(())
     } else {
         Err(err3(
-            "delete-listed refuses to run while another thread exists in this process (the walk changes the process working directory); run the delete as the harness quarantine delete-listed verb in its own process; nothing was deleted",
+            "this verb refuses to run while another thread exists in this process (the walk changes the process working directory); run it as the harness quarantine verb in its own process; nothing was deleted, nothing was removed",
         ))
     }
 }
 
+// ---------------------------------------------------------------- drop-build
+
+/// Fixed cap on `target` matches removed by one drop-build. Over it: exit 3, nothing removed.
+const DROP_MAX_MATCHES: usize = 1000;
+/// Fixed cap on entries visited by the drop-build walk (all roots together). Over it: exit 3, nothing removed.
+const DROP_MAX_VISITED: usize = 200_000;
+/// Fixed cap on drop-build walk depth below a root. Over it: exit 3, nothing removed.
+const DROP_MAX_DEPTH: usize = 16;
+
+// `open(2)` non-blocking flag, spelled per platform like `O_DIRECTORY`/`O_NOFOLLOW` above (the tag open must
+// refuse a FIFO at once instead of waiting for a writer).
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+
+/// The cache tag file name (the cache directory tag standard; the tag cargo writes).
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+/// The cache tag signature line, newline included: the first line the standard (and cargo) writes.
+const CACHE_TAG_SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+
+/// One parsed `quarantine drop-build` command line. `dry_run` set means the walk runs and nothing is removed.
+pub struct DropArgs {
+    pub ticket: String,
+    pub roots: Vec<PathBuf>,
+    pub manifest_dir: PathBuf,
+    pub caps_dir: PathBuf,
+    pub dry_run: bool,
+}
+
+fn parse_drop(a: &[String]) -> Result<DropArgs, Stop> {
+    let mut ticket: Option<String> = None;
+    let mut roots: Vec<String> = Vec::new();
+    let (mut md, mut cd): (Option<&str>, Option<&str>) = (None, None);
+    let mut dry = false;
+    let mut it = a.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--root" => {
+                let val = it.next().ok_or_else(|| usage_err("an option is missing its value"))?;
+                roots.push(val.clone());
+                if roots.len() > 8 {
+                    return Err(usage_err("--root may be given at most 8 times"));
+                }
+            }
+            "--manifest-dir" | "--caps-dir" => {
+                let val = it.next().ok_or_else(|| usage_err("an option is missing its value"))?;
+                let slot = if arg.as_str() == "--manifest-dir" { &mut md } else { &mut cd };
+                if slot.replace(val.as_str()).is_some() {
+                    return Err(usage_err("an option was given twice"));
+                }
+            }
+            "--dry-run" => {
+                if dry {
+                    return Err(usage_err("an option was given twice"));
+                }
+                dry = true;
+            }
+            s if s.starts_with("--") => return Err(usage_err("unknown option")),
+            s => {
+                if ticket.replace(s.to_string()).is_some() {
+                    return Err(usage_err("more than one ticket given"));
+                }
+            }
+        }
+    }
+    let ticket = ticket.ok_or_else(|| usage_err("no ticket given"))?;
+    if !token_ok(&ticket) {
+        return Err(usage_err("ticket must be a plain token (lowercase letters, digits, '-', '_', '.'; not empty, not '.' or '..')"));
+    }
+    if roots.is_empty() {
+        return Err(usage_err("--root is required"));
+    }
+    for (flag, val) in [("--manifest-dir", req("manifest-dir", md)?), ("--caps-dir", req("caps-dir", cd)?)] {
+        if !dir_arg_ok(val) {
+            return Err(usage_err(&format!("{} must be an absolute path with no `..` component", flag)));
+        }
+    }
+    Ok(DropArgs {
+        ticket,
+        roots: roots.iter().map(|r| PathBuf::from(r.as_str())).collect(),
+        manifest_dir: PathBuf::from(req("manifest-dir", md)?),
+        caps_dir: PathBuf::from(req("caps-dir", cd)?),
+        dry_run: dry,
+    })
+}
+
+/// One digit group of a ticket folder suffix: 1 to 20 ASCII digits.
+fn digit_group_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `<d>.<d>`, both groups plain digit groups.
+fn two_digit_groups(s: &str) -> bool {
+    match s.split_once('.') {
+        Some((a, b)) => digit_group_ok(a) && digit_group_ok(b) && !b.contains('.'),
+        None => false,
+    }
+}
+
+/// The three ticket folder forms: exactly `<t>`, `<t>.old.<d>.<d>` or `<t>.<d>.<d>` (the private wrapper's
+/// gate-clone, moved-aside clone and finish-time build-output names).
+fn ticket_folder_ok(name: &str, t: &str) -> bool {
+    if name == t {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix(t) else { return false };
+    if let Some(tail) = rest.strip_prefix(".old.") {
+        return two_digit_groups(tail);
+    }
+    rest.starts_with('.') && two_digit_groups(&rest[1..])
+}
+
+/// Other ticket ids `name` also matches under the three forms: its own whole name (`a.1.2` is also ticket
+/// `a.1.2`), its `<id>.<d>.<d>` reading and its `<id>.old.<d>.<d>` reading (`foo.old.1.2` is also `foo.old`).
+/// Each is kept only if it passes `token_ok`.
+fn other_ticket_ids(name: &str, t: &str) -> Vec<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    let n = parts.len();
+    let mut out: Vec<String> = Vec::new();
+    if name != t && token_ok(name) {
+        out.push(name.to_string());
+    }
+    if n >= 3 && digit_group_ok(parts[n - 2]) && digit_group_ok(parts[n - 1]) {
+        let id = parts[..n - 2].join(".");
+        if id != t && token_ok(&id) {
+            out.push(id);
+        }
+    }
+    if n >= 4 && parts[n - 3] == "old" && digit_group_ok(parts[n - 2]) && digit_group_ok(parts[n - 1]) {
+        let id = parts[..n - 3].join(".");
+        if id != t && token_ok(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Does a manifest file for `oid` sit in `md`? `NotFound` is a plain no; any other stat error is undecidable,
+/// so the run refuses: exit 3, one line, nothing removed.
+fn manifest_present(md: &Path, oid: &str) -> Result<bool, Stop> {
+    match fs::symlink_metadata(md.join(format!("{oid}.jsonl"))) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(err3("a manifest file cannot be examined; nothing was removed")),
+    }
+}
+
+/// Read the cache tag at `p`: opened with no link follow and no blocking (`O_NOFOLLOW | O_NONBLOCK`), the
+/// handle must be a regular file, at most 64 bytes read, and the bytes must start with the signature line.
+/// Any miss is `false`: the `target` folder is kept.
+fn cache_tag_ok(p: &Path) -> bool {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(f) = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK).open(p) else {
+        return false;
+    };
+    if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return false;
+    }
+    let mut buf = Vec::new();
+    f.take(64).read_to_end(&mut buf).is_ok() && buf.starts_with(CACHE_TAG_SIG)
+}
+
+/// One `target` match of the walk: the root it was found under (index into the canonical roots) and the
+/// components from that root to the `target` folder (the last component is `target`).
+struct DropMatch(usize, Vec<std::ffi::OsString>);
+
+/// Counters carried across the walk of every root.
+struct DropWalk {
+    visited: usize,
+    kept: usize,
+    matches: Vec<DropMatch>,
+}
+
+/// Walk one folder inside a ticket folder (read only): a `target` that is a real directory on the root's device
+/// holding the cache tag is a match; any other `target` is kept (counted) or skipped (a link, a file); links
+/// and `.git` are not entered.
+fn drop_walk_inside(
+    dir: &Path,
+    child_depth: usize,
+    root: &Path,
+    root_idx: usize,
+    root_dev: u64,
+    w: &mut DropWalk,
+) -> Result<(), Stop> {
+    let rd = fs::read_dir(dir).map_err(|_| err3("a ticket folder cannot be read; nothing was removed"))?;
+    for ent in rd {
+        let ent = ent.map_err(|_| err3("an entry in a ticket folder cannot be examined; nothing was removed"))?;
+        w.visited += 1;
+        if w.visited > DROP_MAX_VISITED {
+            return Err(err3("over the entries-visited cap (200000); nothing was removed"));
+        }
+        if child_depth > DROP_MAX_DEPTH {
+            return Err(err3("over the walk depth cap (16); nothing was removed"));
+        }
+        let name = ent.file_name();
+        let p = dir.join(&name);
+        let meta = fs::symlink_metadata(&p).map_err(|_| err3("an entry in a ticket folder cannot be examined; nothing was removed"))?;
+        if name.as_encoded_bytes() == b".git" {
+            continue; // not entered
+        }
+        if name.as_encoded_bytes() == b"target" {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                continue; // a link named target is not followed, a file is not a folder: neither counted
+            }
+            if meta.dev() != root_dev || !cache_tag_ok(&p.join(CACHEDIR_TAG)) {
+                w.kept += 1;
+                continue;
+            }
+            if w.matches.len() >= DROP_MAX_MATCHES {
+                return Err(err3("over the matches cap (1000); nothing was removed"));
+            }
+            let rel = p.strip_prefix(root).map_err(|_| err3("an entry in a ticket folder cannot be named; nothing was removed"))?;
+            let comps: Vec<std::ffi::OsString> = rel
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(x) => Some(x.to_os_string()),
+                    _ => None,
+                })
+                .collect();
+            w.matches.push(DropMatch(root_idx, comps));
+            continue;
+        }
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue; // links are not entered, files are not walked
+        }
+        drop_walk_inside(&p, child_depth + 1, root, root_idx, root_dev, w)?;
+    }
+    Ok(())
+}
+
+/// What one component step of the removal walk found.
+enum DropIn {
+    /// Not there: the match is kept, not an error.
+    Absent,
+    Dir,
+}
+
+/// One no-follow stat, then a chdir verified to have landed on that same directory by dev/ino (the same
+/// discipline as `chdir_verified`): a component that is a link, not a directory, or was swapped between
+/// the stat and the chdir is refused; a vanished component is reported absent.
+fn drop_chdir(comp: &OsStr) -> Result<DropIn, ()> {
+    let m = match fs::symlink_metadata(comp) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DropIn::Absent),
+        Err(_) => return Err(()),
+        Ok(m) => m,
+    };
+    if m.file_type().is_symlink() || !m.is_dir() {
+        return Err(());
+    }
+    std::env::set_current_dir(comp).map_err(|_| ())?;
+    let now = fs::symlink_metadata(".").map_err(|_| ())?;
+    if now.dev() != m.dev() || now.ino() != m.ino() {
+        return Err(());
+    }
+    Ok(DropIn::Dir)
+}
+
+/// Remove one matched `target` folder, reached from its canonical root ONE COMPONENT AT A TIME (each entered
+/// by a chdir verified against its stat, so no link in the chain is followed). After the last chdir the final
+/// `target` is checked AGAIN — a real directory, on the root's device, holding the cache tag; a check that
+/// fails now is `Ok(false)`: the folder is kept. Inside `target`, each entry other than the tag is removed
+/// (a folder with `remove_dir_all`, a file or link with `remove_file`), then the tag, then `target` itself by
+/// `remove_dir` from its parent reached again from the root — so a removal that stops before the tag is
+/// removed leaves the tag in place and the next run finds the folder again, while a failure after the tag is
+/// removed (re-reaching the parent or removing the emptied `target` itself) leaves an empty `target` with no
+/// tag, which later runs keep.
+/// `Err(())` is a mid-removal failure: the run stops at this match.
+fn remove_target(root: &Path, comps: &[std::ffi::OsString], root_dev: u64) -> Result<bool, ()> {
+    let Some((final_name, mids)) = comps.split_last() else {
+        return Err(());
+    };
+    drop_chdir(root.as_os_str())?;
+    for c in mids {
+        if let DropIn::Absent = drop_chdir(c.as_os_str())? {
+            return Ok(false);
+        }
+    }
+    // the second check, on the final component by its relative name alone
+    match fs::symlink_metadata(final_name) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+        Ok(m) => {
+            if m.file_type().is_symlink() || !m.is_dir() || m.dev() != root_dev {
+                return Ok(false);
+            }
+            if !cache_tag_ok(&Path::new(final_name).join(CACHEDIR_TAG)) {
+                return Ok(false);
+            }
+        }
+    }
+    if let DropIn::Absent = drop_chdir(final_name.as_os_str())? {
+        return Ok(false);
+    }
+    let rd = fs::read_dir(".").map_err(|_| ())?;
+    for ent in rd {
+        let ent = ent.map_err(|_| ())?;
+        let name = ent.file_name();
+        if name.as_encoded_bytes() == CACHEDIR_TAG.as_bytes() {
+            continue;
+        }
+        let m = fs::symlink_metadata(&name).map_err(|_| ())?;
+        if m.is_dir() {
+            fs::remove_dir_all(&name).map_err(|_| ())?;
+        } else {
+            fs::remove_file(&name).map_err(|_| ())?; // a file or a link: unlinked, not followed
+        }
+    }
+    fs::remove_file(CACHEDIR_TAG).map_err(|_| ())?;
+    // the parent is reached again from the root, then the folder itself goes by relative name
+    drop_chdir(root.as_os_str())?;
+    for c in mids {
+        if let DropIn::Absent = drop_chdir(c.as_os_str())? {
+            return Ok(false);
+        }
+    }
+    fs::remove_dir(final_name).map_err(|_| ())?;
+    Ok(true)
+}
+
+/// `harness quarantine drop-build <ticket> --root <abs> [--root <abs> ...] --manifest-dir <abs>
+/// --caps-dir <abs> [--dry-run]`: remove the cache-tagged build output of a CLOSED ticket under the given
+/// roots, or refuse. Order: usage, ticket id, the single-thread guard (the removal changes the process
+/// working directory), the manifest and caps dirs (real directories, canonicalized once), each root (real,
+/// not a link, canonicalized once, its canonical parent equal to the manifest dir's, so the roots sit beside
+/// the manifests folder in one state folder; the manifest and caps dirs lie inside no root; no two roots
+/// overlap), the per-ticket caps lock (Busy: exit 3 — a run for this ticket is in progress), the closed
+/// proof (the manifest reads, is clean, holds no live entry and a remove line for the id `worktree`), then
+/// the read-only walk, then the removals. A `--dry-run` runs the same walk and removes nothing. The first
+/// failing step before the removals is one stderr line (no folder on either stream; a usage error prints its
+/// error line and the USAGE text) and stops with nothing removed; a failure inside the removals stops the
+/// run with what it already removed kept.
+pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
+    refuse_unless_single_thread()?;
+    if a.roots.is_empty() {
+        return Err(usage_err("--root is required"));
+    }
+    let md = resolve_base_dir("--manifest-dir", &a.manifest_dir)?;
+    let cd = resolve_base_dir("--caps-dir", &a.caps_dir)?;
+    let state = md.parent().ok_or_else(|| err2("--manifest-dir has no parent folder"))?;
+    let mut canon: Vec<PathBuf> = Vec::new();
+    for (i, r) in a.roots.iter().enumerate() {
+        let n = i + 1;
+        let flag = format!("--root {n}");
+        if !r.is_absolute() {
+            return Err(err2(&format!("{flag} must be an absolute path with no `.` or `..` component")));
+        }
+        // the no-follow stat runs on the path rebuilt from its components: lstat on a spelling with a trailing
+        // "/" or "/." resolves through a link at the final component (review r1, B2), which must be refused
+        let spelled: PathBuf = r.components().collect();
+        let meta = fs::symlink_metadata(&spelled).map_err(|_| err2(&format!("{flag} is missing or unreadable")))?;
+        if meta.file_type().is_symlink() {
+            return Err(err2(&format!("{flag} must be a real directory (a link is refused)")));
+        }
+        if !meta.is_dir() {
+            return Err(err2(&format!("{flag} must be a real directory (a file is refused)")));
+        }
+        // the raw text is scanned because `Path` hides interior `.`
+        let text = r.to_str().ok_or_else(|| err2(&format!("{flag} is not utf-8")))?;
+        if text.split('/').any(|seg| seg == "." || seg == "..") {
+            return Err(err2(&format!("{flag} must be an absolute path with no `.` or `..` component")));
+        }
+        let c = r.canonicalize().map_err(|_| err2(&format!("{flag} cannot be resolved")))?;
+        if c == Path::new("/") {
+            return Err(err2(&format!("{flag} may not be the filesystem root")));
+        }
+        if c.parent() != Some(state) {
+            return Err(err2(&format!("{flag} must sit beside the manifest dir in one state folder")));
+        }
+        if cd.starts_with(&c) {
+            return Err(err2("the caps dir must lie outside every --root (equality counts as inside)"));
+        }
+        if md.starts_with(&c) {
+            return Err(err2("the manifest dir must lie outside every --root (equality counts as inside)"));
+        }
+        for (j, prev) in canon.iter().enumerate() {
+            if c == *prev || c.starts_with(prev) || prev.starts_with(&c) {
+                return Err(err2(&format!("{flag} and --root {} must lie outside each other", j + 1)));
+            }
+        }
+        canon.push(c);
+    }
+    // the per-ticket lock, taken without waiting and held until the verb ends: a gate run for this ticket
+    // gets Busy from the other side too. The closed proof is read UNDER the lock.
+    let caps = Caps::open(&a.caps_dir, &canon[0]).map_err(|m| err2(&m))?;
+    let _lock = caps.lock(&a.ticket).map_err(|e| match e {
+        LockError::Busy => err3("a run for this ticket is in progress; nothing was removed"),
+        LockError::Other(m) => err2(&m),
+    })?;
+    let read = manifest::read_manifest(&md, &a.ticket)
+        .map_err(|_| err2("the manifest could not be read (missing or unreadable); nothing was removed"))?;
+    if !read.is_clean() {
+        return Err(err2("the manifest is damaged (torn tail or corrupt); nothing was removed"));
+    }
+    if !read.live.is_empty() {
+        return Err(err2("the manifest holds a live entry, so the ticket is not closed; nothing was removed"));
+    }
+    if !read.lines.iter().any(|l| matches!(l, Line::Remove { id, .. } if id == "worktree")) {
+        return Err(err2("the manifest holds no worktree remove line, so the ticket is not closed; nothing was removed"));
+    }
+    // the walk: read only, complete before the first removal
+    let mut w = DropWalk { visited: 0, kept: 0, matches: Vec::new() };
+    let mut root_devs: Vec<u64> = Vec::new();
+    for (idx, c) in canon.iter().enumerate() {
+        let meta = fs::symlink_metadata(c).map_err(|_| err3("a root cannot be walked; nothing was removed"))?;
+        root_devs.push(meta.dev());
+        let rd = fs::read_dir(c).map_err(|_| err3("a root cannot be walked; nothing was removed"))?;
+        for ent in rd {
+            let ent = ent.map_err(|_| err3("a root cannot be walked; nothing was removed"))?;
+            w.visited += 1;
+            if w.visited > DROP_MAX_VISITED {
+                return Err(err3("over the entries-visited cap (200000); nothing was removed"));
+            }
+            let name = ent.file_name();
+            let Some(name_str) = name.to_str() else { continue };
+            if !ticket_folder_ok(name_str, &a.ticket) {
+                continue; // another ticket's folder, or no ticket folder at all
+            }
+            let p = c.join(&name);
+            let meta = fs::symlink_metadata(&p)
+                .map_err(|_| err3("an entry in a root cannot be examined; nothing was removed"))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                continue; // a linked ticket folder is not followed
+            }
+            // a child that also matches another id with its own manifest belongs to that ticket: skipped
+            let mut other = false;
+            for oid in other_ticket_ids(name_str, &a.ticket) {
+                if manifest_present(&md, &oid)? {
+                    other = true;
+                    break;
+                }
+            }
+            if other {
+                continue;
+            }
+            drop_walk_inside(&p, 2, c, idx, root_devs[idx], &mut w)?;
+        }
+    }
+    if a.dry_run {
+        return Ok(format!("drop-build=dry-run ticket={} would_remove={} kept={}", a.ticket, w.matches.len(), w.kept));
+    }
+    // the removals, in a deterministic order (root path, then components), so a partial run is reproducible
+    w.matches.sort_by(|x, y| (&canon[x.0], &x.1).cmp(&(&canon[y.0], &y.1)));
+    let saved = std::env::current_dir().map_err(|_| err3("the current folder cannot be examined; nothing was removed"))?;
+    let mut removed = 0usize;
+    let mut kept = w.kept;
+    for DropMatch(ri, comps) in &w.matches {
+        match remove_target(&canon[*ri], comps, root_devs[*ri]) {
+            Ok(true) => removed += 1,
+            Ok(false) => kept += 1,
+            Err(()) => {
+                let _ = std::env::set_current_dir(&saved);
+                return Err(err3(&format!(
+                    "a build output folder could not be removed completely; removed={removed} before it"
+                )));
+            }
+        }
+    }
+    let _ = std::env::set_current_dir(&saved);
+    Ok(format!("drop-build=done ticket={} removed={} kept={}", a.ticket, removed, kept))
+}
+
 // ---------------------------------------------------------------- the verb
 
-/// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ...` (the arguments after `quarantine`). Exit 0
+/// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ... | drop-build <ticket> ...` (the arguments
+/// after `quarantine`). The exit lines here are those of sweep and delete-listed; drop-build's are at `drop_build`. Exit 0
 /// done (one stdout line of fixed fields, no folder); 2 refused (usage, bad or misplaced folders, a root that is a
 /// symlink or outside the base, a damaged manifest, wrong class or id); 3 cannot proceed (cross-device, over a cap,
 /// an undecidable journal intent, an event log that cannot be read whole by reconcile, a rename/journal/event write
@@ -1017,6 +1487,7 @@ pub fn quarantine_cmd(a: &[String]) -> i32 {
     let r = match sub.as_str() {
         "sweep" => sweep_cli(rest),
         "delete-listed" => parse_delete(rest).and_then(|args| delete_listed(&args)),
+        "drop-build" => parse_drop(rest).and_then(|args| drop_build(&args)),
         _ => Err(err2("unknown quarantine subcommand")),
     };
     match r {
