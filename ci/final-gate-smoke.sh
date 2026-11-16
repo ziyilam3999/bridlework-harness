@@ -30,12 +30,14 @@ G() { git -c user.name=ci -c user.email=ci -c commit.gpgsign=false -c core.hooks
 mkrepo() {
   d=$1; m=$2; shift 2
   mkdir -p "$d/ci" "$d/gates" "$d/area-fail" "$d/area-clean" || return 1
-  cp "$fx/fixture-fail.sh" "$fx/fixture-clean.sh" "$d/ci/" || return 1
-  chmod +x "$d/ci/fixture-fail.sh" "$d/ci/fixture-clean.sh"
+  cp "$fx/fixture-fail.sh" "$fx/fixture-clean.sh" "$fx/fixture-lines.sh" "$fx/fixture-evil.sh" "$d/ci/" || return 1
+  chmod +x "$d/ci/fixture-fail.sh" "$d/ci/fixture-clean.sh" "$d/ci/fixture-lines.sh" "$d/ci/fixture-evil.sh"
   cp "$m" "$d/gates/path-map.json" || return 1
   for g in "$@"; do
     case $g in
       fixture-fail) cp "$fx/fixture-fail.json" "$d/gates/fixture-fail.json" ;;
+      fixture-lines) cp "$fx/fixture-lines.json" "$d/gates/fixture-lines.json" ;;
+      fixture-evil) cp "$fx/fixture-evil.json" "$d/gates/fixture-evil.json" ;;
       *) sed "s/\"id\":\"fixture-clean\"/\"id\":\"$g\"/" "$fx/fixture-clean.json" > "$d/gates/$g.json" ;;
     esac
   done
@@ -356,6 +358,39 @@ done
 if [ "$ok_all" -eq 1 ]; then ok R1-caps-fresh-each-run-five-fails; else bad R1-caps-fresh-each-run-five-fails; fi
 sh "$entry" "$tmp/b1c" > "$tmp/nl.out" 2>&1
 if [ "$(tail -c 1 "$tmp/nl.out" | od -An -tx1 | tr -d ' ')" = "0a" ] && grep -q '^checks passed: ' "$tmp/nl.out"; then ok R2-output-ends-with-newline; else bad R2-output-ends-with-newline; fi
+
+# ---------------------------------------------------------------- B12 the entry prints a failing check's kept output, or one line saying why none is shown
+run_entry "$tmp/b1f"
+if [ "$rc" -eq 1 ] && has "$out" "result=fail done=refused" && has "$out" "class=check-failed gate=fixture-fail" && has "$out" "final-gate: check output" && has "$out" "planted failure"; then
+  ok B12-fail-prints-check-output
+else
+  bad B12-fail-prints-check-output
+fi
+# the gate id joins the first output line, so 50 printed lines are 50 message lines: the last 40 are row-11..row-50.
+printf '%s\n' '{"area-clean":["fixture-lines"],"area-fail":["fixture-clean"],"ci":["fixture-clean"],"gates":["fixture-clean"]}' > "$tmp/map-lines.json"
+mkrepo "$tmp/b12l" "$tmp/map-lines.json" fixture-lines && chg "$tmp/b12l" area-clean/f.txt || exit 2
+run_entry "$tmp/b12l"
+if [ "$rc" -eq 1 ] && has "$out" "row-11" && has "$out" "row-50" && ! has "$out" "row-10"; then ok B12-last-40-lines; else bad B12-last-40-lines; fi
+# the engine stops with exit 2 before writing a result: the reason line prints, nothing from a file.
+mkrepo "$tmp/b12n" "$fx/map-clean.json" fixture-clean && chg "$tmp/b12n" area-clean/f.txt || exit 2
+echo stray > "$tmp/b12n/stray.txt"
+run_entry "$tmp/b12n"
+if [ "$rc" -eq 2 ] && has "$out" "not clean" && has "$out" "final-gate: no check output shown:"; then ok B12-no-result-fail-closed; else bad B12-no-result-fail-closed; fi
+run_entry "$tmp/b1c"
+if [ "$rc" -eq 0 ] && ! has "$out" "final-gate: check output" && ! has "$out" "final-gate: no check output shown:"; then ok B12-pass-prints-no-check-output; else bad B12-pass-prints-no-check-output; fi
+printf '%s\n' '{"area-clean":["fixture-evil"],"area-fail":["fixture-clean"],"ci":["fixture-clean"],"gates":["fixture-clean"]}' > "$tmp/map-evil.json"
+mkrepo "$tmp/b12e" "$tmp/map-evil.json" fixture-evil && chg "$tmp/b12e" area-clean/f.txt || exit 2
+run_entry "$tmp/b12e"
+# no line of 401 or more characters: the repeat is split (200 then 201) because BSD grep caps one repeat at 255
+if [ "$rc" -eq 1 ] && has "$out" "| ::error::planted" && ! printf '%s\n' "$out" | grep -q '^::' && ! printf '%s\n' "$out" | grep -qE '^.{200}.{201}'; then ok B12-output-neutralised; else bad B12-output-neutralised; fi
+# a scratch python3 that exits 1, first on PATH for this one run only: fail closed, no check output.
+mkdir "$tmp/pybin" && printf '#!/bin/sh\nexit 1\n' > "$tmp/pybin/python3" && chmod +x "$tmp/pybin/python3"
+out=$(PATH="$tmp/pybin:$PATH" sh "$entry" "$tmp/b1f" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && has "$out" "result=fail done=refused" && has "$out" "final-gate: no check output shown:" && ! has "$out" "planted failure"; then
+  ok B12-python-fails-fail-closed
+else
+  bad B12-python-fails-fail-closed
+fi
 
 # ---------------------------------------------------------------- C (P1A-14c) workflow lint rules, each with a planted failing twin
 # ltwin NAME SRC DEST SED-EXPR RULE... : a scratch copy of workflow SRC saved as DEST with one change; the lint must exit 1 and print DEST:<line>:<RULE> for every RULE.
