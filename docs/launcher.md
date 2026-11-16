@@ -4,15 +4,22 @@ Starts a named background session from the harness, with a launch record written
 
 ```
 harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path>
-    [--records <file>] [--config <file>] [--sign-off] [--provider <name>] [--start-timeout-ms <n>] [--map-timeout-ms <n>]
+    [--records <file>] [--config <file>] [--sign-off] [--provider <name>]
+    [--turn <name>[,<name>]] [--turn-reason <text>] [--start-timeout-ms <n>] [--map-timeout-ms <n>]
 harness session launches [--records <file>]
 harness session next-provider --providers <name>[,<name>] [--records <file>]
 ```
 
 `--provider <name>` records which provider ran the seat. A name is 1 to 16 bytes: a lowercase ASCII letter, then
-lowercase letters or digits (`claude` and `zai` pass; `Zai`, `z-ai`, an empty value and a 17-byte name do not).
+lowercase ASCII letters or digits (`claude`, `zai` and `gpt5` pass; `Zai`, `zAi`, `z-ai`, an empty value and a 17-byte name do not).
 A refused name, the flag given twice or the flag with no value is exit 2 before any write; the host is not run.
-Any role may carry a provider. The launch does not read earlier rows and prints the same stdout line as without it.
+Any role may carry a provider. The launch does not read or parse earlier rows (the torn-tail check of the append step
+still runs) and prints the same stdout line as without it.
+
+`--turn <name>[,<name>]` (the list form of `--providers`) asks for a turn check on a builder launch, and
+`--turn-reason <text>` (1 to 200 bytes, no control character, not only blanks) lets a launch out of turn go on; see step 3c.
+`--turn` needs `--provider`, the provider must be in the list, the name must have the role `exec` and be a round 1 name;
+`--turn-reason` needs `--turn`. Each refusal is exit 2 before any write.
 
 ## Order of steps
 
@@ -30,6 +37,18 @@ Any role may carry a provider. The launch does not read earlier rows and prints 
    not checked. With no `builder_state` entries in the config: exit 2, nothing written or started (fail closed).
    Otherwise the FIRST entry (file order) whose text is a byte substring of the brief refuses the launch: one
    `launch_refused` row, no `launch` row, nothing started, exit 6. stderr and the row name the entry, never its text.
+3c. Turn check, for a launch given `--turn`; the same lock and handle as step 4. The launcher takes the exclusive lock
+   on the records file, reads the whole file through that handle (a file that did not exist is empty), computes the next
+   provider as `next-provider` does for the `--turn` list, and appends the `launch` row through the same handle before the
+   lock is let go. No second lock is taken, so two launches at once cannot both take the same turn. The launch goes on
+   when the provider equals the next provider, or when `--turn-reason` is given. Otherwise it exits 7 with no row written
+   and nothing started; stderr starts with `launch refused: turn:` and names the case: `provider <p> is not the turn, next
+   is <q>`, `the last counted launch <run id> carries no provider`, or `the last counted launch <run id> carries provider
+   <x>, not in --turn`. With a reason, those last two cases go on and write no `turn_next`. Records that cannot be read
+   (torn tail, corrupt line, over the read cap) are exit 2 with no row written. After exit 7 an existing file is
+   byte-unchanged; a file that did not exist may be left as an empty file. `--turn` takes round 1 names only: a name
+   with `r2` or more is exit 2 (a fix round goes to a provider typed by hand). Without `--turn` the launch does not read or
+   parse earlier rows.
 4. Write the `launch` row first. Any failure exits 2 with `launch refused: launch record not written: <cause>`
    and the host is never run.
 5. Start `<host> --bg -n <name> <brief>`: the brief is ONE argv element, byte-identical to the file, run from the
@@ -73,11 +92,18 @@ A `--sign-off` launch writes `"sign_off":true` after `owner` in its `launch` row
 without the flag writes the row it wrote before the flag). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
 (`false`, a string, a number) is a corrupt line. `harness session sign-off-check` reads the mark; see `docs/signoff.md`.
 
-A launch given `--provider` writes `"provider":"<name>"` after the fields it writes today (after `"sign_off":true` when
-that is present); a launch without it writes the row it wrote before the flag. A `provider` field that is not a string in the
-provider name form, or `provider` written twice in one row, is a corrupt line: `session launches`,
+A launch given `--provider` writes `"provider":"<name>"` after the fields of the plain row (after `"sign_off":true` when
+that is present); a launch without it writes the row it wrote before the flag. In a launch row, a `provider` field that is not a
+string in the provider name form, or `provider` written twice in one row, is a corrupt line (other row kinds do not read the field): `session launches`,
 `session sign-off-check` and `next-provider` refuse the file, and `lane stale` refuses it on its first read.
 `launches` appends ` provider=<name>` to the line of a launch that carries it, after `sign_off=yes` when present.
+
+A launch that goes on with `--turn` writes `"turn_next":"<name>"` after `provider`, when a next provider could be
+computed, and `"turn_reason":"<text>"` after that, when `--turn-reason` was given (also when the provider equals the
+turn). A launch without `--turn` writes the same row bytes as before the flag. In a launch row, a `turn_next` that is not a
+string in the provider name form, a `turn_reason` that is not a string, either one written twice, or either one in a row with
+no `provider`, is a corrupt line, with the same effect as a bad `provider`. `launches` appends ` turn_next=<name>` after
+`provider=<name>` to the line of a launch that carries it; `turn_reason` is not printed.
 
 ## Next provider (`harness session next-provider`)
 
@@ -100,6 +126,7 @@ Counted launches: role `exec`, state `bound` or `pending`, and a name that reads
 round token counts as round 1; a name that does not read back does not count). `failed` and `refused` launches,
 other roles and fix rounds (`r2` or more) do not count. The last one in file order counts, not by `ts_ms`.
 A pending row left by a killed launcher moves the turn once.
+`session launch --turn` applies this rule to a launch; see step 3c.
 
 | code | meaning |
 |---|---|
@@ -129,6 +156,7 @@ host's working directory); `.harness/` is created when missing.
 | 4 | the id could not be mapped; the session was stopped (`<host> stop <short-id>` exited 0) |
 | 5 | the id could not be mapped and the stop failed; stderr names the short id, stop it by hand |
 | 6 | a signer launch was refused: its brief names a `builder_state` entry (a `launch_refused` row is written, nothing started) |
+| 7 | a `--turn` launch was refused: its provider is not the turn and no `--turn-reason` was given (step 3c; no row is written, nothing started) |
 
 ## Brief cap
 

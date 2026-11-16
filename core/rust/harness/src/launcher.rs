@@ -10,7 +10,9 @@
 //! launch record could not be written (nothing was started); 3 the host failed to start (non-zero,
 //! no short id, E2BIG, timeout); 4 the id could not be mapped and the session was stopped; 5 the id
 //! could not be mapped and the stop FAILED (stop it by hand); 6 a signer launch was refused because its
-//! brief names a builder-state entry from the config (a `launch_refused` row is written, nothing started).
+//! brief names a builder-state entry from the config (a `launch_refused` row is written, nothing started);
+//! 7 a `--turn` launch is refused because its provider is not the turn and no `--turn-reason` was given
+//! (no row is written, nothing started).
 use crate::events::{self, Field, Kind, Record};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -39,7 +41,7 @@ const AGENT_KEY_SHORT: &str = "id";
 const AGENT_KEY_FULL: &str = "sessionId";
 const AGENT_KEY_NAME: &str = "name";
 
-pub const LAUNCH_USAGE: &str = "usage: harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--sign-off] [--provider <name>] [--start-timeout-ms <n>] [--map-timeout-ms <n>] | session launches [--records <file>] | session next-provider --providers <name>[,<name>] [--records <file>]";
+pub const LAUNCH_USAGE: &str = "usage: harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--sign-off] [--provider <name>] [--turn <name>[,<name>]] [--turn-reason <text>] [--start-timeout-ms <n>] [--map-timeout-ms <n>] | session launches [--records <file>] | session next-provider --providers <name>[,<name>] [--records <file>]";
 
 // ------------------------------------------------------------------------------------ sha256
 
@@ -291,6 +293,30 @@ fn now_ms() -> u64 {
 fn append_row(path: &Path, line: &str) -> Result<(), String> {
     let mut f = OpenOptions::new().read(true).append(true).create(true).open(path).map_err(|e| format!("open: {}", e.kind()))?;
     f.lock().map_err(|e| format!("lock: {e}"))?;
+    write_locked(&mut f, line)
+}
+
+/// Why a turn-checked append stopped: the turn refused it, or the file could not be read or written.
+enum Stop {
+    Turn(String),
+    Io(String),
+}
+
+/// Take the exclusive lock once, read the whole file through that handle, let `decide` build the row from
+/// what was read, and append it through the same handle before the lock is let go.
+fn append_checked(path: &Path, decide: impl FnOnce(&[Launch]) -> Result<String, String>) -> Result<(), Stop> {
+    let io = |what: &str, e: std::io::Error| Stop::Io(format!("{what}: {}", e.kind()));
+    let mut f = OpenOptions::new().read(true).append(true).create(true).open(path).map_err(|e| io("open", e))?;
+    f.lock().map_err(|e| Stop::Io(format!("lock: {e}")))?;
+    let mut bytes = Vec::new();
+    f.seek(SeekFrom::Start(0)).and_then(|_| (&f).take(RECORDS_READ_CAP + 1).read_to_end(&mut bytes)).map_err(|e| io("read", e))?;
+    let launches = parse_launches(&bytes).map_err(Stop::Io)?;
+    let line = decide(&launches).map_err(Stop::Turn)?;
+    write_locked(&mut f, &line).map_err(Stop::Io)
+}
+
+/// With the lock held: refuse a torn tail, then write the row and its newline in one `write`, then `sync_all`.
+fn write_locked(f: &mut File, line: &str) -> Result<(), String> {
     let len = f.metadata().map_err(|e| format!("stat: {}", e.kind()))?.len();
     if len > 0 {
         let mut last = [0u8; 1];
@@ -310,9 +336,11 @@ fn append_row(path: &Path, line: &str) -> Result<(), String> {
 struct Extra<'a> {
     sign_off: bool,
     provider: Option<&'a str>,
+    turn_next: Option<&'a str>,
+    turn_reason: Option<&'a str>,
 }
 
-/// A provider name: 1 to 16 bytes, a lowercase ASCII letter, then lowercase letters or digits.
+/// A provider name: 1 to 16 bytes, a lowercase ASCII letter, then lowercase ASCII letters or digits.
 pub(crate) fn provider_ok(s: &str) -> bool {
     let b = s.as_bytes();
     (1..=16).contains(&b.len()) && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -325,6 +353,12 @@ fn launch_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, extra: &Ext
     }
     if let Some(p) = extra.provider {
         mark.push_str(&format!(",\"provider\":{}", jstr(p)));
+    }
+    if let Some(t) = extra.turn_next {
+        mark.push_str(&format!(",\"turn_next\":{}", jstr(t)));
+    }
+    if let Some(t) = extra.turn_reason {
+        mark.push_str(&format!(",\"turn_reason\":{}", jstr(t)));
     }
     format!(
         "{{\"v\":1,\"kind\":\"launch\",\"ts_ms\":{ts},\"run_id\":{},\"name\":{},\"role\":{},\"brief_sha256\":{},\"owner\":\"orchestration\"{mark}}}",
@@ -363,6 +397,8 @@ pub struct Launch {
     pub sign_off: bool,
     /// The `provider` of the `launch` row, none when the row has no such field.
     pub provider: Option<String>,
+    /// The `turn_next` of the `launch` row, none when the row has no such field.
+    pub turn_next: Option<String>,
 }
 
 /// The lane bound for reading a name back: the 15-digit cap, so any lane number reads back.
@@ -396,6 +432,11 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
     File::open(path)
         .and_then(|f| f.take(RECORDS_READ_CAP + 1).read_to_end(&mut bytes))
         .map_err(|e| format!("cannot read {}: {}", path.display(), e.kind()))?;
+    parse_launches(&bytes)
+}
+
+/// Join the launch records in `bytes` (what `read_launches` reads from a path).
+fn parse_launches(bytes: &[u8]) -> Result<Vec<Launch>, String> {
     if bytes.len() as u64 > RECORDS_READ_CAP {
         return Err("the records file is over the read cap".into());
     }
@@ -432,8 +473,10 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     Some(_) => return Err(bad("`sign_off` is not true")),
                 };
                 if let J::Obj(kv) = &row {
-                    if kv.iter().filter(|(k, _)| k == "provider").count() > 1 {
-                        return Err(bad("`provider` is written twice"));
+                    for key in ["provider", "turn_next", "turn_reason"] {
+                        if kv.iter().filter(|(k, _)| k == key).count() > 1 {
+                            return Err(bad(&format!("`{key}` is written twice")));
+                        }
                     }
                 }
                 let provider = match row.get("provider") {
@@ -441,6 +484,19 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     Some(J::Str(s)) if provider_ok(s) => Some(s.clone()),
                     Some(_) => return Err(bad("`provider` is not a provider name")),
                 };
+                let turn_next = match row.get("turn_next") {
+                    None => None,
+                    Some(J::Str(s)) if provider_ok(s) => Some(s.clone()),
+                    Some(_) => return Err(bad("`turn_next` is not a provider name")),
+                };
+                let reason = match row.get("turn_reason") {
+                    None => None,
+                    Some(J::Str(s)) => Some(s),
+                    Some(_) => return Err(bad("`turn_reason` is not a string")),
+                };
+                if provider.is_none() && (turn_next.is_some() || reason.is_some()) {
+                    return Err(bad("`turn_next` or `turn_reason` in a row with no `provider`"));
+                }
                 out.push(Launch {
                     run_id: run.clone(),
                     name: f("name")?,
@@ -452,6 +508,7 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     state: "pending",
                     sign_off,
                     provider,
+                    turn_next,
                 });
             }
             "launch_ids" => {
@@ -494,6 +551,7 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     state: "refused",
                     sign_off: false,
                     provider: None,
+                    turn_next: None,
                 });
             }
             _ => return Err(bad("unknown `kind`")),
@@ -618,6 +676,61 @@ struct Args {
     map_ms: u64,
     sign_off: bool,
     provider: Option<String>,
+    turn: Option<Vec<String>>,
+    turn_reason: Option<String>,
+}
+
+/// Split a provider list: one name or two names, each in the name form, not the same twice.
+fn parse_provider_list<'a>(list: &'a str, flag: &str) -> Result<Vec<&'a str>, String> {
+    let names: Vec<&str> = list.split(',').collect();
+    if names.len() > 2 {
+        return Err(format!("{flag} takes one name or two names"));
+    }
+    if names.iter().any(|n| !provider_ok(n)) {
+        return Err(format!("{flag} has a name that is empty or not in the provider name form"));
+    }
+    if names.len() == 2 && names[0] == names[1] {
+        return Err(format!("{flag} names the same provider twice"));
+    }
+    Ok(names)
+}
+
+/// Why the next provider cannot be computed: the last counted launch's run id, and its provider if it has one.
+enum NoNext {
+    NoProvider(String),
+    Unknown(String, String),
+}
+
+/// The next provider for `names` (one or two) over `launches`, with the basis word of the verb's line.
+fn next_provider<'a>(names: &[&'a str], launches: &[Launch]) -> Result<(&'a str, &'static str), NoNext> {
+    let last = last_counted(launches);
+    match (names.len(), last) {
+        (1, _) => Ok((names[0], "single")),
+        (_, None) => Ok((names[0], "first")),
+        (_, Some(l)) => match l.provider.as_deref() {
+            None => Err(NoNext::NoProvider(l.run_id.clone())),
+            Some(p) => match names.iter().position(|n| *n == p) {
+                Some(i) => Ok((names[1 - i], "turn")),
+                None => Err(NoNext::Unknown(p.to_string(), l.run_id.clone())),
+            },
+        },
+    }
+}
+
+/// The turn check of one launch: `Ok(turn_next)` when it goes on, `Err(text)` when it is refused.
+fn turn_decide(names: &[&str], provider: &str, reason: Option<&str>, launches: &[Launch]) -> Result<Option<String>, String> {
+    match next_provider(names, launches) {
+        Ok((next, _)) if provider == next || reason.is_some() => Ok(Some(next.to_string())),
+        Ok((next, _)) => Err(format!("turn: provider {provider} is not the turn, next is {next}")),
+        Err(_) if reason.is_some() => Ok(None),
+        Err(NoNext::NoProvider(run)) => Err(format!("turn: the last counted launch {run} carries no provider")),
+        Err(NoNext::Unknown(p, run)) => Err(format!("turn: the last counted launch {run} carries provider {p}, not in --turn")),
+    }
+}
+
+/// `--turn-reason` text: 1 to 200 bytes, no control character, not only blanks.
+fn reason_ok(s: &str) -> bool {
+    (1..=200).contains(&s.len()) && !s.chars().any(char::is_control) && !s.chars().all(char::is_whitespace)
 }
 
 fn refused_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, entry: &str) -> String {
@@ -636,6 +749,7 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
         (None, None, None, None, None, None, None, None);
     let mut sign_off = false;
     let mut provider: Option<String> = None;
+    let (mut turn, mut turn_reason): (Option<String>, Option<String>) = (None, None);
     let mut it = a.iter();
     while let Some(f) = it.next() {
         if f == "--sign-off" {
@@ -655,6 +769,8 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
             "--start-timeout-ms" => &mut start,
             "--map-timeout-ms" => &mut map,
             "--provider" => &mut provider,
+            "--turn" => &mut turn,
+            "--turn-reason" => &mut turn_reason,
             _ => return Err(format!("unknown argument `{f}`")),
         };
         let v = it.next().ok_or_else(|| format!("{f} is missing its value"))?;
@@ -664,7 +780,26 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
     }
     if let Some(p) = &provider {
         if !provider_ok(p) {
-            return Err("--provider must be 1 to 16 bytes: a lowercase letter, then lowercase letters or digits".into());
+            return Err("--provider must be 1 to 16 bytes: a lowercase ASCII letter, then lowercase ASCII letters or digits".into());
+        }
+    }
+    let turn_names = match &turn {
+        None => None,
+        Some(list) => {
+            let Some(p) = provider.as_deref() else { return Err("--turn needs --provider".into()) };
+            let names = parse_provider_list(list, "--turn")?;
+            if !names.contains(&p) {
+                return Err("--provider is not in the --turn list".into());
+            }
+            Some(names.iter().map(|n| n.to_string()).collect::<Vec<String>>())
+        }
+    };
+    if let Some(r) = &turn_reason {
+        if turn.is_none() {
+            return Err("--turn-reason needs --turn".into());
+        }
+        if !reason_ok(r) {
+            return Err("--turn-reason must be 1 to 200 bytes, with no control character, and not only blanks".into());
         }
     }
     let need = |o: Option<String>, n: &str| o.ok_or_else(|| format!("{n} is required"));
@@ -683,6 +818,8 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
         map_ms: ms(map, DEFAULT_MAP_TIMEOUT_MS, "--map-timeout-ms")?,
         sign_off,
         provider,
+        turn: turn_names,
+        turn_reason,
     })
 }
 
@@ -752,6 +889,14 @@ pub fn launch_cmd(a: &[String]) -> i32 {
     if args.sign_off && !SIGN_OFF_ROLES.contains(&role) {
         return usage_err("--sign-off needs a gov or e-rvw name");
     }
+    if args.turn.is_some() {
+        if role != "exec" {
+            return usage_err("--turn needs an exec name");
+        }
+        if verdict.round.unwrap_or(1) != 1 {
+            return usage_err("--turn takes round 1 names only; a fix round goes to a provider typed by hand");
+        }
+    }
     let checked = args.sign_off || ALWAYS_CHECKED_ROLES.contains(&role);
     // 3. hash and run id
     let sha = sha256_hex(&brief);
@@ -794,8 +939,32 @@ pub fn launch_cmd(a: &[String]) -> i32 {
             return 6;
         }
     }
-    let extra = Extra { sign_off: args.sign_off, provider: args.provider.as_deref() };
-    if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha, &extra)) {
+    let extra = Extra {
+        sign_off: args.sign_off,
+        provider: args.provider.as_deref(),
+        turn_next: None,
+        turn_reason: args.turn_reason.as_deref(),
+    };
+    if let (Some(names), Some(provider)) = (&args.turn, args.provider.as_deref()) {
+        // 4c. the turn check, under the lock the launch row is appended under
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let written = append_checked(&records, |ls| {
+            let next = turn_decide(&names, provider, args.turn_reason.as_deref(), ls)?;
+            let with_turn = Extra { turn_next: next.as_deref(), ..extra };
+            Ok(launch_row(now_ms(), &run, &args.name, role, &sha, &with_turn))
+        });
+        match written {
+            Ok(()) => {}
+            Err(Stop::Turn(m)) => {
+                eprintln!("launch refused: {m}; nothing started");
+                return 7;
+            }
+            Err(Stop::Io(e)) => {
+                eprintln!("launch refused: launch record not written: {e}");
+                return 2;
+            }
+        }
+    } else if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha, &extra)) {
         eprintln!("launch refused: launch record not written: {e}");
         return 2;
     }
@@ -898,7 +1067,7 @@ pub fn launches_cmd(a: &[String]) -> i32 {
         Ok(ls) => {
             for l in ls {
                 println!(
-                    "run_id={} name={} role={} brief_sha256={} ts_ms={} short_id={} session_id={} state={}{}{}",
+                    "run_id={} name={} role={} brief_sha256={} ts_ms={} short_id={} session_id={} state={}{}{}{}",
                     l.run_id,
                     l.name,
                     l.role,
@@ -908,7 +1077,8 @@ pub fn launches_cmd(a: &[String]) -> i32 {
                     l.session_id.as_deref().unwrap_or("-"),
                     l.state,
                     if l.sign_off { " sign_off=yes" } else { "" },
-                    l.provider.as_ref().map(|p| format!(" provider={p}")).unwrap_or_default()
+                    l.provider.as_ref().map(|p| format!(" provider={p}")).unwrap_or_default(),
+                    l.turn_next.as_ref().map(|p| format!(" turn_next={p}")).unwrap_or_default()
                 );
             }
             0
@@ -943,16 +1113,10 @@ pub fn next_provider_cmd(a: &[String]) -> i32 {
         }
     }
     let Some(list) = list else { return usage_err("--providers is required") };
-    let names: Vec<&str> = list.split(',').collect();
-    if names.len() > 2 {
-        return usage_err("--providers takes one name or two names");
-    }
-    if names.iter().any(|n| !provider_ok(n)) {
-        return usage_err("--providers has a name that is empty or not in the provider name form");
-    }
-    if names.len() == 2 && names[0] == names[1] {
-        return usage_err("--providers names the same provider twice");
-    }
+    let names = match parse_provider_list(list, "--providers") {
+        Ok(n) => n,
+        Err(m) => return usage_err(&m),
+    };
     let path = PathBuf::from(records.map(String::as_str).unwrap_or(DEFAULT_RECORDS));
     let launches = match read_launches(&path) {
         Ok(l) => l,
@@ -964,22 +1128,16 @@ pub fn next_provider_cmd(a: &[String]) -> i32 {
     let last = last_counted(&launches);
     let last_provider = last.and_then(|l| l.provider.as_deref());
     let last_run = last.map(|l| l.run_id.as_str());
-    let (next, basis) = match (names.len(), last) {
-        (1, _) => (names[0], "single"),
-        (_, None) => (names[0], "first"),
-        (_, Some(l)) => match last_provider {
-            None => {
-                eprintln!("harness: next-provider refused: reason=no-provider run_id={}", l.run_id);
-                return 4;
-            }
-            Some(p) => match names.iter().position(|n| *n == p) {
-                Some(i) => (names[1 - i], "turn"),
-                None => {
-                    eprintln!("harness: next-provider refused: reason=unknown-provider provider={p} run_id={}", l.run_id);
-                    return 5;
-                }
-            },
-        },
+    let (next, basis) = match next_provider(&names, &launches) {
+        Ok(x) => x,
+        Err(NoNext::NoProvider(run)) => {
+            eprintln!("harness: next-provider refused: reason=no-provider run_id={run}");
+            return 4;
+        }
+        Err(NoNext::Unknown(p, run)) => {
+            eprintln!("harness: next-provider refused: reason=unknown-provider provider={p} run_id={run}");
+            return 5;
+        }
     };
     println!(
         "next_provider={next} last_provider={} last_run_id={} basis={basis}",
