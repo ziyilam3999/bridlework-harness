@@ -9,7 +9,7 @@
 //! lane) and renames it onto the lane name, so a reader never sees a half-written record. The lanes dir is read strictly: a record that is not a
 //! regular file, cannot be read or parsed (a `repo_id` that is not a legal repo id does not parse: the clash is decided by the repo id, so a
 //! record that spells another repo id is a bad record, not another repo), has a name other than `lane-<n>` (n canonical, 1..=the config
-//! `lanes.count`) or `parked-<ticket-id>` (the id byte-equal to the `ticket=` line inside), or repeats a ticket, is an error and nothing is
+//! `lanes.count`) or `parked-<ticket-id>` (the id byte-equal to the `ticket=` line inside), or repeats a live ticket, is an error and nothing is
 //! changed. The admission record is read fail closed too: one that exists and is not valid is a `bad-admission` refusal
 //! checked before the lanes dir is touched, while a path where nothing exists means no admission (cap 1). A claim whose scope overlaps the scope
 //! of a live ticket of the same repo is refused with `clash`: checked after `already-live` and the cap, before anything is written (`scope_entry_parts`
@@ -895,7 +895,7 @@ fn parse_args(rest: &[String], allowed: &[&str]) -> Result<(Option<String>, std:
     Ok((pos, m))
 }
 
-/// Does this option value end with `/` or hold a `.` or `..` part (split on `/`)? Such a spelling resolves through a symbolic link at the
+/// Does this option value end with `/` or hold a `.` or `..` part (split on `/`)? Such a spelling can resolve through a symbolic link at the
 /// end of the path (`<link>/` and `<link>/.` name the link target), so it is refused before anything is touched.
 fn path_spelling_ok(v: &str) -> bool {
     !v.ends_with('/') && !v.split('/').any(|p| p == "." || p == "..")
