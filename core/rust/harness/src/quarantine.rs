@@ -10,8 +10,10 @@
 //! Symlinks are never followed anywhere in this module: a link found in a root is a leftover like any other and is
 //! moved as the link itself (its target is never read or touched), a listed link is unlinked as the link only, and
 //! the recursive delete unlinks a link inside a listed folder without following it. The walk is read-only and
-//! completes before the first move; every cap and every refusal fires before anything is written. No folder path is
-//! ever printed on stdout or stderr (the workspace privacy rule): fixed lines of fixed fields only.
+//! completes before the first move; in the sweep and delete-listed each cap and each refusal fires before
+//! anything is written, and drop-build holds that order from the caps lock file on (a ticket refused after the
+//! lock leaves an empty lock file). No folder path is ever printed on stdout or stderr (the workspace privacy
+//! rule): fixed lines of fixed fields only.
 
 use crate::caps::{Caps, LockError};
 use crate::events::{self, token_ok, Field, Kind, Record};
@@ -1119,12 +1121,16 @@ fn ticket_folder_ok(name: &str, t: &str) -> bool {
     rest.starts_with('.') && two_digit_groups(&rest[1..])
 }
 
-/// Other ticket ids `name` also matches under the three forms (`foo.old.1.2` is also `foo.old` plus `.1.2`).
+/// Other ticket ids `name` also matches under the three forms: its own whole name (`a.1.2` is also ticket
+/// `a.1.2`), its `<id>.<d>.<d>` reading and its `<id>.old.<d>.<d>` reading (`foo.old.1.2` is also `foo.old`).
 /// Each is a plain token by construction of the split.
 fn other_ticket_ids(name: &str, t: &str) -> Vec<String> {
     let parts: Vec<&str> = name.split('.').collect();
     let n = parts.len();
     let mut out: Vec<String> = Vec::new();
+    if name != t && token_ok(name) {
+        out.push(name.to_string());
+    }
     if n >= 3 && digit_group_ok(parts[n - 2]) && digit_group_ok(parts[n - 1]) {
         let id = parts[..n - 2].join(".");
         if id != t && token_ok(&id) {
@@ -1138,6 +1144,16 @@ fn other_ticket_ids(name: &str, t: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Does a manifest file for `oid` sit in `md`? `NotFound` is a plain no; any other stat error is undecidable,
+/// so the run refuses: exit 3, one line, nothing removed.
+fn manifest_present(md: &Path, oid: &str) -> Result<bool, Stop> {
+    match fs::symlink_metadata(md.join(format!("{oid}.jsonl"))) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(err3("a manifest file cannot be examined; nothing was removed")),
+    }
 }
 
 /// Read the cache tag at `p`: opened with no link follow and no blocking (`O_NOFOLLOW | O_NONBLOCK`), the
@@ -1256,9 +1272,10 @@ fn drop_chdir(comp: &OsStr) -> Result<DropIn, ()> {
 /// `target` is checked AGAIN — a real directory, on the root's device, holding the cache tag; a check that
 /// fails now is `Ok(false)`: the folder is kept. Inside `target`, each entry other than the tag is removed
 /// (a folder with `remove_dir_all`, a file or link with `remove_file`), then the tag, then `target` itself by
-/// `remove_dir` from its parent reached again from the root — so a removal that stops part way leaves the
-/// tag in place and the next run finds the folder again. `Err(())` is a mid-removal failure: the run stops
-/// at this match.
+/// `remove_dir` from its parent reached again from the root — so a removal that stops before the tag is
+/// removed leaves the tag in place and the next run finds the folder again, while a failure at the last step
+/// (removing the emptied `target` itself) leaves an empty `target` with no tag, which later runs keep.
+/// `Err(())` is a mid-removal failure: the run stops at this match.
 fn remove_target(root: &Path, comps: &[std::ffi::OsString], root_dev: u64) -> Result<bool, ()> {
     let Some((final_name, mids)) = comps.split_last() else {
         return Err(());
@@ -1320,8 +1337,9 @@ fn remove_target(root: &Path, comps: &[std::ffi::OsString], root_dev: u64) -> Re
 /// overlap), the per-ticket caps lock (Busy: exit 3 — a run for this ticket is in progress), the closed
 /// proof (the manifest reads, is clean, holds no live entry and a remove line for the id `worktree`), then
 /// the read-only walk, then the removals. A `--dry-run` runs the same walk and removes nothing. The first
-/// failing step before the removals is one stderr line (no folder on either stream) and stops with nothing
-/// removed; a failure inside the removals stops the run with what it already removed kept.
+/// failing step before the removals is one stderr line (no folder on either stream; a usage error prints its
+/// error line and the USAGE text) and stops with nothing removed; a failure inside the removals stops the
+/// run with what it already removed kept.
 pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
     refuse_unless_single_thread()?;
     if a.roots.is_empty() {
@@ -1334,17 +1352,23 @@ pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
     for (i, r) in a.roots.iter().enumerate() {
         let n = i + 1;
         let flag = format!("--root {n}");
-        // the raw text is scanned because `Path` hides interior `.`
-        let text = r.to_str().ok_or_else(|| err2(&format!("{flag} is not utf-8")))?;
-        if !r.is_absolute() || text.split('/').any(|seg| seg == "." || seg == "..") {
+        if !r.is_absolute() {
             return Err(err2(&format!("{flag} must be an absolute path with no `.` or `..` component")));
         }
-        let meta = fs::symlink_metadata(r).map_err(|_| err2(&format!("{flag} is missing or unreadable")))?;
+        // the no-follow stat runs on the path rebuilt from its components: lstat on a spelling with a trailing
+        // "/" or "/." resolves through a link at the final component (review r2, B2), which must be refused
+        let spelled: PathBuf = r.components().collect();
+        let meta = fs::symlink_metadata(&spelled).map_err(|_| err2(&format!("{flag} is missing or unreadable")))?;
         if meta.file_type().is_symlink() {
             return Err(err2(&format!("{flag} must be a real directory (a link is refused)")));
         }
         if !meta.is_dir() {
             return Err(err2(&format!("{flag} must be a real directory (a file is refused)")));
+        }
+        // the raw text is scanned because `Path` hides interior `.`
+        let text = r.to_str().ok_or_else(|| err2(&format!("{flag} is not utf-8")))?;
+        if text.split('/').any(|seg| seg == "." || seg == "..") {
+            return Err(err2(&format!("{flag} must be an absolute path with no `.` or `..` component")));
         }
         let c = r.canonicalize().map_err(|_| err2(&format!("{flag} cannot be resolved")))?;
         if c == Path::new("/") {
@@ -1409,10 +1433,14 @@ pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
                 continue; // a linked ticket folder is not followed
             }
             // a child that also matches another id with its own manifest belongs to that ticket: skipped
-            if other_ticket_ids(name_str, &a.ticket)
-                .iter()
-                .any(|oid| fs::symlink_metadata(md.join(format!("{oid}.jsonl"))).is_ok())
-            {
+            let mut other = false;
+            for oid in other_ticket_ids(name_str, &a.ticket) {
+                if manifest_present(&md, &oid)? {
+                    other = true;
+                    break;
+                }
+            }
+            if other {
                 continue;
             }
             drop_walk_inside(&p, 2, c, idx, root_devs[idx], &mut w)?;

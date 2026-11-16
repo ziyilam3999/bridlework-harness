@@ -267,6 +267,22 @@ fn dry_run_removes_nothing() {
     no_leak(&f, &o);
 }
 
+/// A dry run keeps an untagged target: would_remove=0 kept=1, and the tree is byte-unchanged.
+#[test]
+fn dry_run_keeps_an_untagged_target() {
+    let f = fixture();
+    let t1 = f.gate.join("t-1/core/rust/target");
+    fs::create_dir_all(&t1).unwrap();
+    fs::write(t1.join("build.bin"), b"bin").unwrap();
+    let before = snap(&f.gate);
+    let o = drop_cmd("t-1", &[&f.gate, &f.ignored], &f.md, &f.caps, &["--dry-run"]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(out(&o), "drop-build=dry-run ticket=t-1 would_remove=0 kept=1\n");
+    assert_eq!(snap(&f.gate), before, "a dry run changes nothing");
+    assert_eq!(fs::read(t1.join("build.bin")).unwrap(), b"bin", "the untagged target is intact");
+    no_leak(&f, &o);
+}
+
 // ---------------------------------------------------------------- usage
 
 /// An unknown flag, a missing value, a repeated single flag, a 9th --root, no ticket and a second ticket are
@@ -359,6 +375,36 @@ fn a_root_that_is_a_link_exits_2() {
     assert!(t1.join("CACHEDIR.TAG").exists(), "the target behind the link is byte-unchanged");
 }
 
+/// A linked --root spelled with a trailing "/" is refused with the same line as the plain linked root: the
+/// no-follow stat runs on the path rebuilt from its components (which drops the trailing "/"), so lstat does
+/// not resolve through the link.
+#[test]
+fn a_linked_root_with_a_trailing_slash_exits_2() {
+    let f = fixture();
+    let t1 = build_output(&f.gate.join("t-1"));
+    let link = f.state.join("gate-link");
+    std::os::unix::fs::symlink(&f.gate, &link).unwrap();
+    let spelled = format!("{}/", s(&link));
+    let o = drop_cmd("t-1", &[Path::new(&spelled)], &f.md, &f.caps, &[]);
+    refused_2_unchanged(&f, &o);
+    assert_eq!(err(&o), "harness: error: --root 1 must be a real directory (a link is refused)\n");
+    assert!(t1.join("CACHEDIR.TAG").exists(), "the target behind the link is byte-unchanged");
+}
+
+/// A linked --root spelled with a trailing "/." is refused the same way (the rebuilt spelling drops the "/.").
+#[test]
+fn a_linked_root_with_a_trailing_dot_exits_2() {
+    let f = fixture();
+    let t1 = build_output(&f.gate.join("t-1"));
+    let link = f.state.join("gate-link");
+    std::os::unix::fs::symlink(&f.gate, &link).unwrap();
+    let spelled = format!("{}/.", s(&link));
+    let o = drop_cmd("t-1", &[Path::new(&spelled)], &f.md, &f.caps, &[]);
+    refused_2_unchanged(&f, &o);
+    assert_eq!(err(&o), "harness: error: --root 1 must be a real directory (a link is refused)\n");
+    assert!(t1.join("CACHEDIR.TAG").exists(), "the target behind the link is byte-unchanged");
+}
+
 /// A relative --root is refused, exit 2.
 #[test]
 fn a_relative_root_exits_2() {
@@ -402,6 +448,18 @@ fn a_root_inside_another_root_exits_2() {
     let o = drop_cmd("t-1", &[&f.gate, &sub], &f.md, &f.caps, &[]);
     refused_2_unchanged(&f, &o);
     assert!(err(&o).contains("--root 2"), "the refusal names the root position: {}", err(&o));
+}
+
+/// The same root given twice (`--root gate --root gate`) is refused, exit 2, nothing removed.
+#[test]
+fn an_equal_root_given_twice_exits_2() {
+    let f = fixture();
+    build_output(&f.gate.join("t-1"));
+    let before = snap(&f.state);
+    let o = drop_cmd("t-1", &[&f.gate, &f.gate], &f.md, &f.caps, &[]);
+    refused_2_unchanged(&f, &o);
+    assert!(err(&o).contains("--root 2"), "the refusal names the repeated root: {}", err(&o));
+    assert_eq!(snap(&f.state), before);
 }
 
 /// A --caps-dir that lies inside a root is refused, exit 2.
@@ -708,6 +766,56 @@ fn an_ambiguous_child_with_its_own_manifest_is_kept() {
     assert_eq!(out(&o), "drop-build=done ticket=t-1 removed=0 kept=0\n");
     assert!(amb.join("CACHEDIR.TAG").exists(), "the ambiguous child is skipped, not visited");
     assert!(f.gate.join("t-1.old.1.2/core/rust/lib.rs").exists(), "nothing inside it was touched");
+}
+
+/// A child whose whole name is itself another live ticket's id (`t-1.1.2` is also ticket `t-1.1.2`, and that
+/// ticket has its own manifest with a live worktree) is skipped: only the ticket's own target goes, the other
+/// ticket's target and tag stay.
+#[test]
+fn a_child_named_as_another_live_ticket_is_kept() {
+    let f = fixture();
+    let mine = build_output(&f.gate.join("t-1"));
+    let other = build_output(&f.gate.join("t-1.1.2"));
+    let gate = f.gate.canonicalize().unwrap();
+    fs::write(
+        f.md.join("t-1.1.2.jsonl"),
+        format!(
+            "{{\"v\":1,\"op\":\"root\",\"ticket\":\"t-1.1.2\",\"path\":\"{}\",\"ts_ms\":1}}\n{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1.1.2\",\"id\":\"worktree\",\"class\":\"worktree\",\"path\":\"{}/t-1.1.2/tree\",\"ts_ms\":2}}\n",
+            s(&gate),
+            s(&gate)
+        ),
+    )
+    .unwrap();
+    let o = drop_both(&f);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(out(&o), "drop-build=done ticket=t-1 removed=1 kept=0\n");
+    assert!(!mine.exists(), "the ticket's own target is removed");
+    assert!(other.join("CACHEDIR.TAG").exists(), "the other live ticket's target is kept");
+    assert!(f.gate.join("t-1.1.2/core/rust/lib.rs").exists(), "nothing inside it was touched");
+}
+
+/// The old form reads the same way: a child named `t-1.old.3.4` that is itself another live ticket (its own
+/// manifest exists; the `t-1.old` reading has no manifest) is kept by the whole-name rule alone.
+#[test]
+fn a_child_named_as_another_old_form_ticket_is_kept() {
+    let f = fixture();
+    let mine = build_output(&f.gate.join("t-1"));
+    let other = build_output(&f.gate.join("t-1.old.3.4"));
+    let gate = f.gate.canonicalize().unwrap();
+    fs::write(
+        f.md.join("t-1.old.3.4.jsonl"),
+        format!(
+            "{{\"v\":1,\"op\":\"root\",\"ticket\":\"t-1.old.3.4\",\"path\":\"{}\",\"ts_ms\":1}}\n{{\"v\":1,\"op\":\"add\",\"ticket\":\"t-1.old.3.4\",\"id\":\"worktree\",\"class\":\"worktree\",\"path\":\"{}/t-1.old.3.4/tree\",\"ts_ms\":2}}\n",
+            s(&gate),
+            s(&gate)
+        ),
+    )
+    .unwrap();
+    let o = drop_both(&f);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(out(&o), "drop-build=done ticket=t-1 removed=1 kept=0\n");
+    assert!(!mine.exists(), "the ticket's own target is removed");
+    assert!(other.join("CACHEDIR.TAG").exists(), "the other old-form ticket's target is kept");
 }
 
 /// A target inside `.git` is kept: `.git` is not entered, so kept=0 and the target is intact.
