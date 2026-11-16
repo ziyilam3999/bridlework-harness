@@ -1531,12 +1531,7 @@ fn the_spawn_gate_closes_the_inherited_lock_window() {
             std::thread::spawn(move || {
                 let mut first = true;
                 while !stop.load(Ordering::SeqCst) {
-                    {
-                        let _gate = spawning();
-                        let mut c = Command::new(BIN);
-                        c.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-                        c.spawn().unwrap().wait_with_output().unwrap();
-                    }
+                    run(&["--version"]);
                     if first {
                         first = false;
                         started.fetch_add(1, Ordering::SeqCst);
@@ -1550,13 +1545,14 @@ fn the_spawn_gate_closes_the_inherited_lock_window() {
     while started.load(Ordering::SeqCst) < 4 && begin.elapsed() < limit {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    // The rounds stop at the count cap or the time cap, whichever comes first: wait_for_spawns also waits out the
-    // children of the other tests of this file, so a busy host slows a round. The test asks for 50 rounds, not the full count.
+    assert_eq!(started.load(Ordering::SeqCst), 4, "the spawning threads did not start");
+    // The rounds run for at least 5 seconds and at most 15, and for 2000 rounds when those fit: wait_for_spawns also
+    // waits out the children of the other tests of this file, so a busy host slows a round. The test fails when fewer than 50 rounds ran.
     let rounds_begin = std::time::Instant::now();
-    let rounds_limit = std::time::Duration::from_secs(30);
+    let (rounds_min, rounds_limit) = (std::time::Duration::from_secs(5), std::time::Duration::from_secs(15));
     let mut blocked = 0;
     let mut rounds = 0;
-    while rounds < 2000 && rounds_begin.elapsed() < rounds_limit {
+    while (rounds < 2000 || rounds_begin.elapsed() < rounds_min) && rounds_begin.elapsed() < rounds_limit {
         let h = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path).unwrap();
         if let Err(fs::TryLockError::WouldBlock) = h.try_lock() {
             blocked += 1;
