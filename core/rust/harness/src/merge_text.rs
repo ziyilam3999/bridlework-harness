@@ -1,7 +1,7 @@
 //! `harness ticket merge-text` (std only, Unix; `docs/merge-text.md` is the contract). Reads a ticket file
 //! and a body file, checks a squash subject and body, and writes two new files, or refuses. It runs no gh,
 //! no git and no network call. Exit codes: 0 ok; 1 a refused input; 2 usage, setup or an unusable input.
-//! No title, body or path text is printed.
+//! No title, body or path text is printed (a reader refusal can name a ticket key).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -114,7 +114,7 @@ fn has_control(s: &str) -> bool {
     s.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
 }
 
-/// Two or more runs of ASCII letters or digits joined by single `-`, then blanks, then a colon.
+/// Two or more runs of ASCII letters or digits joined by single `-`, then zero or more blanks, then a colon.
 fn looks_like_trailer(line: &str) -> bool {
     let b = line.trim_start().as_bytes();
     let mut i = 0;
