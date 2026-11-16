@@ -69,12 +69,12 @@ All rows are one compact JSON line in an append-only file, taken under an exclus
 `harness session launches` joins rows by `run_id` and prints one line per launch with `state=bound|failed|pending|refused`.
 A corrupt line stops the read (exit 2, the line number named). `launcher::read_launches` is the same join as a function.
 
-A `--sign-off` launch writes `"sign_off":true` as the last field of its `launch` row (a launch without the flag writes the
-row it always wrote). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
+A `--sign-off` launch writes `"sign_off":true` after `owner` in its `launch` row, before any `provider` field (a launch
+without the flag writes the row it always wrote). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
 (`false`, a string, a number) is a corrupt line. `harness session sign-off-check` reads the mark; see `docs/signoff.md`.
 
 A launch given `--provider` writes `"provider":"<name>"` after the fields it writes today (after `"sign_off":true` when
-that is present); a launch without it writes the row it always wrote. A `provider` field that is not a string in the
+that is present); a launch without it writes the row it wrote before the flag. A `provider` field that is not a string in the
 provider name form, or `provider` written twice in one row, is a corrupt line: `session launches`,
 `session sign-off-check` and `next-provider` refuse the file, and `lane stale` refuses it on its first read.
 `launches` appends ` provider=<name>` to the line of a launch that carries it, after `sign_off=yes` when present.
@@ -85,7 +85,7 @@ provider name form, or `provider` written twice in one row, is a corrupt line: `
 harness session next-provider --providers <name>[,<name>] [--records <file>]
 ```
 
-`<list>` is one name or two different names joined by one comma, each in the provider name form. The default records
+The `--providers` value is one name or two different names joined by one comma, each in the provider name form. The default records
 path is the one of `session launches`. The verb reads and reports; it writes no file and logs no event. It does not
 reserve a turn: two callers at once get the same answer.
 

@@ -922,7 +922,7 @@ pub fn launches_cmd(a: &[String]) -> i32 {
 
 pub const NEXT_PROVIDER_USAGE: &str = "usage: harness session next-provider --providers <name>[,<name>] [--records <file>]";
 
-/// `harness session next-provider --providers <list> [--records <file>]`. Read-only; see docs/launcher.md.
+/// `harness session next-provider --providers <name>[,<name>] [--records <file>]`. Read-only; see docs/launcher.md.
 pub fn next_provider_cmd(a: &[String]) -> i32 {
     let usage_err = |m: &str| {
         eprintln!("harness: error: {m}");
