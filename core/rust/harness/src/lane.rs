@@ -598,8 +598,8 @@ fn nearest_existing_ancestor(p: &Path) -> PathBuf {
 }
 
 // `statvfs(2)` free-space reading (the `quarantine.rs` pattern): one `#[repr(C)]` struct per target, laid out as
-// the platform header declares it. Unread fields carry a leading underscore. A target with no struct fails the
-// build here; the same gate keeps `free_bytes` to macOS and 64-bit Linux.
+// the platform header declares it. Unread fields carry a leading underscore. A target with no struct gets no
+// `statvfs` reading: the same gate limits the real `free_bytes` to macOS and 64-bit Linux, and `free_bytes` is `None` elsewhere.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Default)]
@@ -1170,7 +1170,7 @@ mod tests {
         // floor 50: exactly 50000000000 free claims, 49999999999 is refused with free_gb=49
         assert_eq!(check_disk_floor(&d, Some(50), &|_| Some(50000000000)), FloorCheck::Ok);
         assert_eq!(check_disk_floor(&d, Some(50), &|_| Some(49999999999)), FloorCheck::LowDisk("free_gb=49 min_free_gb=50".to_string()));
-        // floor 999999999999999 with a reading of u64::MAX: refused (a u64 product would wrap to about 0.09 GB and pass)
+        // floor 999999999999999 with a reading of u64::MAX: refused (a u64 product would wrap to about 2.0 GB and pass)
         assert_eq!(
             check_disk_floor(&d, Some(999999999999999), &|_| Some(u64::MAX)),
             FloorCheck::LowDisk(format!("free_gb={} min_free_gb=999999999999999", u64::MAX / 1000000000))
