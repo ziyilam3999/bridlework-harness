@@ -16,9 +16,10 @@ use std::sync::{RwLock, RwLockReadGuard};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
-// The shelf lock is an flock on the open file description, and a child made by a sibling test thread holds a copy of
-// the lock fd until it starts its program. A child of this file is started and waited for under the read side;
-// wait_for_spawns takes the write side, so it returns when each earlier child has exited and holds no copy.
+// The shelf lock is an flock on the open file description, and a child made by a sibling test thread while the lock
+// is held holds a copy of the lock fd until it starts its program. A child of this file is started and waited for
+// under the read side; wait_for_spawns takes the write side, so it returns when each earlier child has exited and
+// holds no copy.
 static SPAWN: RwLock<()> = RwLock::new(());
 
 /// The read side of the spawn gate; a poisoned gate is taken with into_inner.
