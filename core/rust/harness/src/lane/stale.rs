@@ -1,10 +1,12 @@
 //! `harness lane stale` (std only, Unix): the stale-lane check. It reads the live lane records, the launch records and the host session
 //! list, and prints one verdict per live record; it runs no stop, rm or fetch (`docs/lanes.md`, *The stale check*). Without `--apply` it
 //! writes nothing, calls the host once (`agents --json --all`) and the lock is released before the host or git runs. With `--apply` a
-//! record judged `stale gone-clean-pushed` goes through the park step: one critical section under the lanes dir lock that reads the lanes
-//! dir, the host listing, the launch records and the tree again, and parks the lane only when the verdict is still that one. The clean and
-//! pushed answers are the child runs `harness workspace check` and `harness workspace check --pushed` of this same binary, each under a
-//! 30 second limit and a 1 MiB cap per stream.
+//! record judged `stale` (`gone-clean-pushed` or `gone-clean-on-remote`) goes through the park step: one critical section under the lanes dir
+//! lock that reads the lanes dir, the host listing, the launch records and the tree again, and parks the lane only when the verdict is still
+//! stale with either reason; the printed line carries the reason of the re-check. The clean and pushed answers are the child runs `harness
+//! workspace check` and `harness workspace check --pushed --remote-copy` of this same binary, each under a 30 second limit and a 1 MiB cap
+//! per stream. A branch with no upstream whose commits are all on a plain remote-tracking ref is `stale gone-clean-on-remote`; exit 0 with
+//! any other stdout than the two expected lines is `unknown pushed-check-failed`.
 //! Exit 0: no verdict is `unknown`; 3: one or more are; 2: a usage error, a whole-run failure (`lane: error: <cause>`, empty stdout) or a
 //! park body error (the lines of the records handled before it stay on stdout).
 
@@ -300,9 +302,26 @@ fn tree_verdict(o: &Opts, r: &Record) -> Out {
         Some(Answer::Stray) => return ("unsaved", "stray"),
         _ => return ("unknown", "clean-check-failed"),
     }
-    let pushed = run_child(&[OsStr::new("workspace"), OsStr::new("check"), ticket, OsStr::new("--manifest-dir"), md, OsStr::new("--pushed"), OsStr::new("--repo"), repo.as_os_str()]);
+    let pushed = run_child(&[
+        OsStr::new("workspace"),
+        OsStr::new("check"),
+        ticket,
+        OsStr::new("--manifest-dir"),
+        md,
+        OsStr::new("--pushed"),
+        OsStr::new("--repo"),
+        repo.as_os_str(),
+        OsStr::new("--remote-copy"),
+    ]);
+    let t = &r.ticket;
+    let pushed_head = format!("workspace=pushed ticket={t} branch=ws/{t} upstream=");
+    let on_remote = format!("workspace=on-remote ticket={t} branch=ws/{t}\n");
     match pushed {
-        Some(c) if c.code == 0 => ("stale", "gone-clean-pushed"),
+        Some(c) if c.code == 0 => match std::str::from_utf8(&c.stdout) {
+            Ok(s) if s == on_remote => ("stale", "gone-clean-on-remote"),
+            Ok(s) if s.starts_with(&pushed_head) && s.matches('\n').count() == 1 && s.ends_with('\n') => ("stale", "gone-clean-pushed"),
+            _ => ("unknown", "pushed-check-failed"),
+        },
         Some(c) if c.code == 4 => ("unsaved", "unpushed"),
         Some(c) if c.code == 3 && std::str::from_utf8(&c.stderr).is_ok_and(|s| s.trim_end_matches('\n') == NO_UPSTREAM) => ("unknown", "no-upstream"),
         _ => ("unknown", "pushed-check-failed"),
@@ -392,7 +411,8 @@ fn exec_launches<'a>(ls: &'a [Launch], slug: &str) -> Vec<(&'a str, &'static str
 
 /// What the park step gave for one record.
 enum Step {
-    Parked,
+    /// Parked; the reason of the re-check (`gone-clean-pushed` or `gone-clean-on-remote`).
+    Parked(&'static str),
     /// Not parked: the line shows this verdict instead.
     Seen(Out),
     /// A re-read failed: nothing is parked.
@@ -419,9 +439,11 @@ fn park_step(o: &Opts, ap: &Apply, bound: u32, r: &Record, first: &[Launch]) -> 
     mtimes[i] = now_ms(mtime);
     let facts = Facts { o, live: &live, parked: &parked, launches: &launches, entries: &entries, mtimes: &mtimes };
     let verdict = judge(&facts, i);
-    if verdict != ("stale", "gone-clean-pushed") {
-        return Step::Seen(verdict);
-    }
+    let stale_reason = match verdict {
+        ("stale", "gone-clean-pushed") => "gone-clean-pushed",
+        ("stale", "gone-clean-on-remote") => "gone-clean-on-remote",
+        _ => return Step::Seen(verdict),
+    };
     let Some(slug) = slug_of(&r.ticket) else { return Step::Seen(("unknown", "record-changed")) };
     let before = exec_launches(first, &slug);
     if exec_launches(&launches, &slug).iter().any(|l| !before.contains(l)) {
@@ -438,7 +460,7 @@ fn park_step(o: &Opts, ap: &Apply, bound: u32, r: &Record, first: &[Launch]) -> 
     let reason = format!("stale-check listed={listed}: {}", ap.reason);
     let spec = ReleaseSpec { at: &ap.at, reason: &reason, records_dir: ap.records_dir.clone() };
     match park_locked(&o.lanes_dir, &r.ticket, bound, Some(&spec)) {
-        Ok(Ok(_)) => Step::Parked,
+        Ok(Ok(_)) => Step::Parked(stale_reason),
         Ok(Err(_)) => Step::Seen(("unknown", "park-refused")),
         Err(e) => Step::Failed(e),
     }
@@ -484,7 +506,8 @@ pub fn stale_cmd(a: &[String]) -> i32 {
         if let (Some(ap), true) = (&o.apply, verdict == "stale") {
             let step = if recheck_failed { Step::Recheck } else { park_step(&o, ap, name_cap(&cfg), r, &launches) };
             match step {
-                Step::Parked => {
+                Step::Parked(re) => {
+                    reason = re;
                     action = "parked";
                     parks += 1;
                 }

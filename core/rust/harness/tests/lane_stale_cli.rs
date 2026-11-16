@@ -1338,6 +1338,87 @@ fn apply_option_values_are_checked() {
     assert_eq!(fx.calls_log(), "");
 }
 
+// ---------------------------------------------------------------------------------------------- a branch with no upstream
+
+impl Fx {
+    /// Push the master of the fixture repo to its remote, so `refs/remotes/origin/master` exists (call after `ws`).
+    fn push_master(&self) {
+        git(&self.repo, &["push", "-q", "origin", "HEAD:refs/heads/master"]);
+    }
+}
+
+fn on_remote_line(action: &str) -> String {
+    aline("stale", 1, "stale", "gone-clean-on-remote", action)
+}
+
+#[test]
+fn no_upstream_with_base_on_remote_is_stale_on_remote() {
+    let fx = Fx::basic();
+    fx.ws("stale", false);
+    fx.push_master();
+    fx.expect(&[], 0, &[on_remote_line("none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn no_upstream_with_a_local_commit_is_unsaved() {
+    let fx = Fx::basic();
+    let tree = fx.ws("stale", false);
+    fx.push_master();
+    fs::write(tree.join("g.txt"), "two").unwrap();
+    git(&tree, &["add", "g.txt"]);
+    git(&tree, &["commit", "-q", "-m", "two"]);
+    fx.expect(&[], 0, &[aline("stale", 1, "unsaved", "unpushed", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn no_upstream_on_remote_with_an_untracked_file_is_unsaved() {
+    let fx = Fx::basic();
+    let tree = fx.ws("stale", false);
+    fx.push_master();
+    fs::write(tree.join("new.txt"), "x").unwrap();
+    fx.expect(&[], 0, &[aline("stale", 1, "unsaved", "stray", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn apply_parks_a_gone_clean_on_remote_lane() {
+    let fx = Fx::basic();
+    fx.ws("stale", false);
+    fx.push_master();
+    let old = fs::read(fx.lanes.join("lane-1")).unwrap();
+    assert!(!fx.rec.exists());
+    fx.apply(0, &[on_remote_line("parked"), atail(1, 1, 0)]);
+    assert_eq!(snapshot(&fx.lanes), vec![("parked-stale".to_string(), old)]);
+    assert_eq!(snapshot(&fx.rec), vec![("stale.release".to_string(), rel_line(1, "none").into_bytes())]);
+}
+
+#[test]
+fn commit_before_park_on_remote_lane_is_not_parked() {
+    let fx = Fx::basic();
+    let tree = fx.ws("stale", false);
+    fx.push_master();
+    let contact = format!("user.email=t{}scratch", '@');
+    fx.act(
+        2,
+        &[
+            format!("cd {}", q(&tree)),
+            "echo two > g.txt".to_string(),
+            "git add g.txt".to_string(),
+            format!("git -c core.hooksPath=/dev/null -c user.name=t -c {contact} commit -q -m two"),
+        ],
+    );
+    fx.apply_no_write(0, &[aline("stale", 1, "unsaved", "unpushed", "none"), atail(1, 0, 0)]);
+}
+
+#[test]
+fn upstream_set_before_park_still_parks() {
+    let fx = Fx::basic();
+    let tree = fx.ws("stale", false);
+    fx.push_master();
+    fx.act(2, &[format!("cd {}", q(&tree)), "git push -q -u origin ws/stale".to_string()]);
+    fx.apply(0, &[parked_line("stale", 1), atail(1, 1, 0)]);
+    assert_eq!(snapshot(&fx.rec), vec![("stale.release".to_string(), rel_line(1, "none").into_bytes())]);
+}
+
 #[test]
 fn two_applies_at_once_park_each_lane_once() {
     let fx = Fx::basic();
