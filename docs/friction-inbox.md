@@ -272,7 +272,7 @@ all ranked groups and `listed` holds only the ids of the groups printed.
 ```
 harness friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> \
   [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] \
-  [--top <k>] [--config <file>]
+  [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>]
 ```
 
 The loop's one deterministic step: no wall clock runs, the week is an argument. In order: (1) with `--log`, the
@@ -333,6 +333,20 @@ triage week=<w> proposed=<n> open=<n> resolved=<n> escalated=<n>
 counts this run's proposals, `resolved` its feed resolutions (a seed is not counted), `open` and `escalated`
 the standing groups. A second run for the same week proposes 0. Every check precedes every write: a refused run
 leaves the state and the hand-off folder byte-identical.
+
+**The `--as-of` numbers.** `--as-of <YYYY-MM-DDTHH:MM:SSZ>` (a UTC instant; a bad value is exit 2 and a value
+given twice is exit 2) appends the hand-over numbers after the `triage week=` line (ids, counts, status words and the `--as-of` value; no row text):
+one `unsettled group=<id> rows=<n> rows_over_24h=<k> age_hours=<h>` line per ranked group with no state row
+(a group seeded or proposed in the same run has a state row), one `after group=<id> status=<s>
+bound=<yes|no> rows_after=<n>` line per group with a non-empty `resolved_date` anywhere in its history
+(`rows_after` counts member rows later than the LAST such date, `bound` is the page's bound rule), then the
+closing `due as_of=<v> unsettled=<n> unsettled_rows=<n> unsettled_over_24h=<n> after_ge3=<n>
+after_ge3_unbound=<n> escalated=<n> state_no_rows=<n>` line (a state group with no inbox row counts in
+`state_no_rows` and prints no other line). A row's instant is its `at`, else 00:00:00Z of its date; the age of
+a row is `--as-of` minus that instant in whole hours, and `rows_over_24h` counts member rows 24 hours old or
+more. `--as-of` is not compared with `--week` and writes nothing beyond the run's own writes. An inbox row
+whose instant is later than `--as-of` refuses the run (exit 1, `--as-of is before row <id>`, the state and the
+hand-off folder byte-identical; with `--log` the sweep runs first, so the swept row is in the inbox).
 
 ### `harness friction bind`
 

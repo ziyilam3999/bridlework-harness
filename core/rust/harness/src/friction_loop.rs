@@ -846,6 +846,21 @@ fn after(r: &Row, resolved: &str) -> bool {
     }
 }
 
+/// The instant of a row: its `at`, else 00:00:00Z of its date.
+fn instant_of(r: &Row) -> String {
+    if r.at.is_empty() {
+        format!("{}T00:00:00Z", r.date)
+    } else {
+        r.at.clone()
+    }
+}
+
+/// Seconds since the epoch of a canonical UTC instant (its parts are digits: `at_ok` or the row lint ran).
+fn instant_secs(s: &str) -> i64 {
+    let n = |r: std::ops::Range<usize>| s[r].parse::<i64>().unwrap_or(0);
+    days_from_civil(n(0..4), n(5..7), n(8..10)) * 86400 + n(11..13) * 3600 + n(14..16) * 60 + n(17..19)
+}
+
 /// The ISO week `<yyyy>-w<ww>` of a calendar date. For a date in year 9999 and for 0000-01-01 and 0000-01-02 the
 /// text is outside `week_ok`; bind checks its new row before it writes.
 fn iso_week(date: &str) -> String {
@@ -882,16 +897,23 @@ fn ticket_json(id: &str, g: &Group, rows: &[Row], week: &str) -> String {
 }
 
 /// `harness friction triage --week <w> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>]
-/// [--controls <file> --lessons-dir <dir>] [--top K] [--config <file>]`. All checks come before any write; a refused run leaves the state and the
-/// hand-off folder byte-identical (the optional `--log` sweep is the existing sweep, itself all-or-nothing).
+/// [--controls <file> --lessons-dir <dir>] [--as-of <UTC instant>] [--top K] [--config <file>]`. The checks precede the hand-off and state writes, except the state-cap check, which runs
+/// after the hand-off files are written. With `--log` the sweep appends to the inbox before the later checks.
 pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
-    let flags = match parse_flags(rest, &["--week", "--state", "--handoff-dir", "--log", "--closed", "--controls", "--lessons-dir", "--top", "--config"], "triage") {
+    let flags = match parse_flags(rest, &["--week", "--state", "--handoff-dir", "--log", "--closed", "--controls", "--lessons-dir", "--as-of", "--top", "--config"], "triage") {
         Ok(f) => f,
         Err(m) => return fail(&m),
     };
     let Some(week) = flag(&flags, "--week") else { return fail("--week is required (never defaulted: no wall clock runs in this verb)") };
     if !friction::week_ok(week) {
         return fail("--week must be an ISO week <iso-year>-w<ww>: four digits, -w, two digits");
+    }
+    // The one time source of the hand-over numbers; checked before the sweep so a bad value writes nothing.
+    let as_of = flag(&flags, "--as-of");
+    if let Some(v) = as_of {
+        if !friction::at_ok(v) {
+            return fail("--as-of must be a UTC instant YYYY-MM-DDTHH:MM:SSZ");
+        }
     }
     let Some(state_path) = flag(&flags, "--state") else { return fail("--state is required") };
     let Some(handoff) = flag(&flags, "--handoff-dir") else { return fail("--handoff-dir is required") };
@@ -953,11 +975,17 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
             return c;
         }
     }
-    // Step (2): lint + rank.
+    // Step (2): lint + rank. The row-later check runs after the sweep (a swept row lands in the inbox first)
+    // and before the state lock, so the state file and the hand-off folder stay as they were.
     let rows = match lint_rows(&cfg, &ctx) {
         Ok(r) => r,
         Err(c) => return c,
     };
+    if let Some(v) = as_of {
+        if let Some(r) = rows.iter().find(|r| instant_of(r).as_str() > v) {
+            return refuse(&format!("--as-of is before row {}", r.id));
+        }
+    }
     let all = match groups(&rows) {
         Ok(g) => g,
         Err(m) => {
@@ -1156,6 +1184,50 @@ pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
         }
     }
     println!("triage week={week} proposed={} open={open} resolved={resolved_now} escalated={escalated}", props.len());
+    // The hand-over numbers: the one time source is --as-of, no wall clock runs here.
+    if let Some(v) = as_of {
+        let now = instant_secs(v);
+        let (mut n_unset, mut sum_rows, mut sum_over) = (0usize, 0usize, 0usize);
+        for g in all.iter().filter(|g| g.ranked) {
+            if cur.contains_key(&g.id) {
+                continue;
+            }
+            let ages: Vec<i64> = g.members.iter().map(|&m| (now - instant_secs(&instant_of(&rows[m]))) / 3600).collect();
+            let over = ages.iter().filter(|&&h| h >= 24).count();
+            let oldest = ages.iter().max().copied().unwrap_or(0);
+            println!("unsettled group={} rows={} rows_over_24h={} age_hours={}", g.id, g.members.len(), over, oldest);
+            n_unset += 1;
+            sum_rows += g.members.len();
+            sum_over += over;
+        }
+        // The last non-empty resolved_date of the state file plus this run's rows.
+        let mut last_rd: HashMap<String, &str> = HashMap::new();
+        for s in st_rows.iter().chain(new_rows.iter()) {
+            if !s.resolved_date.is_empty() {
+                last_rd.insert(s.group.clone(), s.resolved_date.as_str());
+            }
+        }
+        let (mut ge3, mut ge3_unbound) = (0usize, 0usize);
+        for g in &all {
+            let Some(rd) = last_rd.get(&g.id) else { continue };
+            let s = &cur[&g.id];
+            let bound = !s.task_id.is_empty();
+            let n = g.members.iter().filter(|&&m| after(&rows[m], rd)).count();
+            println!("after group={} status={} bound={} rows_after={}", g.id, s.status, if bound { "yes" } else { "no" }, n);
+            if n >= 3 {
+                ge3 += 1;
+                if !bound {
+                    ge3_unbound += 1;
+                }
+            }
+        }
+        let inbox_groups: HashSet<&str> = all.iter().map(|g| g.id.as_str()).collect();
+        let state_no_rows = cur.keys().filter(|g| !inbox_groups.contains(g.as_str())).count();
+        println!(
+            "due as_of={} unsettled={} unsettled_rows={} unsettled_over_24h={} after_ge3={} after_ge3_unbound={} escalated={} state_no_rows={}",
+            v, n_unset, sum_rows, sum_over, ge3, ge3_unbound, escalated, state_no_rows
+        );
+    }
     0
 }
 
