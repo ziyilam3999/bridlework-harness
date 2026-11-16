@@ -1348,7 +1348,7 @@ pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
         if c == Path::new("/") {
             return Err(err2(&format!("{flag} may not be the filesystem root")));
         }
-        if c.parent() != Some(&state) {
+        if c.parent() != Some(state) {
             return Err(err2(&format!("{flag} must sit beside the manifest dir in one state folder")));
         }
         if cd.starts_with(&c) {
