@@ -35,8 +35,18 @@ fn run(args: &[&str]) -> Output {
     Command::new(BIN).args(args).stdin(Stdio::null()).output().unwrap()
 }
 
+/// A temp copy of the example config with the disk floor lowered to 1 GB, so a claim passes on a disk with
+/// little free space.
+fn floor_config(dir: &Path) -> PathBuf {
+    let text = fs::read_to_string(EXAMPLE).unwrap().replace("  min_free_gb: 50", "  min_free_gb: 1");
+    let p = dir.join("floor-1.yaml");
+    fs::write(&p, text).unwrap();
+    p
+}
+
 fn claim(t: &Path, lanes: &Path, sf: &Path) -> Output {
-    run(&["lane", "claim", t.to_str().unwrap(), "--lanes-dir", lanes.to_str().unwrap(), "--config", EXAMPLE, "--scope-file", sf.to_str().unwrap()])
+    let cfg = floor_config(t.parent().unwrap());
+    run(&["lane", "claim", t.to_str().unwrap(), "--lanes-dir", lanes.to_str().unwrap(), "--config", cfg.to_str().unwrap(), "--scope-file", sf.to_str().unwrap()])
 }
 
 fn list(lanes: &Path) -> String {
@@ -112,11 +122,12 @@ fn bad_input_exits_2_and_records_nothing() {
 
 /// Start every claim at once, then wait for all: (exit code, stderr) per claim.
 fn race(lanes: &Path, sf: &Path, tickets: &[PathBuf]) -> Vec<(Option<i32>, String)> {
+    let cfg = floor_config(sf.parent().unwrap());
     let kids: Vec<_> = tickets
         .iter()
         .map(|t| {
             Command::new(BIN)
-                .args(["lane", "claim", t.to_str().unwrap(), "--lanes-dir", lanes.to_str().unwrap(), "--config", EXAMPLE, "--scope-file", sf.to_str().unwrap()])
+                .args(["lane", "claim", t.to_str().unwrap(), "--lanes-dir", lanes.to_str().unwrap(), "--config", cfg.to_str().unwrap(), "--scope-file", sf.to_str().unwrap()])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
