@@ -4,9 +4,15 @@ Starts a named background session from the harness, with a launch record written
 
 ```
 harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path>
-    [--records <file>] [--config <file>] [--sign-off] [--start-timeout-ms <n>] [--map-timeout-ms <n>]
+    [--records <file>] [--config <file>] [--sign-off] [--provider <name>] [--start-timeout-ms <n>] [--map-timeout-ms <n>]
 harness session launches [--records <file>]
+harness session next-provider --providers <name>[,<name>] [--records <file>]
 ```
+
+`--provider <name>` records which provider ran the seat. A name is 1 to 16 bytes: a lowercase ASCII letter, then
+lowercase letters or digits (`claude` and `zai` pass; `Zai`, `z-ai`, an empty value and a 17-byte name do not).
+A refused name, the flag given twice or the flag with no value is exit 2 before any write; the host is not run.
+Any role may carry a provider. The launch does not read earlier rows and prints the same stdout line as without it.
 
 ## Order of steps
 
@@ -63,9 +69,47 @@ All rows are one compact JSON line in an append-only file, taken under an exclus
 `harness session launches` joins rows by `run_id` and prints one line per launch with `state=bound|failed|pending|refused`.
 A corrupt line stops the read (exit 2, the line number named). `launcher::read_launches` is the same join as a function.
 
-A `--sign-off` launch writes `"sign_off":true` as the last field of its `launch` row (a launch without the flag writes the
-row it always wrote). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
+A `--sign-off` launch writes `"sign_off":true` after `owner` in its `launch` row, before any `provider` field (a launch
+without the flag writes the row it wrote before the flag). `launches` adds ` sign_off=yes` to that launch's line only. Any other `sign_off` value in a row
 (`false`, a string, a number) is a corrupt line. `harness session sign-off-check` reads the mark; see `docs/signoff.md`.
+
+A launch given `--provider` writes `"provider":"<name>"` after the fields it writes today (after `"sign_off":true` when
+that is present); a launch without it writes the row it wrote before the flag. A `provider` field that is not a string in the
+provider name form, or `provider` written twice in one row, is a corrupt line: `session launches`,
+`session sign-off-check` and `next-provider` refuse the file, and `lane stale` refuses it on its first read.
+`launches` appends ` provider=<name>` to the line of a launch that carries it, after `sign_off=yes` when present.
+
+## Next provider (`harness session next-provider`)
+
+```
+harness session next-provider --providers <name>[,<name>] [--records <file>]
+```
+
+The `--providers` value is one name or two different names joined by one comma, each in the provider name form. The default records
+path is the one of `session launches`. The verb reads and reports; it writes no file and logs no event. It does not
+reserve a turn: two callers at once get the same answer.
+
+Output, exit 0, one line: `next_provider=<name> last_provider=<name|-> last_run_id=<run id|-> basis=<turn|first|single>`.
+
+- `basis=turn`: the last counted launch carries a provider in the list; the other name is printed.
+- `basis=first`: no launch counts (an empty file, or no row that counts); the first name is printed, the last parts are `-`.
+- `basis=single`: the list holds one name; it is printed whatever the last provider was (the file is still read).
+  `last_provider` is `-` when the last counted launch has none.
+
+Counted launches: role `exec`, state `bound` or `pending`, and a name that reads back as round 1 (a name with no
+round token counts as round 1; a name that does not read back does not count). `failed` and `refused` launches,
+other roles and fix rounds (`r2` or more) do not count. The last one in file order counts, not by `ts_ms`.
+A pending row left by a killed launcher moves the turn once.
+
+| code | meaning |
+|---|---|
+| 0 | printed |
+| 2 | usage: no `--providers`, a flag twice, a missing value, an unknown argument, a bad list |
+| 3 | the records cannot be used: `reason=unreadable` and the cause (missing file, over the read cap, torn last line, corrupt line) |
+| 4 | two names, the last counted launch has no provider: `reason=no-provider run_id=<id>` |
+| 5 | two names, the last counted launch has a provider not in the list: `reason=unknown-provider provider=<name> run_id=<id>` |
+
+On exit 2 to 5 stdout is empty.
 
 ## Records path
 

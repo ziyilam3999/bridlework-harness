@@ -39,7 +39,7 @@ const AGENT_KEY_SHORT: &str = "id";
 const AGENT_KEY_FULL: &str = "sessionId";
 const AGENT_KEY_NAME: &str = "name";
 
-pub const LAUNCH_USAGE: &str = "usage: harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--sign-off] [--start-timeout-ms <n>] [--map-timeout-ms <n>] | session launches [--records <file>]";
+pub const LAUNCH_USAGE: &str = "usage: harness session launch --name <n> --brief <file> --cwd <dir> --host <abs-path> [--records <file>] [--config <file>] [--sign-off] [--provider <name>] [--start-timeout-ms <n>] [--map-timeout-ms <n>] | session launches [--records <file>] | session next-provider --providers <name>[,<name>] [--records <file>]";
 
 // ------------------------------------------------------------------------------------ sha256
 
@@ -306,8 +306,26 @@ fn append_row(path: &Path, line: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn launch_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, sign_off: bool) -> String {
-    let mark = if sign_off { ",\"sign_off\":true" } else { "" };
+/// The optional fields a launch row may carry after `owner`, in write order.
+struct Extra<'a> {
+    sign_off: bool,
+    provider: Option<&'a str>,
+}
+
+/// A provider name: 1 to 16 bytes, a lowercase ASCII letter, then lowercase letters or digits.
+pub(crate) fn provider_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=16).contains(&b.len()) && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+fn launch_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, extra: &Extra) -> String {
+    let mut mark = String::new();
+    if extra.sign_off {
+        mark.push_str(",\"sign_off\":true");
+    }
+    if let Some(p) = extra.provider {
+        mark.push_str(&format!(",\"provider\":{}", jstr(p)));
+    }
     format!(
         "{{\"v\":1,\"kind\":\"launch\",\"ts_ms\":{ts},\"run_id\":{},\"name\":{},\"role\":{},\"brief_sha256\":{},\"owner\":\"orchestration\"{mark}}}",
         jstr(run),
@@ -343,6 +361,28 @@ pub struct Launch {
     pub state: &'static str,
     /// True only when the `launch` row carries `"sign_off":true` (a `--sign-off` launch, #3704).
     pub sign_off: bool,
+    /// The `provider` of the `launch` row, none when the row has no such field.
+    pub provider: Option<String>,
+}
+
+/// The lane bound for reading a name back: the 15-digit cap, so any lane number reads back.
+const ANY_LANE: u64 = 999_999_999_999_999;
+
+/// A counted launch: role exec, state bound or pending, and a name that reads back as round 1
+/// (a name with no round token counts as round 1; a name that does not read back does not count).
+pub(crate) fn counted(l: &Launch) -> bool {
+    if l.role != "exec" || !(l.state == "bound" || l.state == "pending") {
+        return false;
+    }
+    match crate::session_name::check(&l.name, ANY_LANE, false) {
+        Ok(v) => v.round.unwrap_or(1) == 1,
+        Err(_) => false,
+    }
+}
+
+/// The last counted launch, in file order.
+pub(crate) fn last_counted(ls: &[Launch]) -> Option<&Launch> {
+    ls.iter().rev().find(|l| counted(l))
 }
 
 pub(crate) fn uuid_ok(id: &str) -> bool {
@@ -391,6 +431,16 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     Some(J::Bool(true)) => true,
                     Some(_) => return Err(bad("`sign_off` is not true")),
                 };
+                if let J::Obj(kv) = &row {
+                    if kv.iter().filter(|(k, _)| k == "provider").count() > 1 {
+                        return Err(bad("`provider` is written twice"));
+                    }
+                }
+                let provider = match row.get("provider") {
+                    None => None,
+                    Some(J::Str(s)) if provider_ok(s) => Some(s.clone()),
+                    Some(_) => return Err(bad("`provider` is not a provider name")),
+                };
                 out.push(Launch {
                     run_id: run.clone(),
                     name: f("name")?,
@@ -401,6 +451,7 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     session_id: None,
                     state: "pending",
                     sign_off,
+                    provider,
                 });
             }
             "launch_ids" => {
@@ -442,6 +493,7 @@ pub fn read_launches(path: &Path) -> Result<Vec<Launch>, String> {
                     session_id: None,
                     state: "refused",
                     sign_off: false,
+                    provider: None,
                 });
             }
             _ => return Err(bad("unknown `kind`")),
@@ -565,6 +617,7 @@ struct Args {
     start_ms: u64,
     map_ms: u64,
     sign_off: bool,
+    provider: Option<String>,
 }
 
 fn refused_row(ts: u64, run: &str, name: &str, role: &str, sha: &str, entry: &str) -> String {
@@ -582,6 +635,7 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
     let (mut name, mut brief, mut cwd, mut host, mut records, mut config, mut start, mut map) =
         (None, None, None, None, None, None, None, None);
     let mut sign_off = false;
+    let mut provider: Option<String> = None;
     let mut it = a.iter();
     while let Some(f) = it.next() {
         if f == "--sign-off" {
@@ -600,11 +654,17 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
             "--config" => &mut config,
             "--start-timeout-ms" => &mut start,
             "--map-timeout-ms" => &mut map,
+            "--provider" => &mut provider,
             _ => return Err(format!("unknown argument `{f}`")),
         };
         let v = it.next().ok_or_else(|| format!("{f} is missing its value"))?;
         if slot.replace(v.clone()).is_some() {
             return Err(format!("{f} was given twice"));
+        }
+    }
+    if let Some(p) = &provider {
+        if !provider_ok(p) {
+            return Err("--provider must be 1 to 16 bytes: a lowercase letter, then lowercase letters or digits".into());
         }
     }
     let need = |o: Option<String>, n: &str| o.ok_or_else(|| format!("{n} is required"));
@@ -622,6 +682,7 @@ fn parse_args(a: &[String]) -> Result<Args, String> {
         start_ms: ms(start, DEFAULT_START_TIMEOUT_MS, "--start-timeout-ms")?,
         map_ms: ms(map, DEFAULT_MAP_TIMEOUT_MS, "--map-timeout-ms")?,
         sign_off,
+        provider,
     })
 }
 
@@ -733,7 +794,8 @@ pub fn launch_cmd(a: &[String]) -> i32 {
             return 6;
         }
     }
-    if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha, args.sign_off)) {
+    let extra = Extra { sign_off: args.sign_off, provider: args.provider.as_deref() };
+    if let Err(e) = append_row(&records, &launch_row(now_ms(), &run, &args.name, role, &sha, &extra)) {
         eprintln!("launch refused: launch record not written: {e}");
         return 2;
     }
@@ -836,7 +898,7 @@ pub fn launches_cmd(a: &[String]) -> i32 {
         Ok(ls) => {
             for l in ls {
                 println!(
-                    "run_id={} name={} role={} brief_sha256={} ts_ms={} short_id={} session_id={} state={}{}",
+                    "run_id={} name={} role={} brief_sha256={} ts_ms={} short_id={} session_id={} state={}{}{}",
                     l.run_id,
                     l.name,
                     l.role,
@@ -845,7 +907,8 @@ pub fn launches_cmd(a: &[String]) -> i32 {
                     l.short_id.as_deref().unwrap_or("-"),
                     l.session_id.as_deref().unwrap_or("-"),
                     l.state,
-                    if l.sign_off { " sign_off=yes" } else { "" }
+                    if l.sign_off { " sign_off=yes" } else { "" },
+                    l.provider.as_ref().map(|p| format!(" provider={p}")).unwrap_or_default()
                 );
             }
             0
@@ -855,6 +918,75 @@ pub fn launches_cmd(a: &[String]) -> i32 {
             2
         }
     }
+}
+
+pub const NEXT_PROVIDER_USAGE: &str = "usage: harness session next-provider --providers <name>[,<name>] [--records <file>]";
+
+/// `harness session next-provider --providers <name>[,<name>] [--records <file>]`. Read-only; see docs/launcher.md.
+pub fn next_provider_cmd(a: &[String]) -> i32 {
+    let usage_err = |m: &str| {
+        eprintln!("harness: error: {m}");
+        eprintln!("{NEXT_PROVIDER_USAGE}");
+        2
+    };
+    let (mut list, mut records): (Option<&String>, Option<&String>) = (None, None);
+    let mut it = a.iter();
+    while let Some(f) = it.next() {
+        let slot = match f.as_str() {
+            "--providers" => &mut list,
+            "--records" => &mut records,
+            _ => return usage_err(&format!("unknown argument `{f}`")),
+        };
+        let Some(v) = it.next() else { return usage_err(&format!("{f} is missing its value")) };
+        if slot.replace(v).is_some() {
+            return usage_err(&format!("{f} was given twice"));
+        }
+    }
+    let Some(list) = list else { return usage_err("--providers is required") };
+    let names: Vec<&str> = list.split(',').collect();
+    if names.len() > 2 {
+        return usage_err("--providers takes one name or two names");
+    }
+    if names.iter().any(|n| !provider_ok(n)) {
+        return usage_err("--providers has a name that is empty or not in the provider name form");
+    }
+    if names.len() == 2 && names[0] == names[1] {
+        return usage_err("--providers names the same provider twice");
+    }
+    let path = PathBuf::from(records.map(String::as_str).unwrap_or(DEFAULT_RECORDS));
+    let launches = match read_launches(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("harness: next-provider refused: reason=unreadable {e}");
+            return 3;
+        }
+    };
+    let last = last_counted(&launches);
+    let last_provider = last.and_then(|l| l.provider.as_deref());
+    let last_run = last.map(|l| l.run_id.as_str());
+    let (next, basis) = match (names.len(), last) {
+        (1, _) => (names[0], "single"),
+        (_, None) => (names[0], "first"),
+        (_, Some(l)) => match last_provider {
+            None => {
+                eprintln!("harness: next-provider refused: reason=no-provider run_id={}", l.run_id);
+                return 4;
+            }
+            Some(p) => match names.iter().position(|n| *n == p) {
+                Some(i) => (names[1 - i], "turn"),
+                None => {
+                    eprintln!("harness: next-provider refused: reason=unknown-provider provider={p} run_id={}", l.run_id);
+                    return 5;
+                }
+            },
+        },
+    };
+    println!(
+        "next_provider={next} last_provider={} last_run_id={} basis={basis}",
+        last_provider.unwrap_or("-"),
+        last_run.unwrap_or("-")
+    );
+    0
 }
 
 #[cfg(test)]
