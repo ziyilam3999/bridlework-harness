@@ -177,7 +177,7 @@ fn reader<R: Read + Send + 'static>(mut r: R, over: Arc<AtomicBool>) -> Receiver
 }
 
 /// Run this binary with `args`: stdin closed, both streams read under the cap, 30 seconds, its own process group. `None` is a failed call
-/// (cannot start, time limit, a stream over the cap, no exit code).
+/// (cannot start, time limit, a stream over the cap, a stream not closed 2 seconds after the exit, no exit code).
 fn run_child(args: &[&OsStr]) -> Option<ChildOut> {
     let exe = std::env::current_exe().ok()?;
     let mut child = Command::new(exe).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn().ok()?;
@@ -220,7 +220,7 @@ enum Answer {
 }
 
 /// The clean answer: exit 0 with exactly `workspace=clean ticket=<t>`; exit 2 with `stray <kind> <path>` lines then
-/// `workspace=stray ticket=<t> count=<n>`, clean only when every line is an untracked or ignored path byte-equal to an `--allow` value.
+/// `workspace=stray ticket=<t> count=<n>`, clean only when all lines are untracked or ignored paths byte-equal to an `--allow` value.
 fn clean_answer(ticket: &str, o: &ChildOut, allow: &[String]) -> Answer {
     let Ok(text) = std::str::from_utf8(&o.stdout) else { return Answer::Failed };
     if o.code == 0 {

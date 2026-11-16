@@ -131,7 +131,7 @@ harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --lau
 
 ### The facts
 
-The lanes dir is read as `list` reads it, under its lock; the lock is released before the host or git runs. The host is called once, as `<host> agents --json --all` (10 second limit). Parked records are not judged. For each live record in lane order, the first rule that matches gives the verdict and the reason. The slug is the lower-cased ticket id with every character outside `a-z0-9` dropped. A session name is read with the session name check at any lane number (the bound is the 15-digit cap of a lane number, so a number above `lanes.count` counts).
+The lanes dir is read as `list` reads it, under its lock; the lock is released before the host or git runs. The host is called once, as `<host> agents --json --all` (10 second limit). Parked records are not judged. For each live record in lane order, the first rule that matches gives the verdict and the reason. The slug is the lower-cased ticket id with each character outside `a-z0-9` dropped. A session name is read with the session name check at any lane number (the bound is the 15-digit cap of a lane number, so a number above `lanes.count` counts).
 
 An exec launch is a launch row whose name reads back the role `exec` (or the long form `execution`) and the ticket equal to the slug. An exec entry is a listing entry whose name reads back the same way. An entry is ended when its state is `done` or `stopped`; any other state, or no state field, is running.
 
@@ -181,13 +181,13 @@ Each is exit 2 with one stderr line `lane: error: <cause>` and empty stdout, bef
 
 - bad options or paths;
 - a config that cannot be read or is invalid (a fifo at the config path is refused at once);
-- launch records that are missing, not a regular file, a link, unreadable, over the reader cap, torn or corrupt (the file is opened without following a link and without blocking, and the open handle must be a regular file before the records are read; they are then read through that handle);
+- launch records that are missing, not a regular file, a link, unreadable, over the reader cap, torn or corrupt (the file is opened without following a link and without blocking, and the open handle must be a regular file before the records are read; they are then read through `/dev/fd` of that handle where that path exists, else through the path);
 - a host listing that fails: it cannot run, exits non-zero, passes the time limit, is not JSON, is not an array, is over the entry cap, holds an entry with no string id and name, or holds an entry id that is not a plain token (output past the 1 MiB read cap is cut and then reads as not JSON);
 - a lanes dir that `list` refuses, a parked record that `list` refuses, or a lane record that cannot be inspected.
 
 ### The `--allow` rule
 
-An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not starting or ending with `/`, with no empty, `.` or `..` part. A stray path is allowed only when its kind is `untracked` or `ignored` and the path is byte-equal to an `--allow` value: a modified, deleted, staged, hidden or submodule path is not covered, and an `--allow` of `a` does not cover `a/b`. Nothing is deleted.
+An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not starting or ending with `/`, with no empty, `.` or `..` part. A stray path is allowed only when its kind is `untracked` or `ignored` and the path is byte-equal to an `--allow` value: a modified, deleted, staged, hidden, missing or submodule path is not covered, and an `--allow` of `a` does not cover `a/b`. Nothing is deleted.
 
 ### Limits of this version
 
@@ -196,7 +196,7 @@ An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not startin
 - A launch row left pending by a crashed launch keeps the lane.
 - Launch rows and listing entries are tied to a ticket by its slug only, so the rows of a finished ticket with the same slug count.
 - Listing entries are matched by name, so a session started by hand under a seat name counts.
-- The name-unclear rule looks at the `t<slug>` part of the launcher form only.
+- The name-unclear rule sees a name only when a `-` separated part equals `t<slug>` (any letter case) or when its read-back ticket, with the `-` removed, equals the slug; other spellings of the ticket in a name are not seen.
 - A file inside an allowed folder goes unseen (nothing is deleted).
 - The pushed answer reads local tracking refs only (no fetch).
 - A branch with no upstream is `unknown` in this version.

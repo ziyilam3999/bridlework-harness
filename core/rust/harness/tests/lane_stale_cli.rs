@@ -13,7 +13,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_harness");
 const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../config/harness.example.yaml");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// A launch time far after any lane file time, so a lane file never reads as claimed after its launch.
+/// A launch time far after any lane file time, so a lane file does not read as claimed after its launch.
 const FAR: u64 = 4_102_444_800_000;
 
 /// A child is spawned while this lock is held, and so is the write of a stub script: no fork can then hold the script's write handle when
