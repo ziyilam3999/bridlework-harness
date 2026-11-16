@@ -253,8 +253,9 @@ that carries a `limit` line:
    (`kill -0` EPERM), or a probe that cannot run, is a fail-closed refusal.
 2. **The expiry decision, fail closed.** Only for a proven-live pid: its age is the OS's own age of the
    process — on Linux `/proc/uptime` minus the pid's `starttime` (both boot-relative, so a wall-clock
-   jump cannot move it; an odd uptime reading — below the pid's own `starttime`, NaN, infinite or
-   negative — REFUSES, it never saturates to an age of 0); elsewhere `/bin/ps -o etime=` (whole seconds,
+   jump cannot move it). The uptime text is read as exact integer milliseconds (the kernel shape: digits,
+   a dot, two digits); a text of another shape REFUSES, and so does an uptime below the pid's own
+   `starttime`, with no margin; it is not turned into an age of 0. Elsewhere `/bin/ps -o etime=` (whole seconds,
    wall-based), read by absolute path. Expired means `age >= timeout_ms`, measured from the process's OS
    start (the same instant `pid_start_ms` records), so restarting the harness cannot reset the timer. An
    age that cannot be READ, or a wall clock that reads BEFORE the `limit` line's own `ts_ms` (a

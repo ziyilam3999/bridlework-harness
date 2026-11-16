@@ -1286,33 +1286,43 @@ pub fn process_start_ms(pid: u64) -> Result<u64, String> {
 
 // ---------------------------------------------------------------- process age (#207)
 
-/// The boot-relative age arithmetic of the Linux age read (#207 r1 F2), factored PURE over the two
-/// numbers so its fail-closed rules are testable: the age is `uptime_ms - starttime_ms`, both
-/// boot-relative. An odd clock reading — a NaN, infinite or negative uptime, a finite reading that does
-/// not fit a u64 millisecond clock, or an uptime BELOW the pid's own starttime (an impossible clock) —
-/// is Err, never a saturated 0 that would read as "brand new, within every limit"; the caller refuses
-/// on Err (fail closed).
-/// Compiled on Linux (the only reader) and under `cfg(test)` everywhere, so the pure table runs on both
+/// The first field of a `/proc/uptime` text as exact integer ms, with no float. Only the kernel shape is
+/// read: ASCII digits, a dot, exactly two ASCII digits. Any other shape, an empty text or an overflow is Err.
+/// Same cfg as `boot_age_ms`.
+#[cfg(any(target_os = "linux", test))]
+fn uptime_ms(text: &str) -> Result<u64, String> {
+    let Some(field) = text.split_whitespace().next() else {
+        return Err("the uptime text is empty".to_string());
+    };
+    let bad = || format!("the uptime field {field:?} is not digits, a dot and two digits");
+    let (secs, hundredths) = field.split_once('.').ok_or_else(bad)?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(secs) || hundredths.len() != 2 || !digits(hundredths) {
+        return Err(bad());
+    }
+    let secs: u64 = secs.parse().map_err(|_| format!("the uptime field {field:?} does not fit a millisecond clock"))?;
+    let hundredths: u64 = hundredths.parse().map_err(|_| bad())?;
+    secs.checked_mul(1000)
+        .and_then(|ms| ms.checked_add(hundredths * 10))
+        .ok_or_else(|| format!("the uptime field {field:?} does not fit a millisecond clock"))
+}
+
+/// The boot-relative age of the Linux age read (#207 r1 F2), PURE over integer ms: `up_ms - start_ms`,
+/// both boot-relative. An uptime below the pid's own starttime (an impossible clock) is Err, with no
+/// margin, not a saturated 0 that would read as "brand new"; the caller refuses on Err (fail closed).
+/// Compiled on Linux (the only reader) and under `cfg(test)` everywhere, so the pure tests run on both
 /// CI legs; off-Linux non-test builds carry no dead copy of it.
 #[cfg(any(target_os = "linux", test))]
-fn boot_age_ms(up_s: f64, start_ms: u64) -> Result<u64, String> {
-    if !up_s.is_finite() || up_s < 0.0 {
-        return Err(format!("the uptime reads {up_s}, which is not a usable clock"));
-    }
-    let up_ms = up_s * 1000.0;
-    if up_ms >= u64::MAX as f64 {
-        return Err(format!("the uptime reads {up_s}s, which does not fit a millisecond clock"));
-    }
-    let up_ms = up_ms as u64;
-    if up_ms < start_ms {
-        return Err(format!("the uptime reads {up_ms}ms, before the pid's own start time {start_ms}ms"));
-    }
-    Ok(up_ms - start_ms)
+fn boot_age_ms(up_ms: u64, start_ms: u64) -> Result<u64, String> {
+    up_ms
+        .checked_sub(start_ms)
+        .ok_or_else(|| format!("the uptime reads {up_ms}ms, before the pid's own start time {start_ms}ms"))
 }
 
 /// The AGE of `pid` in ms, read std-only, for the supervisor's timeout decision (#207). On Linux it is
-/// `/proc/uptime` minus `/proc/<pid>/stat` starttime, both boot-relative, so a wall-clock jump cannot move
-/// it; elsewhere it is the system `ps -o etime=` (whole seconds, wall-based — a forward wall jump can stop
+/// `/proc/uptime` (read as exact integer ms; a text of another shape is Err) minus `/proc/<pid>/stat`
+/// starttime, both boot-relative, so a wall-clock jump cannot move it; an uptime below the starttime is
+/// Err; elsewhere it is the system `ps -o etime=` (whole seconds, wall-based — a forward wall jump can stop
 /// a process early, an honest limit named in docs/process-supervisor.md). The `ps` helper path is a
 /// parameter (the same shape as the supervisor's liveness probe) so the not-runnable case is testable: an
 /// age that cannot be read is Err, and the caller refuses on it, never "not expired".
@@ -1325,12 +1335,7 @@ pub fn process_age_ms_at(ps: &Path, pid: u64) -> Result<u64, String> {
     {
         let _ = ps;
         let uptime = fs::read_to_string("/proc/uptime").map_err(|_| "cannot read /proc/uptime".to_string())?;
-        let up_s = uptime
-            .split_whitespace()
-            .next()
-            .ok_or("no uptime in /proc/uptime")?
-            .parse::<f64>()
-            .map_err(|_| "uptime is not a number".to_string())?;
+        let up_ms = uptime_ms(&uptime)?;
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| format!("cannot read /proc/{pid}/stat"))?;
         let after_paren = stat.rsplit_once(')').map(|(_, r)| r).ok_or("stat has no command field")?;
         let fields: Vec<&str> = after_paren.split_whitespace().collect();
@@ -1338,7 +1343,7 @@ pub fn process_age_ms_at(ps: &Path, pid: u64) -> Result<u64, String> {
         let ticks: u64 = fields.get(19).ok_or("stat has no starttime field")?.parse().map_err(|_| "starttime is not an integer")?;
         // CLK_TCK is 100 on every mainstream Linux userspace; both values are boot-relative.
         let start_ms = ticks * 1000 / 100;
-        boot_age_ms(up_s, start_ms)
+        boot_age_ms(up_ms, start_ms)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1394,23 +1399,63 @@ mod tests {
         }
     }
 
-    /// #207 r1 F2 (pure table): the boot-age arithmetic fails CLOSED on every odd clock — an uptime below
-    /// the pid's own starttime (an impossible clock), nan, either infinity, a negative reading, or a finite
-    /// reading that does not fit a u64 millisecond clock — never a saturated 0 that would read as "brand
-    /// new, within every limit". Normal readings answer uptime minus starttime.
+    /// #207 r1 F2 (pure table), in integer ms: normal, exact-now and zero readings answer uptime minus
+    /// starttime; an uptime below the starttime is Err. The odd texts (nan, inf, negative, too large) are
+    /// refused by `uptime_ms`, see `an_uptime_text_of_another_shape_is_refused`.
     #[test]
     fn boot_age_ms_fails_closed_on_odd_clocks() {
-        assert_eq!(boot_age_ms(12.5, 2_500).unwrap(), 10_000, "a normal reading is uptime minus starttime");
-        assert_eq!(boot_age_ms(2.5, 2_500).unwrap(), 0, "a pid started exactly now is age 0");
-        assert_eq!(boot_age_ms(0.0, 0).unwrap(), 0, "a fresh boot with no pid read yet is age 0");
-        assert!(boot_age_ms(2.4, 2_500).is_err(), "an uptime below the starttime is an impossible clock, never age 0");
-        assert!(boot_age_ms(f64::NAN, 2_500).is_err(), "nan refuses");
-        assert!(boot_age_ms(f64::INFINITY, 2_500).is_err(), "inf refuses");
-        assert!(boot_age_ms(f64::NEG_INFINITY, 2_500).is_err(), "-inf refuses");
-        assert!(boot_age_ms(-1.0, 2_500).is_err(), "a negative uptime refuses");
-        assert!(boot_age_ms(1e300, 2_500).is_err(), "a finite reading that does not fit u64 ms refuses");
-        let why = boot_age_ms(f64::NAN, 2_500).unwrap_err();
+        assert_eq!(boot_age_ms(12_500, 2_500).unwrap(), 10_000, "a normal reading is uptime minus starttime");
+        assert_eq!(boot_age_ms(2_500, 2_500).unwrap(), 0, "a pid started exactly now is age 0");
+        assert_eq!(boot_age_ms(0, 0).unwrap(), 0, "a fresh boot with no pid read yet is age 0");
+        assert!(boot_age_ms(2_400, 2_500).is_err(), "an uptime below the starttime is an impossible clock, not age 0");
+        let why = boot_age_ms(2_400, 2_500).unwrap_err();
         assert!(why.contains("uptime"), "the refusal names the uptime: {why}");
+    }
+
+    /// The readings of the failed CI run: a pid in the same tick as the read is age 0.
+    #[test]
+    fn the_ci_reading_is_read_exactly() {
+        assert_eq!(uptime_ms("129.45 300.12\n"), Ok(129_450));
+        assert_eq!(uptime_ms(" 129.45"), Ok(129_450));
+        assert_eq!(uptime_ms("129.45"), Ok(129_450));
+        assert_eq!(uptime_ms("0129.45"), Ok(129_450));
+        assert_eq!(boot_age_ms(uptime_ms("129.45").unwrap(), 12945 * 1000 / 100), Ok(0));
+    }
+
+    #[test]
+    fn each_hundredth_is_read_exactly() {
+        for c in 0..1_000_000u64 {
+            let text = format!("{}.{:02}", c / 100, c % 100);
+            assert_eq!(uptime_ms(&text), Ok(c * 10), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_later_tick_gives_the_tick_gap() {
+        assert_eq!(boot_age_ms(129_460, 129_450), Ok(10));
+    }
+
+    #[test]
+    fn an_uptime_text_of_another_shape_is_refused() {
+        let texts = [
+            "", "\n", "129", "129.", "129.4", "129.456", ".45", "-1.00", "+1.00", "1e3", "nan", "inf", "NaN",
+            "129.4x", "12a.45", "129,45", "\u{0661}2.45", "99999999999999999999.00", "18446744073709552.00",
+            "18446744073709551.99",
+        ];
+        for t in texts {
+            let why = uptime_ms(t).expect_err(t);
+            assert!(why.contains("uptime"), "{t:?}: {why}");
+        }
+        assert!(uptime_ms("129.4").unwrap_err().contains("\"129.4\""));
+        assert_eq!(uptime_ms("18446744073709551.61"), Ok(18_446_744_073_709_551_610));
+    }
+
+    #[test]
+    fn a_start_after_the_uptime_is_refused() {
+        for (up, start) in [(129_440u64, 129_450u64), (1_000, 129_450)] {
+            let why = boot_age_ms(up, start).unwrap_err();
+            assert!(why.contains(&up.to_string()) && why.contains(&start.to_string()), "{why}");
+        }
     }
 
     /// N-f: a later root whose line is over the cap makes init refuse with `TooLong` and leaves NOTHING on disk (no
