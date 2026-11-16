@@ -1309,7 +1309,7 @@ fn uptime_ms(text: &str) -> Result<u64, String> {
 
 /// The boot-relative age of the Linux age read (#207 r1 F2), PURE over integer ms: `up_ms - start_ms`,
 /// both boot-relative. An uptime below the pid's own starttime (an impossible clock) is Err, with no
-/// margin, never a saturated 0 that would read as "brand new"; the caller refuses on Err (fail closed).
+/// margin, not a saturated 0 that would read as "brand new"; the caller refuses on Err (fail closed).
 /// Compiled on Linux (the only reader) and under `cfg(test)` everywhere, so the pure tests run on both
 /// CI legs; off-Linux non-test builds carry no dead copy of it.
 #[cfg(any(target_os = "linux", test))]
@@ -1407,7 +1407,7 @@ mod tests {
         assert_eq!(boot_age_ms(12_500, 2_500).unwrap(), 10_000, "a normal reading is uptime minus starttime");
         assert_eq!(boot_age_ms(2_500, 2_500).unwrap(), 0, "a pid started exactly now is age 0");
         assert_eq!(boot_age_ms(0, 0).unwrap(), 0, "a fresh boot with no pid read yet is age 0");
-        assert!(boot_age_ms(2_400, 2_500).is_err(), "an uptime below the starttime is an impossible clock, never age 0");
+        assert!(boot_age_ms(2_400, 2_500).is_err(), "an uptime below the starttime is an impossible clock, not age 0");
         let why = boot_age_ms(2_400, 2_500).unwrap_err();
         assert!(why.contains("uptime"), "the refusal names the uptime: {why}");
     }

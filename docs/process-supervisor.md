@@ -255,7 +255,7 @@ that carries a `limit` line:
    process — on Linux `/proc/uptime` minus the pid's `starttime` (both boot-relative, so a wall-clock
    jump cannot move it). The uptime text is read as exact integer milliseconds (the kernel shape: digits,
    a dot, two digits); a text of another shape REFUSES, and so does an uptime below the pid's own
-   `starttime`, with no margin; it never saturates to an age of 0. Elsewhere `/bin/ps -o etime=` (whole seconds,
+   `starttime`, with no margin; it is not turned into an age of 0. Elsewhere `/bin/ps -o etime=` (whole seconds,
    wall-based), read by absolute path. Expired means `age >= timeout_ms`, measured from the process's OS
    start (the same instant `pid_start_ms` records), so restarting the harness cannot reset the timer. An
    age that cannot be READ, or a wall clock that reads BEFORE the `limit` line's own `ts_ms` (a
