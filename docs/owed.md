@@ -54,8 +54,9 @@ Checks, in this order: (1) flags — a missing required flag is exit 2 in usage 
 what); (2) `--store` absolute; (3) the field rules; (4) the privacy list loads, else exit 2 — an
 unscanned row is never stored; (5) the privacy scan of each field of the new row (id, at, by, what,
 home), a hit is exit 1 naming the field and the classes; (6) the store path stat — missing (or under a
-file) is exit 2 `does not exist`, any other stat error or anything but a regular file (a symbolic link,
-also one to a regular file, a dangling link, a folder, a fifo) is exit 2; (7) the open, read and append,
+file) is exit 2 `the owed store does not exist`; any other stat error is exit 2 `the owed store cannot be
+opened`; anything but a regular file (a symbolic link, also one to a regular file, a dangling link, a
+folder, a fifo) is exit 2 `the owed store is not a regular file`; (7) the open, read and append,
 no create, with `O_NOFOLLOW` and `O_NONBLOCK`, the handle re-checked to be a regular file; (8) a
 blocking exclusive lock on that handle, no time limit — a stuck holder is freed by killing it; (9) the
 store lint; (10) the id is already in the store (open or closed) is exit 1; (11) one line is written and
@@ -89,8 +90,8 @@ exit 0, stdout `closed id=<id> status=<done|dropped>`.
 
 ## The store lint
 
-One criterion for add, list and close: the store is read no further than 4194304 bytes through the locked
-handle. Each failure is exit 2, one stderr line, no row byte echoed, checked in this order:
+One criterion for add, list and close: at most 4194305 bytes are read through the locked
+handle, and a store over 4194304 bytes is refused. Each failure is exit 2, one stderr line, no row byte echoed, checked in this order:
 
 - `harness: error: the owed store is over 4194304 bytes`
 - `harness: error: the owed store is not utf-8`

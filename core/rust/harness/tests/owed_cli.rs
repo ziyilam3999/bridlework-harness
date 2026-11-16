@@ -1,8 +1,8 @@
-//! Process-level tests for `harness owed add | list | close` (OW-1, ticket owed-store). Every check runs
-//! the real binary as a child process and reads the real store file, so the exit-code contract (0 ok,
-//! 1 a refused input, 2 usage, setup or a damaged store) is exercised end to end. Every row, marker and
-//! deny word is synthetic, built at run time; the privacy list is injected on the child only, and no test
-//! reads an environment variable.
+//! Process-level tests for `harness owed add | list | close` (OW-1, ticket owed-store). The checks run
+//! the real binary as a child process and read the real store file, so the exit-code contract (0 ok,
+//! 1 a refused input, 2 usage, setup or a damaged store) is tested end to end. Rows, markers and the
+//! deny word are synthetic; the privacy list is injected on the child only, and no test reads a
+//! deny-list variable or path.
 #![cfg(unix)]
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ impl Drop for Tmp {
     }
 }
 
-/// The child with no config or list variable inherited: every input arrives as a flag or an explicit `.env`.
+/// The child with no config or list variable inherited: inputs arrive as flags or an explicit `.env`.
 fn base() -> Command {
     let mut c = Command::new(BIN);
     c.env_remove("HARNESS_CONFIG")
@@ -174,6 +174,7 @@ fn worked_case_bytes() {
     let o = run(&add_args(&store, "ow-1", "2026-11-16T00:48:00Z", "orch-a", "write the lesson page for the menu stall"));
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "stored id=ow-1\n");
+    assert!(err(&o).is_empty());
     let l1 = r#"{"op":"add","id":"ow-1","at":"2026-11-16T00:48:00Z","by":"orch-a","what":"write the lesson page for the menu stall","home":""}"#;
     assert_eq!(fs::read_to_string(&store).unwrap(), format!("{l1}\n"));
     let mut a = add_args(&store, "ow-2", "2026-11-16T01:00:00Z", "orch-a", "re-run the gate on the new head");
@@ -182,23 +183,28 @@ fn worked_case_bytes() {
     let o = run(&a);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "stored id=ow-2\n");
+    assert!(err(&o).is_empty());
     let mut open_args = list_args(&store);
     open_args.push(s("--open"));
     let o = run(&open_args);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "owed id=ow-1 status=open\nowed id=ow-2 status=open\nowed open=2\n");
+    assert!(err(&o).is_empty());
     let close = close_args(&store, "ow-2", "2026-11-16T09:00:00Z", "orch-a", "done", "pr:owner/repo#7", "");
     let o = run(&close);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "closed id=ow-2 status=done\n");
+    assert!(err(&o).is_empty());
     let body = fs::read_to_string(&store).unwrap();
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0], l1);
+    assert_eq!(lines[1], r#"{"op":"add","id":"ow-2","at":"2026-11-16T01:00:00Z","by":"orch-a","what":"re-run the gate on the new head","home":"ticket:lane-release-record"}"#);
     assert_eq!(lines[2], r#"{"op":"close","id":"ow-2","at":"2026-11-16T09:00:00Z","by":"orch-a","status":"done","ref":"pr:owner/repo#7","reason":""}"#);
     let o = run(&list_args(&store));
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "owed id=ow-1 status=open\nowed id=ow-2 status=done\nowed open=1 done=1 dropped=0\n");
+    assert!(err(&o).is_empty());
     let before = fs::read(&store).unwrap();
     let o = run(&close);
     refused1(&o, "harness: owed refused: id is already closed");
@@ -243,6 +249,7 @@ fn store_is_folder() {
     refused2(&o, line);
     let o = run(&list_args(&dir));
     refused2(&o, line);
+    assert!(dir.is_dir() && fs::read_dir(&dir).unwrap().count() == 0, "the folder is unchanged");
 }
 
 #[test]
@@ -253,6 +260,7 @@ fn store_is_root() {
     refused2(&o, line);
     let o = run(&list_args(root));
     refused2(&o, line);
+    assert!(root.is_dir(), "the root is still a folder");
 }
 
 #[test]
@@ -267,6 +275,8 @@ fn store_is_fifo() {
     refused2(&o, line);
     let o = run(&list_args(&fifo));
     refused2(&o, line);
+    use std::os::unix::fs::FileTypeExt;
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(), "the fifo is unchanged");
 }
 
 #[test]
@@ -326,6 +336,8 @@ fn store_unreadable() {
     refused2(&o, line);
     let o = run(&list_args(&store));
     refused2(&o, line);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&store).unwrap(), b"", "the store is unchanged");
 }
 
 #[test]
@@ -333,7 +345,7 @@ fn store_over_4_mib() {
     let t = Tmp::new();
     let store = t.store();
     fs::write(&store, [b"a".repeat(4 * 1024 * 1024), b"\n".to_vec()].concat()).unwrap();
-    let before = fs::read(&store).unwrap().len();
+    let before = fs::read(&store).unwrap();
     let line = "harness: error: the owed store is over 4194304 bytes";
     let o = run(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", "t"));
     refused2(&o, line);
@@ -341,7 +353,7 @@ fn store_over_4_mib() {
     refused2(&o, line);
     let o = run(&close_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", "done", "pr:owner/repo#7", ""));
     refused2(&o, line);
-    assert_eq!(fs::read(&store).unwrap().len(), before);
+    assert_eq!(fs::read(&store).unwrap(), before);
 }
 
 #[test]
@@ -357,6 +369,7 @@ fn store_not_utf8() {
     refused2(&o, line);
     let o = run(&list_args(&store));
     refused2(&o, line);
+    assert_eq!(fs::read(&store).unwrap(), row, "the store is unchanged");
 }
 
 #[test]
@@ -379,8 +392,10 @@ fn store_duplicate_added_id() {
     let t = Tmp::new();
     let store = t.store();
     fs::write(&store, planted_add("ow-1", "2026-11-16T00:00:00Z", "one") + &planted_add("ow-1", "2026-11-16T01:00:00Z", "two")).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 2: id is added twice");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -388,8 +403,10 @@ fn store_close_without_add() {
     let t = Tmp::new();
     let store = t.store();
     fs::write(&store, planted_close("ow-404", "2026-11-16T01:00:00Z", "done", "pr:owner/repo#7", "")).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 1: close names no earlier added id");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -400,8 +417,10 @@ fn store_closed_twice() {
         + &planted_close("ow-1", "2026-11-16T01:00:00Z", "done", "pr:owner/repo#7", "")
         + &planted_close("ow-1", "2026-11-16T02:00:00Z", "done", "pr:owner/repo#8", "");
     fs::write(&store, body).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 3: id is closed twice");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -410,8 +429,10 @@ fn store_close_before_add() {
     let store = t.store();
     let body = planted_add("ow-1", "2026-11-16T09:00:00Z", "a row") + &planted_close("ow-1", "2026-11-16T08:00:00Z", "done", "pr:owner/repo#7", "");
     fs::write(&store, body).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 2: close is before the time the id was added");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -421,8 +442,10 @@ fn store_crlf_row() {
     let row = planted_add("ow-1", "2026-11-16T00:00:00Z", "a row");
     let body = format!("{}\r\n", row.trim_end_matches('\n'));
     fs::write(&store, body).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 1: not one JSON object of strings");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -430,12 +453,15 @@ fn store_empty_object_and_no_op() {
     let t = Tmp::new();
     let line = "harness: error: the owed store has a bad row at line 1: op must be add or close";
     let store = t.store();
-    fs::write(&store, "{}\n").unwrap();
+    let planted = b"{}\n".to_vec();
+    fs::write(&store, &planted).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, line);
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
     let store = t.store();
     let no_op = r#"{"id":"ow-1","at":"2026-11-16T00:00:00Z","by":"orch-a","what":"a row with no op","home":""}"#;
-    fs::write(&store, format!("{no_op}\n")).unwrap();
+    let planted = format!("{no_op}\n").into_bytes();
+    fs::write(&store, &planted).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, line);
 }
@@ -447,8 +473,10 @@ fn store_close_row_with_ref_and_reason() {
     let body = planted_add("ow-1", "2026-11-16T00:00:00Z", "a row")
         + &planted_close("ow-1", "2026-11-16T01:00:00Z", "done", "pr:owner/repo#7", "and a reason too");
     fs::write(&store, body).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 2: status done needs --ref and takes no --reason");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -456,8 +484,10 @@ fn store_status_open() {
     let t = Tmp::new();
     let store = t.store();
     fs::write(&store, planted_close("ow-1", "2026-11-16T01:00:00Z", "open", "", "")).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a bad row at line 1: status must be done or dropped");
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -465,9 +495,11 @@ fn store_privacy_hit_in_stored_row() {
     let t = Tmp::new();
     let store = t.store();
     fs::write(&store, planted_add("ow-1", "2026-11-16T00:00:00Z", &format!("see {}", home_path()))).unwrap();
+    let planted = fs::read(&store).unwrap();
     let o = run(&list_args(&store));
     refused2(&o, "harness: error: the owed store has a privacy hit at line 1 in field what (home-path)");
     assert!(!err(&o).contains("zztester"), "no planted user segment on stderr: {}", err(&o));
+    assert_eq!(fs::read(&store).unwrap(), planted, "the store is unchanged");
 }
 
 #[test]
@@ -665,7 +697,7 @@ fn no_privacy_list_fails_closed() {
     let o = bare(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", "t"));
     refused2(&o, line);
     let o = bare(&list_args(&store));
-    refused2(&o, line);
+    refused2(&o, "harness: error: no privacy list configured: an unscanned store is never read");
     let o = bare(&close_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", "done", "pr:owner/repo#7", ""));
     refused2(&o, line);
     assert_eq!(fs::read(&store).unwrap(), b"", "nothing is stored unscanned");
@@ -727,7 +759,7 @@ fn close_dropped_needs_reason() {
     untouched(&store, &o, 1, line, Some(before.clone()));
     let o = run(&close_args(&store, "ow-1", "2026-11-16T01:00:00Z", "orch-a", "dropped", "pr:owner/repo#7", ""));
     untouched(&store, &o, 1, line, Some(before.clone()));
-    let o = run(&vec![
+    let o = run(&[
         s("owed"), s("close"), s("--store"), ss(&store), s("--id"), s("ow-1"),
         s("--at"), s("2026-11-16T01:00:00Z"), s("--by"), s("orch-a"), s("--status"), s("dropped"), s("--reason"), s(""),
     ]);

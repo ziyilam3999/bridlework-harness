@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 pub const OWED_USAGE: &str = "usage: harness owed add --store <absolute-file> --id <id> --at <YYYY-MM-DDTHH:MM:SSZ> --by <tag> --what <text> [--home <home>] | owed list --store <absolute-file> [--open] | owed close --store <absolute-file> --id <id> --at <YYYY-MM-DDTHH:MM:SSZ> --by <tag> --status <done|dropped> (--ref <pointers> | --reason <text>)";
 
-/// The store is read no further than this; one byte over is a damaged store (exit 2).
+/// At most this many bytes plus one are read; a store over this is a damaged store (exit 2).
 const STORE_CAP: u64 = 4 * 1024 * 1024;
 /// `id` and `by` are at most this many bytes.
 const TOKEN_CAP: usize = 64;
@@ -24,10 +24,10 @@ const LINE_CAP: usize = 500;
 /// `home` is at most this many bytes.
 const HOME_CAP: usize = 200;
 
-// The open(2) flags std exposes no constants for (the quarantine.rs pattern): per-platform values read
-// from each platform's own fcntl.h (Linux asm-generic/fcntl.h, macOS sys/fcntl.h). O_NOFOLLOW makes a
-// symlink store fail the open itself (a swapped link cannot be followed past the stat check); O_NONBLOCK
-// makes a fifo fail at once instead of blocking. A platform with no listed value fails the build here.
+// The open(2) flags std exposes no constants for (the quarantine.rs pattern). Values are the Linux
+// asm-generic ones (arm and arm64 differ) and the macOS ones. O_NOFOLLOW makes a symlink store fail the
+// open itself; O_NONBLOCK makes the open of a fifo return at once instead of blocking (the regular-file
+// re-check then refuses it). A platform with no listed OS fails the build here.
 #[cfg(target_os = "linux")]
 const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
 #[cfg(target_os = "macos")]
@@ -291,7 +291,7 @@ fn read_store_locked(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<Item>, 
             }
         }
     }
-    // The first bad line wins; a field problem precedes a cross problem on the same line.
+    // The first bad line wins; one line holds a field problem or a cross problem, never both.
     problems.sort_by_key(|(n, _)| *n);
     if let Some((n, m)) = problems.first() {
         return Err(format!("the owed store has a bad row at line {n}: {m}"));
@@ -313,7 +313,7 @@ fn read_store_locked(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<Item>, 
 /// Steps (6) and (7) of add: a no-follow stat of the store path (a linked parent folder is accepted,
 /// only the last part must not be a link), then an open with O_NOFOLLOW and O_NONBLOCK, read-only for
 /// list, read and append for add and close, no create. The handle is re-checked to be a regular file,
-/// so a path swapped for a link between the two calls is still caught. `Err` is the message after
+/// so a path swapped for a fifo or a folder between the two calls is still refused (a swapped link fails the open itself). `Err` is the message after
 /// `harness: error: `.
 fn open_store(path: &Path, write: bool) -> Result<fs::File, String> {
     match fs::symlink_metadata(path) {
@@ -338,7 +338,9 @@ fn open_store(path: &Path, write: bool) -> Result<fs::File, String> {
 /// Step (11): one whole line plus newline, then sync; on a write or sync error the file is cut back to
 /// its old length before the caller reports the failure.
 fn append_line(f: &mut fs::File, line: &str) -> Result<(), ()> {
-    let old_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let Ok(old_len) = f.metadata().map(|m| m.len()) else {
+        return Err(());
+    };
     let mut buf = line.as_bytes().to_vec();
     buf.push(b'\n');
     if f.write_all(&buf).and_then(|()| f.sync_all()).is_err() {
@@ -504,7 +506,7 @@ fn list_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     let list = match crate::overlay::load() {
         Ok(l) => l,
-        Err(_) => return fail("no privacy list configured: an unscanned row is never stored"),
+        Err(_) => return fail("no privacy list configured: an unscanned store is never read"),
     };
     let ctx = crate::scan::Ctx { list: &list, testmode };
     let file = match open_store(&store, false) {
