@@ -569,7 +569,7 @@ fn add_bad_by() {
     let before = fs::read(&store).unwrap();
     let long_by = "a".repeat(65);
     for by in ["Orch-A", "..", "", long_by.as_str()] {
-        let o = run(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", &by, "t"));
+        let o = run(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", by, "t"));
         untouched(&store, &o, 1, line, Some(before.clone()));
     }
 }
@@ -594,7 +594,7 @@ fn add_bad_what() {
     let before = fs::read(&store).unwrap();
     let long = "a".repeat(501);
     for what in ["   ", "a\nb", "a\u{2028}b", "a\rb", long.as_str()] {
-        let o = run(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", &what));
+        let o = run(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", what));
         untouched(&store, &o, 1, line, Some(before.clone()));
     }
     let o = run(&add_args(&store, "ow-1", "2026-11-16T00:00:00Z", "orch-a", &"a".repeat(500)));
@@ -720,7 +720,7 @@ fn close_dropped_needs_reason() {
     let store = t.store();
     let line = "harness: owed refused: status dropped needs --reason and takes no --ref";
     let before = fs::read(&store).unwrap();
-    let o = run(&vec![
+    let o = run(&[
         s("owed"), s("close"), s("--store"), ss(&store), s("--id"), s("ow-1"),
         s("--at"), s("2026-11-16T01:00:00Z"), s("--by"), s("orch-a"), s("--status"), s("dropped"),
     ]);
@@ -828,9 +828,9 @@ fn flag_errors_exit_2() {
 #[test]
 fn a_relative_store_is_refused() {
     let t = Tmp::new();
-    let o = run(&vec![s("owed"), s("add"), s("--store"), s("owed.jsonl"), s("--id"), s("a"), s("--at"), s("2026-11-16T00:00:00Z"), s("--by"), s("b"), s("--what"), s("t")]);
+    let o = run(&[s("owed"), s("add"), s("--store"), s("owed.jsonl"), s("--id"), s("a"), s("--at"), s("2026-11-16T00:00:00Z"), s("--by"), s("b"), s("--what"), s("t")]);
     refused2(&o, "harness: error: --store must be an absolute path");
-    let o = run(&vec![s("owed"), s("list"), s("--store"), s("owed.jsonl")]);
+    let o = run(&[s("owed"), s("list"), s("--store"), s("owed.jsonl")]);
     refused2(&o, "harness: error: --store must be an absolute path");
     assert!(!t.0.join("owed.jsonl").exists());
 }
