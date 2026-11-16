@@ -42,7 +42,7 @@ The first failing step gives one stderr line and stops.
 
 ## Exit 2 inputs
 
-Lines start with `harness: error: ` and name the input, never a path: the privacy list, the ticket file,
+Lines start with `harness: error: ` and name the input and print no path: the privacy list, the ticket file,
 the ticket id, the output folder, the body file. The output folder is refused when it is missing, not a
 folder, a symbolic link, inside a work tree, not writable, or already holds `<id>.subject` or `<id>.body`.
 

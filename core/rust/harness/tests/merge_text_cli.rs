@@ -390,6 +390,30 @@ fn an_out_dir_link_exits_2() {
     assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
 }
 
+/// The out-dir path is the link plus `suffix`; the run is refused like a plain linked out-dir.
+fn out_link_with_suffix(suffix: &str) {
+    let mut c = good();
+    let link = c.t.0.join("out-link");
+    std::os::unix::fs::symlink(&c.out, &link).unwrap();
+    let real = c.out.clone();
+    c.out = PathBuf::from(format!("{}{suffix}", link.display()));
+    let o = c.go();
+    assert_eq!(code(&o), 2);
+    assert!(out(&o).is_empty());
+    assert_eq!(err(&o), "harness: error: the output folder must be a real folder, not a link or a file\n");
+    assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+}
+
+#[test]
+fn an_out_dir_link_with_a_trailing_slash_exits_2() {
+    out_link_with_suffix("/");
+}
+
+#[test]
+fn an_out_dir_link_with_a_trailing_dot_exits_2() {
+    out_link_with_suffix("/.");
+}
+
 const WORK_TREE_LINE: &str = "harness: error: the output folder lies inside a work tree";
 
 #[test]
@@ -402,6 +426,7 @@ fn an_out_dir_inside_a_work_tree_exits_2() {
     c.out = deep.clone();
     let o = c.go();
     assert_eq!(code(&o), 2);
+    assert!(out(&o).is_empty());
     assert_eq!(err(&o), format!("{WORK_TREE_LINE}\n"));
     assert_eq!(fs::read_dir(&deep).unwrap().count(), 0);
 }
@@ -412,6 +437,7 @@ fn an_out_dir_holding_a_git_file_exits_2() {
     fs::write(c.out.join(".git"), b"gitdir: elsewhere\n").unwrap();
     let o = c.go();
     assert_eq!(code(&o), 2);
+    assert!(out(&o).is_empty());
     assert_eq!(err(&o), format!("{WORK_TREE_LINE}\n"));
     assert_eq!(c.out_count(), 1);
 }
@@ -428,6 +454,7 @@ fn an_out_dir_under_a_linked_parent_inside_a_work_tree_exits_2() {
     c.out = link.join("real-out");
     let o = c.go();
     assert_eq!(code(&o), 2);
+    assert!(out(&o).is_empty());
     assert_eq!(err(&o), format!("{WORK_TREE_LINE}\n"));
     assert_eq!(fs::read_dir(inner.join("real-out")).unwrap().count(), 0);
 }
@@ -644,6 +671,11 @@ fn a_trailer_line_is_refused() {
 }
 
 #[test]
+fn a_trailer_line_after_leading_blanks_is_refused() {
+    body_refused(b"one\n  Co-authored-by: x\nthree\n", "body line 2 looks like a trailer");
+}
+
+#[test]
 fn lines_that_only_look_close_to_a_trailer_pass() {
     body_ok(b"Note: x\na - b: c\nsee core/rust: x\n");
 }
@@ -750,6 +782,7 @@ fn an_existing_body_folder_exits_2() {
     fs::create_dir(&d).unwrap();
     let o = c.go();
     assert_eq!(code(&o), 2);
+    assert!(out(&o).is_empty());
     assert_eq!(err(&o), format!("{DIR_LINE}\n"));
     assert!(d.is_dir());
     assert_eq!(c.out_count(), 1);

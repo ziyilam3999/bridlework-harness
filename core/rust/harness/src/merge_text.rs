@@ -145,6 +145,9 @@ fn looks_like_trailer(line: &str) -> bool {
 
 /// The output folder: a real folder (not a link), canonicalized once, with no `.git` entry in it or above it.
 fn resolve_out(arg: &Path) -> Result<PathBuf, &'static str> {
+    // Rebuilt from components: drops a trailing "/" or "/.", so the last name is not followed.
+    let arg: PathBuf = arg.components().collect();
+    let arg = arg.as_path();
     let meta = fs::symlink_metadata(arg).map_err(|_| "the output folder is missing or unreadable")?;
     if !meta.file_type().is_dir() {
         return Err("the output folder must be a real folder, not a link or a file");
