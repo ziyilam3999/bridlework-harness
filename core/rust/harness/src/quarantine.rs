@@ -1,4 +1,5 @@
-//! `harness quarantine sweep`, `harness quarantine delete-listed` and `harness quarantine drop-build` (std only, Unix): P1B-13, ticket #156; drop-build: build-output-drop.
+//! `harness quarantine sweep`, `delete-listed`, `drop-build` and `put` (std only, Unix): P1B-13, ticket #156; drop-build: build-output-drop; put: quarantine-put.
+//! `put` moves one item onto the shelf with a label written first; it removes nothing.
 //! The sweep NEVER deletes: anything left in the ticket's roots that the manifest does not own is carried, whole and
 //! untouched, to the quarantine shelf — `<quarantine-dir>/<ticket>/<batch>/<item>`, generated token names only, an
 //! original name is never reused as a quarantine name — with one journal line written BEFORE each move (the crash
@@ -27,7 +28,9 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness quarantine sweep <ticket> --manifest-dir <abs> --workspace-root <abs> --quarantine-dir <abs> --log <abs> --repo <token> --role <token> --model <token> [--max-items <n>] [--ts-ms <n>] | quarantine delete-listed <ticket> --id <id> --manifest-dir <abs> [--ts-ms <n>] | quarantine drop-build <ticket> --root <abs> [--root <abs> ...] --manifest-dir <abs> --caps-dir <abs> [--dry-run]";
+pub const USAGE: &str = "usage: harness quarantine sweep <ticket> --manifest-dir <abs> --workspace-root <abs> --quarantine-dir <abs> --log <abs> --repo <token> --role <token> --model <token> [--max-items <n>] [--ts-ms <n>] | quarantine delete-listed <ticket> --id <id> --manifest-dir <abs> [--ts-ms <n>] | quarantine drop-build <ticket> --root <abs> [--root <abs> ...] --manifest-dir <abs> --caps-dir <abs> [--dry-run] | quarantine put <path> --quarantine-dir <abs> --manifest-dir <abs> --kind <k> --why <text> --by <token> [--ticket <token>] [--repo <token>] [--ts-ms <n>]";
+
+pub mod put;
 
 /// Default cap on leftovers moved by one sweep. Over it the sweep fails closed: exit 3, nothing moved.
 pub const DEFAULT_MAX_ITEMS: u64 = 1000;
@@ -1473,8 +1476,9 @@ pub fn drop_build(a: &DropArgs) -> Result<String, Stop> {
 
 // ---------------------------------------------------------------- the verb
 
-/// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ... | drop-build <ticket> ...` (the arguments
-/// after `quarantine`). The exit lines here are those of sweep and delete-listed; drop-build's are at `drop_build`. Exit 0
+/// `harness quarantine sweep <ticket> ... | delete-listed <ticket> ... | drop-build <ticket> ... | put <path> ...` (the
+/// arguments after `quarantine`). The exit lines here are those of sweep and delete-listed; drop-build's are at
+/// `drop_build` and put's are in `put.rs`. Exit 0
 /// done (one stdout line of fixed fields, no folder); 2 refused (usage, bad or misplaced folders, a root that is a
 /// symlink or outside the base, a damaged manifest, wrong class or id); 3 cannot proceed (cross-device, over a cap,
 /// an undecidable journal intent, an event log that cannot be read whole by reconcile, a rename/journal/event write
@@ -1488,6 +1492,7 @@ pub fn quarantine_cmd(a: &[String]) -> i32 {
         "sweep" => sweep_cli(rest),
         "delete-listed" => parse_delete(rest).and_then(|args| delete_listed(&args)),
         "drop-build" => parse_drop(rest).and_then(|args| drop_build(&args)),
+        "put" => put::parse_put(rest).and_then(|args| put::put(&args)),
         _ => Err(err2("unknown quarantine subcommand")),
     };
     match r {
