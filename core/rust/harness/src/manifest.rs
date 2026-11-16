@@ -1,9 +1,14 @@
 //! Resource manifest core (std only): the per-ticket append-only JSON Lines file that lists what a ticket owns.
 //! One operation per line, compact, fixed key order, every key present, `v` (schema version) on every line.
-//! Same line, reader and writer discipline as the event log (`events.rs`): a final fragment with no trailing newline is a
-//! TORN TAIL, reported and never parsed; a complete bad line is CORRUPTION and stops the read; the writer appends under an
-//! exclusive lock with a last-byte check, one write per line, then `sync_all`, and refuses to append onto a torn tail.
-//! On top of the event log's rules the manifest adds a fence: the first line(s) name the ticket's roots (existing folders),
+//! Same LINE rules as the event log (`events.rs`): a final fragment with no trailing newline is a TORN TAIL, reported and
+//! not parsed; a complete bad line is CORRUPTION and stops the read. The manifest's reader and writer differ from the
+//! event log's (the event log locks no reader and cuts back no failed write): the writer appends under an exclusive lock, one
+//! write per line, then `sync_all`, and refuses to append onto a torn tail or repair one it did not write; a write that
+//! fails part way (a short write, a write error, a failed sync) cuts back its own bytes before the lock is released, so
+//! a later write to the same ticket is not refused for good (a cut back that fails says so) — init cuts back to an empty file and syncs the manifest dir
+//! plus the parent of each folder level it made; a read opens the file for reading only and takes a shared lock first,
+//! waiting for a writer up to `READ_LOCK_WAIT_MS` (10 s) and then refusing as busy, reading nothing.
+//! On top of that the manifest adds a fence: the first line(s) name the ticket's roots (existing folders),
 //! and every path entry must resolve inside one of them. The manifest file itself must live outside the roots, so removing
 //! the roots never removes the record.
 
@@ -726,11 +731,54 @@ pub fn manifest_file(dir: &Path, ticket: &str) -> PathBuf {
     dir.join(format!("{ticket}.jsonl"))
 }
 
+/// How long a read waits for the writer's exclusive lock before refusing as busy, reading nothing. std has
+/// no timed lock: the reader retries `try_lock_shared` on a short sleep until this limit. Writers keep
+/// their unbounded wait for the lock; a limit for writers (and for the supervisor lock) is a later ticket.
+const READ_LOCK_WAIT_MS: u64 = 10000;
+
 /// Read a ticket's manifest. A missing or unreadable file is an `Err` (fail closed), never an empty manifest.
+/// The file is opened for READING only (a missing file stays missing, a file the user can read but not write
+/// still reads) and a shared lock is taken before the read, so a reader cannot meet a line a live writer has
+/// not finished. A torn tail or corrupt line still present under the lock is reported exactly as before.
+///
+/// Calling this while holding a handle from `open_locked` returns busy after `READ_LOCK_WAIT_MS`: the lock
+/// is per open handle, so a second handle — even in the same process — cannot get it.
 pub fn read_manifest(dir: &Path, ticket: &str) -> Result<ManifestRead, String> {
+    read_manifest_wait(dir, ticket, READ_LOCK_WAIT_MS)
+}
+
+/// The read itself, with the lock wait as a parameter: release code passes `READ_LOCK_WAIT_MS` and unit
+/// tests pass a short one, so no switch exists in a release build.
+fn read_manifest_wait(dir: &Path, ticket: &str, wait_ms: u64) -> Result<ManifestRead, String> {
     let file = manifest_file(dir, ticket);
-    let bytes = fs::read(&file).map_err(|e| format!("cannot read manifest {}: {}", file.display(), e.kind()))?;
+    let mut f = File::open(&file).map_err(|e| format!("cannot read manifest {}: {}", file.display(), e.kind()))?;
+    lock_shared_bounded(&f, &file, ticket, wait_ms)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).map_err(|e| format!("cannot read manifest {}: {}", file.display(), e.kind()))?;
     Ok(parse_manifest(&bytes, ticket))
+}
+
+/// Take the shared lock, retrying `try_lock_shared` on a short sleep until `wait_ms` passes. A reader that
+/// has no lock when the limit passes reads nothing and returns a busy `Err` naming the ticket; a lock error
+/// other than would-block is an `Err` at once, as for an unreadable file.
+fn lock_shared_bounded(f: &File, file: &Path, ticket: &str, wait_ms: u64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    loop {
+        match f.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "manifest of ticket {ticket} is busy: a writer held its lock past {wait_ms} ms; nothing was read"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("cannot lock manifest {}: {}", file.display(), e.kind()));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- paths and the fence
@@ -921,16 +969,97 @@ thread_local! {
     static SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault seam for the durability paths: a short write, a failed file sync, a failed dir
+    /// sync and a failed cut back cannot be forced on a real disk without filling it. Thread_local
+    /// because unit tests run on parallel threads: a fault armed in one test must not fire in another.
+    /// Each fault is one-shot.
+    static SEAM: std::cell::RefCell<Seam> = std::cell::RefCell::new(Seam::default());
+}
+
+/// The seam's state; see `SEAM`.
+#[cfg(test)]
+#[derive(Default)]
+struct Seam {
+    /// Make a write put only its first `k` bytes on disk and report `k`.
+    short_write: Option<usize>,
+    /// How many whole writes pass before `short_write` fires (init writes one line per root).
+    short_write_skip: usize,
+    /// Make the next file sync fail.
+    fail_sync: bool,
+    /// Make the next dir sync fail.
+    fail_dir_sync: bool,
+    /// Make the next cut back fail.
+    fail_cut_back: bool,
+    /// How many dir syncs have run.
+    dir_syncs: usize,
+}
+
+#[cfg(test)]
+impl Seam {
+    /// The short-write fault of the next write, honouring `short_write_skip`.
+    fn take_short_write(&mut self) -> Option<usize> {
+        if self.short_write_skip > 0 {
+            self.short_write_skip -= 1;
+            return None;
+        }
+        self.short_write.take()
+    }
+}
+
 fn sync(f: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if SEAM.with(|s| std::mem::take(&mut s.borrow_mut().fail_sync)) {
+            return Err(std::io::Error::other("sync failed (test seam)"));
+        }
+    }
     #[cfg(test)]
     SYNC_CALLS.with(|c| c.set(c.get() + 1));
     f.sync_all()
+}
+
+/// Open the folder and sync it, so an entry created inside it (the manifest file, a new folder level)
+/// is on disk. A folder that cannot be opened or synced is an `Err`.
+fn sync_dir(p: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let fail = SEAM.with(|s| {
+            let mut b = s.borrow_mut();
+            b.dir_syncs += 1;
+            std::mem::take(&mut b.fail_dir_sync)
+        });
+        if fail {
+            return Err(std::io::Error::other("dir sync failed (test seam)"));
+        }
+    }
+    File::open(p)?.sync_all()
+}
+
+/// Cut the file back to `keep` bytes: the length it held when this call's lock was taken, before this
+/// call wrote. Runs before the lock is released and removes only bytes this call wrote, so when it succeeds what later
+/// writers and readers see is either the whole new line or the bytes that were there before.
+fn cut_back_locked(f: &mut File, keep: u64) -> Result<(), ManifestError> {
+    #[cfg(test)]
+    {
+        if SEAM.with(|s| std::mem::take(&mut s.borrow_mut().fail_cut_back)) {
+            return Err(ManifestError::Io("cut back failed (test seam)".to_string()));
+        }
+    }
+    let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
+    f.set_len(keep).map_err(io)?;
+    sync(f).map_err(io)?;
+    Ok(())
 }
 
 /// Open the manifest file with the exclusive lock taken FIRST: read, validate and append are ONE critical
 /// section, so two writers cannot both validate against the same stale read and both append (B5). `creating`
 /// is set only by init, the one operation allowed to make the file; every other op opens an existing file,
 /// so a missing manifest is refused having created nothing.
+///
+/// While a handle from here is held, calling `read_manifest` on the same file returns busy after
+/// `READ_LOCK_WAIT_MS`: the lock is per open handle, so a second handle in the same process cannot get it.
 fn open_locked(file: &Path, ticket: &str, creating: bool) -> Result<File, ManifestError> {
     let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
     let f = OpenOptions::new()
@@ -976,31 +1105,77 @@ fn validate_for_write(bytes: &[u8], ticket: &str) -> Result<ManifestRead, Manife
 }
 
 /// Append one encoded line through the already-locked handle: ONE write of the whole line, then `sync_all`.
+/// `keep` is the file's length as read under the lock; a write that fails part way is cut back to it.
 /// Success means the line is on disk.
-fn append_locked(f: &mut File, line: &Line) -> Result<(), ManifestError> {
+fn append_locked(f: &mut File, line: &Line, keep: u64) -> Result<(), ManifestError> {
     let text = line.encode()?;
-    write_text_locked(f, &text)
+    write_text_locked(f, &text, keep)
 }
 
-/// Write one already-encoded line and sync it.
-fn write_text_locked(f: &mut File, text: &str) -> Result<(), ManifestError> {
+/// Write one already-encoded line and sync it. `keep` is the file's length as read under the lock before
+/// this call wrote. A write that fails part way — a short write, a write error, a failed sync after a full
+/// write — is cut back to `keep` before the lock is released, so the file is byte-identical to the bytes
+/// read under the lock and a later write to the same ticket is not refused for good. A cut back that
+/// itself fails says so: after a short write the file may hold a torn tail (the next write refuses as
+/// damaged); after a failed sync the whole line may be on disk (it reads as live); both need a check by hand.
+fn write_text_locked(f: &mut File, text: &str, keep: u64) -> Result<(), ManifestError> {
     let io = |e: std::io::Error| ManifestError::Io(e.kind().to_string());
-    let n = f.write(text.as_bytes()).map_err(io)?;
-    if n != text.len() {
-        return Err(ManifestError::Io("short write".to_string()));
+    let torn_text = |what: &str| {
+        ManifestError::Io(format!(
+            "{what}; cutting the bytes this call wrote back failed: the file may hold a torn tail or the whole line and needs a check by hand"
+        ))
+    };
+    #[cfg(test)]
+    let short = SEAM.with(|s| s.borrow_mut().take_short_write());
+    #[cfg(not(test))]
+    let short: Option<usize> = None;
+    let attempted: Result<usize, std::io::Error> = match short {
+        Some(k) => f.write(&text.as_bytes()[..k.min(text.len())]),
+        None => f.write(text.as_bytes()),
+    };
+    match attempted {
+        Ok(n) if n == text.len() => {}
+        Ok(_) => {
+            return match cut_back_locked(f, keep) {
+                Ok(()) => Err(ManifestError::Io("short write".to_string())),
+                Err(_) => Err(torn_text("short write")),
+            };
+        }
+        Err(e) => {
+            return match cut_back_locked(f, keep) {
+                Ok(()) => Err(io(e)),
+                Err(_) => Err(torn_text("write error")),
+            };
+        }
     }
-    sync(f).map_err(io)?;
+    if let Err(e) = sync(f) {
+        return match cut_back_locked(f, keep) {
+            Ok(()) => Err(io(e)),
+            Err(_) => Err(ManifestError::Io(
+                "sync failed, and cutting the line this call wrote back failed: the whole line may be on disk and reads as live; it needs a check by hand".to_string(),
+            )),
+        };
+    }
     Ok(())
 }
 
 /// The write half of init, for roots already validated and resolved. Every root line is encoded BEFORE anything is
-/// created or written (N-f), so an over-long or invalid later root returns its error with nothing on disk.
+/// created or written (N-f), so an over-long or invalid later root returns its error with nothing on disk. The dir is
+/// resolved before the first write, so a resolve failure cannot land after one. A write or dir sync that fails after
+/// the first write was attempted cuts the file back to 0 bytes — what a crash between create and write leaves today —
+/// so a fresh init of the same roots then succeeds; a cut back that fails says so. After the lines are synced the
+/// manifest dir is synced, and so is the parent of each folder level this init created (create_dir_all can make
+/// several levels).
 fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Result<(), ManifestError> {
     let lines: Vec<String> = resolved
         .iter()
         .map(|r| Line::Root { ticket: ticket.to_string(), path: r.to_string_lossy().into_owned(), ts_ms }.encode())
         .collect::<Result<_, _>>()?;
+    // How many levels of `dir` are missing: each level create_dir_all makes is synced in its parent afterwards.
+    let missing = missing_levels(dir);
     fs::create_dir_all(dir).map_err(|e| ManifestError::Io(e.kind().to_string()))?;
+    // Resolved before the lock and the writes: this failure comes with no line on disk.
+    let abs = dir.canonicalize().map_err(|e| ManifestError::Io(e.kind().to_string()))?;
     // ONE critical section (B5): the lock is taken first, then the empty-file check runs on bytes read
     // through the locked handle, so two concurrent inits of one fresh manifest leave exactly one.
     let mut f = open_locked(&manifest_file(dir, ticket), ticket, true)?;
@@ -1008,9 +1183,54 @@ fn write_init(dir: &Path, ticket: &str, resolved: &[PathBuf], ts_ms: u64) -> Res
         return Err(ManifestError::Invalid("second init: the manifest already holds lines".to_string()));
     }
     for text in &lines {
-        write_text_locked(&mut f, text)?;
+        // init's cut back target is 0: the empty-file check above proved the file held 0 bytes, so only this call's bytes are cut.
+        write_text_locked(&mut f, text, 0)?;
+    }
+    sync_init_dir(&abs, &mut f)?;
+    let mut lvl = abs.as_path();
+    for _ in 0..missing {
+        let Some(parent) = lvl.parent() else { break };
+        sync_init_dir(parent, &mut f)?;
+        lvl = parent;
     }
     Ok(())
+}
+
+/// One init dir sync: a dir that cannot be opened or synced fails init after the file is cut back to 0 bytes;
+/// a cut back that also fails says so, keeping the dir sync cause.
+fn sync_init_dir(p: &Path, f: &mut File) -> Result<(), ManifestError> {
+    sync_dir(p).map_err(|e| {
+        let cause = format!("cannot sync dir {}: {}", p.display(), e.kind());
+        match cut_back_locked(f, 0) {
+            Ok(()) => ManifestError::Io(cause),
+            Err(_) => ManifestError::Io(format!(
+                "{cause}; cutting the init lines back failed: the file may still hold the init lines and needs a check by hand"
+            )),
+        }
+    })
+}
+
+/// How many trailing levels of `dir` do not exist yet (0 when `dir` exists). A relative `dir` is joined
+/// onto the current folder first, so the walk stops at the folder create_dir_all counts from.
+fn missing_levels(dir: &Path) -> usize {
+    let joined = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(dir),
+            Err(_) => dir.to_path_buf(),
+        }
+    };
+    let mut cur = joined.as_path();
+    let mut n = 0;
+    while !cur.exists() {
+        n += 1;
+        match cur.parent() {
+            Some(p) if p != cur => cur = p,
+            _ => return n,
+        }
+    }
+    n
 }
 
 /// Validate one root for init: absolute, existing, a directory, not `/`; return it resolved.
@@ -1073,7 +1293,8 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
             }
             // every file-state check runs inside the critical section (B5)
             let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
-            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let bytes = read_locked(&mut f)?;
+            let r = validate_for_write(&bytes, ticket)?;
             if r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
             }
@@ -1089,7 +1310,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 class: *class,
                 path: stored.to_string(),
                 ts_ms,
-            })
+            }, bytes.len() as u64)
         }
         Op::AddProcess { id, pid, pid_start_ms } => {
             if !token_ok(id) {
@@ -1099,7 +1320,8 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 return Err(ManifestError::Invalid("pid must be an integer > 1 (signalling 0, 1 or a negative would hit a group or init)".to_string()));
             }
             let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
-            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let bytes = read_locked(&mut f)?;
+            let r = validate_for_write(&bytes, ticket)?;
             if r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
             }
@@ -1112,7 +1334,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 pid: *pid,
                 pid_start_ms: *pid_start_ms,
                 ts_ms,
-            })
+            }, bytes.len() as u64)
         }
         Op::AddPort { id, port } => {
             if !token_ok(id) {
@@ -1122,7 +1344,8 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 return Err(ManifestError::Invalid("port must be an integer in 1..65535".to_string()));
             }
             let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
-            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let bytes = read_locked(&mut f)?;
+            let r = validate_for_write(&bytes, ticket)?;
             if r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("duplicate live id {id:?}")));
             }
@@ -1134,7 +1357,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 id: id.to_string(),
                 port: *port,
                 ts_ms,
-            })
+            }, bytes.len() as u64)
         }
         Op::Limit { id, timeout_ms } => {
             if !token_ok(id) {
@@ -1144,7 +1367,8 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 return Err(ManifestError::Invalid("timeout_ms must be an integer >= 1 (a 0 ms limit is already expired)".to_string()));
             }
             let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
-            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let bytes = read_locked(&mut f)?;
+            let r = validate_for_write(&bytes, ticket)?;
             // The writer mirrors the reader rule, so the sheet it wrote can never read back as corrupt.
             let Some(e) = r.live.iter().find(|e| e.id == *id) else {
                 return Err(ManifestError::Invalid(format!("limit of an id that is not live: {id}")));
@@ -1160,7 +1384,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 id: id.to_string(),
                 timeout_ms: *timeout_ms,
                 ts_ms,
-            })
+            }, bytes.len() as u64)
         }
         Op::Session { id, session_id } => {
             if !token_ok(id) {
@@ -1175,7 +1399,8 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 ));
             }
             let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
-            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let bytes = read_locked(&mut f)?;
+            let r = validate_for_write(&bytes, ticket)?;
             let Some(e) = r.live.iter().find(|e| e.id == *id) else {
                 return Err(ManifestError::Invalid(format!(
                     "session of an id that is not live: {id}"
@@ -1199,6 +1424,7 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                     session_id: session_id.to_string(),
                     ts_ms,
                 },
+                bytes.len() as u64,
             )
         }
         Op::Remove { id } => {
@@ -1206,11 +1432,12 @@ pub fn apply(dir: &Path, ticket: &str, op: &Op, ts_ms: u64) -> Result<(), Manife
                 return Err(ManifestError::Invalid("id must be a plain token (lowercase letters, digits, '-', '_', '.')".to_string()));
             }
             let mut f = open_locked(&manifest_file(dir, ticket), ticket, false)?;
-            let r = validate_for_write(&read_locked(&mut f)?, ticket)?;
+            let bytes = read_locked(&mut f)?;
+            let r = validate_for_write(&bytes, ticket)?;
             if !r.live.iter().any(|e| e.id == *id) {
                 return Err(ManifestError::Invalid(format!("remove of an id that is not live: {id}")));
             }
-            append_locked(&mut f, &Line::Remove { ticket: ticket.to_string(), id: id.to_string(), ts_ms })
+            append_locked(&mut f, &Line::Remove { ticket: ticket.to_string(), id: id.to_string(), ts_ms }, bytes.len() as u64)
         }
     }
 }
@@ -1585,6 +1812,219 @@ mod tests {
         );
         let r = read_manifest(&dir, "t-1").unwrap();
         assert_eq!(r.live[0].session.as_deref(), Some(SID));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------- manifest-writer-fix: durability
+
+    /// A scratch layout for the write-fault tests: a real root, a real manifest dir, one init.
+    fn fault_base(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("manifest-fault-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("roots/r");
+        fs::create_dir_all(&root).unwrap();
+        let dir = base.join("man");
+        write_init(&dir, "t-1", &[root.canonicalize().unwrap()], 1).unwrap();
+        (base, dir)
+    }
+
+    #[test]
+    fn a_short_write_on_add_leaves_the_file_byte_identical() {
+        let (base, dir) = fault_base("add");
+        let root = base.join("roots/r");
+        let file = manifest_file(&dir, "t-1");
+        let before = fs::read(&file).unwrap();
+        SEAM.with(|s| s.borrow_mut().short_write = Some(10));
+        let err = apply(&dir, "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &root.join("x") }, 2).unwrap_err();
+        assert!(err.to_string().contains("short write"), "{err}");
+        assert_eq!(fs::read(&file).unwrap(), before, "the failed write was cut back to the bytes read under the lock");
+        // twin: the same add with no fault succeeds and the read is clean with that entry live
+        apply(&dir, "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &root.join("x") }, 2).unwrap();
+        let r = read_manifest(&dir, "t-1").unwrap();
+        assert!(r.is_clean());
+        assert!(r.live.iter().any(|e| e.id == "a"), "the retried add is live: {:?}", r.live);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// One case each for limit, session and remove through `apply`: the short write leaves the file byte-identical.
+    #[test]
+    fn a_short_write_on_limit_session_and_remove_leaves_the_file_byte_identical() {
+        let (base, dir) = fault_base("ops");
+        let file = manifest_file(&dir, "t-1");
+        apply(&dir, "t-1", &Op::AddProcess { id: "w", pid: 4242, pid_start_ms: 7 }, 2).unwrap();
+        for (name, op, redo) in [
+            ("limit", Op::Limit { id: "w", timeout_ms: 60000 }, 3),
+            ("session", Op::Session { id: "w", session_id: SID }, 4),
+            ("remove", Op::Remove { id: "w" }, 5),
+        ] {
+            let before = fs::read(&file).unwrap();
+            SEAM.with(|s| s.borrow_mut().short_write = Some(10));
+            let err = apply(&dir, "t-1", &op, redo).unwrap_err();
+            assert!(err.to_string().contains("short write"), "{name}: {err}");
+            assert_eq!(fs::read(&file).unwrap(), before, "{name}: the file is byte-identical");
+            // advance the sheet with no fault, so the next op has its live target
+            apply(&dir, "t-1", &op, redo).unwrap();
+        }
+        assert!(read_manifest(&dir, "t-1").unwrap().live.is_empty(), "the remove landed");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_short_write_on_the_second_root_line_leaves_init_empty() {
+        let base = std::env::temp_dir().join(format!("manifest-fault-init2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("man");
+        let roots = [PathBuf::from("/short-a"), PathBuf::from("/short-b"), PathBuf::from("/short-c")];
+        SEAM.with(|s| {
+            let mut b = s.borrow_mut();
+            b.short_write = Some(10);
+            b.short_write_skip = 1; // the first root line lands whole; the second is cut short
+        });
+        let err = write_init(&dir, "t-1", &roots, 1).unwrap_err();
+        assert!(err.to_string().contains("short write"), "{err}");
+        assert_eq!(fs::read(manifest_file(&dir, "t-1")).unwrap(), Vec::<u8>::new(), "init is cut back to a 0-byte file");
+        // twin: a fresh init of the same roots succeeds and the read holds three roots
+        write_init(&dir, "t-1", &roots, 1).unwrap();
+        let r = read_manifest(&dir, "t-1").unwrap();
+        assert!(r.is_clean());
+        assert_eq!(r.roots.len(), 3);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_failed_sync_after_a_full_write_leaves_the_file_byte_identical() {
+        let (base, dir) = fault_base("sync");
+        let root = base.join("roots/r");
+        let file = manifest_file(&dir, "t-1");
+        let before = fs::read(&file).unwrap();
+        SEAM.with(|s| s.borrow_mut().fail_sync = true);
+        let err = apply(&dir, "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &root.join("x") }, 2).unwrap_err();
+        assert!(err.to_string().contains("manifest write failed"), "{err}");
+        assert_eq!(fs::read(&file).unwrap(), before, "the whole line was cut back after the failed sync");
+        apply(&dir, "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &root.join("x") }, 2).unwrap();
+        assert!(read_manifest(&dir, "t-1").unwrap().live.iter().any(|e| e.id == "a"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Two cases: a short write then a failed cut back leaves a torn tail (the next write refuses as
+    /// Damaged); a failed sync then a failed cut back leaves the whole line, which reads as live.
+    #[test]
+    fn a_failed_cut_back_says_the_file_may_be_torn() {
+        let (base, dir) = fault_base("cutback-a");
+        let root = base.join("roots/r");
+        SEAM.with(|s| {
+            let mut b = s.borrow_mut();
+            b.short_write = Some(10);
+            b.fail_cut_back = true;
+        });
+        let err = apply(&dir, "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &root.join("x") }, 2).unwrap_err();
+        assert!(err.to_string().contains("torn tail") && err.to_string().contains("check by hand"), "{err}");
+        let err = apply(&dir, "t-1", &Op::AddPath { id: "b", class: Class::TempDir, path: &root.join("y") }, 3).unwrap_err();
+        assert!(matches!(err, ManifestError::Damaged { .. }), "the torn tail the failed cut back left refuses the next write: {err}");
+        let _ = fs::remove_dir_all(&base);
+
+        let (base, dir) = fault_base("cutback-b");
+        let root = base.join("roots/r");
+        SEAM.with(|s| {
+            let mut b = s.borrow_mut();
+            b.fail_sync = true;
+            b.fail_cut_back = true;
+        });
+        let err = apply(&dir, "t-1", &Op::AddPath { id: "a", class: Class::TempDir, path: &root.join("x") }, 2).unwrap_err();
+        assert!(err.to_string().contains("the whole line may be on disk"), "{err}");
+        let r = read_manifest(&dir, "t-1").unwrap();
+        assert!(r.is_clean(), "the uncut line reads as live: {:?}", r.torn_tail);
+        assert!(r.live.iter().any(|e| e.id == "a"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn init_syncs_the_manifest_dir_and_the_parent_of_each_new_dir() {
+        let base = std::env::temp_dir().join(format!("manifest-fault-dirs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = PathBuf::from("/short-a");
+        // the dir already existed: one sync, of the manifest dir itself
+        fs::create_dir_all(base.join("man0")).unwrap();
+        write_init(&base.join("man0"), "t-1", std::slice::from_ref(&root), 1).unwrap();
+        assert_eq!(SEAM.with(|s| s.borrow().dir_syncs), 1, "an existing dir syncs only the manifest dir");
+        // one level created: the manifest dir and its parent
+        write_init(&base.join("one"), "t-2", std::slice::from_ref(&root), 1).unwrap();
+        assert_eq!(SEAM.with(|s| s.borrow().dir_syncs), 3, "one created level adds its parent");
+        // two levels created: the manifest dir and both parents
+        write_init(&base.join("two/deep"), "t-3", &[root], 1).unwrap();
+        assert_eq!(SEAM.with(|s| s.borrow().dir_syncs), 6, "two created levels add two parents");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_failed_dir_sync_fails_init_with_the_file_empty() {
+        let base = std::env::temp_dir().join(format!("manifest-fault-dirfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("man");
+        SEAM.with(|s| s.borrow_mut().fail_dir_sync = true);
+        let err = write_init(&dir, "t-1", &[PathBuf::from("/short-a")], 1).unwrap_err();
+        assert!(err.to_string().contains("cannot sync dir"), "{err}");
+        assert_eq!(fs::read(manifest_file(&dir, "t-1")).unwrap(), Vec::<u8>::new(), "the file is left at 0 bytes");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A failed dir sync whose cut back to 0 also fails is reported: the error keeps the dir sync cause and
+    /// says the file may still hold the init lines and needs a check by hand (the lines stay on disk).
+    #[test]
+    fn a_failed_cut_back_after_a_failed_dir_sync_says_check_by_hand() {
+        let base = std::env::temp_dir().join(format!("manifest-fault-dircut-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("man");
+        SEAM.with(|s| {
+            let mut b = s.borrow_mut();
+            b.fail_dir_sync = true;
+            b.fail_cut_back = true;
+        });
+        let err = write_init(&dir, "t-1", &[PathBuf::from("/short-a")], 1).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("cannot sync dir"), "the dir sync cause stays: {text}");
+        assert!(text.contains("check by hand") && text.contains("init lines"), "{text}");
+        assert!(!fs::read(manifest_file(&dir, "t-1")).unwrap().is_empty(), "the failed cut back left the init line on disk");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_reader_behind_a_held_lock_returns_busy_within_the_bound() {
+        let (base, dir) = fault_base("busy");
+        let file = manifest_file(&dir, "t-1");
+        let hold = File::open(&file).unwrap();
+        hold.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = dir.clone();
+        let t0 = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_manifest_wait(&d2, "t-1", 200));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the reader answers within 5 s, not a hang");
+        let took = t0.elapsed();
+        let err = got.expect_err("a reader behind a held lock is a busy Err");
+        assert!(err.contains("busy") && err.contains("t-1"), "{err}");
+        assert!(took.as_millis() >= 200, "the refusal came no sooner than the 200 ms bound: {took:?}");
+        drop(hold);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_reader_whose_lock_frees_in_time_reads_clean() {
+        let (base, dir) = fault_base("freed");
+        let file = manifest_file(&dir, "t-1");
+        let hold = File::open(&file).unwrap();
+        hold.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_manifest_wait(&d2, "t-1", 2000));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(hold);
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the reader answers within 5 s, not a hang");
+        let r = got.expect("the lock freed inside the bound");
+        assert!(r.is_clean());
         let _ = fs::remove_dir_all(&base);
     }
 }
