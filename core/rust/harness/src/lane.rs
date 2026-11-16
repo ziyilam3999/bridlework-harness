@@ -1,4 +1,5 @@
-//! `harness lane claim | release | list | park | admission-check` (std only; `docs/lanes.md` is the contract). A lane holds one live ticket. The cap
+//! `harness lane claim | release | list | park | admission-check | stale` (std only; `docs/lanes.md` is the contract). `stale` only reports
+//! (`lane/stale.rs`): it prints a verdict per live lane, writes nothing, and exits 3 when a verdict is `unknown`. A lane holds one live ticket. The cap
 //! on live tickets is 1 without a valid admission record and the smaller of the record's admitted lane count and the config `lanes.count` with
 //! one, so no constant is edited to raise the cap. One record file per held lane, `<lanes-dir>/lane-<n>` with n in 1..=the config `lanes.count`
 //! (the legal names follow the config, not the admission), and one parked file per reserved ticket, `<lanes-dir>/parked-<ticket-id>`: `park`
@@ -19,7 +20,7 @@
 //! explicit: a lane is freed by `release` and by `park` (which keeps the file list reserved), not by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
 //! together) that frees a lane appends one line to `<records-dir>/<ticket-id>.release`; the records dir and the record are checked before the lane
 //! file is removed, and a write error after it is exit 2 with the lane freed. `park` takes the same record options and appends its line the same way.
-//! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
+//! Exit 0 done; 3 (`stale` only) at least one verdict is `unknown`; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
 //! field, `clash` also names the live ticket and the overlapping pair of entries, `parked` the parked ticket and the pair, and `low-disk` also names the free GB and the floor); 2 usage
 //! error, unreadable or refused input, free disk space that cannot be read, or a lanes dir in a bad state.
 
@@ -30,7 +31,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file> | lane park <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>]";
+pub mod stale;
+
+const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file> | lane park <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane stale --lanes-dir <absolute-dir> --config <file> --host <absolute-file> --launch-records <absolute-file> --manifest-dir <absolute-dir> --repo-map <repo-id>=<absolute-dir> [--repo-map ...] [--allow <tree-relative-path> ...]";
 const MAX_FILE: u64 = 1024 * 1024;
 const HEADER: &str = "lane-record v1";
 
@@ -1184,6 +1187,7 @@ pub fn lane_cmd(a: &[String]) -> i32 {
                 }
             }
         }
+        "stale" => stale::stale_cmd(rest),
         _ => {
             eprintln!("{USAGE}");
             2
