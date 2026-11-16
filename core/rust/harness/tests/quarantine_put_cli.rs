@@ -11,10 +11,26 @@ use std::io::Write;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
+// The shelf lock is an flock on the open file description, and a child made by a sibling test thread while the lock
+// is held holds a copy of the lock fd until it starts its program. A child of this file is started and waited for
+// under the read side; wait_for_spawns takes the write side, so it returns when each earlier child has exited and
+// holds no copy.
+static SPAWN: RwLock<()> = RwLock::new(());
+
+/// The read side of the spawn gate; a poisoned gate is taken with into_inner.
+fn spawning() -> RwLockReadGuard<'static, ()> {
+    SPAWN.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Returns when each child started earlier has exited (the write side is taken and released at once).
+fn wait_for_spawns() {
+    drop(SPAWN.write().unwrap_or_else(|e| e.into_inner()));
+}
 /// 2026-01-01T00:00:00Z in milliseconds: the entry day folder is 20260101.
 const TS: &str = "1767225600000";
 const TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
@@ -72,11 +88,12 @@ fn plain_item(f: &Fix, name: &str) -> PathBuf {
 
 fn run(args: &[&str]) -> Output {
     let mut c = Command::new(BIN);
-    c.args(args).stdin(Stdio::null());
+    c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for k in ["HARNESS_RUN_ID", "HARNESS_ROLE", "HARNESS_MODEL", "HARNESS_CONFIG"] {
         c.env_remove(k);
     }
-    c.output().unwrap()
+    let _gate = spawning();
+    c.spawn().unwrap().wait_with_output().unwrap()
 }
 
 fn code(o: &Output) -> i32 {
@@ -518,7 +535,10 @@ fn a_manifest_that_is_not_a_regular_file_exits_2() {
     let f = fixture();
     let item = plain_item(&f, "p");
     // A FIFO blocks a read, so put must refuse it from the stat alone; the deadline turns a block into a failure.
-    let mk = Command::new("mkfifo").arg(f.md.join("t-3.jsonl")).status().unwrap();
+    let mk = {
+        let _gate = spawning();
+        Command::new("mkfifo").arg(f.md.join("t-3.jsonl")).status().unwrap()
+    };
     assert!(mk.success(), "mkfifo failed");
     let before = snap(&item);
     let mut c = Command::new(BIN);
@@ -526,6 +546,7 @@ fn a_manifest_that_is_not_a_regular_file_exits_2() {
     for k in ["HARNESS_RUN_ID", "HARNESS_ROLE", "HARNESS_MODEL", "HARNESS_CONFIG"] {
         c.env_remove(k);
     }
+    let _gate = spawning();
     let mut child = c.spawn().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -540,6 +561,7 @@ fn a_manifest_that_is_not_a_regular_file_exits_2() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let o = child.wait_with_output().unwrap();
+    drop(_gate);
     refused(&f, &o, 2);
     assert!(err(&o).contains("t-3"), "stderr names the ticket id: {}", err(&o));
     assert_eq!(snap(&item), before);
@@ -620,6 +642,7 @@ fn a_second_put_while_the_shelf_lock_is_held_exits_3() {
     assert!(err(&o).contains("a put is running"), "stderr: {}", err(&o));
     assert_eq!(snap(&b), before);
     drop(lock);
+    wait_for_spawns();
     assert_eq!(code(&put_cmd(&f, &b, &[])), 0, "the lock was the cause");
 }
 
@@ -660,6 +683,7 @@ fn cross_device_exits_3() {
     let before = snap(&item);
     let qc = f.t.canon.join("w/qh/q");
     let r = put::put_with_device_probe(&pargs(&f, &item), &|p| if p.starts_with(&qc) { Some(1) } else { Some(2) });
+    wait_for_spawns();
     match r {
         Err(Stop(3, line)) => {
             assert!(line.contains("cross-device"), "line: {line}");
@@ -752,6 +776,7 @@ fn an_untagged_target_is_part_of_the_fingerprint() {
     };
     // the untagged target is walked: the edit changes the size, the put says so
     let r = put::put_with_step(&pargs(&f, &plain), &dev_of, &edit(plain.clone()));
+    wait_for_spawns();
     match r {
         Err(Stop(3, line)) => assert!(line.contains("changed while it was put"), "line: {line}"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
@@ -760,6 +785,7 @@ fn an_untagged_target_is_part_of_the_fingerprint() {
     assert!(read(&entry_dir(&f, "hand-1").join("label.json")).contains("\"skipped_build\":0"));
     // the tagged target is not entered: the same edit goes unseen
     let r = put::put_with_step(&pargs(&f, &tagged), &dev_of, &edit(tagged.clone()));
+    wait_for_spawns();
     match r {
         Ok(line) => assert!(line.starts_with("put=done entry=20260101/hand-2"), "line: {line}"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
@@ -824,7 +850,9 @@ fn the_label_is_written_before_the_move() {
         }
         Ok(())
     };
-    match put::put_with_step(&pargs(&f, &item), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(&f, &item), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert_eq!(line, "halt"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
         Ok(line) => panic!("done: {line}"),
@@ -872,7 +900,9 @@ fn a_change_during_put_is_labelled_and_exits_3() {
         }
         Ok(())
     };
-    match put::put_with_step(&pargs(&f, &item), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(&f, &item), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert_eq!(line, "harness: error: the item changed while it was put; it is on the shelf with a label that says so"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
         Ok(line) => panic!("done: {line}"),
@@ -896,7 +926,9 @@ fn a_source_gone_before_the_move_is_void_and_exits_3() {
         }
         Ok(())
     };
-    match put::put_with_step(&pargs(&f, &item), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(&f, &item), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert!(line.contains("did not happen") && line.contains("nothing was moved"), "line: {line}"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
         Ok(line) => panic!("done: {line}"),
@@ -921,7 +953,9 @@ fn a_non_utf8_source_name_is_moved_with_its_exact_bytes_in_from_hex() {
     let item = f.src.join(std::ffi::OsStr::from_bytes(raw_name));
     fs::create_dir_all(&item).unwrap();
     fs::write(item.join("x"), b"x").unwrap();
-    match put::put(&pargs(&f, &item)) {
+    let r = put::put(&pargs(&f, &item));
+    wait_for_spawns();
+    match r {
         Ok(line) => assert!(line.starts_with("put=done entry=20260101/hand-1"), "line: {line}"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
     }
@@ -968,7 +1002,9 @@ fn stop_at(f: &Fix, item: &Path, at: Point) {
             Ok(())
         }
     };
-    match put::put_with_step(&pargs(f, item), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(f, item), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert_eq!(line, "halt"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
         Ok(line) => panic!("done: {line}"),
@@ -1079,7 +1115,9 @@ fn a_change_before_the_stop_is_labelled_by_the_settle() {
         }
         Ok(())
     };
-    match put::put_with_step(&pargs(&f, &a), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(&f, &a), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert_eq!(line, "halt"),
         _ => panic!("not stopped"),
     }
@@ -1100,7 +1138,9 @@ fn a_stale_label_tmp_does_not_block_the_settle() {
     stop_at(&f, &a, Point::AfterIntent);
     let stale = entry_dir(&f, "hand-1").join(format!("label.json.{}-1.tmp", std::process::id()));
     fs::write(&stale, b"stale").unwrap();
-    match put::put(&pargs(&f, &b)) {
+    let r = put::put(&pargs(&f, &b));
+    wait_for_spawns();
+    match r {
         Ok(line) => assert!(line.contains("entry=20260101/hand-2"), "line: {line}"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
     }
@@ -1191,7 +1231,9 @@ fn stop_void(f: &Fix, a: &Path) {
         }
         Ok(())
     };
-    match put::put_with_step(&pargs(f, a), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(f, a), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert_eq!(line, "halt"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
         Ok(line) => panic!("done: {line}"),
@@ -1272,7 +1314,9 @@ fn a_changed_during_put_label_is_settled_as_found() {
         }
         Ok(())
     };
-    match put::put_with_step(&pargs(&f, &a), &dev_of, &step) {
+    let r = put::put_with_step(&pargs(&f, &a), &dev_of, &step);
+    wait_for_spawns();
+    match r {
         Err(Stop(3, line)) => assert_eq!(line, "halt"),
         Err(Stop(c, line)) => panic!("exit {c}: {line}"),
         Ok(line) => panic!("done: {line}"),
@@ -1471,4 +1515,74 @@ fn a_failed_journal_write_in_the_settle_exits_3() {
     let o = put_cmd(&f, &b, &[]);
     hostile(&f, &o, "could not be settled", &bytes, &j, &b, &b_before);
     assert_eq!(fs::symlink_metadata(&label).unwrap().ino(), ino, "label.json keeps its inode");
+}
+
+// ---------------------------------------------------------------- the spawn gate
+
+#[test]
+fn the_spawn_gate_closes_the_inherited_lock_window() {
+    let f = fixture();
+    let lock_path = f.t.raw.join("probe.lock");
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let started = std::sync::Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let (stop, started) = (stop.clone(), started.clone());
+            std::thread::spawn(move || {
+                let mut first = true;
+                while !stop.load(Ordering::SeqCst) {
+                    run(&["--version"]);
+                    if first {
+                        first = false;
+                        started.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        })
+        .collect();
+    let begin = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(120);
+    while started.load(Ordering::SeqCst) < 4 && begin.elapsed() < limit {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 4, "the spawning threads did not start");
+    // The rounds run for at least 5 seconds and at most 15, and for 2000 rounds when those fit: wait_for_spawns also
+    // waits out the children of the other tests of this file, so a busy host slows a round. The test fails when fewer than 50 rounds ran.
+    let rounds_begin = std::time::Instant::now();
+    let (rounds_min, rounds_limit) = (std::time::Duration::from_secs(5), std::time::Duration::from_secs(15));
+    let mut blocked = 0;
+    let mut rounds = 0;
+    while (rounds < 2000 || rounds_begin.elapsed() < rounds_min) && rounds_begin.elapsed() < rounds_limit {
+        let h = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path).unwrap();
+        if let Err(fs::TryLockError::WouldBlock) = h.try_lock() {
+            blocked += 1;
+        }
+        drop(h);
+        wait_for_spawns();
+        rounds += 1;
+    }
+    stop.store(true, Ordering::SeqCst);
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert!(rounds >= 50, "too few rounds ran to judge the gate: {rounds}");
+    assert_eq!(blocked, 0, "{blocked} of {rounds} takes were blocked by a copy of the lock fd in a child");
+}
+
+#[test]
+fn a_poisoned_spawn_gate_still_spawns_and_waits() {
+    let t = std::thread::spawn(|| {
+        let _w = SPAWN.write().unwrap_or_else(|e| e.into_inner());
+        panic!("poison the spawn gate");
+    });
+    assert!(t.join().is_err());
+    assert!(SPAWN.is_poisoned(), "the gate is poisoned");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let o = run(&["--version"]);
+        wait_for_spawns();
+        let _ = tx.send(code(&o));
+    });
+    let c = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("run and wait_for_spawns returned within 10 seconds");
+    assert_eq!(c, 0);
 }
