@@ -897,8 +897,8 @@ fn ticket_json(id: &str, g: &Group, rows: &[Row], week: &str) -> String {
 }
 
 /// `harness friction triage --week <w> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>]
-/// [--controls <file> --lessons-dir <dir>] [--as-of <UTC instant>] [--top K] [--config <file>]`. The checks precede the state and hand-off writes; a refused run leaves the state and the
-/// hand-off folder byte-identical. With `--log` the sweep appends to the inbox before the later checks.
+/// [--controls <file> --lessons-dir <dir>] [--as-of <UTC instant>] [--top K] [--config <file>]`. The checks precede the hand-off and state writes, except the state-cap check, which runs
+/// after the hand-off files are written. With `--log` the sweep appends to the inbox before the later checks.
 pub fn triage_cmd(rest: &[String], testmode: bool) -> i32 {
     let flags = match parse_flags(rest, &["--week", "--state", "--handoff-dir", "--log", "--closed", "--controls", "--lessons-dir", "--as-of", "--top", "--config"], "triage") {
         Ok(f) => f,
