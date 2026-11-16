@@ -1,21 +1,26 @@
-//! `harness lane claim | release | list | admission-check` (std only; `docs/lanes.md` is the contract). A lane holds one live ticket. The cap
+//! `harness lane claim | release | list | park | admission-check` (std only; `docs/lanes.md` is the contract). A lane holds one live ticket. The cap
 //! on live tickets is 1 without a valid admission record and the smaller of the record's admitted lane count and the config `lanes.count` with
 //! one, so no constant is edited to raise the cap. One record file per held lane, `<lanes-dir>/lane-<n>` with n in 1..=the config `lanes.count`
-//! (the legal names follow the config, not the admission). Every claim, release and list runs as one critical section under an exclusive `flock`
+//! (the legal names follow the config, not the admission), and one parked file per reserved ticket, `<lanes-dir>/parked-<ticket-id>`: `park`
+//! moves a live record there unchanged, so the lane is freed while the ticket's file list stays reserved. Parked records take no lane number and
+//! do not count as live. Each claim, release, park and list runs as one critical section under an exclusive `flock`
 //! on the lanes dir itself (no lock file is created), so the read-check-write of two `harness` processes never interleaves. A claim writes the
 //! record to a temp file (`.claim.tmp`, default permissions, one left by a killed claim is removed under the lock by the next claim that takes a
 //! lane) and renames it onto the lane name, so a reader never sees a half-written record. The lanes dir is read strictly: a record that is not a
 //! regular file, cannot be read or parsed (a `repo_id` that is not a legal repo id does not parse: the clash is decided by the repo id, so a
 //! record that spells another repo id is a bad record, not another repo), has a name other than `lane-<n>` (n canonical, 1..=the config
-//! `lanes.count`), or repeats a ticket, is an error and nothing is changed. The admission record is read fail closed too: one that exists and is not valid is a `bad-admission` refusal
+//! `lanes.count`) or `parked-<ticket-id>` (the id byte-equal to the `ticket=` line inside), or repeats a live ticket, is an error and nothing is
+//! changed. The admission record is read fail closed too: one that exists and is not valid is a `bad-admission` refusal
 //! checked before the lanes dir is touched, while a path where nothing exists means no admission (cap 1). A claim whose scope overlaps the scope
 //! of a live ticket of the same repo is refused with `clash`: checked after `already-live` and the cap, before anything is written (`scope_entry_parts`
-//! is the normal form of that comparison). No directory fsync is done, so a claim or release is not guaranteed to survive a crash. Release is
-//! explicit: a lane is not freed by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
+//! is the normal form of that comparison); a claim that overlaps a parked record of another ticket of the same repo is refused with `parked`
+//! right after it. A `--lanes-dir` or `--records-dir` value that ends with `/` or holds a `.` or `..` part is exit 2 before anything is touched.
+//! No directory fsync is done, so a claim, release or park is not guaranteed to survive a crash. Release is
+//! explicit: a lane is freed by `release` and by `park` (which keeps the file list reserved), not by a dead process. A release with `--reason`, `--at` and `--records-dir` (the three go
 //! together) that frees a lane appends one line to `<records-dir>/<ticket-id>.release`; the records dir and the record are checked before the lane
-//! file is removed, and a write error after it is exit 2 with the lane freed.
+//! file is removed, and a write error after it is exit 2 with the lane freed. `park` takes the same record options and appends its line the same way.
 //! Exit 0 done; 1 policy refusal (one stderr line `lane: refused reason=<token>`; `bad-admission` also names the field when the problem is a
-//! field, `clash` also names the live ticket and the overlapping pair of entries, and `low-disk` also names the free GB and the floor); 2 usage
+//! field, `clash` also names the live ticket and the overlapping pair of entries, `parked` the parked ticket and the pair, and `low-disk` also names the free GB and the floor); 2 usage
 //! error, unreadable or refused input, free disk space that cannot be read, or a lanes dir in a bad state.
 
 use crate::config::Config;
@@ -25,7 +30,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file>";
+const USAGE: &str = "usage: harness lane claim <ticket-file> --lanes-dir <absolute-dir> --config <file> --scope-file <file> [--admission <file>] | lane release <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>] | lane list --lanes-dir <absolute-dir> --config <file> [--admission <file>] | lane admission-check <file> --config <file> | lane park <ticket-id> --lanes-dir <absolute-dir> --config <file> [--reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <absolute-dir>]";
 const MAX_FILE: u64 = 1024 * 1024;
 const HEADER: &str = "lane-record v1";
 
@@ -51,6 +56,9 @@ enum Refusal {
     CapFull,
     AlreadyLive,
     NotLive,
+    /// A `park` for a ticket whose parked name the file system already resolves (its own parked file, or on a case-ignoring disk the parked
+    /// file of a ticket whose id differs only in ASCII case).
+    AlreadyParked,
     /// A claim for a second ticket with no valid admission (no `--admission`, or a path where nothing exists).
     NoAdmission,
     /// An admission file that exists and is not valid; the string names what is wrong (the field when it is a field).
@@ -58,6 +66,9 @@ enum Refusal {
     /// A claim whose scope overlaps the scope of a live ticket of the same repo; the string names the live ticket and the overlapping pair
     /// (`ticket=<id> live=<entry> new=<entry>`, the entries as stored).
     Clash(String),
+    /// A claim whose scope overlaps a parked record of another ticket of the same repo; the string names the parked ticket and the pair
+    /// (`ticket=<id> parked=<entry> new=<entry>`, the entries as stored).
+    Parked(String),
     /// A claim under the config disk floor; the string gives `free_gb=<n> min_free_gb=<floor>` (the free bytes rounded down to GB).
     LowDisk(String),
 }
@@ -68,9 +79,11 @@ impl Refusal {
             Refusal::CapFull => "cap-full",
             Refusal::AlreadyLive => "already-live",
             Refusal::NotLive => "not-live",
+            Refusal::AlreadyParked => "already-parked",
             Refusal::NoAdmission => "no-admission",
             Refusal::Admission(_) => "bad-admission",
             Refusal::Clash(_) => "clash",
+            Refusal::Parked(_) => "parked",
             Refusal::LowDisk(_) => "low-disk",
         }
     }
@@ -158,6 +171,28 @@ fn find_clash(live: &[Record], rec: &Record) -> Option<(String, String, String)>
             for (ne, np) in rec.scope.iter().zip(&new_parts) {
                 if parts_overlap(lp, np) {
                     return Some((r.ticket.clone(), le.clone(), ne.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The first overlap of `rec` against the parked records of other tickets, in a repeatable order: the parked tickets by ticket id in byte
+/// order (`read_parked` returns them sorted), then each parked record's entries in stored order, then `rec`'s entries in stored order. The
+/// claim's own parked file (matched by the `ticket=` value, not by the file name) does not refuse the claim. Returns the parked ticket, its
+/// entry and the new entry, as stored.
+fn find_parked_clash(parked: &[Record], rec: &Record) -> Option<(String, String, String)> {
+    let new_parts: Vec<Vec<String>> = rec.scope.iter().map(|e| scope_entry_parts(e)).collect();
+    for p in parked.iter().filter(|p| p.ticket != rec.ticket) {
+        if p.repo_id != rec.repo_id {
+            continue;
+        }
+        let parked_parts: Vec<Vec<String>> = p.scope.iter().map(|e| scope_entry_parts(e)).collect();
+        for (pe, pp) in p.scope.iter().zip(&parked_parts) {
+            for (ne, np) in rec.scope.iter().zip(&new_parts) {
+                if parts_overlap(pp, np) {
+                    return Some((p.ticket.clone(), pe.clone(), ne.clone()));
                 }
             }
         }
@@ -435,6 +470,62 @@ pub fn list_records(dir: &Path, cap: u32) -> Result<Vec<Record>, String> {
     Ok(out)
 }
 
+/// The parked records, by ticket id in byte order, read strictly (the caller holds the lock). A missing dir holds nothing. An entry named
+/// `parked-<rest>` must be a regular file (a link is refused), at most 1 MiB, utf-8, parse as a lane record, and `<rest>` must be byte-equal
+/// to its `ticket=` value; anything else is an error and nothing is changed. A ticket that is live and parked at once (a claim of the parked
+/// ticket whose parked-file removal failed, or a file put there by hand) is accepted.
+pub fn read_parked(dir: &Path) -> Result<Vec<Record>, String> {
+    if !check_dir(dir, false)? {
+        return Ok(Vec::new());
+    }
+    let rd = fs::read_dir(dir).map_err(|_| "the lanes dir cannot be read".to_string())?;
+    let mut out: Vec<Record> = Vec::new();
+    for ent in rd {
+        let ent = ent.map_err(|_| "the lanes dir cannot be read".to_string())?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("parked-") else { continue };
+        if rest.is_empty() {
+            return Err("a parked record name has no ticket id".to_string());
+        }
+        let path = ent.path();
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err("a parked record is not a regular file".to_string()),
+            Err(_) => return Err("a parked record cannot be inspected".to_string()),
+        }
+        // Opened like `open_record` (its `custom_flags`: no link follow, no blocking), so a path swapped for a link or a fifo between
+        // the stat and this open fails the open or the handle check below and cannot block.
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new().read(true).custom_flags(OPEN_NOFOLLOW_NONBLOCK).open(&path).map_err(|_| "a parked record cannot be read".to_string())?;
+        if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Err("a parked record is not a regular file".to_string());
+        }
+        let mut bytes = Vec::new();
+        (&mut f).take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|_| "a parked record cannot be read".to_string())?;
+        if bytes.len() as u64 > MAX_FILE {
+            return Err("a parked record is over 1 MiB".to_string());
+        }
+        if bytes.is_empty() {
+            return Err("a parked record is empty".to_string());
+        }
+        let text = String::from_utf8(bytes).map_err(|_| "a parked record is not utf-8".to_string())?;
+        let rec = decode(0, &text)?;
+        if rest != rec.ticket {
+            return Err("a parked record name does not match its ticket".to_string());
+        }
+        out.push(rec);
+    }
+    out.sort_by(|a, b| a.ticket.cmp(&b.ticket));
+    Ok(out)
+}
+
+/// The path of the parked file of `ticket` (a parked file's name is byte-equal to the `ticket=` line inside it, so this is also the file
+/// whose `ticket=` value is `ticket`).
+fn parked_path(dir: &Path, ticket: &str) -> PathBuf {
+    dir.join(format!("parked-{ticket}"))
+}
+
 /// Take the exclusive `flock` on the lanes dir itself (opened read-only; no lock file is ever created, so a refused call leaves the dir
 /// untouched), waiting for it. The caller has just checked that `dir` is a real directory. The lock is held while the File lives.
 fn lock(dir: &Path) -> Result<fs::File, String> {
@@ -446,13 +537,13 @@ fn lock(dir: &Path) -> Result<fs::File, String> {
     Ok(f)
 }
 
-/// The live records, read under the lock.
-fn list_locked(dir: &Path, cap: u32) -> Result<Vec<Record>, String> {
+/// The live and parked records, read under the lock.
+fn state_locked(dir: &Path, cap: u32) -> Result<(Vec<Record>, Vec<Record>), String> {
     if !check_dir(dir, false)? {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let _guard = lock(dir)?;
-    list_records(dir, cap)
+    Ok((list_records(dir, cap)?, read_parked(dir)?))
 }
 
 /// Take the lowest free lane under `cap` for `rec` (its `lane` field is ignored), as one critical section. Refused when as many tickets are
@@ -464,6 +555,7 @@ fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Resul
     check_dir(dir, true)?;
     let _guard = lock(dir)?;
     let live = list_records(dir, bound)?;
+    let parked = read_parked(dir)?;
     if live.iter().any(|r| r.ticket == rec.ticket) {
         return Ok(Err(Refusal::AlreadyLive));
     }
@@ -472,10 +564,14 @@ fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Resul
     let Some(n) = free else {
         return Ok(Err(if admitted { Refusal::CapFull } else { Refusal::NoAdmission }));
     };
-    // The clash is the last policy check, so nothing is written before it; a claim with a valid admission and a free lane is still refused
-    // here when its scope would break a live ticket of the same repo.
+    // The clash is the last policy check before the parked overlap, so nothing is written before either; a claim with a valid admission and a
+    // free lane is still refused here when its scope would break a live ticket of the same repo, and after it when it would break the
+    // reservation of a parked ticket of the same repo.
     if let Some((ticket, live_entry, new_entry)) = find_clash(&live, &rec) {
         return Ok(Err(Refusal::Clash(format!("ticket={ticket} live={live_entry} new={new_entry}"))));
+    }
+    if let Some((ticket, parked_entry, new_entry)) = find_parked_clash(&parked, &rec) {
+        return Ok(Err(Refusal::Parked(format!("ticket={ticket} parked={parked_entry} new={new_entry}"))));
     }
     let tmp = dir.join(".claim.tmp");
     match fs::symlink_metadata(&tmp) {
@@ -496,74 +592,129 @@ fn claim(dir: &Path, rec: Record, cap: u32, bound: u32, admitted: bool) -> Resul
         let _ = fs::remove_file(&tmp);
         return Err("the lane record cannot be published".to_string());
     }
+    // A claim of a ticket with its own parked file ends the reservation: the parked file is removed after the lane record is written, and a
+    // failure of the removal keeps the parked file (the claim still succeeds; the wrapper arms its rollback only after exit 0).
+    if parked.iter().any(|p| p.ticket == rec.ticket) {
+        let _ = fs::remove_file(parked_path(dir, &rec.ticket));
+    }
     Ok(Ok(n))
 }
 
-/// Free the lane of `ticket`, as one critical section, reading the dir under the config name bound. With `spec`
-/// the records dir and the record are checked before the lane file is removed (a refusal leaves the lane held), then one release record
-/// line is appended; a write error then is exit 2 with the lane freed (`docs/lanes.md` gives the order).
+/// The record checks `release` and `park` run under the lock before they touch the lane file: with `spec` the records dir and the record are
+/// checked (a refusal leaves the lane held), and the open record and its old length come back for the append after it. Without `spec` nothing
+/// is created.
+fn prep_record(dir: &Path, ticket: &str, spec: Option<&ReleaseSpec>) -> Result<Option<(fs::File, u64)>, String> {
+    let Some(s) = spec else { return Ok(None) };
+    let inside = || "--records-dir must not be the lanes dir or inside it".to_string();
+    // Before anything is created: the nearest existing ancestor, resolved, must lie outside the lanes dir
+    // (a ticket id such as `lane-1` would put its record among the lane records, which `list_records` refuses).
+    if inside_lanes(&nearest_existing_ancestor(&s.records_dir), dir) {
+        return Err(inside());
+    }
+    let created = prep_records_dir(&s.records_dir)?;
+    if inside_lanes(&s.records_dir, dir) {
+        if created {
+            let _ = fs::remove_dir_all(&s.records_dir);
+        }
+        return Err(inside());
+    }
+    let path = s.records_dir.join(format!("{ticket}.release"));
+    match fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err("the release record is not a regular file".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("the release record cannot be opened".to_string()),
+    }
+    let mut f = open_record(&path)?;
+    // Re-check through the open handle, so a path swapped for a fifo or other non-regular file between the two calls is still caught
+    // (a swapped-in link already fails the open).
+    let meta = f.metadata().map_err(|_| "the release record cannot be opened".to_string())?;
+    if !meta.file_type().is_file() {
+        return Err("the release record is not a regular file".to_string());
+    }
+    let mut bytes = Vec::new();
+    (&mut f).take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|_| "the release record cannot be opened".to_string())?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err("the release record is over 1 MiB".to_string());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "the release record is not utf-8".to_string())?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err("the release record does not end with a newline".to_string());
+    }
+    Ok(Some((f, meta.len())))
+}
+
+/// Append `<at> lane=<lane> reason=<reason>` to the record and sync it; on a write error the file is cut back to its old length (a failure of
+/// the cut is ignored) and `lost` names what already happened and cannot be taken back (`reason=` runs to the line end; a later field goes
+/// before it).
+fn append_line(f: &mut fs::File, old_len: u64, s: &ReleaseSpec, lane: &str, lost: &str) -> Result<(), String> {
+    let line = format!("{} lane={} reason={}\n", s.at, lane, s.reason);
+    if f.write_all(line.as_bytes()).and_then(|_| f.sync_all()).is_err() {
+        let _ = f.set_len(old_len);
+        return Err(format!("{lost} and the release record cannot be written"));
+    }
+    Ok(())
+}
+
+/// Free the lane of `ticket` and end its reservation, as one critical section, reading the dir under the config name bound. A ticket with
+/// neither a live record nor a parked file is `not-live`. With `spec` the records dir and the record are checked before anything is removed
+/// (a refusal leaves the lane held), the lane file goes first, then the parked file, then one record line is appended (its lane value is
+/// `parked` for a ticket that held only a parked file); a write error after the removals is exit 2 naming what was removed (`the lane was
+/// freed`, or `the parked file was removed` for a parked-only ticket).
 fn release(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Result<Result<(), Refusal>, String> {
     if !check_dir(dir, false)? {
         return Ok(Err(Refusal::NotLive));
     }
     let _guard = lock(dir)?;
-    let Some(r) = list_records(dir, cap)?.into_iter().find(|r| r.ticket == ticket) else { return Ok(Err(Refusal::NotLive)) };
-    let inside = || "--records-dir must not be the lanes dir or inside it".to_string();
-    // The record checks run before the lane file is removed, so a refusal leaves the lane held; the line is written
-    // after it.
-    let mut rec: Option<(fs::File, u64)> = None;
-    if let Some(s) = spec {
-        // Before anything is created: the nearest existing ancestor, resolved, must lie outside the lanes dir
-        // (a ticket id such as `lane-1` would put its record among the lane records, which `list_records` refuses).
-        if inside_lanes(&nearest_existing_ancestor(&s.records_dir), dir) {
-            return Err(inside());
-        }
-        let created = prep_records_dir(&s.records_dir)?;
-        if inside_lanes(&s.records_dir, dir) {
-            if created {
-                let _ = fs::remove_dir_all(&s.records_dir);
-            }
-            return Err(inside());
-        }
-        let path = s.records_dir.join(format!("{ticket}.release"));
-        match fs::symlink_metadata(&path) {
-            Ok(m) if m.file_type().is_file() => {}
-            Ok(_) => return Err("the release record is not a regular file".to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("the release record cannot be opened".to_string()),
-        }
-        let mut f = open_record(&path)?;
-        // Re-check through the open handle, so a path swapped for a fifo or other non-regular file between the two calls is still caught
-        // (a swapped-in link already fails the open).
-        let meta = f.metadata().map_err(|_| "the release record cannot be opened".to_string())?;
-        if !meta.file_type().is_file() {
-            return Err("the release record is not a regular file".to_string());
-        }
-        let mut bytes = Vec::new();
-        (&mut f).take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|_| "the release record cannot be opened".to_string())?;
-        if bytes.len() as u64 > MAX_FILE {
-            return Err("the release record is over 1 MiB".to_string());
-        }
-        let text = String::from_utf8(bytes).map_err(|_| "the release record is not utf-8".to_string())?;
-        if !text.is_empty() && !text.ends_with('\n') {
-            return Err("the release record does not end with a newline".to_string());
-        }
-        rec = Some((f, meta.len()));
+    let live = list_records(dir, cap)?;
+    let parked = read_parked(dir)?;
+    let r = live.iter().find(|r| r.ticket == ticket);
+    let parked_own = parked.iter().any(|p| p.ticket == ticket);
+    if r.is_none() && !parked_own {
+        return Ok(Err(Refusal::NotLive));
     }
-    fs::remove_file(lane_path(dir, r.lane)).map_err(|_| "the lane record cannot be removed".to_string())?;
+    let rec = prep_record(dir, ticket, spec)?;
+    if let Some(r) = r {
+        fs::remove_file(lane_path(dir, r.lane)).map_err(|_| "the lane record cannot be removed".to_string())?;
+    }
+    if parked_own {
+        let lost = if r.is_some() { "the lane was freed and the parked file cannot be removed" } else { "the parked file cannot be removed" };
+        fs::remove_file(parked_path(dir, ticket)).map_err(|_| lost.to_string())?;
+    }
     if let (Some(s), Some((mut f, old_len))) = (spec, rec) {
-        // `reason=` runs to the line end; a later field goes before it.
-        let line = format!("{} lane={} reason={}\n", s.at, r.lane, s.reason);
-        if f.write_all(line.as_bytes()).and_then(|_| f.sync_all()).is_err() {
-            let _ = f.set_len(old_len);
-            return Err("the lane was freed and the release record cannot be written".to_string());
-        }
+        let lost = if r.is_some() { "the lane was freed" } else { "the parked file was removed" };
+        append_line(&mut f, old_len, s, &r.map(|r| r.lane.to_string()).unwrap_or_else(|| "parked".to_string()), lost)?;
     }
     Ok(Ok(()))
 }
 
-/// What a release with the record options writes: the line parts `at` and `reason` (checked before the lanes dir is touched) and the folder
-/// `records_dir` (the given path is checked before it, the resolved path under the lock).
+/// Move the live record of `ticket` onto `parked-<ticket-id>`, as one critical section, reading the dir under the config name bound: the lane
+/// is freed and the ticket's file list stays reserved. The move does not replace a file the file system resolves as the parked name (its own
+/// parked file, or on a case-ignoring disk the parked file of a ticket whose id differs only in ASCII case): `already-parked`. A ticket with
+/// no live record (a parked-only ticket too) is `not-live`; a missing lanes dir is not created. With `spec` the record checks run before the
+/// move and one line (`lane=<n>`, the lane the ticket held) is appended after it, as in `release`. Ok(Ok) carries the lane number.
+fn park(dir: &Path, ticket: &str, cap: u32, spec: Option<&ReleaseSpec>) -> Result<Result<u32, Refusal>, String> {
+    if !check_dir(dir, false)? {
+        return Ok(Err(Refusal::NotLive));
+    }
+    let _guard = lock(dir)?;
+    let live = list_records(dir, cap)?;
+    read_parked(dir)?;
+    let Some(r) = live.iter().find(|r| r.ticket == ticket) else { return Ok(Err(Refusal::NotLive)) };
+    let target = parked_path(dir, ticket);
+    if fs::symlink_metadata(&target).is_ok() {
+        return Ok(Err(Refusal::AlreadyParked));
+    }
+    let rec = prep_record(dir, ticket, spec)?;
+    fs::rename(lane_path(dir, r.lane), &target).map_err(|_| "the lane record cannot be parked".to_string())?;
+    if let (Some(s), Some((mut f, old_len))) = (spec, rec) {
+        append_line(&mut f, old_len, s, &r.lane.to_string(), "the ticket was parked")?;
+    }
+    Ok(Ok(r.lane))
+}
+
+/// What a release or park with the record options writes: the line parts `at` and `reason` (checked before the lanes dir is touched) and the
+/// folder `records_dir` (the given path is checked before it, the resolved path under the lock).
 struct ReleaseSpec<'a> {
     at: &'a str,
     reason: &'a str,
@@ -695,8 +846,8 @@ enum FloorCheck {
 /// The disk floor of a claim: with a floor set, the free bytes of the file system of the lanes dir (its nearest
 /// existing ancestor when it is missing) must reach `floor * 1000000000`, compared in `u128` so the product
 /// cannot wrap. `read` reads the free bytes, a parameter so a test can supply its own; with no floor set the
-/// reader is not called and the disk is not read. `release`, `list` and `admission-check` run no check: a
-/// running job is not stopped, and its lane can be freed on a full disk.
+/// reader is not called and the disk is not read. `release`, `park`, `list` and `admission-check` run no
+/// check: a running job is not stopped, and its lane can be freed on a full disk.
 fn check_disk_floor(dir: &Path, floor: Option<u64>, read: &dyn Fn(&Path) -> Option<u64>) -> FloorCheck {
     let Some(floor) = floor else { return FloorCheck::Ok };
     let Some(free) = read(&nearest_existing_ancestor(dir)) else { return FloorCheck::Unreadable };
@@ -748,13 +899,61 @@ fn parse_args(rest: &[String], allowed: &[&str]) -> Result<(Option<String>, std:
     Ok((pos, m))
 }
 
+/// Does this option value end with `/` or hold a `.` or `..` part (split on `/`)? Such a spelling can resolve through a symbolic link at the
+/// end of the path (`<link>/` and `<link>/.` name the link target), so it is refused before anything is touched.
+fn path_spelling_ok(v: &str) -> bool {
+    !v.ends_with('/') && !v.split('/').any(|p| p == "." || p == "..")
+}
+
 fn lanes_dir(m: &std::collections::HashMap<String, String>) -> Result<PathBuf, String> {
     let d = m.get("lanes-dir").ok_or("--lanes-dir is required")?;
     let p = PathBuf::from(d);
     if !p.is_absolute() {
         return Err("--lanes-dir must be an absolute path".to_string());
     }
+    if !path_spelling_ok(d) {
+        return Err("--lanes-dir must not end with a slash or hold a . or .. part".to_string());
+    }
     Ok(p)
+}
+
+/// The record options of `release` and `park`: all three or none, the value checks in the stated order, before the lanes dir is touched.
+fn record_spec<'a>(m: &'a std::collections::HashMap<String, String>, dir: &Path) -> Result<Option<ReleaseSpec<'a>>, String> {
+    let given = ["reason", "at", "records-dir"].iter().filter(|k| m.contains_key(**k)).count();
+    if given == 0 {
+        return Ok(None);
+    }
+    if given != 3 {
+        return Err("--reason, --at and --records-dir go together".to_string());
+    }
+    let (reason, at, rd) = (&m["reason"], &m["at"], &m["records-dir"]);
+    if reason.trim().is_empty() {
+        return Err("--reason must not be empty or only white space".to_string());
+    }
+    if reason.contains('\n') {
+        return Err("--reason must be one line".to_string());
+    }
+    if reason.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+        return Err("--reason must hold no control character".to_string());
+    }
+    if reason.len() > 1024 {
+        return Err("--reason is over 1024 bytes".to_string());
+    }
+    if !crate::friction::at_ok(at) {
+        return Err("--at must be a UTC time written YYYY-MM-DDTHH:MM:SSZ".to_string());
+    }
+    let rdp = PathBuf::from(rd.as_str());
+    if !rdp.is_absolute() {
+        return Err("--records-dir must be an absolute path".to_string());
+    }
+    if rd.ends_with('/') {
+        return Err("--records-dir must not end with a slash".to_string());
+    }
+    // A `.` or `..` part keeps the message it has had since the check was added (the same message as the inside-lanes refusal).
+    if !rd.split('/').all(|p| p != "." && p != "..") || rdp.starts_with(dir) {
+        return Err("--records-dir must not be the lanes dir or inside it".to_string());
+    }
+    Ok(Some(ReleaseSpec { at, reason, records_dir: rdp }))
 }
 
 fn load_config(m: &std::collections::HashMap<String, String>) -> Result<Config, String> {
@@ -769,6 +968,7 @@ fn refused(r: Refusal) -> i32 {
     match r {
         Refusal::Admission(detail) => eprintln!("lane: refused reason=bad-admission {detail}"),
         Refusal::Clash(detail) => eprintln!("lane: refused reason=clash {detail}"),
+        Refusal::Parked(detail) => eprintln!("lane: refused reason=parked {detail}"),
         Refusal::LowDisk(detail) => eprintln!("lane: refused reason=low-disk {detail}"),
         other => eprintln!("lane: refused reason={}", other.token()),
     }
@@ -879,40 +1079,47 @@ pub fn lane_cmd(a: &[String]) -> i32 {
                 Err(e) => return fail(&e),
             };
             // The record options go together and are checked, in this order, before the lanes dir is touched.
-            let mut spec = None;
-            let given = ["reason", "at", "records-dir"].iter().filter(|k| m.contains_key(**k)).count();
-            if given != 0 {
-                if given != 3 {
-                    return fail("--reason, --at and --records-dir go together");
-                }
-                let (reason, at, rd) = (&m["reason"], &m["at"], &m["records-dir"]);
-                if reason.trim().is_empty() {
-                    return fail("--reason must not be empty or only white space");
-                }
-                if reason.contains('\n') {
-                    return fail("--reason must be one line");
-                }
-                if reason.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
-                    return fail("--reason must hold no control character");
-                }
-                if reason.len() > 1024 {
-                    return fail("--reason is over 1024 bytes");
-                }
-                if !crate::friction::at_ok(at) {
-                    return fail("--at must be a UTC time written YYYY-MM-DDTHH:MM:SSZ");
-                }
-                let rdp = PathBuf::from(rd);
-                if !rdp.is_absolute() {
-                    return fail("--records-dir must be an absolute path");
-                }
-                if rd.split('/').any(|p| p == "." || p == "..") || rdp.starts_with(&dir) {
-                    return fail("--records-dir must not be the lanes dir or inside it");
-                }
-                spec = Some(ReleaseSpec { at, reason, records_dir: rdp });
-            }
+            let spec = match record_spec(&m, &dir) {
+                Ok(s) => s,
+                Err(e) => return fail(&e),
+            };
             match release(&dir, &id, name_cap(&cfg), spec.as_ref()) {
                 Ok(Ok(())) => {
                     println!("ticket={id} released");
+                    0
+                }
+                Ok(Err(r)) => refused(r),
+                Err(e) => fail(&e),
+            }
+        }
+        "park" => {
+            let (pos, m) = match run(&["lanes-dir", "config", "reason", "at", "records-dir"]) {
+                Ok(v) => v,
+                Err(e) => return fail(&e),
+            };
+            let Some(id) = pos else {
+                eprintln!("{USAGE}");
+                return 2;
+            };
+            if !ticket_id_ok(&id) {
+                return fail("the ticket id must be plain characters (letters, digits, '.', '_', '-')");
+            }
+            let dir = match lanes_dir(&m) {
+                Ok(d) => d,
+                Err(e) => return fail(&e),
+            };
+            let cfg = match load_config(&m) {
+                Ok(c) => c,
+                Err(e) => return fail(&e),
+            };
+            // The record options follow the release rules unchanged.
+            let spec = match record_spec(&m, &dir) {
+                Ok(s) => s,
+                Err(e) => return fail(&e),
+            };
+            match park(&dir, &id, name_cap(&cfg), spec.as_ref()) {
+                Ok(Ok(n)) => {
+                    println!("ticket={id} parked lane={n}");
                     0
                 }
                 Ok(Err(r)) => refused(r),
@@ -940,12 +1147,16 @@ pub fn lane_cmd(a: &[String]) -> i32 {
                 Ok(Err(r)) => return refused(r),
                 Err(e) => return fail(&e),
             };
-            let recs = match list_locked(&dir, name_cap(&cfg)) {
-                Ok(r) => r,
+            let (recs, parked) = match state_locked(&dir, name_cap(&cfg)) {
+                Ok(v) => v,
                 Err(e) => return fail(&e),
             };
             for r in &recs {
                 println!("ticket={} lane={} repo_id={} scope={}", r.ticket, r.lane, r.repo_id, r.scope.len());
+            }
+            // One line per parked record in ticket id byte order, after the live lines; `live=` counts live records only.
+            for p in &parked {
+                println!("parked ticket={} repo_id={} scope={}", p.ticket, p.repo_id, p.scope.len());
             }
             println!("live={} cap={}", recs.len(), cap);
             0
