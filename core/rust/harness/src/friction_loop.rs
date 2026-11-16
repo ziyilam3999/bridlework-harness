@@ -811,8 +811,8 @@ fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, Stri
     Ok(out)
 }
 
-/// `harness friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]`: read only. Refuses
-/// (1) while a ranked group with 2 or more occurrences has no valid controls line naming its id.
+/// `harness friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]`: read only. Exit 1 when
+/// a ranked group with 2 or more occurrences has no valid controls line naming its id; setup errors exit 2.
 pub fn controls_check_cmd(rest: &[String], testmode: bool) -> i32 {
     let flags = match parse_flags(rest, &["--controls", "--lessons-dir", "--config"], "controls-check") {
         Ok(f) => f,

@@ -372,9 +372,13 @@ Output. Exit 0: stdout is one line, stderr is empty:
 controls-check ok groups=<ranked groups> repeat=<repeat groups> lines=<valid controls lines>
 ```
 
-Exit 1 and 2 leave stdout empty. When repeat groups are not covered the exit is 1 and stderr is one line,
-`harness: friction refused: repeat groups with no valid line: <ids in byte order, joined by a comma and a blank>. Add one
-line per group to the controls file: <the line shape of the triage section>`. It holds no line text and no path. `lines=` counts every valid line, so two equal lines
+Exit 1 and 2 leave stdout empty. When repeat groups are not covered the exit is 1 and stderr is one line:
+
+```
+harness: friction refused: repeat groups with no valid line: <ids in byte order, joined by a comma and a blank>. Add one line per group to the controls file: <the line shape of the triage section>
+```
+
+It holds no line text and no path. `lines=` counts every valid line, so two equal lines
 count twice.
 
 Where the private wrapper's python check and this verb differ (the wrapper is not edited here):
@@ -384,8 +388,8 @@ Where the private wrapper's python check and this verb differ (the wrapper is no
 2. A carriage return inside a line: the wrapper splits the line in two; the verb refuses the line (stricter). A CRLF
    line end is read by both.
 3. A control character other than a tab: the wrapper reads it; the verb refuses (stricter).
-4. The error text: the wrapper echoes the line text and the controls path; the verb prints line numbers and group
-   ids only.
+4. The error text: the wrapper echoes the line text and the controls path; the verb prints line numbers, group
+   ids and fixed text, and no controls line text and no controls path.
 5. A controls file over 1 MiB is exit 2 here and has no cap in the wrapper (stricter); a missing lessons folder is
    exit 2 here and exit 1 in the wrapper; a missing inbox file is exit 2 here and exit 1 in the wrapper.
 6. A file that is not UTF-8 is a named exit 1 here and a python traceback with exit 1 in the wrapper.
@@ -397,7 +401,8 @@ Where the private wrapper's python check and this verb differ (the wrapper is no
    (stricter).
 
 Apart from item 7, none of these makes the verb pass where the wrapper refuses. A U+FEFF in front of the first line
-is part of the id in both, so that line covers no group.
+is part of its first part in both: a valid line then names an id that begins with U+FEFF and covers no group, and a
+comment line there is a malformed line.
 
 ### `harness friction bind`
 

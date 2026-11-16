@@ -1,4 +1,4 @@
-//! `harness friction controls-check`, process-level on scratch files. Every id and name is synthetic.
+//! `harness friction controls-check`, process-level on scratch files. The ids and names are synthetic.
 #![cfg(unix)]
 mod friction_common;
 use friction_common::*;
