@@ -28,7 +28,7 @@ No key outside these 11 and the two plan link keys below is allowed, and no key 
 
 ## The plan link (optional)
 
-A ticket may carry one of two optional keys, never both:
+A ticket may carry one of two optional keys, not both:
 
 | Field | Shape |
 |---|---|
@@ -37,7 +37,7 @@ A ticket may carry one of two optional keys, never both:
 
 The reader refuses a bad link shape with an error that names the field, so each caller that parses a ticket refuses it. A ticket with neither key parses as before.
 
-At this version only `harness ticket intake --plan-index <file>` checks the link against an index (see `docs/plan-index.md`): it requires one of the two keys and requires each `main_plan_ref` element to be an id of the index. Every other caller reads the link and does not check it.
+At this version only `harness ticket intake --plan-index <file>` checks the link against an index (see `docs/plan-index.md`): it requires one of the two keys and requires each `main_plan_ref` element to be an id of the index. The other callers check its shape (through the ticket parser), not the index.
 
 ## The repo id
 

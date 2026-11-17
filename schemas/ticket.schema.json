@@ -24,14 +24,14 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
-      "description": "Optional. The plan index rows this ticket builds. Never beside off_plan."
+      "description": "Optional. The plan index rows this ticket builds. Not beside off_plan."
     },
     "off_plan": {
       "type": "string",
       "minLength": 1,
       "maxLength": 300,
       "pattern": "^[^\\u0000-\\u001f\\u007f]*[^ \\t\\u0000-\\u001f\\u007f][^\\u0000-\\u001f\\u007f]*$",
-      "description": "Optional. One line saying why the ticket is off plan. Never beside main_plan_ref."
+      "description": "Optional. One line saying why the ticket is off plan. Not beside main_plan_ref."
     }
   },
   "not": { "allOf": [{ "required": ["main_plan_ref"] }, { "required": ["off_plan"] }] }

@@ -28,7 +28,7 @@ pub struct Ticket {
     pub risk: String,
     pub owner_role: String,
     pub evidence_links: Vec<String>,
-    /// Optional plan link: the plan index rows this ticket builds. Never empty when present; never beside `off_plan`.
+    /// Optional plan link: the plan index rows this ticket builds. As read by `parse`: not empty when present, not beside `off_plan`.
     pub main_plan_ref: Option<Vec<String>>,
     /// Optional plan link: one line saying why the ticket is off plan. Not judged.
     pub off_plan: Option<String>,
@@ -185,7 +185,7 @@ fn one_of(name: &str, s: &str, list: &[&str]) -> Result<(), String> {
 }
 
 impl Ticket {
-    /// Strict parse of the ticket shape: eleven keys, each exactly once, plus the optional `main_plan_ref` and `off_plan` (never both),
+    /// Strict parse of the ticket shape: eleven keys, each exactly once, plus the optional `main_plan_ref` and `off_plan` (not both),
     /// no unknown key, no default. The Err names the field. Text over 1 MiB is refused.
     pub fn parse(text: &str) -> Result<Ticket, String> {
         if text.len() > MAX_TICKET_BYTES {
