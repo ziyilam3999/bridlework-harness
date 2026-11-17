@@ -67,7 +67,7 @@
 //! all by no-follow stat before any git call of this mode reads them; `info/grafts` or a `shallow` file in
 //! the common dir is refused (either can rewrite the ancestry the answer depends on) and every git call of
 //! this mode also forces the commit graph off on top of the global `--no-replace-objects`. A missing
-//! upstream, a tracking ref that is a symbolic ref or points at a non-commit, an upstream that is not a
+//! upstream (unless `--remote-copy` is given and no upstream key is set), a tracking ref that is a symbolic ref or points at a non-commit, an upstream that is not a
 //! `refs/remotes/` name (for example `branch.<b>.remote=.` making a LOCAL branch the "upstream"), or a
 //! tracking-ref/branch pair that cannot be resolved all fail CLOSED (exit 3, never a pass). The answer is
 //! reachability, not recency: `rev-list --topo-order <branch> ^<upstream-commit>` (full shas only, after
@@ -78,6 +78,16 @@
 //! `workspace=unpushed ticket=<t> branch=ws/<t> upstream=<ref> count=<n>`; exit 3 prints nothing on stdout
 //! and one fixed folder-free `harness: error:` line on stderr. No fetch, no push, no ref or config write, no
 //! index refresh.
+//!
+//! `--remote-copy` (only with `--pushed`) adds one fallback, entered only at the first no-upstream exit of
+//! step (d) (after steps (a) to (c), so a grafts or shallow file still stops first); with either
+//! `branch.ws/<t>.remote` or `branch.ws/<t>.merge` set it refuses at once, as before. It asks whether each
+//! commit of the branch is also on a plain ref under `refs/remotes/`: a link anywhere under that folder, a ref that does not peel
+//! to a commit, more than 10000 entries or refs, a cap on the commit list, or no plain ref at all is exit 3
+//! (symbolic refs are skipped). Exit 0 prints `workspace=on-remote ticket=<t> branch=ws/<t>`; exit 4 prints
+//! the `unpushed` lines, then the summary with `upstream=none`. A remote-tracking ref is the local record of
+//! the remote: a ref of a branch deleted on the server stays until pruned, and a ref written by hand counts.
+//! With an upstream that resolves the flag changes nothing.
 
 use crate::events::token_ok;
 use crate::manifest::{self, Target};
@@ -86,7 +96,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: harness workspace check <ticket> --manifest-dir <absolute-dir> [--pushed --repo <absolute-dir>]";
+pub const USAGE: &str = "usage: harness workspace check <ticket> --manifest-dir <absolute-dir> [--pushed --repo <absolute-dir> [--remote-copy]]";
 
 /// The hard cap on any single git output read: an "unbounded read" is impossible past this, and hitting it is
 /// exit 3, never a silently truncated answer.
@@ -161,14 +171,16 @@ fn dir_arg_ok(s: &str) -> bool {
     p.is_absolute() && !p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-/// `<ticket> --manifest-dir <absolute-dir> [--pushed --repo <absolute-dir>]`. The ticket must be a plain token
+/// `<ticket> --manifest-dir <absolute-dir> [--pushed --repo <absolute-dir> [--remote-copy]]`. The ticket must be a plain token
 /// exactly as the manifest defines it: refused, never rewritten. No default folder, no config file, no
 /// current-folder lookup. `--pushed` (P1B-12) switches the command to the unpushed check ONLY; it carries
 /// `--repo <absolute-dir>` (the ticket repo's top folder) and the two are a pair: either one without the
 /// other, either one given twice, or a `--repo` that is not absolute or holds `..` is a usage error (exit 3).
-fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>), i32> {
+/// `--remote-copy` is a flag with no value: it needs `--pushed`, and given twice is a usage error too.
+fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>, bool), i32> {
     let (mut ticket, mut md) = (None, None);
     let (mut pushed, mut repo) = (false, None);
+    let mut remote_copy = false;
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -185,6 +197,12 @@ fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>), i3
                     return Err(usage3("--pushed was given twice"));
                 }
                 pushed = true;
+            }
+            "--remote-copy" => {
+                if remote_copy {
+                    return Err(usage3("--remote-copy was given twice"));
+                }
+                remote_copy = true;
             }
             "--repo" => {
                 let val = it
@@ -221,11 +239,14 @@ fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>), i3
         Some(r) => Some(r.to_string()),
         None => None,
     };
+    if remote_copy && !pushed {
+        return Err(usage3("--remote-copy requires --pushed"));
+    }
     match (pushed, repo) {
-        (true, Some(r)) => Ok((ticket.to_string(), md.to_string(), true, Some(r))),
+        (true, Some(r)) => Ok((ticket.to_string(), md.to_string(), true, Some(r), remote_copy)),
         (true, None) => Err(usage3("--pushed requires --repo")),
         (false, Some(_)) => Err(usage3("--repo requires --pushed")),
-        (false, None) => Ok((ticket.to_string(), md.to_string(), false, None)),
+        (false, None) => Ok((ticket.to_string(), md.to_string(), false, None, false)),
     }
 }
 
@@ -970,14 +991,191 @@ fn sha40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The cap on entries under `refs/remotes` and on plain remote-tracking refs read by `--remote-copy`.
+const REMOTE_REF_CAP: usize = 10_000;
+
+/// No-follow walk of one folder under `refs/remotes`: a link at any depth is exit 3 (git can read a linked
+/// file or folder as a ref), and more than `REMOTE_REF_CAP` entries is exit 3.
+fn walk_remote_refs(dir: &Path, n: &mut usize) -> Result<(), i32> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Err(stop3("the remote-tracking refs cannot be read"));
+    };
+    for e in rd {
+        let Ok(e) = e else {
+            return Err(stop3("the remote-tracking refs cannot be read"));
+        };
+        *n += 1;
+        if *n > REMOTE_REF_CAP {
+            return Err(stop3("too many remote-tracking refs"));
+        }
+        let Ok(ft) = e.file_type() else {
+            return Err(stop3("the remote-tracking refs cannot be read"));
+        };
+        if ft.is_symlink() {
+            return Err(stop3("a remote-tracking ref is a link; cannot check"));
+        }
+        if ft.is_dir() {
+            walk_remote_refs(&e.path(), n)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `--remote-copy` fallback (entered only at the first no-upstream exit of step (d)): with no
+/// `branch.ws/<t>.remote` and no `.merge` key, is each commit of the branch also on a plain ref under
+/// `refs/remotes/`? Same forced git calls as the rest of the mode; a fixed number of them.
+fn remote_copy_check(ticket: &str, tree: &Path, common: &Path, branch: &str) -> i32 {
+    // (1) The branch config: either key present ends the check as before.
+    let g = pushed_git(tree, &["config", "-z", "--list"]);
+    if g.overflow {
+        return stop3("too many paths: a config answer went over the read cap");
+    }
+    if !g.ok {
+        return stop3("a git call in the worktree failed");
+    }
+    let want_sub = format!("ws/{}", ticket);
+    for rec in g.bytes.split(|&b| b == 0) {
+        let key = rec.split(|&b| b == b'\n').next().unwrap_or(&[]);
+        let key = String::from_utf8_lossy(key);
+        let Some(rest) = key.strip_prefix("branch.") else {
+            continue;
+        };
+        if let Some((sub, name)) = rest.rsplit_once('.') {
+            if sub == want_sub && (name == "remote" || name == "merge") {
+                return stop3("the ticket branch has no upstream");
+            }
+        }
+    }
+
+    // (2) A no-follow look at the refs/remotes folder of the common dir.
+    let rr = common.join("refs").join("remotes");
+    match std::fs::symlink_metadata(&rr) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return stop3("a remote-tracking ref is a link; cannot check")
+        }
+        Ok(m) if m.file_type().is_dir() => {
+            if let Err(c) = walk_remote_refs(&rr, &mut 0) {
+                return c;
+            }
+        }
+        Ok(_) => return stop3("the remote-tracking refs cannot be read"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return stop3("the remote-tracking refs cannot be read"),
+    }
+
+    // (3) The plain refs under refs/remotes (a symbolic ref is skipped), each peeled to a commit.
+    let g = pushed_git(
+        tree,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(symref)",
+            "--",
+            "refs/remotes/",
+        ],
+    );
+    if g.overflow {
+        return stop3("too many paths: a git answer went over the read cap");
+    }
+    if !g.ok {
+        return stop3("a git call in the worktree failed");
+    }
+    let Some(text) = std::str::from_utf8(&g.bytes).ok() else {
+        return stop3("a git answer in the worktree was not valid UTF-8");
+    };
+    let mut tips: Vec<String> = Vec::new();
+    let mut plain = 0usize;
+    for l in text.lines().filter(|l| !l.is_empty()) {
+        let f: Vec<&str> = l.split(' ').collect();
+        if f.len() != 5 {
+            return stop3("a remote-tracking ref cannot be read");
+        }
+        if !f[4].is_empty() {
+            continue;
+        }
+        plain += 1;
+        if plain > REMOTE_REF_CAP {
+            return stop3("too many remote-tracking refs");
+        }
+        let tip = match (f[1], f[3]) {
+            ("commit", _) => f[0],
+            ("tag", "commit") => f[2],
+            _ => return stop3("a remote-tracking ref does not point at a commit"),
+        };
+        if !sha40(tip) {
+            return stop3("a remote-tracking ref does not point at a commit");
+        }
+        tips.push(tip.to_string());
+    }
+    if tips.is_empty() {
+        return stop3("the ticket branch has no upstream");
+    }
+    tips.sort();
+    tips.dedup();
+
+    // (4) Commits of the branch on none of those tips, full shas only, capped as step (g).
+    let branch_sha = match pushed_git_text(
+        tree,
+        &["rev-parse", "--verify", "--end-of-options", branch],
+    ) {
+        Some(Ok(s)) if sha40(&s) => s,
+        Some(Err(c)) => return c,
+        _ => return stop3("the ticket branch cannot be resolved"),
+    };
+    let negs: Vec<String> = tips.iter().map(|t| format!("^{}", t)).collect();
+    let max_count = ["--max-count", "1001"].join("=");
+    let mut args: Vec<&str> = vec![
+        "rev-list",
+        "--topo-order",
+        &max_count,
+        "--end-of-options",
+        &branch_sha,
+    ];
+    args.extend(negs.iter().map(|s| s.as_str()));
+    let g = pushed_git(tree, &args);
+    if g.overflow {
+        return stop3("too many paths: a git answer went over the read cap");
+    }
+    if !g.ok {
+        return stop3("a git call in the worktree failed");
+    }
+    let Some(text) = std::str::from_utf8(&g.bytes).ok() else {
+        return stop3("a git answer in the worktree was not valid UTF-8");
+    };
+    let commits: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    if commits.len() > PUSHED_CAP {
+        return stop3("too many commits to check (over the 1000-commit cap)");
+    }
+    if commits.iter().any(|c| !sha40(c)) {
+        return stop3("a git answer in the worktree was not a commit list");
+    }
+    if commits.is_empty() {
+        println!(
+            "workspace=on-remote ticket={} branch=ws/{}",
+            ticket, ticket
+        );
+        return 0;
+    }
+    for c in &commits {
+        println!("unpushed {} ws/{}", c, ticket);
+    }
+    println!(
+        "workspace=unpushed ticket={} branch=ws/{} upstream=none count={}",
+        ticket,
+        ticket,
+        commits.len()
+    );
+    4
+}
+
 /// The unpushed check (P1B-12), entered only with `--pushed --repo <absolute-dir>` once steps 1-6 of the
 /// clean-state check have passed unchanged. One question: is every commit on `ws/<ticket>` also on the
 /// branch's upstream remote-tracking ref? Everything is read locally (the tracking ref git already has);
 /// there is no fetch, no push, no ref or config write, and no index refresh. Every shape the answer depends
 /// on is verified before it is used, and anything that cannot be PROVEN makes the whole check exit 3 —
-/// "cannot check" — never a pass: a missing upstream, a symbolic tracking ref, a grafts/shallow file, a
+/// "cannot check" — never a pass: a missing upstream (unless `--remote-copy` is given and no upstream key is
+/// set: then `remote_copy_check` decides), a symbolic tracking ref, a grafts/shallow file, a
 /// worktree of another repo, or odd `.git` shapes.
-fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
+fn pushed_check(ticket: &str, tree: &Path, repo: &Path, remote_copy: bool) -> i32 {
     // (a) The `.git` shapes, by no-follow stat BEFORE any git call of this mode reads them: the worktree must
     //     be a linked worktree (its `.git` a regular pointer FILE — a symlink, directory or anything else is
     //     exit 3) and `--repo` a main work tree (a real directory whose `.git` is a real directory).
@@ -1060,6 +1258,7 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
     ) {
         Some(Ok(u)) if !u.is_empty() => u,
         Some(Err(c)) => return c,
+        _ if remote_copy => return remote_copy_check(ticket, tree, &common, &branch),
         _ => return stop3("the ticket branch has no upstream"),
     };
     if !upstream.starts_with("refs/remotes/") {
@@ -1261,10 +1460,11 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path) -> i32 {
 }
 
 /// `harness workspace check ...` (the arguments after `check`). Exit 0 clean (or, with `--pushed --repo`,
-/// every commit on the branch also on its upstream); 2 at least one stray path; 3 cannot check; 4 (with
+/// each commit on the branch also on its upstream; with `--remote-copy` and no upstream key, each commit
+/// on a plain ref under `refs/remotes/`); 2 at least one stray path; 3 cannot check; 4 (with
 /// `--pushed`) at least one unpushed commit. Any non-zero exit means "not proven clean"/"not proven pushed".
 pub fn check_cmd(a: &[String]) -> i32 {
-    let (ticket, md, pushed, repo) = match parse_args(a) {
+    let (ticket, md, pushed, repo, remote_copy) = match parse_args(a) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -1364,7 +1564,12 @@ pub fn check_cmd(a: &[String]) -> i32 {
     //     scan below never runs in this mode) after the same steps 1-6, and never reads a ticket file or a
     //     repo map: `--repo` is the ticket repo's top folder, taken by the caller from the repo map.
     if pushed {
-        return pushed_check(&ticket, &tree, Path::new(repo.as_deref().unwrap_or("")));
+        return pushed_check(
+            &ticket,
+            &tree,
+            Path::new(repo.as_deref().unwrap_or("")),
+            remote_copy,
+        );
     }
 
     // 7. The repo-settings refusal scan: attributes, filters and a redirecting core.worktree are exit 3

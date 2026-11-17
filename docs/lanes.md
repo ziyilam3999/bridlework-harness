@@ -118,7 +118,7 @@ When several match, the line names the first in this order: the parked tickets b
 
 ## The stale check
 
-`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` each record judged `stale gone-clean-pushed` goes to the park step, which parks its lane only when the verdict still holds there; nothing else is written (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
+`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` each record judged `stale` (`gone-clean-pushed`, or `gone-clean-on-remote` for a branch with no upstream key whose commits are each on some plain remote-tracking ref) goes to the park step, which parks its lane only when the verdict is still `stale` there; nothing else is written (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
 
 ```
 harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...] [--apply --reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]
@@ -145,7 +145,7 @@ A ticket id with no letter or digit (such as `_` or `--`) has an empty slug. No 
 5. The lane record file was last modified after the `ts_ms` of the newest bound exec launch: `alive claimed-after-launch` (a start whose seat is not listed yet).
 6. A running exec entry: `alive listed-running`.
 7. A running entry whose name holds a `-` separated part equal, ignoring ASCII case, to `t<slug>` and that does not read back the ticket `<slug>` in any role, or whose hyphenated read-back equals the slug once its `-` are removed: `unknown name-unclear`.
-8. Otherwise the session is gone (no exec entry, or ended ones only); an entry of another role for the slug, such as a reviewer, does not hold the lane. Then the tree is judged: no `--repo-map` for the record repo id is `unknown no-repo-map`. The clean check is `harness workspace check <ticket> --manifest-dir <dir>`, run as a child of the same binary: exit 0 with stdout exactly `workspace=clean ticket=<ticket>` is clean; exit 2 whose stdout is `stray <kind> <path>` lines then `workspace=stray ticket=<ticket> count=<n>` is clean when each stray line has the kind `untracked` or `ignored` and a path byte-equal to an `--allow` value, else `unsaved stray`; any other result (exit 3, another code, the time limit, a cap, output not in that form) is `unknown clean-check-failed`. Then the pushed check, the same command with `--pushed --repo <map dir>`: exit 0 is `stale gone-clean-pushed`; exit 4 is `unsaved unpushed`; exit 3 whose stderr is the line `harness: error: the ticket branch has no upstream` is `unknown no-upstream`; anything else is `unknown pushed-check-failed`.
+8. Otherwise the session is gone (no exec entry, or ended ones only); an entry of another role for the slug, such as a reviewer, does not hold the lane. Then the tree is judged: no `--repo-map` for the record repo id is `unknown no-repo-map`. The clean check is `harness workspace check <ticket> --manifest-dir <dir>`, run as a child of the same binary: exit 0 with stdout exactly `workspace=clean ticket=<ticket>` is clean; exit 2 whose stdout is `stray <kind> <path>` lines then `workspace=stray ticket=<ticket> count=<n>` is clean when each stray line has the kind `untracked` or `ignored` and a path byte-equal to an `--allow` value, else `unsaved stray`; any other result (exit 3, another code, the time limit, a cap, output not in that form) is `unknown clean-check-failed`. Then the pushed check, the same command with `--pushed --repo <map dir> --remote-copy`: exit 0 whose stdout is one line that starts with `workspace=pushed ticket=<ticket> branch=ws/<ticket> upstream=` is `stale gone-clean-pushed`; exit 0 whose stdout is exactly `workspace=on-remote ticket=<ticket> branch=ws/<ticket>` and a newline is `stale gone-clean-on-remote`; exit 0 with any other stdout is `unknown pushed-check-failed`; exit 4 is `unsaved unpushed`; exit 3 whose stderr is the line `harness: error: the ticket branch has no upstream` is `unknown no-upstream`; anything else (another exit 3 line such as `too many remote-tracking refs`, the time limit, a cap) is `unknown pushed-check-failed`. The `--remote-copy` answer is given only when the branch has no upstream that resolves (see `docs/workspace.md`, *Clean-state check*), after the checks that run before it there, so a repo with a `shallow` or `grafts` file is a failed check.
 
 Each check child has a 30 second limit with stdin closed and stdout and stderr each read under a 1 MiB cap; past the limit or a cap the child and its process group are killed and the call counts as failed.
 
@@ -164,9 +164,10 @@ Each check child has a 30 second limit with stdin closed and stdout and stderr e
 | `unknown` | `clean-check-failed` | the clean check gave no usable answer |
 | `unsaved` | `stray` | the tree holds a path that is not allowed |
 | `unsaved` | `unpushed` | a commit of the ticket branch is not pushed |
-| `unknown` | `no-upstream` | the ticket branch has no upstream (not decided in this version; not parked) |
+| `unknown` | `no-upstream` | no upstream that resolves, and either an upstream key is set (the fallback refuses at once) or the fallback found no plain remote-tracking ref |
 | `unknown` | `pushed-check-failed` | the pushed check gave no usable answer |
 | `stale` | `gone-clean-pushed` | the session is gone and nothing is unsaved |
+| `stale` | `gone-clean-on-remote` | the session is gone, nothing is unsaved, the branch has no upstream key and each commit of it is on a plain remote-tracking ref |
 | `unknown` | `record-changed` | `--apply` only: the record, the launch rows or the lane changed between the report and the park step |
 | `unknown` | `recheck-failed` | `--apply` only: the lock, the lanes dir, the host listing or the launch records could not be read again; nothing is parked after it |
 | `unknown` | `park-refused` | `--apply` only: the park body refused (`not-live` or `already-parked`); nothing changed |
@@ -179,13 +180,13 @@ Stdout holds one line per live record in lane order:
 stale ticket=<id> lane=<n> verdict=<hand|alive|unknown|unsaved|stale> reason=<token> action=<none|parked>
 ```
 
-then one line `stale checked=<n> parked=<k> unknown=<u>`, where n is the number of live records printed, k the number of parks done in this run (0 without `--apply`) and u the number with verdict `unknown`. A parked record prints `verdict=stale reason=gone-clean-pushed action=parked`; each other line has `action=none`. With no live record only the last line is printed. Exit 0 when no printed verdict is `unknown`; exit 3 when one or more are (the other lanes are still judged and printed); exit 2 for a usage error, a whole-run failure or, with `--apply`, a park body error.
+then one line `stale checked=<n> parked=<k> unknown=<u>`, where n is the number of live records printed, k the number of parks done in this run (0 without `--apply`) and u the number with verdict `unknown`. A parked record prints `verdict=stale reason=<gone-clean-pushed|gone-clean-on-remote> action=parked`, with the reason of the re-check in the park step, not of the first read; each other line has `action=none`. With no live record only the last line is printed. Exit 0 when no printed verdict is `unknown`; exit 3 when one or more are (the other lanes are still judged and printed); exit 2 for a usage error, a whole-run failure or, with `--apply`, a park body error.
 
 ### The apply step
 
 `--apply` takes `--reason <text>`, `--at <YYYY-MM-DDTHH:MM:SSZ>` and `--records-dir <absolute-dir>`: the four go together or none is given, else exit 2 with one `lane: error:` line and empty stdout before anything is read. `--apply` and each of the three given twice is exit 2. The three values take the checks of the release record options (*The release record*, with the same messages), and `--reason` is at most 900 bytes. Without `--apply` the output and the exit code are those of the report.
 
-Only a live record whose verdict is `stale gone-clean-pushed` goes to the park step. Each other verdict is printed with `action=none` and its lane is untouched; a branch with no upstream stays `unknown no-upstream`. For each live record in lane order the verdict is judged on the first read; for a stale one the park step runs at once, then its line is printed. The park step is one critical section under the lanes dir lock, taken once and held from (a) to (g):
+Only a live record whose verdict is `stale` (`gone-clean-pushed` or `gone-clean-on-remote`) goes to the park step. Each other verdict is printed with `action=none` and its lane is untouched; a branch with no upstream stays `unknown no-upstream` when the pushed check refuses with that line, and `unknown pushed-check-failed` on the fallback's other refusals. The first read may say one reason and the re-check the other (the branch got an upstream in between, or the reverse); the park goes ahead on either, and the printed line carries the reason of the re-check. For each live record in lane order the verdict is judged on the first read; for a stale one the park step runs at once, then its line is printed. The park step is one critical section under the lanes dir lock, taken once and held from (a) to (g):
 
 1. (a) take the lock;
 2. (b) read the lanes dir (live and parked records, under the config name bound) and the mtime of the ticket's lane file;
@@ -193,7 +194,7 @@ Only a live record whose verdict is `stale gone-clean-pushed` goes to the park s
 4. (d) call the host listing again;
 5. (e) read the launch records again, after the listing;
 6. (f) judge the ticket again on the facts of (b), (d) and (e), the clean and pushed checks run again; when the verdict is again `stale`, the exec launches of the slug are compared with the first read, and a launch that was not there or a changed state is `unknown record-changed`;
-7. (g) only when the verdict of (f) is `stale gone-clean-pushed`, park the record with the body of `lane park` (run under the held lock) and the record options, then release the lock.
+7. (g) only when the verdict of (f) is `stale` with either reason, park the record with the body of `lane park` (run under the held lock) and the record options, then release the lock.
 
 When (f) gives another verdict nothing is written and the line shows that verdict with `action=none`. A failure of (a), (b), (d) or (e) parks nothing: that record and each later record whose first verdict is `stale` print `unknown recheck-failed` with `action=none`, no later park step runs, the other records are still judged and printed, and the exit is 3. A park body refusal prints `unknown park-refused` and changes nothing. The config is loaded once per run.
 
@@ -231,7 +232,7 @@ An `--allow` value is a tree-relative path of `A-Z a-z 0-9 . _ - /`, not startin
 - The name-unclear rule sees a name only when a `-` separated part equals `t<slug>` (any letter case) or when its read-back ticket, with the `-` removed, equals the slug; other spellings of the ticket in a name are not seen.
 - A file inside an allowed folder goes unseen (nothing is deleted).
 - The pushed answer reads local tracking refs only (no fetch).
-- A branch with no upstream is `unknown` in this version.
+- With no upstream key in the branch config, the commits of the branch are read against the plain refs under `refs/remotes/` of the local repo (no fetch). A ref of a branch deleted on the server stays there until pruned, a ref written by hand counts, and a remote whose URL is a local folder counts: each reads as a remote copy. A branch with a commit on no remote-tracking ref while plain remote refs exist is `unsaved unpushed`; a repo with no plain remote ref at all stays `unknown no-upstream`; over 10000 entries or remote refs the answer is `unknown pushed-check-failed`.
 - Reviewer sessions do not hold a lane.
 - Jobs with no exec launch are not checked.
 - Lanes dir entries whose names are not UTF-8 are skipped, as in `list`.

@@ -647,3 +647,317 @@ fn symref_at_remapped_upstream_refused() {
     assert_refused("symref_remapped_upstream", &o, "is a symbolic ref");
     assert_no_folder("symref_remapped_upstream", &o, &t);
 }
+
+// ------------------------------------------- --remote-copy: a branch with no upstream
+
+/// A workspace whose repo master is pushed to a local bare remote `origin` (so `refs/remotes/origin/master`
+/// exists), the ws branch made at that base with no upstream config. Returns (repo raw path, tree, remote).
+fn ws_on_remote(t: &Tmp) -> (PathBuf, PathBuf, PathBuf) {
+    let (r_raw, tree) = mk_ws(t);
+    let remote = bare(t, "origin.git");
+    git(&r_raw, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&r_raw, &["push", "-q", "origin", "HEAD:refs/heads/master"]);
+    (r_raw, tree, remote)
+}
+
+/// `pushed_run` plus `--remote-copy`.
+fn rc_run(t: &Tmp, repo: &Path) -> Output {
+    let (unrelated, _) = t.both("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    let args: Vec<String> = ["workspace", "check", "t1", "--manifest-dir", t.raw.join("M").to_str().unwrap(), "--pushed", "--repo", repo.to_str().unwrap(), "--remote-copy"]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+    run(&args, Some(&unrelated))
+}
+
+const ON_REMOTE: &str = "workspace=on-remote ticket=t1 branch=ws/t1\n";
+
+fn common_dir(tree: &Path) -> PathBuf {
+    PathBuf::from(git(tree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+}
+
+#[test]
+fn remote_copy_passes_a_branch_at_a_pushed_base() {
+    let t = Tmp::new();
+    let (r_raw, _, _) = ws_on_remote(&t);
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), ON_REMOTE);
+    assert_eq!(err(&o), "");
+    assert_no_folder("remote_copy_at_base", &o, &t);
+}
+
+#[test]
+fn remote_copy_passes_a_branch_behind_a_remote_ref() {
+    let t = Tmp::new();
+    let (r_raw, _, _) = ws_on_remote(&t);
+    git(&r_raw, &["commit", "-q", "--allow-empty", "-m", "more"]);
+    git(&r_raw, &["push", "-q", "origin", "HEAD:refs/heads/master"]);
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), ON_REMOTE);
+}
+
+#[test]
+fn remote_copy_lists_a_local_commit() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let c = commit(&tree, "c.txt", "C");
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 4, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(lines(&o), vec![format!("unpushed {} ws/t1", c), "workspace=unpushed ticket=t1 branch=ws/t1 upstream=none count=1".to_string()]);
+    assert_no_folder("remote_copy_lists_a_local_commit", &o, &t);
+}
+
+#[test]
+fn remote_copy_passes_commits_pushed_under_another_name() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    commit(&tree, "c.txt", "C");
+    git(&tree, &["push", "-q", "origin", "ws/t1:refs/heads/elsewhere"]);
+    assert_eq!(git(&tree, &["rev-parse", "refs/remotes/origin/elsewhere"]), head(&tree));
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), ON_REMOTE);
+}
+
+#[test]
+fn remote_copy_passes_commits_on_a_second_remote() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let base = head(&tree);
+    commit(&tree, "c.txt", "C");
+    let backup = bare(&t, "backup.git");
+    git(&tree, &["remote", "add", "backup", backup.to_str().unwrap()]);
+    // An early-sorting ref at the base, so a check that read only the first ref would miss the commit.
+    git(&tree, &["push", "-q", "backup", &format!("{base}:refs/heads/aaa")]);
+    git(&tree, &["push", "-q", "backup", "ws/t1:refs/heads/ws/t1"]);
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), ON_REMOTE);
+}
+
+#[test]
+fn remote_copy_passes_beside_a_remote_head_symref() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    git(&tree, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master"]);
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 0, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(out(&o), ON_REMOTE);
+}
+
+#[test]
+fn remote_copy_with_an_upstream_is_the_plain_check() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_pushed(&t);
+    for label in ["clean", "unpushed"] {
+        if label == "unpushed" {
+            commit(&tree, "c.txt", "C");
+        }
+        let (a, b) = (pushed_run(&t, &r_raw), rc_run(&t, &r_raw));
+        assert_eq!(code(&a), code(&b), "{label}: exit");
+        assert_eq!(a.stdout, b.stdout, "{label}: stdout");
+        assert_eq!(a.stderr, b.stderr, "{label}: stderr");
+        assert_eq!(code(&a), if label == "clean" { 0 } else { 4 }, "{label}: the outcome checked");
+    }
+}
+
+#[test]
+fn without_remote_copy_no_upstream_still_fails_closed() {
+    let t = Tmp::new();
+    let (r_raw, _, _) = ws_on_remote(&t);
+    let o = pushed_run(&t, &r_raw);
+    assert_refused("without_remote_copy", &o, "the ticket branch has no upstream");
+}
+
+#[test]
+fn remote_copy_is_read_only() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    commit(&tree, "c.txt", "C");
+    let common = common_dir(&tree);
+    let gitdir = PathBuf::from(git(&tree, &["rev-parse", "--path-format=absolute", "--absolute-git-dir"]));
+    let snap = || {
+        (
+            git(&tree, &["for-each-ref", "--format=%(refname) %(objectname) %(symref)"]),
+            fs::read(common.join("config")).unwrap(),
+            fs::read(gitdir.join("index")).unwrap(),
+            fs::read(gitdir.join("HEAD")).unwrap(),
+            fs::read(common.join("index")).ok(),
+            fs::read(common.join("HEAD")).unwrap(),
+        )
+    };
+    let before = snap();
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 4, "the outcome checked: {}", out(&o));
+    assert!(before == snap(), "refs, config, index or HEAD changed across the run");
+}
+
+// ------------------------------------------- --remote-copy: hostile shapes
+
+#[test]
+fn remote_copy_without_any_remote_ref_fails_closed() {
+    let t = Tmp::new();
+    let (r_raw, _) = mk_ws(&t);
+    let remote = bare(&t, "origin.git");
+    git(&r_raw, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    let o = rc_run(&t, &r_raw);
+    assert_refused("no_remote_ref", &o, "the ticket branch has no upstream");
+}
+
+#[test]
+fn remote_copy_with_upstream_configured_but_missing_fails_closed() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    for (label, remote, merge) in [("both", true, true), ("remote only", true, false), ("merge only", false, true)] {
+        if remote {
+            git(&tree, &["config", "branch.ws/t1.remote", "origin"]);
+        }
+        if merge {
+            git(&tree, &["config", "branch.ws/t1.merge", "refs/heads/ws/t1"]);
+        }
+        let o = rc_run(&t, &r_raw);
+        assert_refused(label, &o, "the ticket branch has no upstream");
+        for k in ["branch.ws/t1.remote", "branch.ws/t1.merge"] {
+            let _ = Command::new("git").arg("-C").arg(&tree).args(["config", "--unset", k]).output();
+        }
+    }
+}
+
+#[test]
+fn remote_copy_skips_a_symbolic_remote_ref() {
+    let t = Tmp::new();
+    let (r_raw, tree) = mk_ws(&t);
+    let remote = bare(&t, "origin.git");
+    git(&r_raw, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&tree, &["symbolic-ref", "refs/remotes/origin/x", "refs/heads/ws/t1"]);
+    let o = rc_run(&t, &r_raw);
+    assert_refused("only_a_symref", &o, "the ticket branch has no upstream");
+    git(&r_raw, &["push", "-q", "origin", "HEAD:refs/heads/master"]);
+    let c = commit(&tree, "c.txt", "C");
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 4, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(lines(&o), vec![format!("unpushed {} ws/t1", c), "workspace=unpushed ticket=t1 branch=ws/t1 upstream=none count=1".to_string()]);
+}
+
+#[test]
+fn remote_copy_refuses_a_linked_remote_ref() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    commit(&tree, "c.txt", "C");
+    let common = common_dir(&tree);
+    let file_link = common.join("refs/remotes/origin/lnk");
+    symlink(common.join("refs/heads/ws/t1"), &file_link).unwrap();
+    let o = rc_run(&t, &r_raw);
+    assert_refused("linked_file", &o, "a remote-tracking ref is a link");
+    fs::remove_file(&file_link).unwrap();
+    let dir_link = common.join("refs/remotes/dl");
+    symlink(common.join("refs/heads/ws"), &dir_link).unwrap();
+    let o = rc_run(&t, &r_raw);
+    assert_refused("linked_folder", &o, "a remote-tracking ref is a link");
+}
+
+#[test]
+fn remote_copy_remote_ref_not_a_commit_fails_closed() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let (blob_file, _) = t.both("blob.txt");
+    fs::write(&blob_file, "blob").unwrap();
+    let blob = git(&tree, &["hash-object", "-w", blob_file.to_str().unwrap()]);
+    git(&tree, &["update-ref", "refs/remotes/origin/blob", &blob]);
+    let o = rc_run(&t, &r_raw);
+    assert_refused("not_a_commit", &o, "a remote-tracking ref does not point at a commit");
+}
+
+#[test]
+fn remote_copy_over_the_ref_cap_fails_closed() {
+    use std::io::Write;
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let sha = head(&tree);
+    let mut script = String::new();
+    for i in 0..10_001 {
+        script.push_str(&format!("create refs/remotes/many/r{i} {sha}\n"));
+    }
+    let mut c = Command::new("git");
+    c.arg("-C").arg(&tree).args(["update-ref", "--stdin"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+        c.env_remove(k);
+    }
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success(), "the scratch refs must be made");
+    let o = rc_run(&t, &r_raw);
+    assert_refused("over_the_ref_cap", &o, "too many remote-tracking refs");
+}
+
+/// The same cap with the refs packed: no loose file is left under refs/remotes, so the folder walk counts few
+/// entries and only the cap on the plain refs of the listing can refuse.
+#[test]
+fn remote_copy_over_the_ref_cap_with_packed_refs_fails_closed() {
+    use std::io::Write;
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let sha = head(&tree);
+    let mut script = String::new();
+    for i in 0..10_001 {
+        script.push_str(&format!("create refs/remotes/many/r{i} {sha}\n"));
+    }
+    let mut c = Command::new("git");
+    c.arg("-C").arg(&tree).args(["update-ref", "--stdin"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+        c.env_remove(k);
+    }
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success(), "the scratch refs must be made");
+    git(&tree, &["pack-refs", "--all"]);
+    let common = common_dir(&tree);
+    assert!(!common.join("refs/remotes/many/r0").exists(), "the refs must be packed, not loose");
+    assert!(!common.join("refs/remotes/origin/master").exists(), "the refs must be packed, not loose");
+    let o = rc_run(&t, &r_raw);
+    assert_refused("over_the_ref_cap_packed", &o, "too many remote-tracking refs");
+}
+
+#[test]
+fn remote_copy_counts_only_refs_under_refs_remotes() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let c = commit(&tree, "c.txt", "C");
+    git(&tree, &["tag", "keep", &c]);
+    git(&tree, &["branch", "remotes/origin/fake", &c]);
+    let o = rc_run(&t, &r_raw);
+    assert_eq!(code(&o), 4, "stdout: {}\nstderr: {}", out(&o), err(&o));
+    assert_eq!(lines(&o)[0], format!("unpushed {} ws/t1", c));
+}
+
+#[test]
+fn remote_copy_refuses_grafts() {
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let common = common_dir(&tree);
+    let base = head(&tree);
+    fs::write(common.join("shallow"), format!("{base}\n")).unwrap();
+    let o = rc_run(&t, &r_raw);
+    assert_refused("shallow", &o, "shallow");
+}
+
+#[test]
+fn remote_copy_needs_pushed() {
+    let t = Tmp::new();
+    let (r_raw, _) = mk_ws(&t);
+    let r = r_raw.to_str().unwrap();
+    for (label, extra, needle) in [
+        ("alone", vec!["--remote-copy"], "--remote-copy requires --pushed"),
+        ("twice", vec!["--pushed", "--repo", r, "--remote-copy", "--remote-copy"], "--remote-copy was given twice"),
+    ] {
+        let o = pushed_args(&t, &extra);
+        assert_eq!(code(&o), 3, "{label}: {}", err(&o));
+        assert_eq!(out(&o), "", "{label}: stdout");
+        assert!(err(&o).starts_with("harness: error: "), "{label}: {}", err(&o));
+        assert!(err(&o).contains(needle), "{label}: {}", err(&o));
+        assert!(err(&o).contains("usage:"), "{label}: {}", err(&o));
+    }
+}
