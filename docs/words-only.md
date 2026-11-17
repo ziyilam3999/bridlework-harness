@@ -71,7 +71,7 @@ A refusal is exit 1 with one stderr line `harness: words-only refused: <path or 
 - `not-utf8`: either blob is not UTF-8.
 - `unparsed`: the lexer cannot read a `.rs` version to its end (an unterminated string, char literal or
   block comment).
-- `code-changed`: the two `.rs` versions differ after comments are removed.
+- `code-changed`: the two `.rs` versions differ after plain comments are removed.
 
 ## What the lexer removes and keeps
 

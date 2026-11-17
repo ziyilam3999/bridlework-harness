@@ -1,5 +1,5 @@
 //! `harness ticket words-only` (std only, Unix; `docs/words-only.md` is the contract). Reads two commits of one
-//! repo and exits 0 when each change between them is comment text in a Rust file or text of a docs Markdown
+//! repo and exits 0 when each change between them is plain comment text in a Rust file or text of a docs Markdown
 //! file; else it refuses. Plain comments (`//`, `/* */`) are removed; each doc comment (`///`, `//!`, `/** */`,
 //! `/*! */`) is kept as code, whole, so a doc comment change is code-changed (rustdoc may run its text as a
 //! doctest). It decides no review and marks no finding: a caller uses it as one input. It does not replace the
