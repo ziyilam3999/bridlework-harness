@@ -123,6 +123,8 @@ fn read_inputs(a: &Args) -> Result<Inputs, String> {
         }
         tickets.push(t);
     }
+    // File-name order differs from id order when one id is a prefix of another.
+    tickets.sort_by(|a, b| a.id.cmp(&b.id));
     let mut done = BTreeSet::new();
     for name in list(&a.done, ".done", "done")? {
         let stem = entry(&a.done, &name, ".done", "done record")?;

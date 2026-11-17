@@ -111,6 +111,18 @@ fn refused(o: &Out, err: &str) {
 // ---- check
 
 #[test]
+fn tickets_are_ordered_by_id_not_file_name() {
+    // "a-b.json" sorts before "a.json" by name, but the id "a" sorts before "a-b".
+    let e = Env::new();
+    e.index(&[r("R-1", "not-built")]);
+    for id in ["a", "a-b"] {
+        e.ticket(id, "S", "");
+        e.done(id);
+    }
+    is(&e.check(), 1, "red done-ticket-no-row a\nred done-ticket-no-row a-b\nplan check red findings=2\n");
+}
+
+#[test]
 fn a_built_row_with_no_ticket_is_red() {
     let e = Env::new();
     e.index(&[r("R-1", "built")]);
