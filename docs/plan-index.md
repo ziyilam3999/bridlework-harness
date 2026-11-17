@@ -77,7 +77,7 @@ A ticket links to a row when its `main_plan_ref` names the row id, or the row li
 
 ### plan check
 
-One stdout line per finding, `red <class> <id>`, then the last line `plan check red findings=<n>` and exit 1. Order: rows in index order, then tickets in byte order of the id, then done records in byte order of the name. With no finding: one line `plan check ok rows=<n> tickets=<n> done=<n>` and exit 0. Stderr is empty.
+One stdout line per finding, `red <class> <id>`, then the last line `plan check red findings=<n>` and exit 1. Order: rows in index order, then tickets in byte order of the id, then done records in byte order of the name without `.done`. With no finding: one line `plan check ok rows=<n> tickets=<n> done=<n>` and exit 0. Stderr is empty.
 
 | Class | Meaning |
 |---|---|
@@ -114,11 +114,11 @@ Points come from the ticket `size`: S=1, M=3, L=9. A ticket counts once, however
 
 ## What it does not do
 
-- It does not check whether a row is built, or that the row fits the work. Intake checks that an id exists.
+- It does not check that a row fits the work. Intake with `--plan-index` checks that each `main_plan_ref` element is an id of the index.
 - `plan check` reads links and states. It does not read whether code does what a row says.
 - Plan rows that no ticket links to add nothing to progress.
 - A ticket made before intake took a plan link carries no link, so it counts only when a row lists it.
-- On an index with rows marked `built` and no ticket listed, or rows in state `unknown`, `plan check` is red until the index is fixed.
+- On an index with rows marked `built` with no linked done ticket (by either direction), or rows in state `unknown`, `plan check` is red.
 - One ticket that does not parse or one bad done record in the folders makes check, status and ticket mode exit 2.
 - The MCP intake tool passes no index.
 - An `off_plan` reason is not judged.
