@@ -67,7 +67,7 @@
 //! all by no-follow stat before any git call of this mode reads them; `info/grafts` or a `shallow` file in
 //! the common dir is refused (either can rewrite the ancestry the answer depends on) and every git call of
 //! this mode also forces the commit graph off on top of the global `--no-replace-objects`. A missing
-//! upstream, a tracking ref that is a symbolic ref or points at a non-commit, an upstream that is not a
+//! upstream (unless `--remote-copy` is given and no upstream key is set), a tracking ref that is a symbolic ref or points at a non-commit, an upstream that is not a
 //! `refs/remotes/` name (for example `branch.<b>.remote=.` making a LOCAL branch the "upstream"), or a
 //! tracking-ref/branch pair that cannot be resolved all fail CLOSED (exit 3, never a pass). The answer is
 //! reachability, not recency: `rev-list --topo-order <branch> ^<upstream-commit>` (full shas only, after
@@ -171,11 +171,12 @@ fn dir_arg_ok(s: &str) -> bool {
     p.is_absolute() && !p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-/// `<ticket> --manifest-dir <absolute-dir> [--pushed --repo <absolute-dir>]`. The ticket must be a plain token
+/// `<ticket> --manifest-dir <absolute-dir> [--pushed --repo <absolute-dir> [--remote-copy]]`. The ticket must be a plain token
 /// exactly as the manifest defines it: refused, never rewritten. No default folder, no config file, no
 /// current-folder lookup. `--pushed` (P1B-12) switches the command to the unpushed check ONLY; it carries
 /// `--repo <absolute-dir>` (the ticket repo's top folder) and the two are a pair: either one without the
 /// other, either one given twice, or a `--repo` that is not absolute or holds `..` is a usage error (exit 3).
+/// `--remote-copy` is a flag with no value: it needs `--pushed`, and given twice is a usage error too.
 fn parse_args(a: &[String]) -> Result<(String, String, bool, Option<String>, bool), i32> {
     let (mut ticket, mut md) = (None, None);
     let (mut pushed, mut repo) = (false, None);
@@ -993,8 +994,8 @@ fn sha40(s: &str) -> bool {
 /// The cap on entries under `refs/remotes` and on plain remote-tracking refs read by `--remote-copy`.
 const REMOTE_REF_CAP: usize = 10_000;
 
-/// No-follow walk of one folder under `refs/remotes`: a link at any depth is exit 3 (git reads a linked
-/// file or folder as a plain ref), and more than `REMOTE_REF_CAP` entries is exit 3.
+/// No-follow walk of one folder under `refs/remotes`: a link at any depth is exit 3 (git can read a linked
+/// file or folder as a ref), and more than `REMOTE_REF_CAP` entries is exit 3.
 fn walk_remote_refs(dir: &Path, n: &mut usize) -> Result<(), i32> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Err(stop3("the remote-tracking refs cannot be read"));
@@ -1171,7 +1172,8 @@ fn remote_copy_check(ticket: &str, tree: &Path, common: &Path, branch: &str) -> 
 /// branch's upstream remote-tracking ref? Everything is read locally (the tracking ref git already has);
 /// there is no fetch, no push, no ref or config write, and no index refresh. Every shape the answer depends
 /// on is verified before it is used, and anything that cannot be PROVEN makes the whole check exit 3 —
-/// "cannot check" — never a pass: a missing upstream, a symbolic tracking ref, a grafts/shallow file, a
+/// "cannot check" — never a pass: a missing upstream (unless `--remote-copy` is given and no upstream key is
+/// set: then `remote_copy_check` decides), a symbolic tracking ref, a grafts/shallow file, a
 /// worktree of another repo, or odd `.git` shapes.
 fn pushed_check(ticket: &str, tree: &Path, repo: &Path, remote_copy: bool) -> i32 {
     // (a) The `.git` shapes, by no-follow stat BEFORE any git call of this mode reads them: the worktree must
@@ -1458,7 +1460,8 @@ fn pushed_check(ticket: &str, tree: &Path, repo: &Path, remote_copy: bool) -> i3
 }
 
 /// `harness workspace check ...` (the arguments after `check`). Exit 0 clean (or, with `--pushed --repo`,
-/// every commit on the branch also on its upstream); 2 at least one stray path; 3 cannot check; 4 (with
+/// each commit on the branch also on its upstream; with `--remote-copy` and no upstream key, each commit
+/// on a plain ref under `refs/remotes/`); 2 at least one stray path; 3 cannot check; 4 (with
 /// `--pushed`) at least one unpushed commit. Any non-zero exit means "not proven clean"/"not proven pushed".
 pub fn check_cmd(a: &[String]) -> i32 {
     let (ticket, md, pushed, repo, remote_copy) = match parse_args(a) {

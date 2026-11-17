@@ -118,7 +118,7 @@ When several match, the line names the first in this order: the parked tickets b
 
 ## The stale check
 
-`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` each record judged `stale` (`gone-clean-pushed`, or `gone-clean-on-remote` for a branch with no upstream key whose commits are all on a remote-tracking ref) goes to the park step, which parks its lane only when the verdict is still `stale` there; nothing else is written (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
+`harness lane stale` says which live lanes belong to a job whose builder session is gone and that left nothing unsaved. It decides and prints. Without `--apply` it changes nothing: the lanes dir, the manifests, the trees, the branches and the host session list are the same after it. With `--apply` each record judged `stale` (`gone-clean-pushed`, or `gone-clean-on-remote` for a branch with no upstream key whose commits are each on some plain remote-tracking ref) goes to the park step, which parks its lane only when the verdict is still `stale` there; nothing else is written (see *The apply step*). It runs no stop, no rm, no fetch and no network call. Nothing calls the verb yet.
 
 ```
 harness lane stale --lanes-dir <abs dir> --config <file> --host <abs file> --launch-records <abs file> --manifest-dir <abs dir> --repo-map <repo-id>=<abs dir> [--repo-map ...] [--allow <tree-relative path> ...] [--apply --reason <text> --at <YYYY-MM-DDTHH:MM:SSZ> --records-dir <abs dir>]

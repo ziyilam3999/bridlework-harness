@@ -5,7 +5,7 @@
 //! lock that reads the lanes dir, the host listing, the launch records and the tree again, and parks the lane only when the verdict is still
 //! stale with either reason; the printed line carries the reason of the re-check. The clean and pushed answers are the child runs `harness
 //! workspace check` and `harness workspace check --pushed --remote-copy` of this same binary, each under a 30 second limit and a 1 MiB cap
-//! per stream. A branch with no upstream key whose commits are all on a plain remote-tracking ref is `stale gone-clean-on-remote`; exit 0 with
+//! per stream. A branch with no upstream key whose commits are each on some plain remote-tracking ref is `stale gone-clean-on-remote`; exit 0 with
 //! any other stdout than the two expected lines is `unknown pushed-check-failed`.
 //! Exit 0: no verdict is `unknown`; 3: one or more are; 2: a usage error, a whole-run failure (`lane: error: <cause>`, empty stdout) or a
 //! park body error (the lines of the records handled before it stay on stdout).

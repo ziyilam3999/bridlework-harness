@@ -893,6 +893,34 @@ fn remote_copy_over_the_ref_cap_fails_closed() {
     assert_refused("over_the_ref_cap", &o, "too many remote-tracking refs");
 }
 
+/// The same cap with the refs packed: no loose file is left under refs/remotes, so the folder walk counts few
+/// entries and only the cap on the plain refs of the listing can refuse.
+#[test]
+fn remote_copy_over_the_ref_cap_with_packed_refs_fails_closed() {
+    use std::io::Write;
+    let t = Tmp::new();
+    let (r_raw, tree, _) = ws_on_remote(&t);
+    let sha = head(&tree);
+    let mut script = String::new();
+    for i in 0..10_001 {
+        script.push_str(&format!("create refs/remotes/many/r{i} {sha}\n"));
+    }
+    let mut c = Command::new("git");
+    c.arg("-C").arg(&tree).args(["update-ref", "--stdin"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+        c.env_remove(k);
+    }
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success(), "the scratch refs must be made");
+    git(&tree, &["pack-refs", "--all"]);
+    let common = common_dir(&tree);
+    assert!(!common.join("refs/remotes/many/r0").exists(), "the refs must be packed, not loose");
+    assert!(!common.join("refs/remotes/origin/master").exists(), "the refs must be packed, not loose");
+    let o = rc_run(&t, &r_raw);
+    assert_refused("over_the_ref_cap_packed", &o, "too many remote-tracking refs");
+}
+
 #[test]
 fn remote_copy_counts_only_refs_under_refs_remotes() {
     let t = Tmp::new();
