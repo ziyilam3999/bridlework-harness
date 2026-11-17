@@ -34,8 +34,12 @@ a Markdown file elsewhere are not words files.
 Each git call runs on the repo dir, removes each inherited variable whose name starts with `GIT_`, gets no
 stdin and runs with `--no-replace-objects` and `--no-lazy-fetch`. It reads only: no fetch, no ref, config,
 index or work tree write. A blob that is missing from the object store (a partial clone) is not fetched: the
-call fails and the answer is exit 2 `harness: error: a git call failed`. Changed entries come from a raw tree compare with renames off. File contents come from the object
-store as raw bytes, so no text conversion, filter or diff driver runs. The work tree is not read.
+call fails and the answer is exit 2 `harness: error: a git call failed`. Changed entries come from a raw tree
+compare with renames off. File contents come from the object store as raw bytes, so no text conversion,
+filter or diff driver runs. The work tree is not read.
+
+The verb needs a git that accepts `--no-lazy-fetch`. On an older git each call fails, and the verb refuses
+with exit 2 (`harness: error: the repo dir is not a git repo`).
 
 ## Order of steps
 
@@ -104,6 +108,11 @@ starts a char literal when the next character is a backslash, or when the charac
 a quote. Else it is a lifetime or label only when the next character is an ASCII letter, an underscore or a
 non-ASCII character; any other quote (for example `'1`) is `unparsed`.
 
+Some tails are read as code with their token, as rustc reads them, so a following `r"` is a plain string with
+escapes and not a raw string: the whole name of a lifetime or label (`'r`), the identifier suffix right after
+the end of a string, byte string, C string, raw string, char or byte literal (`'a'r`, `"z"r`), and the name
+after `r#` in a raw identifier (`r#r`).
+
 ## The ok line
 
 Exit 0 with stderr empty and one stdout line:
@@ -124,6 +133,8 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
 - A doc comment wording fix (`///`, `//!`, `/** */`, `/*! */`) is not words only: it is `code-changed`.
 - A words-only answer can still go with a failing build or test: some checks read comment or docs text (see
   above), and the gate catches those. A check that reads a plain comment can fail after a plain comment edit.
+- An added or removed comment line moves `line!()` values and panic locations, and a plain comment edit
+  that changes the line count can change them.
 - It says nothing about whether a sentence is true.
 - A `.md` words file passes on any change, so a `.md` file pulled into Rust docs with `include_str!` would let
   a doctest edit pass. No `.rs` file does that today.

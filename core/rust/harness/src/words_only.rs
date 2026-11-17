@@ -234,6 +234,15 @@ impl Lexer<'_> {
         }
     }
 
+    /// Copies the identifier bytes at `i` as code (a literal suffix, a lifetime name); returns where they end.
+    fn suffix(&mut self, mut i: usize) -> usize {
+        while i < self.s.len() && ident_byte(self.s[i]) {
+            self.out.push(self.s[i]);
+            i += 1;
+        }
+        i
+    }
+
     /// A comment starts here: the blanks before it on its line go.
     fn strip_start(&mut self) {
         while self.out.len() > self.line_start && self.out.last().is_some_and(|&b| is_blank(b)) {
@@ -307,16 +316,17 @@ fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
             b'"' => {
                 let e = string_end(s, i)?;
                 x.lit(&s[i..e]);
-                i = e;
+                i = x.suffix(e);
             }
             b'\'' => match char_end(s, i)? {
                 Some(e) => {
                     x.lit(&s[i..e]);
-                    i = e;
+                    i = x.suffix(e);
                 }
                 None => {
+                    // A lifetime or label: its identifier is one code token (so `'r"` opens no raw string).
                     x.out.push(c);
-                    i += 1;
+                    i = x.suffix(i + 1);
                 }
             },
             _ if ident_byte(c) => {
@@ -326,11 +336,21 @@ fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
                 }
                 let word = &s[i..j];
                 if matches!(word, b"r" | b"br" | b"cr") {
-                    if let Some(end) = raw_end(s, j) {
-                        let end = end?;
-                        x.lit(&s[i..end]);
-                        i = end;
-                        continue;
+                    match raw_end(s, j) {
+                        Some(end) => {
+                            let end = end?;
+                            x.lit(&s[i..end]);
+                            i = x.suffix(end);
+                            continue;
+                        }
+                        // A raw identifier such as r#type: the name after the # is one code token.
+                        None if s.get(j) == Some(&b'#') && s.get(j + 1).is_some_and(|&b| ident_byte(b)) => {
+                            x.out.extend_from_slice(word);
+                            x.out.push(b'#');
+                            i = x.suffix(j + 1);
+                            continue;
+                        }
+                        None => {}
                     }
                 }
                 x.out.extend_from_slice(word);

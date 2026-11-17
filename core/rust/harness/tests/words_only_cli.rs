@@ -378,6 +378,42 @@ fn a_lifetime_is_not_a_char_literal() {
     rs_case("fn f<'a>(x: &'a u8, y: &'a u8) {} // one\n", "fn f<'a>(x: &'a u8, y: &'a u8) {} // two\n").pass(1);
 }
 
+// The lifetime 'a is one token: a lexer that reads 'a as a char opener and falls back to a lifetime still
+// reads the quote in the string wrong.
+#[test]
+fn a_lifetime_before_a_string_with_a_quote_is_code() {
+    rs_case(
+        "fn f<'a>(t: &'a str) { let u: &'a str = \"q'; // x\"; }\n",
+        "fn f<'a>(t: &'a str) { let u: &'a str = \"q'; // y\"; }\n",
+    )
+    .refused("a.rs code-changed");
+}
+
+// A token tail is code: a following r" is a plain string with escapes in rustc 2021, not a raw string.
+fn tail_case(line: &str) -> Case {
+    rs_case(&format!("{line}\n"), &format!("{}\n", line.replace("// x", "// y")))
+}
+
+#[test]
+fn a_char_literal_suffix_r_does_not_open_a_raw_string() {
+    tail_case("const S: &str = stringify!('a'r\"q\\\" // x\");").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_lifetime_named_r_does_not_open_a_raw_string() {
+    tail_case("const S: &str = stringify!('r\"q\\\" // x\");").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_string_literal_suffix_r_does_not_open_a_raw_string() {
+    tail_case("const S: &str = stringify!(\"z\"r\"q\\\" // x\");").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_raw_identifier_named_r_does_not_open_a_raw_string() {
+    tail_case("const S: &str = stringify!(r#r\"q\\\" // x\");").refused("a.rs code-changed");
+}
+
 #[test]
 fn a_crlf_line_end_change_is_refused() {
     rs_case("fn f() {\r\n    x();\r\n}\r\n", "fn f() {\r\n    x();\n}\r\n").refused("a.rs code-changed");
@@ -567,9 +603,15 @@ fn a_git_dir_in_the_environment_is_ignored() {
 
 #[test]
 fn a_gitattributes_filter_is_not_run() {
-    let c = rs_case("fn f() { x(1); } // a\n", "fn f() { x(1); } // b\n");
-    write(&c.dir, ".gitattributes", b"*.rs filter=boom diff=boom text eol=crlf\n");
-    for (k, v) in [("filter.boom.clean", "false"), ("filter.boom.smudge", "false"), ("diff.boom.textconv", "false")] {
+    // The attributes file is committed and the filter is required: a blob read through it fails the call.
+    let attrs: &[u8] = b"*.rs filter=boom diff=boom text eol=crlf\n";
+    let c = case(&[("a.rs", b"fn f() { x(1); } // a\n"), (".gitattributes", attrs)], &[("a.rs", b"fn f() { x(1); } // b\n"), (".gitattributes", attrs)]);
+    for (k, v) in [
+        ("filter.boom.clean", "false"),
+        ("filter.boom.smudge", "false"),
+        ("filter.boom.required", "true"),
+        ("diff.boom.textconv", "false"),
+    ] {
         g(&c.dir, &["config", k, v]);
     }
     c.pass(1);
