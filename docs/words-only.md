@@ -1,6 +1,6 @@
 # harness ticket words-only
 
-Reads two commits of one repo and exits 0 when each change between them is plain comment text in a Rust file
+Reads two commits of one repo and exits 0 only when each change between them is plain comment text in a Rust file
 (a doc comment is code) or text of a docs Markdown file. Else it refuses. A form the lexer cannot read with
 certainty is refused as `unparsed`, not passed.
 
@@ -37,7 +37,8 @@ stdin and runs with `--no-replace-objects` and `--no-lazy-fetch`. It reads only:
 index or work tree write. A blob that is missing from the object store (a partial clone) is not fetched: the
 call fails when that blob is read, and the answer is exit 2 `harness: error: a git call failed` (an earlier
 refused entry gives exit 1 first). Changed entries come from a raw tree
-compare with renames off. File contents come from the object store as raw bytes, so no text conversion,
+compare with renames off and `--ignore-submodules=none`, so a `submodule.<name>.ignore` setting of
+`.gitmodules` does not hide a submodule entry. File contents come from the object store as raw bytes, so no text conversion,
 filter or diff driver runs. The work tree is not read.
 
 The verb needs a git that accepts `--no-lazy-fetch`. On an older git each call fails, and the verb fails

@@ -553,6 +553,49 @@ fn a_submodule_entry_is_refused() {
     c.refused("sub submodule");
 }
 
+const GITMODULES_IGNORE: &[u8] = b"[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n";
+
+/// A docs edit plus a gitlink bump; `committed` puts .gitmodules (ignore = all) into both commits.
+fn gitlink_bump_with_docs_edit(committed: bool) -> Case {
+    let (t, dir) = init();
+    write(&dir, "docs/x.md", b"old\n");
+    g(&dir, &["add", "docs/x.md"]);
+    if committed {
+        write(&dir, ".gitmodules", GITMODULES_IGNORE);
+        g(&dir, &["add", ".gitmodules"]);
+    }
+    g(&dir, &["update-index", "--add", "--cacheinfo", &format!("160000,{},sub", "1".repeat(40))]);
+    let from = commit(&dir);
+    write(&dir, "docs/x.md", b"new\n");
+    g(&dir, &["add", "docs/x.md"]);
+    g(&dir, &["update-index", "--add", "--cacheinfo", &format!("160000,{},sub", "2".repeat(40))]);
+    let to = commit(&dir);
+    if !committed {
+        write(&dir, ".gitmodules", GITMODULES_IGNORE);
+    }
+    Case { t, dir, from, to }
+}
+
+#[test]
+fn a_gitlink_bump_is_refused_when_gitmodules_ignores_it() {
+    gitlink_bump_with_docs_edit(true).refused("sub submodule");
+}
+
+#[test]
+fn a_gitlink_bump_is_refused_when_only_the_work_tree_gitmodules_ignores_it() {
+    gitlink_bump_with_docs_edit(false).refused("sub submodule");
+}
+
+#[test]
+fn a_root_contributing_edit_passes() {
+    md_case("CONTRIBUTING.md", "old\n", "new\n").pass(1);
+}
+
+#[test]
+fn a_root_security_edit_passes() {
+    md_case("SECURITY.md", "old\n", "new\n").pass(1);
+}
+
 #[test]
 fn a_non_utf8_rust_file_is_refused() {
     case(&[("a.rs", b"// a\nfn f() {}\n")], &[("a.rs", b"// \xff\nfn f() {}\n")]).refused("a.rs not-utf8");
