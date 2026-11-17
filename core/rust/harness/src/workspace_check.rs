@@ -79,10 +79,10 @@
 //! and one fixed folder-free `harness: error:` line on stderr. No fetch, no push, no ref or config write, no
 //! index refresh.
 //!
-//! `--remote-copy` (only with `--pushed`) adds one fallback, reached only at the first no-upstream exit of
-//! step (d) (after steps (a) to (c), so a grafts or shallow file still stops first) and only when the config
-//! holds neither `branch.ws/<t>.remote` nor `branch.ws/<t>.merge`. It asks whether every commit of the branch
-//! is also on a plain ref under `refs/remotes/`: a link anywhere under that folder, a ref that does not peel
+//! `--remote-copy` (only with `--pushed`) adds one fallback, entered only at the first no-upstream exit of
+//! step (d) (after steps (a) to (c), so a grafts or shallow file still stops first); with either
+//! `branch.ws/<t>.remote` or `branch.ws/<t>.merge` set it refuses at once, as before. It asks whether each
+//! commit of the branch is also on a plain ref under `refs/remotes/`: a link anywhere under that folder, a ref that does not peel
 //! to a commit, more than 10000 entries or refs, a cap on the commit list, or no plain ref at all is exit 3
 //! (symbolic refs are skipped). Exit 0 prints `workspace=on-remote ticket=<t> branch=ws/<t>`; exit 4 prints
 //! the `unpushed` lines, then the summary with `upstream=none`. A remote-tracking ref is the local record of
@@ -1020,8 +1020,8 @@ fn walk_remote_refs(dir: &Path, n: &mut usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// The `--remote-copy` fallback (reached only at the no-upstream exit of step (d)): with no
-/// `branch.ws/<t>.remote` and no `.merge` key, is every commit of the branch also on a plain ref under
+/// The `--remote-copy` fallback (entered only at the first no-upstream exit of step (d)): with no
+/// `branch.ws/<t>.remote` and no `.merge` key, is each commit of the branch also on a plain ref under
 /// `refs/remotes/`? Same forced git calls as the rest of the mode; a fixed number of them.
 fn remote_copy_check(ticket: &str, tree: &Path, common: &Path, branch: &str) -> i32 {
     // (1) The branch config: either key present ends the check as before.
