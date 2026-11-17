@@ -81,7 +81,7 @@ The lexer reads each `.rs` version and removes comments:
 - a block comment `/* */`, with nesting
 - the line doc forms `///` and `//!` (not `////`)
 
-It keeps, so a change there is a code change (rustdoc runs these as doctests):
+It keeps, so a change there is a code change (rustdoc may run these as doctests):
 
 - a block doc comment `/** */` or `/*! */`, whole
 - each line doc comment (`///` or `//!`) of a file in which a doc comment of either version holds three or
