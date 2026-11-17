@@ -1,7 +1,7 @@
 # harness ticket words-only
 
-Reads two commits of one repo and exits 0 when each change between them is comment text in a Rust file or
-text of a docs Markdown file. Else it refuses.
+Reads two commits of one repo and exits 0 when each change between them is plain comment text in a Rust file
+(a doc comment is code) or text of a docs Markdown file. Else it refuses.
 
 ## Synopsis
 
@@ -48,7 +48,7 @@ The first failing step gives one stderr line and stops.
 5. More than 200 changed entries: `too-many-files`.
 6. Each changed entry, in the order git lists them (see the classes).
 7. A `.md` words file passes on any text change. A `.rs` file passes when the two versions are equal after the
-   lexer removes comments.
+   lexer removes plain comments (doc comments stay).
 8. Done: exit 0.
 
 A refusal is exit 1 with one stderr line `harness: words-only refused: <path or -> <class>` and stdout empty.
@@ -75,22 +75,22 @@ A refusal is exit 1 with one stderr line `harness: words-only refused: <path or 
 
 ## What the lexer removes and keeps
 
-The lexer reads each `.rs` version and removes comments:
+The lexer reads each `.rs` version and removes plain comments:
 
-- a line comment `//` to its line end (a `/*` inside it opens nothing)
-- a block comment `/* */`, with nesting
-- the line doc forms `///` and `//!` (not `////`)
+- a line comment `//` to its line end, also `////` (a `/*` inside it opens nothing)
+- a block comment `/* */`, with nesting, also `/**/` and `/***`
 
-It keeps, so a change there is a code change (rustdoc may run these as doctests):
+It keeps each doc comment, whole, so a change there is a code change:
 
-- a block doc comment `/** */` or `/*! */`, whole
-- each line doc comment (`///` or `//!`) of a file in which a doc comment of either version holds three or
-  more backticks or three or more tildes anywhere in its text (a block doc comment counts too). A doc change
-  in such a file is a code change, because the fence may sit after a list or quote marker, a gap or a longer
-  fence, and a finding in doubt is code
-- a line doc comment whose text after the marker and at most one blank starts with four blanks or a tab
+- a line doc comment `///` (not `////`) or `//!`
+- a block doc comment `/** */` or `/*! */`
 
-Removing a comment also removes the blanks before it on its line. A block comment with a non-blank byte
+Why: rustdoc may run the text of a doc comment as a doctest, and a doctest can be written in many Markdown
+shapes (a fence, an indented block, a block after a list or quote marker). Telling those shapes apart is not
+attempted, so a doc comment wording fix is not words only. A doc comment in any file is kept, with or
+without a fence.
+
+Removing a plain comment also removes the blanks before it on its line. A block comment with a non-blank byte
 before it (ahead of those blanks) and a non-blank byte right after it is replaced by one blank, so two
 tokens are not joined. A line left with only blanks is dropped with its newline when it held comment text.
 A line that held no comment text is kept as it is, blank or not. A CR before an LF stays in the code, so a
@@ -120,6 +120,9 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
   comment lines, and `tests/intake.rs` runs that lint on its own file. `tests/manifest.rs` reads
   `docs/resource-manifest.md`. `ci/install-guide-smoke.sh` reads `README.md` and `docs/install.md`. A comment
   edit can fail a lint.
+- A doc comment wording fix (`///`, `//!`, `/** */`, `/*! */`) is not words only: it is `code-changed`.
+- A words-only answer can still go with a failing build or test: some checks read comment or docs text (see
+  above), and the gate catches those. A check that reads a plain comment can fail after a plain comment edit.
 - It says nothing about whether a sentence is true.
 - A `.md` words file passes on any change, so a `.md` file pulled into Rust docs with `include_str!` would let
   a doctest edit pass. No `.rs` file does that today.

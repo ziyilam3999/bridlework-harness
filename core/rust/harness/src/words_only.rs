@@ -1,8 +1,10 @@
 //! `harness ticket words-only` (std only, Unix; `docs/words-only.md` is the contract). Reads two commits of one
 //! repo and exits 0 when each change between them is comment text in a Rust file or text of a docs Markdown
-//! file; else it refuses. It decides no review and marks no finding: a caller uses it as one input. It does not
-//! replace the gate (some checks read comment and docs text), it reads shell files as not-words-file, it reads
-//! two commits and not the work tree, and a rebased fix round is refused as not-ancestor.
+//! file; else it refuses. Plain comments (`//`, `/* */`) are removed; each doc comment (`///`, `//!`, `/** */`,
+//! `/*! */`) is kept as code, whole, so a doc comment change is code-changed (rustdoc may run its text as a
+//! doctest). It decides no review and marks no finding: a caller uses it as one input. It does not replace the
+//! gate (some checks read comment and docs text), it reads shell files as not-words-file, it reads two commits
+//! and not the work tree, and a rebased fix round is refused as not-ancestor.
 //! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, raw tree compare, raw blob bytes.
 //! Exit codes: 0 words only; 1 refused (one stderr line); 2 usage or setup error (one stderr line, no path).
 
@@ -194,27 +196,11 @@ fn raw_end(s: &[u8], j: usize) -> Option<Option<usize>> {
     Some(None)
 }
 
-/// Three backticks or three tildes anywhere in the text: a doctest fence may be there (a finding in doubt is code).
-fn has_fence(t: &[u8]) -> bool {
-    t.windows(3).any(|w| w == b"```" || w == b"~~~")
-}
-
-fn starts_indented(x: &[u8]) -> bool {
-    x.first() == Some(&b'\t') || (x.len() >= 4 && x[..4].iter().all(|&b| is_blank(b)))
-}
-
-/// A doc line whose text after the marker and at most one blank starts with four blanks or a tab.
-fn indented(rest: &[u8]) -> bool {
-    starts_indented(rest) || (rest.first().is_some_and(|&b| is_blank(b)) && starts_indented(&rest[1..]))
-}
-
 struct Lexer<'a> {
     s: &'a [u8],
     out: Vec<u8>,
     line_start: usize,
     held: bool,
-    keep_all: bool,
-    fenced: bool,
 }
 
 impl Lexer<'_> {
@@ -266,13 +252,8 @@ impl Lexer<'_> {
             self.strip_start();
             return e;
         }
-        let rest = &s[i + 3..e];
-        self.fenced |= has_fence(rest);
-        if self.keep_all || indented(rest) {
-            self.out.extend_from_slice(&s[i..e]);
-        } else {
-            self.strip_start();
-        }
+        // A doc comment is kept whole: rustdoc may run its text as a doctest.
+        self.out.extend_from_slice(&s[i..e]);
         e
     }
 
@@ -295,7 +276,6 @@ impl Lexer<'_> {
         }
         let doc = s.get(i + 2) == Some(&b'!') || (s.get(i + 2) == Some(&b'*') && !matches!(s.get(i + 3), Some(b'*' | b'/')));
         if doc {
-            self.fenced |= has_fence(&s[i..j]);
             self.lit(&s[i..j]);
             return Some(j);
         }
@@ -308,10 +288,10 @@ impl Lexer<'_> {
     }
 }
 
-/// Reads Rust source and returns it with comments removed (the doc forms that run as doctests stay). None: the
-/// lexer cannot read it to its end. `keep_all` keeps each line doc comment. The flag: a doc comment holds a fence.
-fn strip_comments(s: &[u8], keep_all: bool) -> Option<(Vec<u8>, bool)> {
-    let mut x = Lexer { s, out: Vec::with_capacity(s.len()), line_start: 0, held: false, keep_all, fenced: false };
+/// Reads Rust source and returns it with plain comments removed; each doc comment (line or block) is kept as
+/// code, whole. None: the lexer cannot read it to its end.
+fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
+    let mut x = Lexer { s, out: Vec::with_capacity(s.len()), line_start: 0, held: false };
     let mut i = 0;
     while i < s.len() {
         let c = s[i];
@@ -363,7 +343,7 @@ fn strip_comments(s: &[u8], keep_all: bool) -> Option<(Vec<u8>, bool)> {
     if x.dropped_line() {
         x.out.truncate(x.line_start);
     }
-    Some((x.out, x.fenced))
+    Some(x.out)
 }
 
 fn path_bad(p: &[u8]) -> bool {
@@ -454,13 +434,8 @@ fn check_entry(repo: &Path, e: &Entry) -> Option<Result<&'static str, ()>> {
     if path.ends_with(".md") {
         return None;
     }
-    let (mut x, mut y) = (strip_comments(&old, false), strip_comments(&new, false));
-    // A fence in a doc comment of either version: each line doc comment is kept, so a change there is code.
-    if x.iter().chain(y.iter()).any(|r| r.1) {
-        (x, y) = (strip_comments(&old, true), strip_comments(&new, true));
-    }
-    match (x, y) {
-        (Some(x), Some(y)) if x.0 == y.0 => None,
+    match (strip_comments(&old), strip_comments(&new)) {
+        (Some(x), Some(y)) if x == y => None,
         (Some(_), Some(_)) => Some(Ok("code-changed")),
         _ => Some(Ok("unparsed")),
     }

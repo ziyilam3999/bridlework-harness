@@ -187,8 +187,13 @@ fn a_trailing_comment_edit_passes() {
 }
 
 #[test]
-fn a_doc_comment_edit_outside_a_fence_passes() {
-    rs_case("//! Crate.\n/// Does a thing.\nfn f() {}\n", "//! Crate text.\n/// Does another thing.\n///\n/// More words.\nfn f() {}\n").pass(1);
+fn a_doc_comment_edit_is_refused() {
+    rs_case("//! Crate.\n/// Does a thing.\nfn f() {}\n", "//! Crate text.\n/// Does another thing.\n///\n/// More words.\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_four_slash_and_triple_star_comment_edit_passes() {
+    rs_case("//// a\n/*** x ***/\n/**/\nfn f() {}\n", "//// b\n/*** y ***/\n/**/\nfn f() {}\n").pass(1);
 }
 
 #[test]
@@ -261,6 +266,46 @@ fn a_block_doc_comment_edit_is_refused() {
     rs_case("/** a word */\nfn f() {}\n", "/** a nord */\nfn f() {}\n").refused("a.rs code-changed");
 }
 
+// Doctest shapes that a fence rule missed: each is a doc comment change, so each is code.
+fn doc_edit(line: &str) -> Case {
+    rs_case(&format!("/// text\n///\n{line}\nfn f() {{}}\n"), &format!("/// text\n///\n{}\nfn f() {{}}\n", line.replace("1, 1", "1, 2")))
+}
+
+#[test]
+fn a_doc_attribute_fence_around_a_doc_line_is_refused() {
+    rs_case("#[doc = \"```\"]\n/// assert_eq!(1, 1);\n#[doc = \"```\"]\nfn f() {}\n", "#[doc = \"```\"]\n/// assert_eq!(1, 2);\n#[doc = \"```\"]\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn indented_code_inside_a_quote_is_refused() {
+    doc_edit("///  >     assert_eq!(1, 1);").refused("a.rs code-changed");
+}
+
+#[test]
+fn two_blanks_and_a_tab_in_a_doc_line_is_refused() {
+    doc_edit("///  \tassert_eq!(1, 1);").refused("a.rs code-changed");
+}
+
+#[test]
+fn indented_code_after_a_list_marker_is_refused() {
+    doc_edit("/// -     assert_eq!(1, 1);").refused("a.rs code-changed");
+}
+
+#[test]
+fn indented_code_after_a_numbered_marker_is_refused() {
+    doc_edit("/// 1.     assert_eq!(1, 1);").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_new_doctest_in_a_file_with_no_fence_is_refused() {
+    rs_case("/// text\nfn f() {}\n", "/// text\n///\n/// >     assert!(false);\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_quote_before_a_digit_is_unparsed() {
+    rs_case("fn f() { m!('1); } // a\n", "fn f() { m!('1); } // b\n").refused("a.rs unparsed");
+}
+
 #[test]
 fn slashes_inside_a_string_are_code() {
     rs_case("fn f() {\n    let s = \"a // b\";\n}\n", "fn f() {\n    let s = \"a // c\";\n}\n").refused("a.rs code-changed");
@@ -320,29 +365,6 @@ fn a_code_line_with_a_trailing_comment_changed_from_crlf_to_lf_is_refused() {
     rs_case("fn f() {\r\n    x(); // a\r\n}\r\n", "fn f() {\r\n    x(); // a\n}\r\n").refused("a.rs code-changed");
 }
 
-// A doc fence of either version keeps each line doc comment of the file, so these are code (rustdoc runs them).
-const DOC_TAIL: &str = "/// assert_eq!(x, 1);\n/// ```\nfn f() {}\n";
-
-fn doctest_split(gap: &str) -> Case {
-    let head = format!("/// ```\n/// let x = 1;\n{gap}");
-    rs_case(&format!("{head}{DOC_TAIL}"), &format!("{head}{}", DOC_TAIL.replace("x, 1", "x, 2")))
-}
-
-#[test]
-fn a_doctest_split_by_a_plain_comment_is_refused() {
-    doctest_split("// note\n").refused("a.rs code-changed");
-}
-
-#[test]
-fn a_doctest_split_by_a_blank_line_is_refused() {
-    doctest_split("\n").refused("a.rs code-changed");
-}
-
-#[test]
-fn a_doctest_split_by_a_doc_attribute_is_refused() {
-    doctest_split("#[doc = \"\"]\n").refused("a.rs code-changed");
-}
-
 #[test]
 fn a_fence_after_a_list_marker_is_refused() {
     rs_case("/// - ```\n///   assert_eq!(1, 1);\n///   ```\nfn f() {}\n", "/// - ```\n///   assert_eq!(1, 2);\n///   ```\nfn f() {}\n").refused("a.rs code-changed");
@@ -351,11 +373,6 @@ fn a_fence_after_a_list_marker_is_refused() {
 #[test]
 fn a_fence_after_a_quote_marker_is_refused() {
     rs_case("/// > ```\n/// > assert_eq!(1, 1);\n/// > ```\nfn f() {}\n", "/// > ```\n/// > assert_eq!(1, 2);\n/// > ```\nfn f() {}\n").refused("a.rs code-changed");
-}
-
-#[test]
-fn a_four_backtick_fence_with_an_inner_fence_line_is_refused() {
-    rs_case("/// ````\n/// ```\n/// let x = 1;\n/// ````\nfn f() {}\n", "/// ````\n/// ```\n/// let x = 2;\n/// ````\nfn f() {}\n").refused("a.rs code-changed");
 }
 
 #[test]
