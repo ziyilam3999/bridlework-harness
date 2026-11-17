@@ -84,15 +84,15 @@ One stdout line per finding, `red <class> <id>`, then the last line `plan check 
 | `duplicate-id <row id>` | an id on more than one row; named once, at its second row |
 | `unknown-state <row id>` | state `unknown` (fail closed: unknown is not a pass) |
 | `built-no-done-ticket <row id>` | state `built` and no linked ticket has a done record (a listed ticket with no ticket file does not count) |
-| `deviation-no-reason`, `deviation-no-decided-by`, `deviation-no-date <row id>` | state `deviation` and that key missing or empty, or the `deviation` null |
-| `deviation-bad-decided-by <row id>` | `decided_by` is not `operator` or `orchestrator-reading` |
+| `deviation-no-reason`, `deviation-no-decided-by`, `deviation-no-date <row id>` | state `deviation` and that key missing, empty or blanks only, or the `deviation` null |
+| `deviation-bad-decided-by <row id>` | `decided_by` is given and is not `operator` or `orchestrator-reading` |
 | `ticket-names-unknown-row <ticket id> <element>` | a `main_plan_ref` element that is not an index id, on any ticket |
 | `done-ticket-no-row <ticket id>` | a done ticket with no `off_plan` and no linked row |
 | `done-record-no-ticket <name>` | a `.done` file with no ticket file |
 
 ### Ticket mode
 
-`plan check --ticket <id>` is the call the `bw finish --merge` wrapper makes before the merge, before the done record is written. `<tickets>/<id>.json` must be a ticket file (else exit 2). The three inputs are read and refused as above, so one broken file in either folder is exit 2. Findings are only about this ticket and the rows it links to: `no-plan-link <ticket id>` (no `off_plan` and no linked row), `ticket-names-unknown-row`, and for each linked row `duplicate-id`, `unknown-state` and the four `deviation-` classes. A done record is not needed. Red ends with `plan check red findings=<n>` (exit 1); green is exactly `plan check ok ticket=<id>` (exit 0). A finding about another row or ticket does not change the answer.
+`plan check --ticket <id>` is meant for the `bw finish --merge` wrapper (a later ticket), to be called before the merge and before the done record is written. `<tickets>/<id>.json` must be a ticket file (else exit 2). The three inputs are read and refused as above, so one broken file in either folder is exit 2. Findings are only about this ticket and the rows it links to: `no-plan-link <ticket id>` (no `off_plan` and no linked row), `ticket-names-unknown-row`, and for each linked row `duplicate-id`, `unknown-state` and the four `deviation-` classes. A done record is not needed. Red ends with `plan check red findings=<n>` (exit 1); green is exactly `plan check ok ticket=<id>` (exit 0). A finding about another row or ticket does not change the answer.
 
 ### plan status
 

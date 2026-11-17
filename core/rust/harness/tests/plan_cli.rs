@@ -1,5 +1,5 @@
-//! Process-level tests for `harness plan check|status`. Each test builds its own folders with made-up ids, runs the real binary and
-//! asserts the exact stdout, stderr and exit code. No test reads an environment variable.
+//! Process-level tests for `harness plan check|status`. Most tests build their own folders with made-up ids, run the real binary and
+//! assert the stdout, stderr and exit code (a few assert only part of the output). No test calls `std::env::var`.
 #![cfg(unix)]
 use std::fs;
 use std::path::PathBuf;
@@ -290,7 +290,7 @@ fn a_not_done_ticket_with_no_link_is_not_red() {
     is(&e.check(), 0, "plan check ok rows=1 tickets=1 done=0\n");
 }
 
-// ---- inputs: each case runs for check and for status
+// ---- inputs: most refusal cases run for check and for status
 
 fn both(e: &Env, err: &str) {
     for sub in ["check", "status"] {

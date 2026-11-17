@@ -3,7 +3,7 @@
 //! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
 //! done ticket, a done ticket with no row and no reason, an incomplete deviation, a repeated id, an unknown state); `status`
 //! reports rows per state and progress weighted by size (S=1, M=3, L=9). Both read only. They read links and states, not code.
-//! One unparsable ticket or bad done record makes every subcommand exit 2. Details: `docs/plan-index.md`.
+//! One unparsable ticket or bad done record makes check, status and ticket mode exit 2. Details: `docs/plan-index.md`.
 
 use crate::plan_index::{self, Row, State};
 use crate::ticket::Ticket;
