@@ -505,9 +505,9 @@ const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-ma
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 
-/// `harness ticket intake <ticket-file> --repo-map <id>=<dir> [--repo-map ...]`. Exit 0 accepted (one stdout line:
-/// `ticket=<id> repo_id=<id> head=<sha>`); 1 the ticket is refused (stdout empty, stderr names the field or the repo id);
-/// 2 usage error or the ticket file cannot be read (stdout empty). The repo comes from the ticket and the map only, never from the
+/// `harness ticket intake <ticket-file> --repo-map <id>=<dir> [--repo-map ...] [--plan-index <absolute-file>]`. Exit 0 accepted
+/// (one stdout line: `ticket=<id> repo_id=<id> head=<sha>`); 1 the ticket is refused (stdout empty, stderr names the field, the
+/// repo id or the plan link); 2 usage error, a plan index refusal, or the ticket file cannot be read (stdout empty). The repo comes from the ticket and the map only, never from the
 /// working folder. Read-only. No folder (mapped or ticket file) is ever printed.
 fn ticket_cmd(a: &[String]) -> i32 {
     use crate::intake::{intake, RepoMap};

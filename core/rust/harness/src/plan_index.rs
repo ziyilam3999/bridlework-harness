@@ -1,7 +1,8 @@
 //! The plan index reader (std only, no cfg(unix); it does not use launcher.rs). The index is one file of JSON lines, one object per
 //! row with exactly eight keys (`docs/plan-index.md`). It is private data of the operator, passed by path; none of it is kept in this
 //! repo. The reader runs nothing and writes nothing. A refusal of a line names the line, and the field when it has one; no refusal prints a value or a path.
-//! It does not check whether a row is built; `harness ticket intake --plan-index` only checks that an id exists.
+//! It does not check whether a row is built; `harness ticket intake --plan-index` checks that each `main_plan_ref` element is an
+//! id of the index, and refuses an index with a repeated id.
 
 use std::io::Read;
 use std::path::Path;
