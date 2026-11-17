@@ -36,6 +36,7 @@ pub mod lane;
 #[cfg(unix)]
 pub mod launcher;
 pub mod lesson;
+pub mod limit_check;
 pub mod manifest;
 #[cfg(unix)]
 pub mod merge_text;
