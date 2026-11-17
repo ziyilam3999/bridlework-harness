@@ -51,11 +51,11 @@ A Claude shape under `--provider zai`, or a z.ai code under `--provider claude`,
 
 ## Other and unknown
 
-Other (exit 4): the row has `apiErrorIsTransient` true, or its status is not 429 and its error is not `rate_limit` and its
-text holds no limit marker.
+Other (exit 4): the row has `apiErrorIsTransient` true, or it has a text item, its status is not 429, its error is not
+`rate_limit` and its text holds no limit marker.
 
 Unknown (exit 5): any other last error row: a 429 or `rate_limit` row that matches no shape, a `[1308]` row, a provider
-mismatch, a row with a marker whose status is not 429 or whose error is not `rate_limit`, a row with no text item.
+mismatch, a row with a marker whose status is not 429 or whose error is not `rate_limit`, a row that is not transient and has no text item.
 
 The limit markers are the starts `You've hit your ` and `You've reached your `, and the words `[1310]`, `[1113]`, `[1308]` and
 `Limit Exhausted`. The plain word limit is not a marker. Exit 0 means limit and nothing else.
@@ -66,7 +66,7 @@ The limit markers are the starts `You've hit your ` and `You've reached your `, 
 
 - z.ai 1310: the text time `YYYY-MM-DD HH:MM:SS` is read at +08:00, the provider zone.
 - Claude: the words after `resets ` and before the opening bracket of the zone name are `Mon D at <clock>` or `<clock>` alone.
-  `<clock>` is `H am`, `H pm`, `H:MM am` or `H:MM pm` written with no space. The time is local at `--utc-offset`; the zone name
+  `<clock>` is `Ham`, `Hpm`, `H:MMam` or `H:MMpm` (lowercase, no space; H 1 to 12, MM two digits 00 to 59). The time is local at `--utc-offset`; the zone name
   in the text is not checked. Without `--utc-offset` the Claude reset is unknown.
 - A date with no year takes the year of now at that offset, and the next year when that moment is not after now. A clock with
   no date takes today at that offset, or tomorrow when that moment is not after now. Feb 29 is read only in a leap year.
@@ -76,8 +76,10 @@ The limit markers are the starts `You've hit your ` and `You've reached your `, 
 ## Output line
 
 One stdout line on exit 0, 4 and 5, fields in this order separated by one space:
-`class provider scope code resets text`. `text=` is last and holds the first 80 characters of the error text, each control
-character replaced by one space. On exit 4 and 5, `provider`, `scope` are `-` and `code` is the status or `-`.
+`class provider scope code resets text`. `text=` is last and holds the first 80 characters of the error text, each character
+below U+0020, and U+007F, replaced by one space. On exit 4 and 5, `provider`, `scope` are `-` and `code` is `apiErrorStatus` when it is a whole number of up to 6 digits, else `-`.
+
+Run with `--utc-offset +08:00` and `--now-ms` at 2026-11-17T00:00:00Z:
 
 ```
 class=limit provider=claude scope=provider code=weekly resets=2026-11-19T03:00:00Z text=You've hit your weekly limit · resets Nov 19 at 11am (Etc/UTC)
@@ -90,7 +92,7 @@ class=unknown provider=- scope=- code=429 resets=unknown text=Too many requests
 | exit | meaning | stdout | stderr |
 |---|---|---|---|
 | 0 | the last error row is a limit | one line | empty |
-| 2 | usage: missing, repeated or unknown flag, bad value, stray word | empty | the usage text |
+| 2 | usage: missing, repeated or unknown flag, bad value, stray word; or the system clock is before the epoch | empty | the usage text, or `harness: error: clock is before the epoch` |
 | 3 | the transcript is unreadable: missing, not a regular file, empty, not UTF-8, a line that is not a JSON object | empty | `harness: limit-check refused: reason=unreadable` and the cause, with the 1-based line number for a line problem |
 | 4 | other | one line | empty |
 | 5 | unknown | one line | empty |

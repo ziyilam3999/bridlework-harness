@@ -344,7 +344,7 @@ fn digits_to(t: &str) -> Option<i128> {
     t.parse().ok()
 }
 
-/// `H am`, `H pm`, `H:MM am`, `H:MM pm` written without the space: seconds since midnight.
+/// `Ham`, `Hpm`, `H:MMam`, `H:MMpm` (lowercase, no space; H 1 to 12, MM two digits): seconds since midnight.
 fn parse_clock(t: &str) -> Option<i128> {
     let (body, pm) = match (t.strip_suffix("am"), t.strip_suffix("pm")) {
         (Some(b), _) => (b, false),
@@ -511,7 +511,7 @@ fn classify(row: &ErrorRow, provider: &str, offset_s: Option<i128>, now_ms: i128
     Verdict::Other
 }
 
-/// The first 80 characters of the text, each control character replaced by one space.
+/// The first 80 characters of the text, each character below U+0020, and U+007F, replaced by one space.
 fn short_text(text: &str) -> String {
     text.chars().take(80).map(|c| if (c as u32) < 0x20 || c as u32 == 0x7f { ' ' } else { c }).collect()
 }
@@ -550,7 +550,7 @@ fn usage() -> i32 {
     2
 }
 
-/// `harness session limit-check ...`. Exit 0 limit, 2 usage, 3 unreadable transcript, 4 other, 5 unknown, 6 no error row or
+/// `harness session limit-check ...`. Exit 0 limit, 2 usage or a clock before the epoch, 3 unreadable transcript, 4 other, 5 unknown, 6 no error row or
 /// the seat recovered. One stdout line on 0, 4 and 5; stdout is empty otherwise.
 pub fn limit_check_cmd(a: &[String]) -> i32 {
     let mut transcript: Option<&str> = None;
