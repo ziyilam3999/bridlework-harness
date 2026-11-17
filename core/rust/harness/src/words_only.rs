@@ -5,8 +5,8 @@
 //! doctest). It decides no review and marks no finding: a caller uses it as one input. It does not replace the
 //! gate (some checks read comment and docs text), it reads shell files as not-words-file, it reads two commits
 //! and not the work tree, and a rebased fix round is refused as not-ancestor. A raw lifetime ('r#name) and a
-//! shebang first line are not read: unparsed. line!() and column!() move with a comment edit; two commits
-//! with equal trees pass with files=0.
+//! shebang first line are not read: unparsed. line!() and column!() can move with a comment edit; two
+//! commits with equal trees pass with files=0.
 //! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch (a blob missing from a
 //! partial clone fails the call), raw tree compare, raw blob bytes.
 //! Exit codes: 0 words only; 1 refused (one stderr line); 2 usage or setup error (one stderr line, no path).
@@ -301,8 +301,8 @@ impl Lexer<'_> {
     }
 }
 
-/// A first line that starts with `#!` (after an optional BOM) and is not an inner attribute `#![`: rustc drops
-/// it, this lexer would read it as code, so the file is not read.
+/// A first line that starts with `#!` (after an optional BOM) whose next non-blank byte is not `[` (an inner
+/// attribute such as `#![`): rustc drops it, this lexer would read it as code, so the file is not read.
 fn shebang(s: &[u8]) -> bool {
     let s = s.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(s);
     let Some(rest) = s.strip_prefix(b"#!") else { return false };

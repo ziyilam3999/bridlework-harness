@@ -77,7 +77,7 @@ A refusal is exit 1 with one stderr line `harness: words-only refused: <path or 
 - `too-large`: either blob is over 1 MiB. It is refused, not cut.
 - `not-utf8`: either blob is not UTF-8.
 - `unparsed`: the lexer cannot read a `.rs` version to its end (an unterminated string, char literal or
-  block comment), or the version holds a form it does not read: a raw lifetime before a string or a shebang
+  block comment), or the version holds a form it does not read: a raw lifetime or a shebang
   first line (see the lexer part).
 - `code-changed`: the two `.rs` versions differ after plain comments are removed.
 
@@ -118,8 +118,8 @@ after `r#` in a raw identifier (`r#r`).
 
 Two forms are refused as `unparsed`, because the lexer cannot tell how rustc reads what follows:
 
-- a raw lifetime `'r#name` (the lifetime `'r` followed by `#`), which would let a following string be read as
-  a raw string
+- a raw lifetime `'r#name` (the lifetime `'r` followed by `#`), which for a name `r`, `br` or `cr` would
+  let a following string be read as a raw string
 - a shebang first line: the file starts with `#!` (after an optional BOM) and the next non-blank byte is not
   `[`. rustc drops that line, so a `/*` or a quote in it must not open a comment or string here. A file that
   starts with an inner attribute such as `#![allow(dead_code)]` is not a shebang file.
@@ -145,8 +145,8 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
 - A words-only answer can still go with a failing build or test: some checks read comment or docs text (see
   above), and the gate catches those. A check that reads a plain comment can fail after a plain comment edit.
 - An added or removed comment line moves `line!()` values and panic locations, and a plain comment edit
-  that changes the line count can change them. `column!()` moves with an edit of a block comment inside a
-  line, as `line!()` does with a line change.
+  that changes the line count can change them. `column!()` can move with an edit of a block comment inside a
+  line, as `line!()` can with a line change.
 - Two commits with equal trees (for example an empty commit) pass with `files=0`.
 - It says nothing about whether a sentence is true.
 - A `.md` words file passes on any change, so a `.md` file pulled into Rust docs with `include_str!` would let
