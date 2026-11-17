@@ -304,7 +304,7 @@ fn a_char_literal_quote_does_not_open_a_string() {
 }
 
 // Three quotes of lifetimes: a lexer that reads each quote as a char opener pairs the first two, opens a
-// third literal that never closes and answers unparsed (exit 1) where the right answer is a pass.
+// third literal that does not close and answers unparsed (exit 1) where the right answer is a pass.
 #[test]
 fn a_lifetime_is_not_a_char_literal() {
     rs_case("fn f<'a>(x: &'a u8, y: &'a u8) {} // one\n", "fn f<'a>(x: &'a u8, y: &'a u8) {} // two\n").pass(1);

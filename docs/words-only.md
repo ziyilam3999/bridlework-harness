@@ -117,8 +117,8 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
 - It does not replace the gate, because some checks read comment and docs text. As of 1ef1556,
   `ci/lint-rust-tests.sh` and `ci/lint-fixtures.sh` read a code line with a trailing comment and block
   comment lines, and `tests/intake.rs` runs that lint on its own file. `tests/manifest.rs` reads
-  `docs/resource-manifest.md`. `ci/install-guide-smoke.sh` reads `README.md` and `docs/install.md`. A removed
-  doc comment can fail a lint.
+  `docs/resource-manifest.md`. `ci/install-guide-smoke.sh` reads `README.md` and `docs/install.md`. A comment
+  edit can fail a lint.
 - It says nothing about whether a sentence is true.
 - It reads shell files as `not-words-file` (a later change).
 - It reads two commits, not the work tree.

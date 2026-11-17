@@ -242,7 +242,7 @@ impl Lexer<'_> {
         self.held && body.iter().all(|&b| is_blank(b))
     }
 
-    /// Copies a kept span (a literal or a kept comment) as it is; a newline inside it is never dropped.
+    /// Copies a kept span (a literal or a kept comment) as it is; a newline inside it is not dropped.
     fn lit(&mut self, seg: &[u8]) {
         for &b in seg {
             self.out.push(b);
