@@ -414,6 +414,41 @@ fn a_raw_identifier_named_r_does_not_open_a_raw_string() {
     tail_case("const S: &str = stringify!(r#r\"q\\\" // x\");").refused("a.rs code-changed");
 }
 
+// A raw lifetime 'r#name is one token for rustc: a lexer that reads only 'r then a raw string passes.
+#[test]
+fn a_raw_lifetime_before_a_string_is_unparsed() {
+    tail_case("const S: &str = stringify!('r#r\"q\\\" // x\");").refused("a.rs unparsed");
+}
+
+#[test]
+fn a_raw_lifetime_before_a_byte_string_is_unparsed() {
+    tail_case("const S: &str = stringify!('r#br\"q\\\" // x\");").refused("a.rs unparsed");
+}
+
+#[test]
+fn a_raw_lifetime_before_a_c_string_is_unparsed() {
+    tail_case("const S: &str = stringify!('r#cr\"q\\\" // x\");").refused("a.rs unparsed");
+}
+
+// rustc drops a shebang first line: a comment or string opener in it must not hide later code.
+#[test]
+fn a_shebang_with_a_block_opener_is_unparsed() {
+    let body = |a: u8| format!("#!/usr/bin/env run /*\nfn main() {{ let a = {a}; println!(\"{{}}\", a); }} // */\n");
+    rs_case(&body(1), &body(2)).refused("a.rs unparsed");
+}
+
+#[test]
+fn a_shebang_with_a_quote_is_unparsed() {
+    let body = |a: u8| format!("#!/usr/bin/env run \"\nfn main() {{ let a = {a}; }}\n// \"\n");
+    rs_case(&body(1), &body(2)).refused("a.rs unparsed");
+}
+
+#[test]
+fn an_inner_attribute_first_line_is_not_a_shebang() {
+    rs_case("#![allow(dead_code)]\nfn f() {} // a\n", "#![allow(dead_code)]\nfn f() {} // b\n").pass(1);
+    rs_case("#!  [allow(dead_code)]\nfn f() {} // a\n", "#!  [allow(dead_code)]\nfn f() {} // b\n").pass(1);
+}
+
 #[test]
 fn a_crlf_line_end_change_is_refused() {
     rs_case("fn f() {\r\n    x();\r\n}\r\n", "fn f() {\r\n    x();\n}\r\n").refused("a.rs code-changed");

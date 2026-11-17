@@ -1,7 +1,8 @@
 # harness ticket words-only
 
 Reads two commits of one repo and exits 0 when each change between them is plain comment text in a Rust file
-(a doc comment is code) or text of a docs Markdown file. Else it refuses.
+(a doc comment is code) or text of a docs Markdown file. Else it refuses. A form the lexer cannot read with
+certainty is refused as `unparsed`, not passed.
 
 ## Synopsis
 
@@ -34,7 +35,8 @@ a Markdown file elsewhere are not words files.
 Each git call runs on the repo dir, removes each inherited variable whose name starts with `GIT_`, gets no
 stdin and runs with `--no-replace-objects` and `--no-lazy-fetch`. It reads only: no fetch, no ref, config,
 index or work tree write. A blob that is missing from the object store (a partial clone) is not fetched: the
-call fails and the answer is exit 2 `harness: error: a git call failed`. Changed entries come from a raw tree
+call fails when that blob is read, and the answer is exit 2 `harness: error: a git call failed` (an earlier
+refused entry gives exit 1 first). Changed entries come from a raw tree
 compare with renames off. File contents come from the object store as raw bytes, so no text conversion,
 filter or diff driver runs. The work tree is not read.
 
@@ -75,7 +77,8 @@ A refusal is exit 1 with one stderr line `harness: words-only refused: <path or 
 - `too-large`: either blob is over 1 MiB. It is refused, not cut.
 - `not-utf8`: either blob is not UTF-8.
 - `unparsed`: the lexer cannot read a `.rs` version to its end (an unterminated string, char literal or
-  block comment).
+  block comment), or the version holds a form it does not read: a raw lifetime before a string or a shebang
+  first line (see the lexer part).
 - `code-changed`: the two `.rs` versions differ after plain comments are removed.
 
 ## What the lexer removes and keeps
@@ -97,7 +100,7 @@ without a fence.
 
 Removing a plain comment also removes the blanks before it on its line. A block comment with a non-blank byte
 before it (ahead of those blanks) and a non-blank byte right after it is replaced by one blank, so two
-tokens are not joined. A line left with only blanks is dropped with its newline when it held comment text.
+tokens are not joined (a CR or LF right after the comment counts as no byte). A line left with only blanks is dropped with its newline when it held comment text.
 A line that held no comment text is kept as it is, blank or not. A CR before an LF stays in the code, so a
 line end change on a code line is a code change.
 
@@ -112,6 +115,14 @@ Some tails are read as code with their token, as rustc reads them, so a followin
 escapes and not a raw string: the whole name of a lifetime or label (`'r`), the identifier suffix right after
 the end of a string, byte string, C string, raw string, char or byte literal (`'a'r`, `"z"r`), and the name
 after `r#` in a raw identifier (`r#r`).
+
+Two forms are refused as `unparsed`, because the lexer cannot tell how rustc reads what follows:
+
+- a raw lifetime `'r#name` (the lifetime `'r` followed by `#`), which would let a following string be read as
+  a raw string
+- a shebang first line: the file starts with `#!` (after an optional BOM) and the next non-blank byte is not
+  `[`. rustc drops that line, so a `/*` or a quote in it must not open a comment or string here. A file that
+  starts with an inner attribute such as `#![allow(dead_code)]` is not a shebang file.
 
 ## The ok line
 
@@ -134,7 +145,9 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
 - A words-only answer can still go with a failing build or test: some checks read comment or docs text (see
   above), and the gate catches those. A check that reads a plain comment can fail after a plain comment edit.
 - An added or removed comment line moves `line!()` values and panic locations, and a plain comment edit
-  that changes the line count can change them.
+  that changes the line count can change them. `column!()` moves with an edit of a block comment inside a
+  line, as `line!()` does with a line change.
+- Two commits with equal trees (for example an empty commit) pass with `files=0`.
 - It says nothing about whether a sentence is true.
 - A `.md` words file passes on any change, so a `.md` file pulled into Rust docs with `include_str!` would let
   a doctest edit pass. No `.rs` file does that today.
