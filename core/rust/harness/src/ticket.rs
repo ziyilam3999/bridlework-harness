@@ -1,4 +1,4 @@
-//! The ticket reader (std only). One ticket is one JSON file with exactly eleven keys (`docs/ticket-contract.md`); `Ticket::parse` turns
+//! The ticket reader (std only). One ticket is one JSON file with eleven required keys and two optional plan link keys (`docs/ticket-contract.md`); `Ticket::parse` turns
 //! the text into data and runs nothing. Reading fails closed: anything the contract does not name is a refusal that names the field.
 //! The repo comes from the ticket's `repo_id` through `RepoId`, never from the folder the reader runs in.
 
@@ -28,6 +28,45 @@ pub struct Ticket {
     pub risk: String,
     pub owner_role: String,
     pub evidence_links: Vec<String>,
+    /// Optional plan link: the plan index rows this ticket builds. As read by `parse`: not empty when present, not beside `off_plan`.
+    pub main_plan_ref: Option<Vec<String>>,
+    /// Optional plan link: one line saying why the ticket is off plan. Not judged.
+    pub off_plan: Option<String>,
+}
+
+/// Longest `off_plan` reason, in bytes.
+const MAX_OFF_PLAN_BYTES: usize = 300;
+
+/// The shape rules of the two optional link keys. Each Err names the field.
+fn check_links(plan_ref: &Option<Vec<String>>, off_plan: &Option<String>) -> Result<(), String> {
+    if plan_ref.is_some() && off_plan.is_some() {
+        return Err("`main_plan_ref` and `off_plan` must not both be given".to_string());
+    }
+    if let Some(list) = plan_ref {
+        if list.is_empty() {
+            return Err("`main_plan_ref`: must not be empty".to_string());
+        }
+        for (i, el) in list.iter().enumerate() {
+            if !crate::plan_index::id_ok(el) {
+                return Err("`main_plan_ref`: each element must be 1 to 64 bytes of letters, digits, '.', '_' or '-'".to_string());
+            }
+            if list[..i].contains(el) {
+                return Err("`main_plan_ref`: an element is repeated".to_string());
+            }
+        }
+    }
+    if let Some(s) = off_plan {
+        if s.is_empty() || s.trim().is_empty() {
+            return Err("`off_plan`: must not be empty or blank".to_string());
+        }
+        if s.len() > MAX_OFF_PLAN_BYTES {
+            return Err("`off_plan`: must be at most 300 bytes".to_string());
+        }
+        if s.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}') {
+            return Err("`off_plan`: must not hold a control character".to_string());
+        }
+    }
+    Ok(())
 }
 
 struct P<'a> {
@@ -146,8 +185,8 @@ fn one_of(name: &str, s: &str, list: &[&str]) -> Result<(), String> {
 }
 
 impl Ticket {
-    /// Strict parse of the one ticket shape: eleven keys, each exactly once, no unknown key, no optional key, no default. The Err names
-    /// the field. Text over 1 MiB is refused.
+    /// Strict parse of the ticket shape: eleven keys, each exactly once, plus the optional `main_plan_ref` and `off_plan` (not both),
+    /// no unknown key, no default. The Err names the field. Text over 1 MiB is refused.
     pub fn parse(text: &str) -> Result<Ticket, String> {
         if text.len() > MAX_TICKET_BYTES {
             return Err("ticket is over 1 MiB".to_string());
@@ -157,6 +196,7 @@ impl Ticket {
         let (mut id, mut repo_id, mut title, mut group) = (None, None, None, None);
         let (mut size, mut objective, mut acceptance_criteria) = (None, None, None);
         let (mut dependencies, mut risk, mut owner_role, mut evidence_links) = (None, None, None, None);
+        let (mut main_plan_ref, mut off_plan) = (None, None);
         if p.peek() == Some(b'}') {
             p.i += 1;
         } else {
@@ -175,6 +215,8 @@ impl Ticket {
                     "risk" => once(&mut risk, "risk", field("risk", p.string())?)?,
                     "owner_role" => once(&mut owner_role, "owner_role", field("owner_role", p.string())?)?,
                     "evidence_links" => once(&mut evidence_links, "evidence_links", field("evidence_links", p.string_array())?)?,
+                    "main_plan_ref" => once(&mut main_plan_ref, "main_plan_ref", field("main_plan_ref", p.string_array())?)?,
+                    "off_plan" => once(&mut off_plan, "off_plan", field("off_plan", p.string())?)?,
                     _ => return Err(format!("unknown key `{}`", key)),
                 }
                 match p.peek() {
@@ -213,7 +255,8 @@ impl Ticket {
         }
         one_of("risk", &risk, &RISKS)?;
         one_of("owner_role", &owner_role, &OWNER_ROLES)?;
-        Ok(Ticket { id, repo_id, title, group, size, objective, acceptance_criteria, dependencies, risk, owner_role, evidence_links })
+        check_links(&main_plan_ref, &off_plan)?;
+        Ok(Ticket { id, repo_id, title, group, size, objective, acceptance_criteria, dependencies, risk, owner_role, evidence_links, main_plan_ref, off_plan })
     }
 
     /// Read from raw bytes: over 1 MiB and not UTF-8 are refused before any parsing.
@@ -384,5 +427,71 @@ mod tests {
         let mut drift = required_of(&drifted);
         drift.sort();
         assert_ne!(drift, want, "a schema that dropped a field is detected");
+    }
+
+    fn plus(key: &str, raw: &str) -> String {
+        let mut pairs: Vec<(&str, &str)> = base();
+        pairs.push((key, raw));
+        render(&pairs)
+    }
+
+    #[test]
+    fn an_eleven_key_ticket_still_parses_with_no_link() {
+        let t = Ticket::parse(&render(&base())).unwrap();
+        assert_eq!((t.main_plan_ref, t.off_plan), (None, None));
+    }
+
+    #[test]
+    fn each_link_shape_is_read() {
+        let t = Ticket::parse(&plus("main_plan_ref", "[\"R-1\",\"R.2_x\"]")).unwrap();
+        assert_eq!(t.main_plan_ref, Some(vec!["R-1".to_string(), "R.2_x".to_string()]));
+        assert_eq!(t.off_plan, None);
+        let t = Ticket::parse(&plus("off_plan", "\"a tool for the operator\"")).unwrap();
+        assert_eq!(t.off_plan.as_deref(), Some("a tool for the operator"));
+        assert_eq!(t.main_plan_ref, None);
+    }
+
+    #[test]
+    fn bad_link_values_are_refused_naming_the_field() {
+        let long_id = format!("[\"{}\"]", "a".repeat(65));
+        let long_reason = format!("\"{}\"", "r".repeat(301));
+        let ok_reason = format!("\"{}\"", "r".repeat(300));
+        assert!(Ticket::parse(&plus("off_plan", &ok_reason)).is_ok(), "300 bytes is the limit");
+        let ref_cases: Vec<&str> = vec!["[]", "[1]", "[\"\"]", "[\"a b\"]", "[\"a,b\"]", &long_id, "[\"A\",\"A\"]", "\"R-1\"", "null"];
+        for raw in ref_cases {
+            let err = Ticket::parse(&plus("main_plan_ref", raw)).expect_err(raw);
+            assert!(err.contains("`main_plan_ref`"), "names the field for {raw}: {err}");
+        }
+        let off_cases: Vec<&str> =
+            vec!["null", "\"\"", "\"   \"", "\"a\\nb\"", "\"a\\u0000b\"", "\"a\\tb\"", "\"a\\u007fb\"", "\"a\\rb\"", &long_reason, "5"];
+        for raw in off_cases {
+            let err = Ticket::parse(&plus("off_plan", raw)).expect_err(raw);
+            assert!(err.contains("`off_plan`"), "names the field for {raw}: {err}");
+        }
+        let mut both = base();
+        both.push(("main_plan_ref", "[\"R-1\"]"));
+        both.push(("off_plan", "\"why\""));
+        let err = Ticket::parse(&render(&both)).expect_err("both keys");
+        assert!(err.contains("main_plan_ref") && err.contains("off_plan"), "names both: {err}");
+        for (k, v) in [("main_plan_ref", "[\"R-1\"]"), ("off_plan", "\"why\"")] {
+            let mut twice = base();
+            twice.push((k, v));
+            twice.push((k, v));
+            let err = Ticket::parse(&render(&twice)).expect_err("key twice");
+            assert!(err.contains(k) && err.contains("duplicate"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_schema_names_the_two_optional_link_fields() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let schema = std::fs::read_to_string(repo.join("schemas/ticket.schema.json")).unwrap();
+        assert!(schema.contains("\"main_plan_ref\": {") && schema.contains("\"off_plan\": {"), "both keys are properties");
+        let mut got = required_of(&schema);
+        got.sort();
+        let mut want: Vec<String> = FIELDS.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want, "the required set is still the eleven");
+        assert!(!got.iter().any(|k| k == "main_plan_ref" || k == "off_plan"));
     }
 }

@@ -1,12 +1,14 @@
-# Ticket contract (v1)
+# Ticket contract (v2)
 
-A ticket is one JSON file with a fixed shape. This page is the contract in plain words. `schemas/ticket.schema.json` is the machine mirror of the same field set.
+A ticket is one JSON file with a fixed shape. This page is the contract in plain words. `schemas/ticket.schema.json` is the machine mirror of the same field set. The reader is `core/rust/harness/src/ticket.rs`.
 
-Status: contract only. No reader exists yet; the id type, the strict reader and their tests come in later tickets, and each rule below gains the name of the test that enforces it when that reader lands.
+## Changes from v1
 
-## The eleven fields
+v2 adds two optional plan link keys, `main_plan_ref` and `off_plan`. A v1 ticket (the 11 keys) reads unchanged.
 
-Every field is required. There are no optional fields and no defaults.
+## The eleven required fields
+
+The ticket has 11 required keys and two optional plan link keys (below). There are no defaults.
 
 | Field | Shape |
 |---|---|
@@ -22,7 +24,20 @@ Every field is required. There are no optional fields and no defaults.
 | `owner_role` | exactly one of the six role ids below |
 | `evidence_links` | array of strings, may be empty |
 
-No other key is allowed, and no key may appear twice.
+No key outside these 11 and the two plan link keys below is allowed, and no key may appear twice.
+
+## The plan link (optional)
+
+A ticket may carry one of two optional keys, not both:
+
+| Field | Shape |
+|---|---|
+| `main_plan_ref` | non-empty array of strings, each 1 to 64 bytes of ASCII letters, digits, `.`, `_` or `-`, none repeated: the plan index rows the ticket builds |
+| `off_plan` | string of 1 to 300 bytes, not blank, with no control character (U+0000 to U+001F, U+007F, also when written as an escape): one line saying why the ticket is off plan |
+
+The reader refuses a bad link shape with an error that names the field, so each caller that parses a ticket refuses it. A ticket with neither key parses as before.
+
+At this version only `harness ticket intake --plan-index <file>` checks the link against an index (see `docs/plan-index.md`): it requires one of the two keys and requires each `main_plan_ref` element to be an id of the index. The other callers check its shape (through the ticket parser), not the index.
 
 ## The repo id
 
@@ -49,14 +64,15 @@ The plan for this work assumed five roles; the spec lists six, so all six are al
 
 ## Refusal
 
-A reader of this contract refuses, and runs nothing, on: a missing field, an unknown or duplicate field, a wrongly typed value, a value outside a closed list, a malformed repo id, trailing text after the object, input that is not UTF-8, and a file over 1 MiB. A refusal names the field.
+A reader of this contract refuses, and runs nothing, on: a missing field, an unknown or duplicate field, both plan link keys, a bad plan link value, a wrongly typed value, a value outside a closed list, a malformed repo id, trailing text after the object, input that is not UTF-8, and a file over 1 MiB. A refusal names the field.
 
 ## Future fields
 
-The build spec v1.1 lists more ticket fields than the eleven above. They are not v1 fields. They are recorded here so none is silently lost; adding any of them is a later schema version, not an edit to v1.
+The build spec v1.1 lists more ticket fields than the eleven above. They are not fields yet. They are recorded here so none is silently lost; adding any of them is a later schema version.
+
+The item related main-plan objective is now met by `main_plan_ref`.
 
 - novelty
-- related main-plan objective
 - related milestone
 - related Wiki pages
 - related Skills and Hooks

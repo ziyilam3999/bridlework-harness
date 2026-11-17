@@ -44,6 +44,7 @@ pub mod owed;
 pub mod overlay;
 pub mod permission;
 pub mod path_map;
+pub mod plan_index;
 pub mod plugin;
 #[cfg(unix)]
 pub mod quarantine;

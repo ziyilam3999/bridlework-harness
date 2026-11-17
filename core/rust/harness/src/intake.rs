@@ -104,6 +104,19 @@ fn head_sha(dir: &Path) -> Option<String> {
     }
 }
 
+/// The plan link step, run only when an index is given. A ticket with neither key is refused; each `main_plan_ref` element must be an
+/// id of the index; an `off_plan` ticket passes. The Err is the text after `ticket refused: `.
+pub fn plan_link(ticket: &Ticket, rows: &[crate::plan_index::Row]) -> Result<(), String> {
+    match (&ticket.main_plan_ref, &ticket.off_plan) {
+        (None, None) => Err("no plan link: main_plan_ref or off_plan is required".to_string()),
+        (Some(list), _) => match list.iter().find(|el| !rows.iter().any(|r| &r.id == *el)) {
+            Some(el) => Err(format!("main_plan_ref names {el}, which is not in the plan index")),
+            None => Ok(()),
+        },
+        (None, Some(_)) => Ok(()),
+    }
+}
+
 /// Settle which repo a parsed ticket is about. Read-only; refuses rather than guesses.
 pub fn intake(ticket: &Ticket, map: &RepoMap) -> Result<Accepted, Refusal> {
     let id = ticket.repo_id.as_str().to_string();
@@ -165,6 +178,8 @@ mod tests {
             risk: "normal".to_string(),
             owner_role: "execution_verification".to_string(),
             evidence_links: vec![],
+            main_plan_ref: None,
+            off_plan: None,
         }
     }
 

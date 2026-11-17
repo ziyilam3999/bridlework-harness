@@ -501,13 +501,13 @@ fn session_record_start(rest: &[String]) -> i32 {
     }
 }
 
-const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> [--log <absolute-path>] | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>] | ticket merge-text <ticket-file> --pr <n> --body-file <absolute-file> --out-dir <absolute-dir> | ticket words-only --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>";
+const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] [--plan-index <absolute-file>] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> [--log <absolute-path>] | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>] | ticket merge-text <ticket-file> --pr <n> --body-file <absolute-file> --out-dir <absolute-dir> | ticket words-only --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 
-/// `harness ticket intake <ticket-file> --repo-map <id>=<dir> [--repo-map ...]`. Exit 0 accepted (one stdout line:
-/// `ticket=<id> repo_id=<id> head=<sha>`); 1 the ticket is refused (stdout empty, stderr names the field or the repo id);
-/// 2 usage error or the ticket file cannot be read (stdout empty). The repo comes from the ticket and the map only, never from the
+/// `harness ticket intake <ticket-file> --repo-map <id>=<dir> [--repo-map ...] [--plan-index <absolute-file>]`. Exit 0 accepted
+/// (one stdout line: `ticket=<id> repo_id=<id> head=<sha>`); 1 the ticket is refused (stdout empty, stderr names the field, the
+/// repo id or the plan link); 2 usage error, a plan index refusal, or the ticket file cannot be read (stdout empty). The repo comes from the ticket and the map only, never from the
 /// working folder. Read-only. No folder (mapped or ticket file) is ever printed.
 fn ticket_cmd(a: &[String]) -> i32 {
     use crate::intake::{intake, RepoMap};
@@ -546,12 +546,22 @@ fn ticket_cmd(a: &[String]) -> i32 {
     }
     let mut map = RepoMap::new();
     let mut file: Option<&str> = None;
+    let mut index: Option<&str> = None;
     let mut it = a[1..].iter();
     while let Some(arg) = it.next() {
         if arg == "--repo-map" {
             let Some(spec) = it.next() else { return fail("--repo-map is missing its value") };
             if let Err(e) = map.add(spec) {
                 return fail(&e);
+            }
+        } else if arg == "--plan-index" {
+            let Some(v) = it.next() else { return fail("--plan-index is missing its value") };
+            if index.replace(v.as_str()).is_some() {
+                return fail("--plan-index was given twice");
+            }
+            let p = std::path::Path::new(v);
+            if !p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
+                return fail("--plan-index must be an absolute path with no .. part");
             }
         } else if arg.starts_with("--") {
             return fail("unknown option");
@@ -562,6 +572,14 @@ fn ticket_cmd(a: &[String]) -> i32 {
     let Some(file) = file else {
         eprintln!("{}", TICKET_USAGE);
         return 2;
+    };
+    let plan_rows = match index {
+        Some(p) => match crate::plan_index::read(std::path::Path::new(p)) {
+            Ok(rows) if crate::plan_index::repeated_ids(&rows).is_empty() => Some(rows),
+            Ok(_) => return fail("plan index: an id appears on more than one row"),
+            Err(e) => return fail(&format!("plan index: {e}")),
+        },
+        None => None,
     };
     let mut bytes = Vec::new();
     let read = std::fs::File::open(file).and_then(|f| f.take(TICKET_READ_LIMIT).read_to_end(&mut bytes));
@@ -575,6 +593,12 @@ fn ticket_cmd(a: &[String]) -> i32 {
             return 1;
         }
     };
+    if let Some(rows) = &plan_rows {
+        if let Err(e) = crate::intake::plan_link(&ticket, rows) {
+            eprintln!("harness: ticket refused: {}", e);
+            return 1;
+        }
+    }
     match intake(&ticket, &map) {
         Ok(ok) => {
             println!("ticket={} repo_id={} head={}", ok.ticket_id, ok.repo_id.as_str(), ok.head_sha);
