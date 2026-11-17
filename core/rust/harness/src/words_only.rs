@@ -5,7 +5,8 @@
 //! doctest). It decides no review and marks no finding: a caller uses it as one input. It does not replace the
 //! gate (some checks read comment and docs text), it reads shell files as not-words-file, it reads two commits
 //! and not the work tree, and a rebased fix round is refused as not-ancestor.
-//! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, raw tree compare, raw blob bytes.
+//! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch (a blob missing from a
+//! partial clone fails the call), raw tree compare, raw blob bytes.
 //! Exit codes: 0 words only; 1 refused (one stderr line); 2 usage or setup error (one stderr line, no path).
 
 use std::path::{Component, Path, PathBuf};
@@ -69,10 +70,11 @@ fn parse_args(a: &[String]) -> Option<Args> {
     Some(Args { repo: PathBuf::from(repo), from: from.to_string(), to: to.to_string() })
 }
 
-/// One read-only git call on the repo: no inherited GIT_ name, no stdin, no replace refs. None: git cannot run.
+/// One read-only git call on the repo: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch of a
+/// missing object (a partial clone fails the call). None: git cannot run.
 fn git(repo: &Path, args: &[&str]) -> Option<Output> {
     let mut c = Command::new("git");
-    c.arg("--no-replace-objects").arg("-C").arg(repo).args(args);
+    c.arg("--no-replace-objects").arg("--no-lazy-fetch").arg("-C").arg(repo).args(args);
     for (k, _) in std::env::vars_os() {
         if k.as_encoded_bytes().starts_with(b"GIT_") {
             c.env_remove(&k);

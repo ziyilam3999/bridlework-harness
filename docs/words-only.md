@@ -32,8 +32,9 @@ a Markdown file elsewhere are not words files.
 ## How git is read
 
 Each git call runs on the repo dir, removes each inherited variable whose name starts with `GIT_`, gets no
-stdin and runs with `--no-replace-objects`. It reads only: no fetch, no ref, config, index or work tree
-write. Changed entries come from a raw tree compare with renames off. File contents come from the object
+stdin and runs with `--no-replace-objects` and `--no-lazy-fetch`. It reads only: no fetch, no ref, config,
+index or work tree write. A blob that is missing from the object store (a partial clone) is not fetched: the
+call fails and the answer is exit 2 `harness: error: a git call failed`. Changed entries come from a raw tree compare with renames off. File contents come from the object
 store as raw bytes, so no text conversion, filter or diff driver runs. The work tree is not read.
 
 ## Order of steps

@@ -266,6 +266,16 @@ fn a_block_doc_comment_edit_is_refused() {
     rs_case("/** a word */\nfn f() {}\n", "/** a nord */\nfn f() {}\n").refused("a.rs code-changed");
 }
 
+#[test]
+fn a_inner_line_doc_comment_edit_is_refused() {
+    rs_case("//! Crate.\nfn f() {}\n", "//! Crate text.\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn an_inner_block_doc_comment_edit_is_refused() {
+    rs_case("/*! a word */\nfn f() {}\n", "/*! a nord */\nfn f() {}\n").refused("a.rs code-changed");
+}
+
 // Doctest shapes that a fence rule missed: each is a doc comment change, so each is code.
 fn doc_edit(line: &str) -> Case {
     rs_case(&format!("/// text\n///\n{line}\nfn f() {{}}\n"), &format!("/// text\n///\n{}\nfn f() {{}}\n", line.replace("1, 1", "1, 2")))
@@ -346,6 +356,19 @@ fn a_byte_string_is_code() {
 fn a_char_literal_quote_does_not_open_a_string() {
     rs_case("fn f() {\n    let c = '\"'; // a\n}\n", "fn f() {\n    let c = '\"'; // b\n}\n").pass(1);
     rs_case("fn f() {\n    let c = '\"'; x(1);\n}\n", "fn f() {\n    let c = '\"'; x(2);\n}\n").refused("a.rs code-changed");
+}
+
+// An escaped quote does not end the string: a lexer that ends it there reads the rest as a comment.
+#[test]
+fn a_code_edit_after_an_escaped_quote_in_a_string_is_refused() {
+    rs_case("fn f() {\n    let s = \"a\\\" // b\";\n}\n", "fn f() {\n    let s = \"a\\\" // c\";\n}\n").refused("a.rs code-changed");
+}
+
+// The char literal '\'' holds an escaped quote: a lexer that ends it at that quote leaves a stray quote.
+#[test]
+fn a_char_literal_of_an_escaped_quote_is_read_to_its_end() {
+    rs_case("fn f() {\n    let q = '\\''; // a\n}\n", "fn f() {\n    let q = '\\''; // b\n}\n").pass(1);
+    rs_case("fn f() {\n    let q = '\\''; x(1);\n}\n", "fn f() {\n    let q = '\\''; x(2);\n}\n").refused("a.rs code-changed");
 }
 
 // Three quotes of lifetimes: a lexer that reads each quote as a char opener pairs the first two, opens a
@@ -581,6 +604,19 @@ fn is_read_only() {
     check_pass(&o, &c.from, &c.to, 1);
     assert!(before == snapshot(&c.dir), "the repo changed");
     assert!(before_cwd == snapshot(&cwd), "the working folder changed");
+}
+
+#[test]
+fn a_blob_missing_from_a_partial_clone_is_not_fetched() {
+    let c = rs_case(FN_BODY, "fn f() {\n    // two\n    x();\n}\n");
+    g(&c.dir, &["config", "uploadpack.allowFilter", "true"]);
+    let clone = c.t.0.join("clone");
+    let url = format!("file://{}", c.dir.display());
+    g(&c.t.0, &["clone", "-q", "--no-checkout", "--filter=blob:none", &url, clone.to_str().unwrap()]);
+    let before = snapshot(&clone.join(".git/objects"));
+    let o = run_with(&args_of(&clone, &c.from, &c.to), None, &[]);
+    check_exit2(&o, "harness: error: a git call failed");
+    assert!(before == snapshot(&clone.join(".git/objects")), "the object store changed");
 }
 
 // ---- usage and exit 2 ----
