@@ -24,7 +24,7 @@ The ticket has 11 required keys and two optional plan link keys (below). There a
 | `owner_role` | exactly one of the six role ids below |
 | `evidence_links` | array of strings, may be empty |
 
-No other key is allowed, and no key may appear twice.
+No key outside these 11 and the two plan link keys below is allowed, and no key may appear twice.
 
 ## The plan link (optional)
 

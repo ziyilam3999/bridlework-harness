@@ -33,7 +33,7 @@ One JSON object per line, with exactly these 8 keys, each once:
 - Refused for the file: missing, a folder or not readable; over 1 MiB; not UTF-8; zero rows.
 - A function lists the ids that appear on more than one row. Intake refuses an index with one.
 
-Each refusal names the line number and the field when there is one. It prints no value and no path. Each reason text is distinct for: missing or unreadable file, over the cap, not UTF-8, zero rows, and a line that does not parse.
+A refusal of a line names the line number, and the field when it has one; a refusal of the whole file names no line. No refusal prints a value or a path. Each reason text is distinct for: missing or unreadable file, over the cap, not UTF-8, zero rows, and a line that does not parse.
 
 ## Intake flag
 
@@ -52,7 +52,7 @@ Order, with the exit code of each step:
 5. The plan link, only when `--plan-index` is given: exit 1 with `harness: ticket refused: no plan link: main_plan_ref or off_plan is required`, or with `harness: ticket refused: main_plan_ref names <element>, which is not in the plan index` for the first element that is not an id of the index. An `off_plan` ticket passes this step.
 6. The repo lookup.
 
-Without `--plan-index`, intake behaves as before: no link is required and none is checked. The accept line is the same in both modes: `ticket=<id> repo_id=<id> head=<sha>`.
+Without `--plan-index`, no link is required and none is checked against an index; the shape of a link that is given is still checked at step 4. The accept line is the same in both modes: `ticket=<id> repo_id=<id> head=<sha>`.
 
 ## What it does not do
 

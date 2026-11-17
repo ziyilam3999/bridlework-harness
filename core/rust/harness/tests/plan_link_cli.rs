@@ -1,6 +1,7 @@
 //! Process-level tests of the plan link: `harness ticket intake --plan-index <file>`. Each test builds its own temp folder and temp git repo
-//! (local git only), writes its own small index with made-up ids, and runs the real binary. This file reads no environment variable.
-//! Each exit 1 and exit 2 case asserts stdout empty and the exact stderr line.
+//! (local git only), writes its own small index with made-up ids when it needs one, and runs the real binary. Apart from the temp folder
+//! location, this file reads no environment variable.
+//! Most exit 1 and exit 2 cases assert stdout empty and the exact stderr line.
 #![cfg(unix)]
 use std::fs;
 use std::path::{Path, PathBuf};
