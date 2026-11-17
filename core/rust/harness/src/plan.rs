@@ -1,0 +1,370 @@
+//! `harness plan check|status` (std only, no cfg(unix); it does not use launcher.rs or ticket_gate.rs). It reads three private
+//! inputs passed by path: the plan index (`plan_index.rs`), the folder of ticket files (`<id>.json`) and the folder of done records
+//! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
+//! done ticket, a done ticket with no row and no reason, an incomplete deviation, a repeated id, an unknown state); `status`
+//! reports rows per state and progress weighted by size (S=1, M=3, L=9). Both read only. They read links and states, not code.
+//! One unparsable ticket or bad done record makes every subcommand exit 2. Details: `docs/plan-index.md`.
+
+use crate::plan_index::{self, Row, State};
+use crate::ticket::Ticket;
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+pub const USAGE: &str = "usage: harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>]";
+
+const MAX_TICKET_BYTES: u64 = 1024 * 1024 + 1;
+const DONE_READ_CAP: u64 = 256;
+const DECIDERS: [&str; 2] = ["operator", "orchestrator-reading"];
+
+struct Args {
+    check: bool,
+    index: PathBuf,
+    tickets: PathBuf,
+    done: PathBuf,
+    ticket: Option<String>,
+}
+
+/// A ticket id or a file stem: the link element rule, not starting with a dot, no two dots in a row.
+fn name_ok(s: &str) -> bool {
+    plan_index::id_ok(s) && !s.starts_with('.') && !s.contains("..")
+}
+
+fn abs_ok(s: &str) -> bool {
+    let p = Path::new(s);
+    p.is_absolute() && !p.components().any(|c| c == Component::ParentDir)
+}
+
+fn parse_args(a: &[String]) -> Option<Args> {
+    let (sub, rest) = a.split_first()?;
+    let check = match sub.as_str() {
+        "check" => true,
+        "status" => false,
+        _ => return None,
+    };
+    let (mut index, mut tickets, mut done, mut ticket): (Option<&String>, Option<&String>, Option<&String>, Option<&String>) = (None, None, None, None);
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        let slot = match flag.as_str() {
+            "--index" => &mut index,
+            "--tickets" => &mut tickets,
+            "--done" => &mut done,
+            "--ticket" => &mut ticket,
+            _ => return None,
+        };
+        let v = it.next()?;
+        if slot.replace(v).is_some() {
+            return None;
+        }
+    }
+    let (index, tickets, done) = (index?, tickets?, done?);
+    if ![index, tickets, done].iter().all(|p| abs_ok(p)) || ticket.is_some_and(|t| !name_ok(t)) {
+        return None;
+    }
+    Some(Args { check, index: index.into(), tickets: tickets.into(), done: done.into(), ticket: ticket.cloned() })
+}
+
+/// One refusal text: the file name is shown only when it follows the id rule.
+fn refusal(kind: &str, stem: &str, what: &str) -> String {
+    if name_ok(stem) {
+        format!("{kind} {stem}: {what}")
+    } else {
+        format!("a {kind} file: {what}")
+    }
+}
+
+/// The names in `dir` ending in `ext`, in byte order. No sub-folder is read.
+fn list(dir: &Path, ext: &str, kind: &str) -> Result<Vec<String>, String> {
+    let gone = || format!("the {kind} folder is missing or cannot be read");
+    let mut names = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|_| gone())? {
+        let n = e.map_err(|_| gone())?.file_name().to_string_lossy().into_owned();
+        if n.ends_with(ext) {
+            names.push(n);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// The stem of an entry, after the name rule and the regular-file rule.
+fn entry<'a>(dir: &Path, name: &'a str, ext: &str, kind: &str) -> Result<&'a str, String> {
+    let stem = name.strip_suffix(ext).unwrap_or(name);
+    if !name_ok(stem) {
+        return Err(format!("a {kind} file name is outside the id rule"));
+    }
+    match std::fs::symlink_metadata(dir.join(name)) {
+        Ok(m) if m.file_type().is_file() => Ok(stem),
+        _ => Err(refusal(kind, stem, "is not a regular file")),
+    }
+}
+
+struct Inputs {
+    rows: Vec<Row>,
+    /// Ticket files in byte order of the id.
+    tickets: Vec<Ticket>,
+    /// Ids that have a done record.
+    done: BTreeSet<String>,
+}
+
+fn read_inputs(a: &Args) -> Result<Inputs, String> {
+    let rows = plan_index::read(&a.index).map_err(|e| format!("plan index: {e}"))?;
+    let mut tickets = Vec::new();
+    for name in list(&a.tickets, ".json", "tickets")? {
+        let stem = entry(&a.tickets, &name, ".json", "ticket")?;
+        let mut bytes = Vec::new();
+        let got = std::fs::File::open(a.tickets.join(&name)).and_then(|f| f.take(MAX_TICKET_BYTES).read_to_end(&mut bytes));
+        if got.is_err() {
+            return Err(refusal("ticket", stem, "cannot be read"));
+        }
+        let t = Ticket::parse_bytes(&bytes).map_err(|_| refusal("ticket", stem, "does not parse"))?;
+        if t.id != stem {
+            return Err(refusal("ticket", stem, "its id differs from its file name"));
+        }
+        tickets.push(t);
+    }
+    let mut done = BTreeSet::new();
+    for name in list(&a.done, ".done", "done")? {
+        let stem = entry(&a.done, &name, ".done", "done record")?;
+        let mut bytes = Vec::new();
+        let got = std::fs::File::open(a.done.join(&name)).and_then(|f| f.take(DONE_READ_CAP).read_to_end(&mut bytes));
+        if got.is_err() {
+            return Err(refusal("done record", stem, "cannot be read"));
+        }
+        let first = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
+        if first != format!("ticket={stem}").as_bytes() {
+            return Err(refusal("done record", stem, "its first line is not ticket=<id>"));
+        }
+        done.insert(stem.to_string());
+    }
+    Ok(Inputs { rows, tickets, done })
+}
+
+fn state_name(s: State) -> &'static str {
+    match s {
+        State::NotBuilt => "not-built",
+        State::InBuild => "in-build",
+        State::Built => "built",
+        State::Deviation => "deviation",
+        State::Later => "later",
+        State::Unknown => "unknown",
+    }
+}
+
+const STATES: [State; 6] = [State::NotBuilt, State::InBuild, State::Built, State::Deviation, State::Later, State::Unknown];
+
+/// A title or reason with each control character replaced by one blank.
+fn clean(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// Indices of the rows a ticket links to: it names the row id, or the row lists it.
+fn linked(rows: &[Row], t: &Ticket) -> Vec<usize> {
+    let named = |r: &Row| t.main_plan_ref.as_ref().is_some_and(|m| m.contains(&r.id));
+    (0..rows.len()).filter(|&i| named(&rows[i]) || rows[i].tickets.contains(&t.id)).collect()
+}
+
+fn points(t: &Ticket) -> u64 {
+    match t.size.as_str() {
+        "S" => 1,
+        "M" => 3,
+        _ => 9,
+    }
+}
+
+fn pct(part: u64, whole: u64) -> String {
+    (100 * part).checked_div(whole).map_or("none".to_string(), |p| p.to_string())
+}
+
+/// The deviation classes of one row (none unless its state is deviation).
+fn deviation_classes(r: &Row) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if r.state != State::Deviation {
+        return out;
+    }
+    let field = |f: fn(&plan_index::Deviation) -> &Option<String>| r.deviation.as_ref().and_then(|d| f(d).as_deref()).filter(|s| !s.trim().is_empty());
+    if field(|d| &d.reason).is_none() {
+        out.push("deviation-no-reason");
+    }
+    if field(|d| &d.decided_by).is_none() {
+        out.push("deviation-no-decided-by");
+    }
+    if field(|d| &d.date).is_none() {
+        out.push("deviation-no-date");
+    }
+    if field(|d| &d.decided_by).is_some_and(|v| !DECIDERS.contains(&v)) {
+        out.push("deviation-bad-decided-by");
+    }
+    out
+}
+
+/// True when row `i` is the second row of an id (a third sighting is not named again).
+fn second_of_id(rows: &[Row], i: usize) -> bool {
+    rows[..i].iter().filter(|e| e.id == rows[i].id).count() == 1
+}
+
+fn red(findings: &[String]) -> i32 {
+    for f in findings {
+        println!("{f}");
+    }
+    println!("plan check red findings={}", findings.len());
+    1
+}
+
+fn check(inp: &Inputs) -> i32 {
+    let (rows, tickets) = (&inp.rows, &inp.tickets);
+    let mut f: Vec<String> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if second_of_id(rows, i) {
+            f.push(format!("red duplicate-id {}", r.id));
+        }
+        if r.state == State::Unknown {
+            f.push(format!("red unknown-state {}", r.id));
+        }
+        if r.state == State::Built {
+            let any_done = tickets.iter().any(|t| inp.done.contains(&t.id) && linked(rows, t).contains(&i));
+            if !any_done {
+                f.push(format!("red built-no-done-ticket {}", r.id));
+            }
+        }
+        f.extend(deviation_classes(r).into_iter().map(|c| format!("red {c} {}", r.id)));
+    }
+    for t in tickets {
+        for el in t.main_plan_ref.iter().flatten().filter(|el| !rows.iter().any(|r| &r.id == *el)) {
+            f.push(format!("red ticket-names-unknown-row {} {el}", t.id));
+        }
+        if inp.done.contains(&t.id) && t.off_plan.is_none() && linked(rows, t).is_empty() {
+            f.push(format!("red done-ticket-no-row {}", t.id));
+        }
+    }
+    for d in inp.done.iter().filter(|d| !tickets.iter().any(|t| &t.id == *d)) {
+        f.push(format!("red done-record-no-ticket {d}"));
+    }
+    if f.is_empty() {
+        let done = tickets.iter().filter(|t| inp.done.contains(&t.id)).count();
+        println!("plan check ok rows={} tickets={} done={}", rows.len(), tickets.len(), done);
+        0
+    } else {
+        red(&f)
+    }
+}
+
+fn check_ticket(inp: &Inputs, t: &Ticket) -> i32 {
+    let rows = &inp.rows;
+    let links = linked(rows, t);
+    let mut f: Vec<String> = Vec::new();
+    if t.off_plan.is_none() && links.is_empty() {
+        f.push(format!("red no-plan-link {}", t.id));
+    }
+    for el in t.main_plan_ref.iter().flatten().filter(|el| !rows.iter().any(|r| &r.id == *el)) {
+        f.push(format!("red ticket-names-unknown-row {} {el}", t.id));
+    }
+    let mut dup_seen: Vec<&str> = Vec::new();
+    for &i in &links {
+        let r = &rows[i];
+        if rows.iter().filter(|e| e.id == r.id).count() > 1 && !dup_seen.contains(&r.id.as_str()) {
+            dup_seen.push(&r.id);
+            f.push(format!("red duplicate-id {}", r.id));
+        }
+        if r.state == State::Unknown {
+            f.push(format!("red unknown-state {}", r.id));
+        }
+        f.extend(deviation_classes(r).into_iter().map(|c| format!("red {c} {}", r.id)));
+    }
+    if f.is_empty() {
+        println!("plan check ok ticket={}", t.id);
+        0
+    } else {
+        red(&f)
+    }
+}
+
+fn status(inp: &Inputs) -> i32 {
+    let (rows, tickets) = (&inp.rows, &inp.tickets);
+    for s in STATES {
+        let ids: Vec<&str> = rows.iter().filter(|r| r.state == s).map(|r| r.id.as_str()).collect();
+        let list = if ids.is_empty() { "-".to_string() } else { ids.join(",") };
+        println!("state {} rows={} ids={}", state_name(s), ids.len(), list);
+    }
+    let links: Vec<Vec<usize>> = tickets.iter().map(|t| linked(rows, t)).collect();
+    let listed = |t: &Ticket| rows.iter().any(|r| r.tickets.contains(&t.id));
+    for t in tickets {
+        if let Some(reason) = &t.off_plan {
+            if !listed(t) {
+                let d = if inp.done.contains(&t.id) { "yes" } else { "no" };
+                println!("off-plan ticket={} done={} reason={}", t.id, d, clean(reason));
+            }
+        }
+    }
+    for (i, r) in rows.iter().enumerate() {
+        if r.state != State::Later {
+            continue;
+        }
+        let ids: Vec<&str> = tickets.iter().zip(&links).filter(|(_, l)| l.contains(&i)).map(|(t, _)| t.id.as_str()).collect();
+        if !ids.is_empty() {
+            println!("leaned-on row={} tickets={}", r.id, ids.join(","));
+        }
+    }
+    let (mut done_pts, mut left_pts, mut all_done) = (0u64, 0u64, 0u64);
+    for (t, l) in tickets.iter().zip(&links) {
+        let is_done = inp.done.contains(&t.id);
+        if is_done {
+            all_done += points(t);
+        }
+        if !l.is_empty() {
+            if is_done {
+                done_pts += points(t);
+            } else {
+                left_pts += points(t);
+            }
+        }
+    }
+    println!("progress done={} left={} percent={}", done_pts, left_pts, pct(done_pts, done_pts + left_pts));
+    println!("on-plan done={} all-done={} percent={}", done_pts, all_done, pct(done_pts, all_done));
+    0
+}
+
+fn status_ticket(inp: &Inputs, t: &Ticket) -> i32 {
+    let links = linked(&inp.rows, t);
+    for &i in &links {
+        let r = &inp.rows[i];
+        println!("row={} state={} plan_line={} title={}", r.id, state_name(r.state), r.plan_line, clean(&r.title));
+    }
+    if links.is_empty() {
+        match &t.off_plan {
+            Some(reason) => println!("off-plan reason={}", clean(reason)),
+            None => println!("no-plan-link ticket={}", t.id),
+        }
+    }
+    0
+}
+
+pub fn plan_cmd(a: &[String]) -> i32 {
+    let Some(args) = parse_args(a) else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
+    let inp = match read_inputs(&args) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("harness: error: {e}");
+            return 2;
+        }
+    };
+    let one = match &args.ticket {
+        Some(id) => match inp.tickets.iter().find(|t| &t.id == id) {
+            Some(t) => Some(t),
+            None => {
+                eprintln!("harness: error: the ticket file is missing");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    match (args.check, one) {
+        (true, None) => check(&inp),
+        (true, Some(t)) => check_ticket(&inp, t),
+        (false, None) => status(&inp),
+        (false, Some(t)) => status_ticket(&inp, t),
+    }
+}
