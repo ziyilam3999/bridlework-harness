@@ -38,7 +38,7 @@ call fails and the answer is exit 2 `harness: error: a git call failed`. Changed
 compare with renames off. File contents come from the object store as raw bytes, so no text conversion,
 filter or diff driver runs. The work tree is not read.
 
-The verb needs a git that accepts `--no-lazy-fetch`. On an older git each call fails, and the verb refuses
+The verb needs a git that accepts `--no-lazy-fetch`. On an older git each call fails, and the verb fails
 with exit 2 (`harness: error: the repo dir is not a git repo`).
 
 ## Order of steps

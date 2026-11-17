@@ -389,7 +389,7 @@ fn a_lifetime_before_a_string_with_a_quote_is_code() {
     .refused("a.rs code-changed");
 }
 
-// A token tail is code: a following r" is a plain string with escapes in rustc 2021, not a raw string.
+// A token tail is code: a following r" is a plain string with escapes, not a raw string.
 fn tail_case(line: &str) -> Case {
     rs_case(&format!("{line}\n"), &format!("{}\n", line.replace("// x", "// y")))
 }
@@ -603,7 +603,7 @@ fn a_git_dir_in_the_environment_is_ignored() {
 
 #[test]
 fn a_gitattributes_filter_is_not_run() {
-    // The attributes file is committed and the filter is required: a blob read through it fails the call.
+    // The attributes file is committed and the filter is required: a blob read through it would fail the call.
     let attrs: &[u8] = b"*.rs filter=boom diff=boom text eol=crlf\n";
     let c = case(&[("a.rs", b"fn f() { x(1); } // a\n"), (".gitattributes", attrs)], &[("a.rs", b"fn f() { x(1); } // b\n"), (".gitattributes", attrs)]);
     for (k, v) in [
