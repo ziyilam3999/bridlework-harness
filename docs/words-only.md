@@ -12,7 +12,8 @@ harness ticket words-only
   --to <full-sha>
 ```
 
-- `--repo-dir`: a git repo or a linked work tree. Absolute, with no `..` component.
+- `--repo-dir`: a git repo or a linked work tree. Absolute, with no `..` component. Git finds the repo upward
+  from it, so a folder inside a repo is accepted.
 - `--from`: 40 lowercase hex characters, the older commit.
 - `--to`: 40 lowercase hex characters, the newer commit.
 
@@ -83,12 +84,11 @@ The lexer reads each `.rs` version and removes comments:
 It keeps, so a change there is a code change (rustdoc runs these as doctests):
 
 - a block doc comment `/** */` or `/*! */`, whole
-- in a run of line doc comments, a fence line (text after the marker and leading blanks starts with three or
-  more backticks or three or more tildes) and the lines up to and with the next fence line of the same
-  character, or to the end of the run when none closes it
+- each line doc comment (`///` or `//!`) of a file in which a doc comment of either version holds three or
+  more backticks or three or more tildes anywhere in its text (a block doc comment counts too). A doc change
+  in such a file is a code change, because the fence may sit after a list or quote marker, a gap or a longer
+  fence, and a finding in doubt is code
 - a line doc comment whose text after the marker and at most one blank starts with four blanks or a tab
-
-A run of line doc comments is a set of consecutive lines that each end in a line doc comment.
 
 Removing a comment also removes the blanks before it on its line. A block comment with a non-blank byte
 before it (ahead of those blanks) and a non-blank byte right after it is replaced by one blank, so two
@@ -100,7 +100,8 @@ The lexer reads string literals with escapes, byte strings, raw strings (`r"..."
 number of `#`), byte and C string forms of both, raw identifiers such as `r#type` (not a raw string), char
 and byte literals (with escapes such as a quote, `\n` and `\u{...}`), and lifetimes and loop labels. A quote
 starts a char literal when the next character is a backslash, or when the character after the next one is
-a quote. Else it is a lifetime or label.
+a quote. Else it is a lifetime or label only when the next character is an ASCII letter, an underscore or a
+non-ASCII character; any other quote (for example `'1`) is `unparsed`.
 
 ## The ok line
 
@@ -120,6 +121,8 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
   `docs/resource-manifest.md`. `ci/install-guide-smoke.sh` reads `README.md` and `docs/install.md`. A comment
   edit can fail a lint.
 - It says nothing about whether a sentence is true.
+- A `.md` words file passes on any change, so a `.md` file pulled into Rust docs with `include_str!` would let
+  a doctest edit pass. No `.rs` file does that today.
 - It reads shell files as `not-words-file` (a later change).
 - It reads two commits, not the work tree.
 - A fix round that was rebased onto a new base is refused as `not-ancestor`.

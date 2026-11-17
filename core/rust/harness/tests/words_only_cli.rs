@@ -316,6 +316,49 @@ fn a_crlf_line_end_change_is_refused() {
 }
 
 #[test]
+fn a_code_line_with_a_trailing_comment_changed_from_crlf_to_lf_is_refused() {
+    rs_case("fn f() {\r\n    x(); // a\r\n}\r\n", "fn f() {\r\n    x(); // a\n}\r\n").refused("a.rs code-changed");
+}
+
+// A doc fence of either version keeps each line doc comment of the file, so these are code (rustdoc runs them).
+const DOC_TAIL: &str = "/// assert_eq!(x, 1);\n/// ```\nfn f() {}\n";
+
+fn doctest_split(gap: &str) -> Case {
+    let head = format!("/// ```\n/// let x = 1;\n{gap}");
+    rs_case(&format!("{head}{DOC_TAIL}"), &format!("{head}{}", DOC_TAIL.replace("x, 1", "x, 2")))
+}
+
+#[test]
+fn a_doctest_split_by_a_plain_comment_is_refused() {
+    doctest_split("// note\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_doctest_split_by_a_blank_line_is_refused() {
+    doctest_split("\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_doctest_split_by_a_doc_attribute_is_refused() {
+    doctest_split("#[doc = \"\"]\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_fence_after_a_list_marker_is_refused() {
+    rs_case("/// - ```\n///   assert_eq!(1, 1);\n///   ```\nfn f() {}\n", "/// - ```\n///   assert_eq!(1, 2);\n///   ```\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_fence_after_a_quote_marker_is_refused() {
+    rs_case("/// > ```\n/// > assert_eq!(1, 1);\n/// > ```\nfn f() {}\n", "/// > ```\n/// > assert_eq!(1, 2);\n/// > ```\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
+fn a_four_backtick_fence_with_an_inner_fence_line_is_refused() {
+    rs_case("/// ````\n/// ```\n/// let x = 1;\n/// ````\nfn f() {}\n", "/// ````\n/// ```\n/// let x = 2;\n/// ````\nfn f() {}\n").refused("a.rs code-changed");
+}
+
+#[test]
 fn an_unterminated_string_is_unparsed() {
     rs_case("fn f() {\n    let s = \"abc\";\n}\n", "fn f() {\n    let s = \"abc;\n}\n").refused("a.rs unparsed");
 }
@@ -410,20 +453,29 @@ fn a_blob_over_1_mib_is_refused() {
     case(&[("docs/big.md", b"small\n")], &[("docs/big.md", big.as_bytes())]).refused("docs/big.md too-large");
 }
 
-#[test]
-fn too_many_files_is_refused() {
+/// A commit pair that changes `n` docs files.
+fn many_files(n: usize) -> Case {
     let (t, dir) = init();
-    for i in 0..201 {
+    for i in 0..n {
         write(&dir, &format!("docs/f{i:03}.md"), b"a\n");
     }
     g(&dir, &["add", "-A"]);
     let from = commit(&dir);
-    for i in 0..201 {
+    for i in 0..n {
         write(&dir, &format!("docs/f{i:03}.md"), b"b\n");
     }
     g(&dir, &["add", "-A"]);
-    let c = Case { t, dir: dir.clone(), from, to: commit(&dir) };
-    c.refused("- too-many-files");
+    Case { t, dir: dir.clone(), from, to: commit(&dir) }
+}
+
+#[test]
+fn too_many_files_is_refused() {
+    many_files(201).refused("- too-many-files");
+}
+
+#[test]
+fn exactly_200_files_are_not_refused_on_count() {
+    many_files(200).pass(200);
 }
 
 #[test]

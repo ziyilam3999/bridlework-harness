@@ -194,14 +194,9 @@ fn raw_end(s: &[u8], j: usize) -> Option<Option<usize>> {
     Some(None)
 }
 
-fn fence_char(t: &[u8]) -> Option<u8> {
-    if t.starts_with(b"```") {
-        Some(b'`')
-    } else if t.starts_with(b"~~~") {
-        Some(b'~')
-    } else {
-        None
-    }
+/// Three backticks or three tildes anywhere in the text: a doctest fence may be there (a finding in doubt is code).
+fn has_fence(t: &[u8]) -> bool {
+    t.windows(3).any(|w| w == b"```" || w == b"~~~")
 }
 
 fn starts_indented(x: &[u8]) -> bool {
@@ -218,9 +213,8 @@ struct Lexer<'a> {
     out: Vec<u8>,
     line_start: usize,
     held: bool,
-    line: usize,
-    last_doc: Option<usize>,
-    fence: Option<u8>,
+    keep_all: bool,
+    fenced: bool,
 }
 
 impl Lexer<'_> {
@@ -233,7 +227,6 @@ impl Lexer<'_> {
         }
         self.line_start = self.out.len();
         self.held = false;
-        self.line += 1;
     }
 
     fn dropped_line(&self) -> bool {
@@ -249,7 +242,6 @@ impl Lexer<'_> {
             if b == b'\n' {
                 self.line_start = self.out.len();
                 self.held = false;
-                self.line += 1;
             }
         }
     }
@@ -275,26 +267,8 @@ impl Lexer<'_> {
             return e;
         }
         let rest = &s[i + 3..e];
-        if self.last_doc.is_none_or(|l| l + 1 != self.line) {
-            self.fence = None;
-        }
-        self.last_doc = Some(self.line);
-        let t = rest.iter().position(|&b| !is_blank(b)).map_or(&rest[rest.len()..], |p| &rest[p..]);
-        let fc = fence_char(t);
-        let keep = match (self.fence, fc) {
-            (Some(c), f) => {
-                if f == Some(c) {
-                    self.fence = None;
-                }
-                true
-            }
-            (None, Some(c)) => {
-                self.fence = Some(c);
-                true
-            }
-            (None, None) => indented(rest),
-        };
-        if keep {
+        self.fenced |= has_fence(rest);
+        if self.keep_all || indented(rest) {
             self.out.extend_from_slice(&s[i..e]);
         } else {
             self.strip_start();
@@ -321,11 +295,11 @@ impl Lexer<'_> {
         }
         let doc = s.get(i + 2) == Some(&b'!') || (s.get(i + 2) == Some(&b'*') && !matches!(s.get(i + 3), Some(b'*' | b'/')));
         if doc {
+            self.fenced |= has_fence(&s[i..j]);
             self.lit(&s[i..j]);
             return Some(j);
         }
         self.strip_start();
-        self.line += s[i..j].iter().filter(|&&b| b == b'\n').count();
         let after = s.get(j).is_some_and(|&b| !is_blank(b) && b != b'\n' && b != b'\r');
         if self.out.len() > self.line_start && after {
             self.out.push(b' ');
@@ -335,9 +309,9 @@ impl Lexer<'_> {
 }
 
 /// Reads Rust source and returns it with comments removed (the doc forms that run as doctests stay). None: the
-/// lexer cannot read it to its end.
-fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
-    let mut x = Lexer { s, out: Vec::with_capacity(s.len()), line_start: 0, held: false, line: 0, last_doc: None, fence: None };
+/// lexer cannot read it to its end. `keep_all` keeps each line doc comment. The flag: a doc comment holds a fence.
+fn strip_comments(s: &[u8], keep_all: bool) -> Option<(Vec<u8>, bool)> {
+    let mut x = Lexer { s, out: Vec::with_capacity(s.len()), line_start: 0, held: false, keep_all, fenced: false };
     let mut i = 0;
     while i < s.len() {
         let c = s[i];
@@ -389,7 +363,7 @@ fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
     if x.dropped_line() {
         x.out.truncate(x.line_start);
     }
-    Some(x.out)
+    Some((x.out, x.fenced))
 }
 
 fn path_bad(p: &[u8]) -> bool {
@@ -480,8 +454,13 @@ fn check_entry(repo: &Path, e: &Entry) -> Option<Result<&'static str, ()>> {
     if path.ends_with(".md") {
         return None;
     }
-    match (strip_comments(&old), strip_comments(&new)) {
-        (Some(x), Some(y)) if x == y => None,
+    let (mut x, mut y) = (strip_comments(&old, false), strip_comments(&new, false));
+    // A fence in a doc comment of either version: each line doc comment is kept, so a change there is code.
+    if x.iter().chain(y.iter()).any(|r| r.1) {
+        (x, y) = (strip_comments(&old, true), strip_comments(&new, true));
+    }
+    match (x, y) {
+        (Some(x), Some(y)) if x.0 == y.0 => None,
         (Some(_), Some(_)) => Some(Ok("code-changed")),
         _ => Some(Ok("unparsed")),
     }
