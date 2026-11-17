@@ -71,6 +71,8 @@ pub mod tree_prep;
 pub mod workspace;
 #[cfg(unix)]
 pub mod workspace_check;
+#[cfg(unix)]
+pub mod words_only;
 
 /// Crate version string printed by `harness --version`.
 pub fn version_line() -> String {
