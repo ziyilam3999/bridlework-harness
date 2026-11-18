@@ -598,24 +598,38 @@ fn diff_hits(tok: &str, d: &Diff) -> bool {
     if !tp.is_empty() && d.paths.iter().any(|p| path_parts(p).starts_with(&tp)) {
         return true;
     }
-    let low = tok.to_lowercase();
+    // A cheap pre-check: the lower case of each character is joined, as `word_in` compares them.
+    let low = lower(tok);
     d.lines.iter().any(|(l, orig)| l.contains(&low) && word_in(tok, orig))
 }
 
-/// One read-only git call: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch, no stderr. The
-/// answer is read to `limit` bytes; Err(true) is an answer over it, Err(false) a call that cannot run or fails.
-fn git_read(repo: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, bool> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut c = Command::new("git");
+/// The lower case of each character, one by one (not of the whole string, which reads a word-final sigma
+/// differently).
+fn lower(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// A git command in the repo: no inherited GIT_ name, no replace refs, no lazy fetch, no color, no external diff.
+fn git_cmd(repo: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("git");
     c.arg("--no-replace-objects").arg("--no-lazy-fetch").arg("-C").arg(repo);
     c.args(["-c", "color.ui=false", "-c", "diff.relative=false", "-c", "diff.external=", "-c", "core.fsmonitor=false"]);
-    c.args(args);
+    c.args(["-c", "diff.interHunkContext=0", "-c", "diff.suppressBlankEmpty=false"]);
     for (k, _) in std::env::vars_os() {
         if k.as_encoded_bytes().starts_with(b"GIT_") {
             c.env_remove(&k);
         }
     }
+    c
+}
+
+/// One read-only git call: no stdin, no stderr. The answer is read to `limit` bytes; Err(true) is an answer
+/// over it, Err(false) a call that cannot run or fails.
+fn git_read(repo: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, bool> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut c = git_cmd(repo);
+    c.args(args);
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| false)?;
     let mut buf = Vec::new();
     let read = child.stdout.take().map(|o| o.take(limit as u64 + 1).read_to_end(&mut buf));
@@ -647,15 +661,84 @@ fn raw_paths(raw: &[u8]) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The blob ids (not all zero) of the `index` lines of a full-index patch. A hunk line never starts with `index `.
+fn index_ids(l: &[u8]) -> Vec<String> {
+    let Some(r) = l.strip_prefix(b"index ") else { return Vec::new() };
+    let Ok(r) = std::str::from_utf8(r) else { return Vec::new() };
+    let ids = r.split(' ').next().unwrap_or("");
+    ids.split("..").filter(|s| !s.is_empty() && s.bytes().any(|b| b != b'0')).map(str::to_string).collect()
+}
+
+/// Which blobs hold a NUL byte in their first 8000 bytes: the default rule of git for a binary file, read here so
+/// that no attribute, size or user setting decides it. A missing object or a non-blob reads as text.
+fn nul_blobs(repo: &Path, ids: &[String]) -> Result<HashMap<String, bool>, ()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+    let mut res = HashMap::new();
+    if ids.is_empty() {
+        return Ok(res);
+    }
+    let mut c = git_cmd(repo);
+    c.args(["cat-file", "--batch"]);
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| ())?;
+    let (Some(mut sin), Some(sout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(());
+    };
+    let input: Vec<u8> = ids.iter().flat_map(|s| format!("{}\n", s).into_bytes()).collect();
+    let writer = std::thread::spawn(move || {
+        let _ = sin.write_all(&input);
+    });
+    let mut r = BufReader::new(sout);
+    let mut read_all = || -> Result<(), ()> {
+        for id in ids {
+            let mut head = String::new();
+            if r.read_line(&mut head).map_err(|_| ())? == 0 {
+                return Err(());
+            }
+            let f: Vec<&str> = head.trim_end().split(' ').collect();
+            let nul = match f.as_slice() {
+                [_, "missing"] => false,
+                [_, kind, size] => {
+                    let size: u64 = size.parse().map_err(|_| ())?;
+                    let mut first = Vec::new();
+                    r.by_ref().take(size.min(8000)).read_to_end(&mut first).map_err(|_| ())?;
+                    // the rest of the object and the newline after it
+                    std::io::copy(&mut r.by_ref().take(size - first.len() as u64 + 1), &mut std::io::sink()).map_err(|_| ())?;
+                    *kind == "blob" && first.contains(&0)
+                }
+                _ => return Err(()),
+            };
+            res.insert(id.clone(), nul);
+        }
+        Ok(())
+    };
+    let ok = read_all();
+    if ok.is_err() {
+        let _ = child.kill();
+    }
+    let _ = writer.join();
+    let st = child.wait();
+    if ok.is_err() || !st.is_ok_and(|s| s.success()) {
+        return Err(());
+    }
+    Ok(res)
+}
+
 /// The added lines of a `-U0` patch, read by the hunk counts so a line that only looks like a file header is
-/// still a line. A gitlink change has no line read. None: the patch cannot be read.
-fn added_lines(patch: &[u8]) -> Option<Vec<(String, String)>> {
+/// still a line. A gitlink change and a file with a NUL byte (`bin`) have no line read. None: the patch cannot be read.
+fn added_lines(patch: &[u8], bin: &HashMap<String, bool>) -> Option<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut gitlink = false;
+    let mut binary = false;
     let mut it = patch.split(|&b| b == b'\n');
     while let Some(l) = it.next() {
         if l.starts_with(b"diff --git ") {
             gitlink = false;
+            binary = false;
+        } else if l.starts_with(b"index ") && !l.ends_with(b" 160000") {
+            binary = index_ids(l).iter().any(|i| bin.get(i) == Some(&true));
         } else if l.starts_with(b"new file mode 160000")
             || l.starts_with(b"deleted file mode 160000")
             || l.starts_with(b"new mode 160000")
@@ -681,11 +764,16 @@ fn added_lines(patch: &[u8]) -> Option<Vec<(String, String)>> {
                     Some(b'-') if old > 0 => old -= 1,
                     Some(b'+') if new > 0 => {
                         new -= 1;
-                        if !gitlink {
+                        if !gitlink && !binary {
                             let t = String::from_utf8_lossy(&l[1..]);
                             let t = t.strip_suffix('\r').unwrap_or(&t).to_string();
-                            out.push((t.to_lowercase(), t));
+                            out.push((lower(&t), t));
                         }
+                    }
+                    // a context line (a setting can ask for one)
+                    Some(b' ') | None if old > 0 && new > 0 => {
+                        old -= 1;
+                        new -= 1;
                     }
                     Some(b'\\') => {}
                     _ => return None,
@@ -703,8 +791,13 @@ fn read_diff(repo: &Path, from: &str, to: &str) -> Result<Diff, String> {
     }
     let big = "the diff is over 8 MiB";
     let small = |args: &[&str]| git_read(repo, args, MAX_FILE as usize).map_err(|_| "a git call failed".to_string());
-    if git_read(repo, &["rev-parse", "--git-dir"], 4096).is_err() {
+    let Ok(top) = git_read(repo, &["rev-parse", "--show-toplevel"], 4096) else {
         return Err("the repo dir is not a git repo".to_string());
+    };
+    let top = String::from_utf8(top).unwrap_or_default();
+    match (std::fs::canonicalize(repo), std::fs::canonicalize(top.trim_end_matches('\n'))) {
+        (Ok(a), Ok(b)) if a == b => {}
+        _ => return Err("the repo dir is not the top folder of a git work tree".to_string()),
     }
     for (flag, sha) in [("--from", from), ("--to", to)] {
         if !matches!(small(&["cat-file", "-t", sha]), Ok(o) if o == b"commit\n") {
@@ -723,11 +816,17 @@ fn read_diff(repo: &Path, from: &str, to: &str) -> Result<Diff, String> {
     raw.extend([from, to]);
     let raw = git_read(repo, &raw, MAX_DIFF).map_err(|o| if o { big.to_string() } else { "a git call failed".to_string() })?;
     let paths = raw_paths(&raw).ok_or("the tree compare could not be read")?;
-    let mut patch = vec!["diff-tree", "-p", "-r", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short"];
+    // --text: no attribute or size setting decides which file is read; a NUL byte rule below does.
+    let mut patch = vec!["diff-tree", "-p", "-r", "-U0", "--text", "--full-index", "--diff-algorithm=myers"];
+    patch.extend(["--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short"]);
     patch.extend(tree);
     patch.extend([from, to]);
     let patch = git_read(repo, &patch, MAX_DIFF).map_err(|o| if o { big.to_string() } else { "a git call failed".to_string() })?;
-    let lines = added_lines(&patch).ok_or("the diff could not be read")?;
+    let mut ids: Vec<String> = patch.split(|&b| b == b'\n').flat_map(index_ids).collect();
+    ids.sort();
+    ids.dedup();
+    let bin = nul_blobs(repo, &ids).map_err(|_| "a git call failed")?;
+    let lines = added_lines(&patch, &bin).ok_or("the diff could not be read")?;
     Ok(Diff { paths, lines })
 }
 

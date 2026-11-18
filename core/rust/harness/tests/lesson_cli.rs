@@ -1738,13 +1738,10 @@ fn diff_a_short_or_upper_case_sha_is_a_usage_error() {
         assert!(stdout(&o).is_empty());
         assert!(stderr(&o).starts_with("usage: harness lesson"), "{}", stderr(&o));
     }
-    // a relative or dot-dot repo dir, a flag twice, a missing flag
+    // a flag twice, a missing flag
     let l = c.root.join("lessons");
     let l = l.to_str().unwrap();
-    let dd = format!("{}/../repo", c.root.to_str().unwrap());
     for args in [
-        vec!["lesson", "lookup", l, "--repo-dir", "repo", "--from", &c.from, "--to", &c.to],
-        vec!["lesson", "lookup", l, "--repo-dir", &dd, "--from", &c.from, "--to", &c.to],
         vec!["lesson", "lookup", l, "--repo-dir", c.repo.to_str().unwrap(), "--from", &c.from, "--from", &c.from, "--to", &c.to],
         vec!["lesson", "lookup", l, "--repo-dir", c.repo.to_str().unwrap(), "--from", &c.from],
         vec!["lesson", "lookup", l, "--from", &c.from, "--to", &c.to],
@@ -1838,4 +1835,126 @@ fn diff_over_the_limit_exits_2() {
     }
     let c = dc(&[("big.txt", b"a\n")], &[("big.txt", &big)], &[], &["tokenx"]);
     refused2(&dlook(&c), "8 MiB");
+}
+
+// ---- diff mode: the answer rests on the two commits, not on a setting or a checked-out file ----
+
+const HIT1: &str = "lesson: ISSUE-001 p ISSUE-001-p.md\nlessons: scanned=1 matched=ISSUE-001\n";
+
+fn tokenx_dc() -> DC {
+    dc(&[("a.txt", b"one\n")], &[("a.txt", b"one\ntokenx\n")], &[], &["tokenx"])
+}
+
+#[test]
+fn diff_a_big_file_threshold_does_not_decide_the_lines() {
+    let c = tokenx_dc();
+    g(&c.repo, &["config", "core.bigFileThreshold", "1"]);
+    assert_eq!(ok_out(&dlook(&c)), HIT1);
+}
+
+#[test]
+fn diff_an_info_attributes_no_diff_does_not_decide_the_lines() {
+    let c = tokenx_dc();
+    put(&c.repo, ".git/info/attributes", b"*.txt -diff\n");
+    assert_eq!(ok_out(&dlook(&c)), HIT1);
+}
+
+#[test]
+fn diff_a_binary_diff_driver_does_not_decide_the_lines() {
+    let c = tokenx_dc();
+    put(&c.repo, ".git/info/attributes", b"*.txt diff=bin\n");
+    g(&c.repo, &["config", "diff.bin.binary", "true"]);
+    assert_eq!(ok_out(&dlook(&c)), HIT1);
+}
+
+#[test]
+fn diff_a_user_attributes_file_does_not_decide_the_lines() {
+    let c = tokenx_dc();
+    let home = c.root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("attrs"), "* -diff\n").unwrap();
+    fs::write(home.join(".gitconfig"), format!("[core]\n\tattributesFile = {}\n", home.join("attrs").display())).unwrap();
+    let a = dargs(&c, &c.from, &c.to);
+    let o = Command::new(BIN).args(&a).env("HOME", &home).env("XDG_CONFIG_HOME", &home).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(ok_out(&o), HIT1);
+}
+
+#[test]
+fn diff_a_checked_out_gitattributes_does_not_decide_the_lines() {
+    let c = tokenx_dc();
+    gcommit(&c.repo, &[(".gitattributes", b"* -diff\n")], &[]);
+    assert_eq!(ok_out(&dlook(&c)), HIT1);
+}
+
+#[test]
+fn diff_a_nul_byte_after_the_first_8000_bytes_reads_as_text() {
+    let mut new = b"tokenx\n".to_vec();
+    new.extend_from_slice(&[b'x'; 8100]);
+    new.extend_from_slice(b"\0\n");
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", &new)], &[], &["tokenx"]);
+    assert_eq!(ok_out(&dlook(&c)), HIT1);
+}
+
+#[test]
+fn diff_a_nul_byte_in_the_old_file_makes_the_file_binary() {
+    let c = dc(&[("a.txt", b"\0one\n")], &[("a.txt", b"one\ntokenx\n")], &[], &["tokenx", "a.txt"]);
+    assert_eq!(matched(&dlook(&c)), "ISSUE-002");
+}
+
+#[test]
+fn diff_a_word_final_sigma_reads_as_in_ticket_mode() {
+    // the whole-string lower case of `Α'Σ` ends in a final sigma; the per-character rule keeps the plain one
+    assert_eq!(one_file(b"a\n", "Α'Σ\n".as_bytes(), "Σ"), "ISSUE-001");
+}
+
+#[test]
+fn diff_a_relative_or_dot_dot_repo_dir_is_a_usage_error() {
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", b"two\n")], &[], &["a.txt"]);
+    fs::create_dir_all(c.root.join("cwd")).unwrap();
+    let l = c.root.join("lessons");
+    let dd = format!("{}/cwd/../repo", c.root.to_str().unwrap());
+    // run in the root, where `repo` is the real repo; the dot-dot path also reaches it
+    for repo in ["repo", dd.as_str()] {
+        let o = Command::new(BIN)
+            .args(["lesson", "lookup", l.to_str().unwrap(), "--repo-dir", repo, "--from", &c.from, "--to", &c.to])
+            .current_dir(&c.root)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{}", repo);
+        assert!(stdout(&o).is_empty());
+        assert!(stderr(&o).starts_with("usage: harness lesson lint"), "{}", stderr(&o));
+    }
+}
+
+#[test]
+fn diff_a_plain_folder_inside_a_repo_is_refused() {
+    let c = dc(&[("sub/a.txt", b"one\n")], &[("sub/a.txt", b"one\ntokenx\n")], &[], &["tokenx"]);
+    let inner = DC { root: c.root.clone(), repo: c.repo.join("sub"), from: c.from.clone(), to: c.to.clone() };
+    refused2(&dlook(&inner), "top folder");
+}
+
+#[test]
+fn diff_a_marker_inside_a_hunk_is_skipped() {
+    // old side has no final newline and more lines follow: `-b`, the marker, `+b`, `+tokenx`
+    assert_eq!(one_file(b"a\nb", b"a\nb\ntokenx\n", "tokenx"), "ISSUE-001");
+}
+
+#[test]
+fn diff_a_gitlink_bump_counts_by_path_only() {
+    let root = tmp("diff");
+    let repo = root.join("repo");
+    ginit(&repo);
+    let (s1, s2) = ("1".repeat(40), "2".repeat(40));
+    dc_pages(&root, &["subproject", s2.as_str(), "sub"]);
+    gcommit(&repo, &[("a.txt", b"one\n")], &[]);
+    let link = |sha: &str| {
+        g(&repo, &["update-index", "--add", "--cacheinfo", &format!("160000,{},sub", sha)]);
+        g(&repo, &["commit", "-q", "-m", "m"]);
+        g(&repo, &["rev-parse", "HEAD"])
+    };
+    let from = link(&s1);
+    let to = link(&s2);
+    let c = DC { root, repo, from, to };
+    assert_eq!(matched(&dlook(&c)), "ISSUE-003");
 }

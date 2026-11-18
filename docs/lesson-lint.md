@@ -140,20 +140,24 @@ token refused). A token hits when:
 - path: its parts (split on `/`, empty parts dropped, letter case included) equal the first parts of one changed path. A
   changed path is added, changed, deleted or type-changed; a rename reads as a delete plus an add; a gitlink change counts.
   A path is read whole (a blank in a path is part of it).
-- word: it occurs, by the word rule above, in one added line of the diff. A removed line, a context line, a file header
+- word: it occurs, by the word rule of ticket mode (letter case ignored per character), in one added line of the diff. A removed line, a context line, a file header
   line and a no-newline marker line do not count. An added line whose text starts with `++` is an added line, and a
   removed line whose text starts with `--` is a removed line (the patch is read by its hunk counts). A CR at the end of an
   added line is not part of a word.
-- a file git reads as binary counts by its path only (no line of it is read).
+- a binary file counts by its path only (no line of it is read). Binary is one fixed rule, read by the code: a NUL byte
+  in the first 8000 bytes of the old or the new blob (the default rule of git). The patch is asked for with `--text`, so
+  no attribute (`.gitattributes`, `info/attributes`, a user attributes file, a diff driver), no `core.bigFileThreshold`
+  and no checked-out file decides which lines are read; the answer rests on the two commits.
 - the repo rule does not apply (there is no ticket). Two different commits with equal trees give no changed path and no
   added line. The git settings color.ui, diff.noprefix, diff.mnemonicPrefix, diff.external and a textconv driver do not
   change the result (the ones the tests cover).
 
 Refusals, usage (exit 2, the usage text): `--repo-dir` relative or with a `..` part, a sha that is not 40 or 64 lowercase
-hex, a missing flag, `--ticket` or `--scope-file` beside the diff flags. Git faults (exit 2, one
-`harness: error: <message>` line, no partial list): a flag given twice, a folder that is not a git repo, a sha that is not a commit of the repo,
-`--from` equal to `--to`, a `--from` that is not an ancestor of `--to`, a failed git call, a diff over 8 MiB. A bad page is
-refused as in ticket mode (exit 1).
+hex, a missing flag, `--ticket` or `--scope-file` beside the diff flags. A flag given twice is read with the arguments
+(exit 2, one `harness: error:` line, before any git call). Git faults (exit 2, one `harness: error: <message>` line, no
+partial list): a folder that is not the top folder of a git work tree (a plain folder inside a repo is refused), a sha
+that is not a commit of the repo, `--from` equal to `--to`, a `--from` that is not an ancestor of `--to`, a failed git
+call, a diff over 8 MiB. A bad page is refused as in ticket mode (exit 1).
 
 Order: the usage checks, then the git checks and the diff read, then the lessons folder and the pages. A git or size
 fault exits 2 even when a page is bad.
@@ -166,6 +170,7 @@ Known gaps:
 
 - a token matches added text only, so a lesson about a removal is not offered
 - a base that is not an ancestor exits 2, so a caller passes the merge base of the branch and its target
+- the patch is read as text (`--text`), so a large binary file counts toward the 8 MiB limit
 
 ### Ticket mode and the wrapper lookup
 
