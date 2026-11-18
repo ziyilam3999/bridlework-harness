@@ -647,7 +647,8 @@ impl Caps {
 /// the guard drops (write side). A child forked while a lock file is open holds a copy of it until it execs, so a re-lock in that window reads as
 /// busy. Many readers may spawn at once; the write side runs alone, so no child can be mid-fork while it checks.
 /// The gate covers only children started by tests that take it; many lib tests start children without it, so the two lock-release tests
-/// (children_started_by_other_tests..., a_write_then_a_read...) run alone in a child process of the test binary.
+/// (children_started_by_other_tests_never_make_a_released_lock_look_busy and a_write_then_a_read_round_trips_and_a_second_lock_is_busy)
+/// run alone in a child process of the test binary.
 #[cfg(test)]
 pub(crate) mod spawn_gate {
     use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -975,7 +976,7 @@ mod tests {
     }
 
     /// Body of the test above. Four threads start children (each holding the read side of the gate); this thread locks, drops and re-locks
-    /// under the write side, 50 rounds. Without the write side this fails within a few rounds on a normal machine; with it, 0 of 50 rounds.
+    /// under the write side, 50 rounds. Without the write side this failed in 9 of 10 runs of 50 rounds on a copy; with it, 0 of 50 in the runs made.
     #[cfg(unix)]
     #[test]
     #[ignore]
@@ -1012,7 +1013,8 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    // Same exposure as above (the re-lock after the guard drops), so the body runs alone in a child process of this test binary.
+    // Same exposure as above (the re-lock after the guard drops). The spawn gate covers only children started by tests that take it, so the
+    // body runs alone in a child process of this test binary.
     #[cfg(unix)]
     #[test]
     fn a_write_then_a_read_round_trips_and_a_second_lock_is_busy() {

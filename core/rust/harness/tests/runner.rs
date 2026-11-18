@@ -25,7 +25,7 @@ fn load(dir: &Path, prog: &str, budget_ms: u64, cap: usize) -> Result<Check, Str
     Check::load(dir, "smoke", prog, &[], Duration::from_millis(budget_ms), cap)
 }
 
-// Failure text of a run result: the status, the class and the message name the wait that failed.
+// Failure text of a run result: the status and the class name the wait that failed; the message holds the run's output.
 fn why(what: &str, r: &GateResult) -> String {
     format!("{what}: status {:?}, class {:?}, message {:?}", r.status, r.failure_class, r.message)
 }
@@ -57,7 +57,7 @@ fn a_malformed_check_id_is_refused_at_load() {
 #[test]
 fn past_budget_is_fail_and_inside_budget_is_pass() {
     let d = scratch("budget");
-    // The child sleeps 60 s; the run must return at the 300 ms budget, far under 30 s even on a loaded machine.
+    // The child sleeps 60 s; the run returns soon after the 300 ms budget (under 1 s with 36 busy loops on a copy), far under 30 s.
     script(&d, "slow.sh", "exec sleep 60");
     let t = Instant::now();
     let r = run(&d, &load(&d, "slow.sh", 300, 1000).unwrap(), SHA);
