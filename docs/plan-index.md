@@ -6,7 +6,7 @@ The index is private data of the operator. It is passed by path and is not kept 
 
 ## Row format
 
-One JSON object per line, with exactly these 8 keys, each once:
+One JSON object per line, with these 8 required keys and one optional key `left_estimate`, each once:
 
 | Key | Shape |
 |---|---|
@@ -18,6 +18,9 @@ One JSON object per line, with exactly these 8 keys, each once:
 | `deviation` | `null`, or an object whose keys are among `reason`, `decided_by`, `date`, `source`, each once and each a string |
 | `trigger` | `null` or a string |
 | `code` | array of strings |
+| `left_estimate` (optional) | JSON integer from 0 to 1000000, written with digits only: points of work on the row that has no ticket file yet (S=1, M=3, L=9) |
+
+A `left_estimate` that is a string, a decimal, negative, `-0`, written with an exponent, `null`, a boolean, an array, an object or over 1000000 is refused as `line <n>: field `left_estimate`: wrong type or value`. A repeated one is refused as `line <n>: field `left_estimate`: given twice`. Rows with and without the key may be mixed.
 
 `unknown` means no source shows the state yet. `null` is told apart from a number, `true`, `false`, an array and an object: a `deviation` of `1.5`, `true` or `[]` is a wrong type, not `null`.
 
@@ -29,7 +32,7 @@ One JSON object per line, with exactly these 8 keys, each once:
 - An empty or blanks-only line is refused (a lone newline is one).
 - A line must be one JSON object with nothing after it.
 - Refused in any object: a repeated key, a lone surrogate escape, a raw control byte or NUL in a string, a byte order mark, a trailing comma, nesting deeper than 32.
-- Refused: a missing key, an unknown key, a wrong type, an `id` outside the character rule, a `state` outside the six.
+- Refused: a missing required key, an unknown key (any key outside the nine), a wrong type, an `id` outside the character rule, a `state` outside the six.
 - Refused for the file: missing, a folder or not readable; over 1 MiB; not UTF-8; zero rows.
 - A function lists the ids that appear on more than one row. Intake refuses an index with one.
 
@@ -83,6 +86,7 @@ One stdout line per finding, `red <class> <id>`, then the last line `plan check 
 |---|---|
 | `duplicate-id <row id>` | an id on more than one row; named once, at its second row |
 | `unknown-state <row id>` | state `unknown` (fail closed: unknown is not a pass) |
+| `open-row-no-estimate <row id>` | state `not-built` or `in-build` and no `left_estimate` key (fail closed: a missing number is not zero; `0` passes); whole-index mode only, named after the other findings of the same row, once per sighting |
 | `built-no-done-ticket <row id>` | state `built` and no linked ticket has a done record (a listed ticket with no ticket file does not count) |
 | `deviation-no-reason`, `deviation-no-decided-by`, `deviation-no-date <row id>` | state `deviation` and that key missing, empty or blanks only, or the `deviation` null |
 | `deviation-bad-decided-by <row id>` | `decided_by` is given and is not `operator` or `orchestrator-reading` |
@@ -102,7 +106,9 @@ Exit 0 when the inputs read; it does not go red. Lines, in this order:
 - one line `off-plan ticket=<id> done=<yes|no> reason=<reason>` for each `off_plan` ticket that no row lists;
 - one line `leaned-on row=<id> tickets=<id,...>` for each `later` row that has a linked ticket;
 - `progress done=<points> left=<points> percent=<n|none>`: done is the points of linked tickets with a done record, left the points of linked tickets with none;
-- `on-plan done=<points> all-done=<points> percent=<n|none>`: done as above, all-done the points of every ticket with a done record, linked or not.
+- `on-plan done=<points> all-done=<points> percent=<n|none>`: done as above, all-done the points of the tickets with a done record, linked or not;
+- one line `no-estimate row=<id>` for each `not-built` or `in-build` row with no `left_estimate`, in index order;
+- last, `progress-estimated done=<D> left=<L> estimate=<E> percent=<n|none>`: D is the done of the progress line, E the sum of `left_estimate` over rows in state `not-built` or `in-build` (a row counts once per sighting), L the left of the progress line plus E. Percent is the floor of 100 x D / (D + L); it is `none` when D + L is 0 or when at least one `no-estimate` line was printed. Estimates on rows in other states are read and not added.
 
 Points come from the ticket `size`: S=1, M=3, L=9. A ticket counts once, however many rows link it and in either direction. Percent is the floor of 100 x done / (done + left), or of 100 x done / all-done; `none` when the divisor is 0. A printed title or reason has each control character replaced by one blank.
 
@@ -116,7 +122,7 @@ Points come from the ticket `size`: S=1, M=3, L=9. A ticket counts once, however
 
 - It does not check that a row fits the work. Intake with `--plan-index` checks that each `main_plan_ref` element is an id of the index.
 - `plan check` reads links and states. It does not read whether code does what a row says.
-- Plan rows that no ticket links to add nothing to progress.
+- The `progress` line counts linked tickets only; the `progress-estimated` line adds the row estimates. An estimate is a number kept by hand in the index: it is not checked against the work, and a ticket filed for estimated work counts twice until the estimate is lowered.
 - A ticket made before intake took a plan link carries no link, so it counts only when a row lists it.
 - On an index with rows marked `built` with no linked done ticket (by either direction), or rows in state `unknown`, `plan check` is red.
 - One ticket that does not parse or one bad done record in the folders makes check, status and ticket mode exit 2.

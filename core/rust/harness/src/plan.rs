@@ -2,7 +2,9 @@
 //! inputs passed by path: the plan index (`plan_index.rs`), the folder of ticket files (`<id>.json`) and the folder of done records
 //! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
 //! done ticket, a done ticket with no row and no reason, an incomplete deviation, a repeated id, an unknown state); `status`
-//! reports rows per state and progress weighted by size (S=1, M=3, L=9). Both read only. They read links and states, not code.
+//! reports rows per state and progress weighted by size (S=1, M=3, L=9); progress counts linked tickets. In whole-index
+//! status the last line `progress-estimated` adds the optional `left_estimate` of open rows; in whole-index check an open row
+//! with no estimate is red. Both read only. They read links and states, not code.
 //! One unparsable ticket or bad done record makes check, status and ticket mode exit 2. Details: `docs/plan-index.md`.
 
 use crate::plan_index::{self, Row, State};
@@ -205,6 +207,11 @@ fn second_of_id(rows: &[Row], i: usize) -> bool {
     rows[..i].iter().filter(|e| e.id == rows[i].id).count() == 1
 }
 
+/// A not-built or in-build row without a left_estimate key (a missing number is not zero).
+fn open_no_estimate(r: &Row) -> bool {
+    matches!(r.state, State::NotBuilt | State::InBuild) && r.left_estimate.is_none()
+}
+
 fn red(findings: &[String]) -> i32 {
     for f in findings {
         println!("{f}");
@@ -230,6 +237,9 @@ fn check(inp: &Inputs) -> i32 {
             }
         }
         f.extend(deviation_classes(r).into_iter().map(|c| format!("red {c} {}", r.id)));
+        if open_no_estimate(r) {
+            f.push(format!("red open-row-no-estimate {}", r.id));
+        }
     }
     for t in tickets {
         for el in t.main_plan_ref.iter().flatten().filter(|el| !rows.iter().any(|r| &r.id == *el)) {
@@ -323,6 +333,21 @@ fn status(inp: &Inputs) -> i32 {
     }
     println!("progress done={} left={} percent={}", done_pts, left_pts, pct(done_pts, done_pts + left_pts));
     println!("on-plan done={} all-done={} percent={}", done_pts, all_done, pct(done_pts, all_done));
+    // Row estimates: open rows only, one count per sighting.
+    let mut missing = 0usize;
+    let mut estimate = 0u64;
+    for r in rows {
+        if open_no_estimate(r) {
+            println!("no-estimate row={}", r.id);
+            missing += 1;
+        }
+        if matches!(r.state, State::NotBuilt | State::InBuild) {
+            estimate += r.left_estimate.unwrap_or(0);
+        }
+    }
+    let left_all = left_pts + estimate;
+    let percent = if missing > 0 { "none".to_string() } else { pct(done_pts, done_pts + left_all) };
+    println!("progress-estimated done={} left={} estimate={} percent={}", done_pts, left_all, estimate, percent);
     0
 }
 

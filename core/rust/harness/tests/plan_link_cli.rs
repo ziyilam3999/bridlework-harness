@@ -177,6 +177,21 @@ fn index_read(name: &str, body: impl AsRef<[u8]>) {
 
 const NOT_ONE: &str = "line 1: does not parse as one JSON object";
 
+/// A default row with a left_estimate key added.
+fn row_est(id: &str, est: &str) -> String {
+    row(id).replace(r#""code":[]"#, &format!(r#""code":[],"left_estimate":{est}"#))
+}
+
+#[test]
+fn intake_reads_an_index_with_a_left_estimate() {
+    index_read("estimates", format!("{}\n{}\n", row_est("R-1", "0"), row_est("R-2", "7")));
+}
+
+#[test]
+fn intake_refuses_a_bad_left_estimate() {
+    index_refused("minus one", format!("{}\n", row_est("R-1", "-1")), "line 1: field `left_estimate`: wrong type or value");
+}
+
 #[test]
 fn a_ticket_with_neither_link_is_refused_when_the_index_is_given() {
     let fx = Fx::new();

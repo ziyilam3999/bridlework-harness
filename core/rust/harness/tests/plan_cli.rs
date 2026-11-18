@@ -73,9 +73,22 @@ impl Drop for Env {
 
 const DEV_OK: &str = r#"{"reason":"r","decided_by":"operator","date":"2026-01-01"}"#;
 
-fn row(id: &str, state: &str, tickets: &[&str], dev: &str) -> String {
+/// A row with an optional left_estimate key.
+fn row_est(id: &str, state: &str, tickets: &[&str], dev: &str, est: Option<u64>) -> String {
     let t: Vec<String> = tickets.iter().map(|t| format!("\"{t}\"")).collect();
-    format!(r#"{{"id":"{id}","title":"t","plan_line":3,"state":"{state}","tickets":[{}],"deviation":{dev},"trigger":null,"code":[]}}"#, t.join(","))
+    let e = est.map_or(String::new(), |v| format!(r#","left_estimate":{v}"#));
+    format!(r#"{{"id":"{id}","title":"t","plan_line":3,"state":"{state}","tickets":[{}],"deviation":{dev},"trigger":null,"code":[]{e}}}"#, t.join(","))
+}
+
+/// A row without the key.
+fn row_bare(id: &str, state: &str, tickets: &[&str], dev: &str) -> String {
+    row_est(id, state, tickets, dev, None)
+}
+
+/// Open rows get left_estimate 0 so the older arms keep their output.
+fn row(id: &str, state: &str, tickets: &[&str], dev: &str) -> String {
+    let open = matches!(state, "not-built" | "in-build");
+    row_est(id, state, tickets, dev, open.then_some(0))
 }
 
 fn r(id: &str, state: &str) -> String {
@@ -545,7 +558,7 @@ fn status_prints_rows_per_state() {
     is(
         &e.status(),
         0,
-        "state not-built rows=1 ids=R-1\nstate in-build rows=0 ids=-\nstate built rows=2 ids=R-2,R-3\nstate deviation rows=0 ids=-\nstate later rows=1 ids=R-4\nstate unknown rows=1 ids=R-5\nprogress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\n",
+        "state not-built rows=1 ids=R-1\nstate in-build rows=0 ids=-\nstate built rows=2 ids=R-2,R-3\nstate deviation rows=0 ids=-\nstate later rows=1 ids=R-4\nstate unknown rows=1 ids=R-5\nprogress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\nprogress-estimated done=0 left=0 estimate=0 percent=none\n",
     );
 }
 
@@ -563,7 +576,7 @@ fn status_lists_off_plan_tickets() {
     e.ticket("T-1", "S", &off("first"));
     e.done("T-1");
     let want = only_not_built("R-1", 1)
-        + "off-plan ticket=T-1 done=yes reason=first\noff-plan ticket=T-2 done=no reason=second\nprogress done=0 left=0 percent=none\non-plan done=0 all-done=1 percent=0\n";
+        + "off-plan ticket=T-1 done=yes reason=first\noff-plan ticket=T-2 done=no reason=second\nprogress done=0 left=0 percent=none\non-plan done=0 all-done=1 percent=0\nprogress-estimated done=0 left=0 estimate=0 percent=none\n";
     is(&e.status(), 0, &want);
 }
 
@@ -574,7 +587,7 @@ fn status_lists_leaned_on_later_rows() {
     e.ticket("T-1", "S", &names(r#""R-1""#));
     e.ticket("T-2", "S", "");
     let mut want = NO_ROWS.replace("state later rows=0 ids=-", "state later rows=2 ids=R-1,R-2");
-    want += "leaned-on row=R-1 tickets=T-1,T-2\nprogress done=0 left=2 percent=0\non-plan done=0 all-done=0 percent=none\n";
+    want += "leaned-on row=R-1 tickets=T-1,T-2\nprogress done=0 left=2 percent=0\non-plan done=0 all-done=0 percent=none\nprogress-estimated done=0 left=2 estimate=0 percent=0\n";
     is(&e.status(), 0, &want);
 }
 
@@ -587,7 +600,7 @@ fn status_progress_is_weighted() {
     e.ticket("T-3", "L", &names(r#""R-1""#));
     e.done("T-1");
     e.done("T-2");
-    is(&e.status(), 0, &(only_not_built("R-1", 1) + "progress done=4 left=9 percent=30\non-plan done=4 all-done=4 percent=100\n"));
+    is(&e.status(), 0, &(only_not_built("R-1", 1) + "progress done=4 left=9 percent=30\non-plan done=4 all-done=4 percent=100\nprogress-estimated done=4 left=9 estimate=0 percent=30\n"));
 }
 
 #[test]
@@ -596,7 +609,7 @@ fn status_progress_counts_a_ticket_once() {
     e.index(&[row("R-1", "not-built", &["T-1"], "null"), row("R-2", "not-built", &["T-1"], "null")]);
     e.ticket("T-1", "M", &names(r#""R-1""#));
     e.done("T-1");
-    is(&e.status(), 0, &(only_not_built("R-1,R-2", 2) + "progress done=3 left=0 percent=100\non-plan done=3 all-done=3 percent=100\n"));
+    is(&e.status(), 0, &(only_not_built("R-1,R-2", 2) + "progress done=3 left=0 percent=100\non-plan done=3 all-done=3 percent=100\nprogress-estimated done=3 left=0 estimate=0 percent=100\n"));
 }
 
 #[test]
@@ -605,7 +618,7 @@ fn an_off_plan_ticket_listed_by_a_row_is_linked() {
     e.index(&[row("R-1", "not-built", &["T-1"], "null")]);
     e.ticket("T-1", "S", &off("why"));
     e.done("T-1");
-    is(&e.status(), 0, &(only_not_built("R-1", 1) + "progress done=1 left=0 percent=100\non-plan done=1 all-done=1 percent=100\n"));
+    is(&e.status(), 0, &(only_not_built("R-1", 1) + "progress done=1 left=0 percent=100\non-plan done=1 all-done=1 percent=100\nprogress-estimated done=1 left=0 estimate=0 percent=100\n"));
 }
 
 #[test]
@@ -613,7 +626,7 @@ fn status_progress_with_no_linked_ticket_prints_none() {
     let e = Env::new();
     e.index(&[r("R-1", "not-built")]);
     e.ticket("T-1", "S", "");
-    is(&e.status(), 0, &(only_not_built("R-1", 1) + "progress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\n"));
+    is(&e.status(), 0, &(only_not_built("R-1", 1) + "progress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\nprogress-estimated done=0 left=0 estimate=0 percent=none\n"));
 }
 
 #[test]
@@ -626,7 +639,7 @@ fn status_on_plan_share() {
     for t in ["T-1", "T-2", "T-3"] {
         e.done(t);
     }
-    let want = only_not_built("R-1", 1) + "off-plan ticket=T-3 done=yes reason=why\nprogress done=4 left=0 percent=100\non-plan done=4 all-done=13 percent=30\n";
+    let want = only_not_built("R-1", 1) + "off-plan ticket=T-3 done=yes reason=why\nprogress done=4 left=0 percent=100\non-plan done=4 all-done=13 percent=30\nprogress-estimated done=4 left=0 estimate=0 percent=100\n";
     is(&e.status(), 0, &want);
 }
 
@@ -652,6 +665,96 @@ fn status_on_a_red_index_exits_0() {
     assert_eq!((o.code, o.err.as_str()), (0, ""));
     assert!(o.out.starts_with("state not-built rows=0 ids=-\n"));
     assert!(!o.out.contains("red "));
+}
+
+// ---- left_estimate
+
+#[test]
+fn an_open_row_with_no_estimate_is_red() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "not-built", &[], "null"), row_bare("R-2", "in-build", &["T-1"], "null")]);
+    e.ticket("T-1", "S", "");
+    is(&e.check(), 1, "red open-row-no-estimate R-1\nred open-row-no-estimate R-2\nplan check red findings=2\n");
+}
+
+#[test]
+fn the_estimate_finding_follows_the_row_findings() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "not-built", &[], "null"), row_bare("R-1", "in-build", &[], "null")]);
+    is(&e.check(), 1, "red open-row-no-estimate R-1\nred duplicate-id R-1\nred open-row-no-estimate R-1\nplan check red findings=3\n");
+}
+
+#[test]
+fn an_open_row_with_an_estimate_is_green() {
+    let e = Env::new();
+    e.index(&[row_est("R-1", "not-built", &[], "null", Some(0))]);
+    is(&e.check(), 0, "plan check ok rows=1 tickets=0 done=0\n");
+}
+
+#[test]
+fn a_closed_row_needs_no_estimate() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "built", &["T-1"], "null"), row_bare("R-2", "later", &[], "null"), row_bare("R-3", "deviation", &[], DEV_OK)]);
+    e.ticket("T-1", "S", "");
+    e.done("T-1");
+    is(&e.check(), 0, "plan check ok rows=3 tickets=1 done=1\n");
+}
+
+#[test]
+fn ticket_mode_ignores_a_missing_estimate() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "not-built", &[], "null")]);
+    e.ticket("T-1", "S", &names(r#""R-1""#));
+    is(&e.run("check", &["--ticket", "T-1"]), 0, "plan check ok ticket=T-1\n");
+}
+
+#[test]
+fn an_index_with_a_bad_left_estimate_exits_2() {
+    let e = Env::new();
+    e.index(&[r("R-1", "not-built").replace(r#""left_estimate":0"#, r#""left_estimate":-1"#)]);
+    both(&e, "harness: error: plan index: line 1: field `left_estimate`: wrong type or value");
+}
+
+#[test]
+fn status_adds_estimates_of_open_rows() {
+    let e = Env::new();
+    e.index(&[
+        row_est("R-1", "not-built", &[], "null", Some(9)),
+        row_est("R-2", "in-build", &["T-2"], "null", Some(2)),
+        row_bare("R-3", "built", &["T-1"], "null"),
+        row_est("R-4", "later", &[], "null", Some(5)),
+    ]);
+    e.ticket("T-1", "L", "");
+    e.ticket("T-2", "M", "");
+    e.done("T-1");
+    let want = "state not-built rows=1 ids=R-1\nstate in-build rows=1 ids=R-2\nstate built rows=1 ids=R-3\nstate deviation rows=0 ids=-\nstate later rows=1 ids=R-4\nstate unknown rows=0 ids=-\n\
+progress done=9 left=3 percent=75\non-plan done=9 all-done=9 percent=100\nprogress-estimated done=9 left=14 estimate=11 percent=39\n";
+    is(&e.status(), 0, want);
+}
+
+#[test]
+fn status_ignores_estimates_on_closed_rows() {
+    let e = Env::new();
+    e.index(&[
+        row_est("R-1", "built", &["T-1"], "null", Some(7)),
+        row_est("R-2", "later", &[], "null", Some(7)),
+        row_est("R-3", "deviation", &[], DEV_OK, Some(7)),
+        row_est("R-4", "not-built", &[], "null", Some(2)),
+    ]);
+    e.ticket("T-1", "S", "");
+    e.done("T-1");
+    let want = "state not-built rows=1 ids=R-4\nstate in-build rows=0 ids=-\nstate built rows=1 ids=R-1\nstate deviation rows=1 ids=R-3\nstate later rows=1 ids=R-2\nstate unknown rows=0 ids=-\n\
+progress done=1 left=0 percent=100\non-plan done=1 all-done=1 percent=100\nprogress-estimated done=1 left=2 estimate=2 percent=33\n";
+    is(&e.status(), 0, want);
+}
+
+#[test]
+fn status_prints_none_while_a_row_has_no_estimate() {
+    let e = Env::new();
+    e.index(&[row_est("R-1", "not-built", &[], "null", Some(4)), row_bare("R-2", "in-build", &[], "null")]);
+    let want = "state not-built rows=1 ids=R-1\nstate in-build rows=1 ids=R-2\nstate built rows=0 ids=-\nstate deviation rows=0 ids=-\nstate later rows=0 ids=-\nstate unknown rows=0 ids=-\n\
+progress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\nno-estimate row=R-2\nprogress-estimated done=0 left=4 estimate=4 percent=none\n";
+    is(&e.status(), 0, want);
 }
 
 // ---- usage

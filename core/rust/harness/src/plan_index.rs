@@ -1,5 +1,5 @@
 //! The plan index reader (std only, no cfg(unix); it does not use launcher.rs). The index is one file of JSON lines, one object per
-//! row with exactly eight keys (`docs/plan-index.md`). It is private data of the operator, passed by path; none of it is kept in this
+//! row with eight required keys and one optional key, `left_estimate` (`docs/plan-index.md`). It is private data of the operator, passed by path; none of it is kept in this
 //! repo. The reader runs nothing and writes nothing. A refusal of a line names the line, and the field when it has one; no refusal prints a value or a path.
 //! It does not check whether a row is built; `harness ticket intake --plan-index` checks that each `main_plan_ref` element is an
 //! id of the index, and refuses an index with a repeated id.
@@ -12,6 +12,8 @@ pub const MAX_INDEX_BYTES: u64 = 1024 * 1024;
 /// Deepest nesting of arrays and objects in one row.
 const MAX_DEPTH: usize = 32;
 const KEYS: [&str; 8] = ["id", "title", "plan_line", "state", "tickets", "deviation", "trigger", "code"];
+/// Largest left_estimate.
+const MAX_ESTIMATE: u64 = 1_000_000;
 const DEVIATION_KEYS: [&str; 4] = ["reason", "decided_by", "date", "source"];
 
 /// A row id or a ticket link element: 1 to 64 bytes of ASCII letters, digits, dot, underscore or hyphen.
@@ -62,6 +64,8 @@ pub struct Row {
     pub deviation: Option<Deviation>,
     pub trigger: Option<String>,
     pub code: Vec<String>,
+    /// Points of work on the row that has no ticket file yet (optional key).
+    pub left_estimate: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -313,7 +317,7 @@ fn row(line: &[u8], n: usize) -> Result<Row, String> {
     let J::Obj(mut obj) = (match parsed {
         Ok(v) => v,
         Err(E::Deep) => return Err(format!("line {n}: nesting is too deep")),
-        Err(E::Dup(k)) if KEYS.contains(&k.as_str()) || DEVIATION_KEYS.contains(&k.as_str()) => {
+        Err(E::Dup(k)) if KEYS.contains(&k.as_str()) || k == "left_estimate" || DEVIATION_KEYS.contains(&k.as_str()) => {
             return Err(format!("line {n}: field `{k}`: given twice"))
         }
         Err(E::Dup(_)) => return Err(format!("line {n}: a key is given twice")),
@@ -358,10 +362,21 @@ fn row(line: &[u8], n: usize) -> Result<Row, String> {
     };
     let trigger = opt_string(take(&mut obj, "trigger", n)?, n, "trigger")?;
     let code = strings(take(&mut obj, "code", n)?, n, "code", false)?;
+    // Optional ninth key: digits only, 0 to MAX_ESTIMATE.
+    let left_estimate = match obj.iter().position(|(k, _)| k == "left_estimate") {
+        None => None,
+        Some(i) => match obj.remove(i).1 {
+            J::Num(s) if s.bytes().all(|b| b.is_ascii_digit()) => match s.parse::<u64>() {
+                Ok(v) if v <= MAX_ESTIMATE => Some(v),
+                _ => return Err(wrong(n, "left_estimate")),
+            },
+            _ => return Err(wrong(n, "left_estimate")),
+        },
+    };
     if !obj.is_empty() {
         return Err(format!("line {n}: an unknown key"));
     }
-    Ok(Row { id, title, plan_line, state, tickets, deviation, trigger, code })
+    Ok(Row { id, title, plan_line, state, tickets, deviation, trigger, code, left_estimate })
 }
 
 /// Read rows from the bytes of an index file. Lines end at LF; a CR before the LF is JSON whitespace, so CR LF lines are read. The
@@ -423,6 +438,35 @@ mod tests {
         let rows = parse(format!("{ROW}\n{ROW}").as_bytes()).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(repeated_ids(&rows), vec!["R-1".to_string()]);
+    }
+
+    fn with(extra: &str) -> String {
+        ROW.replace("\"code\":[]", &format!("\"code\":[],{extra}"))
+    }
+
+    #[test]
+    fn a_row_with_a_left_estimate_reads() {
+        let rows = parse(format!("{}\n{}\n{ROW}", with("\"left_estimate\":0"), with("\"left_estimate\":1000000")).as_bytes()).unwrap();
+        assert_eq!(rows[0].left_estimate, Some(0));
+        assert_eq!(rows[1].left_estimate, Some(1_000_000));
+        assert_eq!(rows[2].left_estimate, None);
+    }
+
+    #[test]
+    fn a_bad_left_estimate_is_refused() {
+        let bad = ["\"3\"", "1.5", "-1", "-0", "1e2", "null", "true", "[]", "{}", "1000001", "18446744073709551616"];
+        for v in bad {
+            let e = parse(with(&format!("\"left_estimate\":{v}")).as_bytes()).unwrap_err();
+            assert_eq!(e, "line 1: field `left_estimate`: wrong type or value", "{v}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_left_estimate_is_refused() {
+        let e = parse(with("\"left_estimate\":1,\"left_estimate\":2").as_bytes()).unwrap_err();
+        assert_eq!(e, "line 1: field `left_estimate`: given twice");
+        let e = parse(with("\"zzz\":1").as_bytes()).unwrap_err();
+        assert_eq!(e, "line 1: an unknown key");
     }
 
     #[test]
