@@ -187,7 +187,7 @@ fn token(r: &mut Rng, multi: bool) -> String {
 struct Line {
     text: Vec<u8>,
     eol: &'static [u8],
-    /// The line ends in a doc line comment: nothing can be added after it.
+    /// The line ends in a doc line comment: no comment can be added after it.
     doc_end: bool,
 }
 
