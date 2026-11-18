@@ -1,0 +1,1 @@
+{"id":"test-ratchet","program":"gates/test-ratchet.sh","args":[],"timeout_ms":1200000,"max_output_bytes":1048576,"both_ends":false}
