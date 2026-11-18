@@ -7,9 +7,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// The scratch name: the tag, the process id and a sequence number.
+fn scratch_name(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("lesson-{}-{}-{}", tag, std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)))
+}
+
+/// Make an empty folder at `d`. A process id repeats across runs and a run leaves
+/// folders behind, so what is at the name is removed first (a link is removed, not followed).
+/// The folder is made with a call that fails when the name exists.
+fn make_scratch(d: &std::path::Path) {
+    if let Ok(md) = fs::symlink_metadata(d) {
+        if md.is_dir() {
+            fs::remove_dir_all(d).unwrap_or_else(|e| panic!("scratch folder {} was not removed: {}", d.display(), e));
+        } else {
+            fs::remove_file(d).unwrap_or_else(|e| panic!("scratch entry {} was not removed: {}", d.display(), e));
+        }
+    }
+    fs::create_dir(d).unwrap_or_else(|e| panic!("scratch folder {} was not made empty: {}", d.display(), e));
+}
+
+/// A new empty scratch folder (see `make_scratch` for why it is cleared).
 fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("lesson-{}-{}-{}", tag, std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
-    fs::create_dir_all(&d).unwrap();
+    let d = scratch_name(tag);
+    make_scratch(&d);
     d
 }
 
@@ -530,13 +550,17 @@ fn default_ticket(title: &str) -> String {
 /// A scratch folder with `lessons/`, `ticket.json`, `scope.txt` and the given pages.
 fn setup(ticket: &[u8], scope: &[u8], pages: &[(&str, &str)]) -> PathBuf {
     let d = tmp("look");
+    fill(&d, ticket, scope, pages);
+    d
+}
+
+fn fill(d: &std::path::Path, ticket: &[u8], scope: &[u8], pages: &[(&str, &str)]) {
     fs::create_dir_all(d.join("lessons")).unwrap();
     fs::write(d.join("ticket.json"), ticket).unwrap();
     fs::write(d.join("scope.txt"), scope).unwrap();
     for (n, t) in pages {
         fs::write(d.join("lessons").join(n), t).unwrap();
     }
-    d
 }
 
 fn look(d: &std::path::Path) -> Output {
@@ -573,6 +597,43 @@ fn hit_with(ticket: &str, token: &str) -> bool {
 
 fn hit(token: &str) -> bool {
     hit_in("Say hello", token)
+}
+
+/// The cross-process reuse made on purpose: an earlier run left a page at the scratch name.
+#[test]
+fn a_scratch_folder_left_by_an_earlier_run_is_not_reused() {
+    let d = scratch_name("reuse");
+    fill(&d, default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-002-old.md", &fm("match: [nomatchtoken]"))]);
+    make_scratch(&d);
+    fill(&d, default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    let o = look(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=1 matched=ISSUE-001\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_scratch_name_that_is_a_file_or_a_link_is_replaced_by_a_new_folder() {
+    let file_name = scratch_name("isfile");
+    fs::write(&file_name, "x").unwrap();
+    make_scratch(&file_name);
+    let md = fs::symlink_metadata(&file_name).unwrap();
+    assert!(md.is_dir() && !md.file_type().is_symlink());
+    assert_eq!(fs::read_dir(&file_name).unwrap().count(), 0);
+
+    let target = scratch_name("linktarget");
+    make_scratch(&target);
+    fs::write(target.join("keep.txt"), "kept").unwrap();
+    let link_name = scratch_name("islink");
+    link(&target, &link_name);
+    make_scratch(&link_name);
+    let md = fs::symlink_metadata(&link_name).unwrap();
+    assert!(md.is_dir() && !md.file_type().is_symlink());
+    assert_eq!(fs::read_dir(&link_name).unwrap().count(), 0);
+    assert_eq!(fs::read_to_string(target.join("keep.txt")).unwrap(), "kept");
+    let _ = fs::remove_dir_all(&file_name);
+    let _ = fs::remove_dir_all(&link_name);
+    let _ = fs::remove_dir_all(&target);
 }
 
 #[test]
