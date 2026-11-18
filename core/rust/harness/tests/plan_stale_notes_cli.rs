@@ -106,7 +106,7 @@ fn foot(notes: usize, rows: usize, files: usize) -> String {
     format!("stale-notes notes={notes} rows={rows} files={files}\n")
 }
 
-/// A file whose lines all list nothing: exit 0 and the empty footer.
+/// A file whose lines list nothing: exit 0 and the empty footer.
 fn nothing(e: &Env, text: &str) {
     is(&e.one(text), 0, &foot(0, 0, 1));
 }
