@@ -1958,3 +1958,178 @@ fn diff_a_gitlink_bump_counts_by_path_only() {
     let c = DC { root, repo, from, to };
     assert_eq!(matched(&dlook(&c)), "ISSUE-003");
 }
+
+// ---- status: a retired page is skipped, an unknown status is refused ----
+
+/// A page that hits the default ticket (token `example`), with the given status line text.
+fn spage(status_line: &str) -> String {
+    fm(&format!("{}\nmatch: [example]", status_line))
+}
+
+/// Ticket-mode lookup over the given pages (default ticket, scope src/).
+fn slook(pages: &[(&str, &str)]) -> Output {
+    look(&setup(default_ticket("t").as_bytes(), b"src/\n", pages))
+}
+
+const A_ONLY: &str = "lesson: ISSUE-001 a ISSUE-001-a.md\n";
+
+fn status_refusal(detail: &str) -> String {
+    format!("harness: lesson lookup refused: ISSUE-001-a.md: STATUS status {} is not unvalidated, validated or retired\n", detail)
+}
+
+#[test]
+fn lookup_a_retired_page_that_hits_is_not_listed() {
+    let o = slook(&[("ISSUE-001-a.md", &spage("status: retired"))]);
+    assert_eq!(ok_out(&o), "lessons: scanned=1 matched=none retired=1\n");
+}
+
+#[test]
+fn lookup_the_same_page_unvalidated_or_validated_is_listed() {
+    for s in ["unvalidated", "validated"] {
+        let o = slook(&[("ISSUE-001-a.md", &spage(&format!("status: {}", s)))]);
+        assert_eq!(ok_out(&o), format!("{}lessons: scanned=1 matched=ISSUE-001\n", A_ONLY), "{}", s);
+    }
+}
+
+#[test]
+fn lookup_a_page_with_no_status_that_hits_is_listed() {
+    let o = slook(&[("ISSUE-001-a.md", &fm("match: [example]"))]);
+    assert_eq!(ok_out(&o), format!("{}lessons: scanned=1 matched=ISSUE-001\n", A_ONLY));
+}
+
+#[test]
+fn lookup_a_status_key_in_other_letter_case_is_not_read() {
+    let o = slook(&[("ISSUE-001-a.md", &spage("Status: retired"))]);
+    assert_eq!(ok_out(&o), format!("{}lessons: scanned=1 matched=ISSUE-001\n", A_ONLY));
+}
+
+#[test]
+fn lookup_a_retired_page_and_an_active_page_count_in_scanned() {
+    let o = slook(&[("ISSUE-001-a.md", &spage("status: retired")), ("ISSUE-002-b.md", &spage("status: validated"))]);
+    assert_eq!(ok_out(&o), "lesson: ISSUE-002 b ISSUE-002-b.md\nlessons: scanned=2 matched=ISSUE-002 retired=1\n");
+}
+
+#[test]
+fn lookup_a_retired_page_that_does_not_hit_counts_as_retired() {
+    let miss = fm("status: retired\nmatch: [nosuch]");
+    let none = fm("status: retired");
+    let o = slook(&[("ISSUE-001-a.md", &miss), ("ISSUE-002-b.md", &none)]);
+    assert_eq!(ok_out(&o), "lessons: scanned=2 matched=none retired=2\n");
+}
+
+#[test]
+fn lookup_with_no_retired_page_prints_no_retired_field() {
+    let o = slook(&[("ISSUE-001-a.md", &spage("status: validated")), ("ISSUE-002-b.md", &spage("status: unvalidated"))]);
+    let out = ok_out(&o);
+    assert!(!out.contains("retired"), "{}", out);
+    assert!(out.ends_with("lessons: scanned=2 matched=ISSUE-001,ISSUE-002\n"), "{}", out);
+}
+
+#[test]
+fn lookup_a_status_with_blanks_around_it_is_read() {
+    let o = slook(&[("ISSUE-001-a.md", &spage("status:  \t retired \t  "))]);
+    assert_eq!(ok_out(&o), "lessons: scanned=1 matched=none retired=1\n");
+}
+
+#[test]
+fn lookup_a_crlf_retired_page_is_not_listed() {
+    let page = "---\r\nstatus: retired\r\nmatch: [example]\r\n---\r\n# t\r\n";
+    let o = slook(&[("ISSUE-001-a.md", page)]);
+    assert_eq!(ok_out(&o), "lessons: scanned=1 matched=none retired=1\n");
+}
+
+#[test]
+fn lookup_an_unknown_status_is_refused() {
+    for (line, detail) in [("status: draft", "draft"), ("status: Retired", "Retired"), ("status: \"retired\"", "\"retired\""), ("status:", "")] {
+        let o = slook(&[("ISSUE-001-a.md", &spage(line))]);
+        assert_eq!(o.status.code(), Some(1), "{}", line);
+        assert!(stdout(&o).is_empty(), "{}", line);
+        assert_eq!(stderr(&o), status_refusal(detail), "{}", line);
+    }
+}
+
+#[test]
+fn lookup_an_unknown_status_on_a_page_with_no_match_key_is_refused() {
+    let o = slook(&[("ISSUE-001-a.md", &fm("status: draft"))]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), status_refusal("draft"));
+}
+
+#[test]
+fn lookup_a_retired_page_with_a_bad_match_is_still_refused() {
+    let o = slook(&[("ISSUE-001-a.md", &fm("status: retired\nmatch: []"))]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-a.md: MATCH match is an empty list\n");
+}
+
+#[test]
+fn lookup_an_unknown_status_and_a_bad_match_come_in_the_lint_order() {
+    let o = slook(&[("ISSUE-001-a.md", &fm("status: draft\nmatch: []"))]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), format!("{}harness: lesson lookup refused: ISSUE-001-a.md: MATCH match is an empty list\n", status_refusal("draft")));
+}
+
+#[test]
+fn lookup_a_repeated_status_key_gives_both_lines() {
+    let o = slook(&[("ISSUE-001-a.md", &spage("status: validated\nstatus: draft"))]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        format!("harness: lesson lookup refused: ISSUE-001-a.md: FRONT-MATTER line 3 repeats the key status\n{}", status_refusal("draft"))
+    );
+}
+
+#[test]
+fn lookup_and_lint_print_the_same_status_line() {
+    for (i, v) in ["draft", "\"retired\"", "a\u{1b}b"].iter().enumerate() {
+        let page = spage(&format!("status: {}", v));
+        let d = setup(default_ticket("t").as_bytes(), b"src/\n", &[("ISSUE-001-a.md", &page)]);
+        let l = run(&["lesson", "lint", d.join("lessons/ISSUE-001-a.md").to_str().unwrap()]);
+        let lint_line = stdout(&l).lines().find_map(|x| x.strip_prefix("ISSUE-001-a.md: STATUS ").map(|r| r.to_string())).unwrap();
+        let o = look(&d);
+        assert_eq!(o.status.code(), Some(1), "{}", i);
+        assert_eq!(stderr(&o), format!("harness: lesson lookup refused: ISSUE-001-a.md: STATUS {}\n", lint_line), "{}", i);
+    }
+}
+
+/// A diff-mode scratch folder whose one page ISSUE-001-p.md is replaced by `page` (it hits: token tokenx).
+fn dc_with_page(page: &str) -> DC {
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", b"one\ntokenx\n")], &[], &["tokenx"]);
+    fs::write(c.root.join("lessons/ISSUE-001-p.md"), page).unwrap();
+    c
+}
+
+#[test]
+fn diff_a_retired_page_that_hits_is_not_listed() {
+    let c = dc_with_page(&fm("status: retired\nmatch: [tokenx]"));
+    assert_eq!(ok_out(&dlook(&c)), "lessons: scanned=1 matched=none retired=1\n");
+}
+
+#[test]
+fn diff_the_same_page_unvalidated_is_listed() {
+    let c = dc_with_page(&fm("status: unvalidated\nmatch: [tokenx]"));
+    assert_eq!(ok_out(&dlook(&c)), HIT1);
+}
+
+#[test]
+fn diff_an_unknown_status_is_refused_as_in_ticket_mode() {
+    let c = dc_with_page(&fm("status: draft\nmatch: [tokenx]"));
+    let o = dlook(&c);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-p.md: STATUS status draft is not unvalidated, validated or retired\n");
+}
+
+#[test]
+fn diff_a_git_fault_wins_over_an_unknown_status() {
+    let c = dc_with_page(&fm("status: draft\nmatch: [tokenx]"));
+    let a = dargs(&c, &c.to, &c.to);
+    let a: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    let o = run(&a);
+    refused2(&o, "same commit");
+    assert!(!stderr(&o).contains("refused"));
+}
