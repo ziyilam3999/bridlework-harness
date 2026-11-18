@@ -52,6 +52,8 @@ pub mod plugin;
 pub mod quarantine;
 pub mod question_class;
 pub mod repo_id;
+#[cfg(unix)]
+pub mod review_cap;
 pub mod runner;
 pub mod scan;
 #[cfg(unix)]

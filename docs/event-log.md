@@ -30,7 +30,7 @@ Sixteen kinds today, in two families. Each kind's key set is declared once, in t
 
 | Kind | Meaning |
 |---|---|
-| `escalation` | a fix-round cap was reached and the ticket was escalated |
+| `escalation` | a cap was reached and the ticket was escalated: `fix-round-cap` (the gate runs) or `review-round-cap` (review FAILs, see `docs/review-round-cap.md`) |
 | `replan_required` | the ticket must be re-planned before more work is done on it |
 | `budget_exceeded` | the ticket went over its budget and was stopped |
 | `run_issued` | a run identity was self-issued; the first line such an invocation appends |
