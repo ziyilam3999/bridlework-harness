@@ -134,7 +134,7 @@ harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> 
 ```
 
 Lists the pages that match the committed diff between two commits of one repo, with the two output line shapes above.
-A caller such as a review brief can list the matched lessons as checks. Tokens are read as above (quotes removed, an empty
+A later review brief is meant to list the matched lessons as checks (that brief line is not built). Tokens are read as above (quotes removed, an empty
 token refused). A token hits when:
 
 - path: its parts (split on `/`, empty parts dropped, letter case included) equal the first parts of one changed path. A
@@ -146,11 +146,12 @@ token refused). A token hits when:
   added line is not part of a word.
 - a file git reads as binary counts by its path only (no line of it is read).
 - the repo rule does not apply (there is no ticket). Two different commits with equal trees give no changed path and no
-  added line. Repo and user git settings do not change the result.
+  added line. The git settings color.ui, diff.noprefix, diff.mnemonicPrefix, diff.external and a textconv driver do not
+  change the result (the ones the tests cover).
 
 Refusals, usage (exit 2, the usage text): `--repo-dir` relative or with a `..` part, a sha that is not 40 or 64 lowercase
-hex, a flag given twice, a missing flag, `--ticket` or `--scope-file` beside the diff flags. Git faults (exit 2, one
-`harness: error: <message>` line, no partial list): a folder that is not a git repo, a sha that is not a commit of the repo,
+hex, a missing flag, `--ticket` or `--scope-file` beside the diff flags. Git faults (exit 2, one
+`harness: error: <message>` line, no partial list): a flag given twice, a folder that is not a git repo, a sha that is not a commit of the repo,
 `--from` equal to `--to`, a `--from` that is not an ancestor of `--to`, a failed git call, a diff over 8 MiB. A bad page is
 refused as in ticket mode (exit 1).
 
@@ -158,7 +159,7 @@ Order: the usage checks, then the git checks and the diff read, then the lessons
 fault exits 2 even when a page is bad.
 
 Git runs read only (as `harness ticket words-only` does): no inherited `GIT_` name, no stdin, no replace refs, no lazy
-fetch, no hook, no external diff, no textconv, no color, submodules not ignored. Nothing is written: no file in the repo
+fetch, no hook, no external diff, no textconv, no color, submodules not ignored. The mode writes no file in the repo
 folder, its `.git` folder, the lessons folder or the current folder.
 
 Known gaps:
