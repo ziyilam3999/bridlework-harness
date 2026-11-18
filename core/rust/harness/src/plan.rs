@@ -6,6 +6,8 @@
 //! status the last line `progress-estimated` adds the optional `left_estimate` of open rows; in whole-index check an open row
 //! with no estimate is red. Both read only. They read links and states, not code.
 //! One unparsable ticket or bad done record makes check, status and ticket mode exit 2. Details: `docs/plan-index.md`.
+//! `harness plan stale-notes` (read only) lists lines in named files that hold a pending phrase and a done or built id, and
+//! in-build rows with all tickets done and no work left.
 
 use crate::plan_index::{self, Row, State};
 use crate::ticket::Ticket;
@@ -366,7 +368,189 @@ fn status_ticket(inp: &Inputs, t: &Ticket) -> i32 {
     0
 }
 
+pub const STALE_USAGE: &str = "usage: harness plan stale-notes --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> <absolute-file> [<absolute-file> ...]";
+
+/// Largest file `stale-notes` reads, in bytes.
+const MAX_NOTE_BYTES: u64 = 4 * 1024 * 1024;
+/// Pending phrases, lower case, split into words.
+const PHRASES: [&[&str]; 6] = [&["until"], &["being", "built"], &["not", "built"], &["not", "yet", "built"], &["waits", "for"], &["todo"]];
+
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn blank(b: u8) -> bool {
+    b == b' ' || b == b'\t'
+}
+
+/// True when a phrase starts at `i` with no word byte directly before or after it.
+fn phrase_at(l: &[u8], i: usize) -> bool {
+    if i > 0 && word_byte(l[i - 1]) {
+        return false;
+    }
+    'phrase: for words in PHRASES {
+        let mut p = i;
+        for (k, w) in words.iter().enumerate() {
+            if k > 0 {
+                let s = p;
+                while p < l.len() && blank(l[p]) {
+                    p += 1;
+                }
+                if p == s {
+                    continue 'phrase;
+                }
+            }
+            if !l.get(p..p + w.len()).is_some_and(|x| x.eq_ignore_ascii_case(w.as_bytes())) {
+                continue 'phrase;
+            }
+            p += w.len();
+        }
+        if p >= l.len() || !word_byte(l[p]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_phrase(l: &[u8]) -> bool {
+    (0..l.len()).any(|i| phrase_at(l, i))
+}
+
+fn id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+/// True when `id` stands as a whole id somewhere in the line.
+fn has_id(l: &[u8], id: &str) -> bool {
+    let n = id.len();
+    (0..l.len()).any(|i| {
+        if l.get(i..i + n) != Some(id.as_bytes()) {
+            return false;
+        }
+        if i > 0 && (id_byte(l[i - 1]) || l[i - 1] == b'.') {
+            return false;
+        }
+        match l.get(i + n) {
+            None => true,
+            Some(&c) if id_byte(c) => false,
+            Some(b'.') => !l.get(i + n + 1).is_some_and(|&d| id_byte(d)),
+            Some(_) => true,
+        }
+    })
+}
+
+fn stale_args(a: &[String]) -> Option<(Args, Vec<String>)> {
+    let (mut index, mut tickets, mut done): (Option<&String>, Option<&String>, Option<&String>) = (None, None, None);
+    let mut files: Vec<String> = Vec::new();
+    let mut it = a.iter();
+    while let Some(w) = it.next() {
+        if w.starts_with("--") {
+            let slot = match w.as_str() {
+                "--index" => &mut index,
+                "--tickets" => &mut tickets,
+                "--done" => &mut done,
+                _ => return None,
+            };
+            if slot.replace(it.next()?).is_some() {
+                return None;
+            }
+        } else {
+            if files.contains(w) || !abs_ok(w) {
+                return None;
+            }
+            files.push(w.clone());
+        }
+    }
+    let (index, tickets, done) = (index?, tickets?, done?);
+    if files.is_empty() || ![index, tickets, done].iter().all(|p| abs_ok(p)) {
+        return None;
+    }
+    Some((Args { check: true, index: index.into(), tickets: tickets.into(), done: done.into(), ticket: None }, files))
+}
+
+/// One named file as text, or the reason it is refused.
+fn read_note(path: &str) -> Result<String, &'static str> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err("is not a regular file"),
+        Err(_) => return Err("is missing or cannot be read"),
+    }
+    let mut bytes = Vec::new();
+    let got = std::fs::File::open(path).and_then(|f| f.take(MAX_NOTE_BYTES + 1).read_to_end(&mut bytes));
+    if got.is_err() {
+        return Err("cannot be read");
+    }
+    if bytes.len() as u64 > MAX_NOTE_BYTES {
+        return Err("is over 4194304 bytes");
+    }
+    String::from_utf8(bytes).map_err(|_| "is not valid UTF-8")
+}
+
+fn stale_notes(a: &[String]) -> i32 {
+    let Some((args, files)) = stale_args(a) else {
+        eprintln!("{STALE_USAGE}");
+        return 2;
+    };
+    let inp = match read_inputs(&args) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("harness: error: {e}");
+            return 2;
+        }
+    };
+    let mut texts = Vec::new();
+    for (n, f) in files.iter().enumerate() {
+        match read_note(f) {
+            Ok(t) => texts.push(t),
+            Err(what) => {
+                eprintln!("harness: error: file {}: {what}", n + 1);
+                return 2;
+            }
+        }
+    }
+    // id -> (done, built)
+    let mut ids: std::collections::BTreeMap<&str, (bool, bool)> = std::collections::BTreeMap::new();
+    for d in &inp.done {
+        ids.entry(d).or_default().0 = true;
+    }
+    for r in inp.rows.iter().filter(|r| r.state == State::Built) {
+        ids.entry(&r.id).or_default().1 = true;
+    }
+    let (mut notes, mut rows) = (0usize, 0usize);
+    for (f, text) in files.iter().zip(&texts) {
+        for (n, line) in text.split('\n').enumerate() {
+            let l = line.strip_suffix('\r').unwrap_or(line).as_bytes();
+            if !has_phrase(l) {
+                continue;
+            }
+            for (id, (d, b)) in &ids {
+                if has_id(l, id) {
+                    let by = match (d, b) {
+                        (true, true) => "done,built",
+                        (true, false) => "done",
+                        _ => "built",
+                    };
+                    println!("stale-note id={id} by={by} line={} file={}", n + 1, clean(f));
+                    notes += 1;
+                }
+            }
+        }
+    }
+    for r in &inp.rows {
+        if r.state == State::InBuild && !r.tickets.is_empty() && r.tickets.iter().all(|t| inp.done.contains(t)) && r.left_estimate.unwrap_or(0) == 0 {
+            let est = r.left_estimate.map_or("none".to_string(), |v| v.to_string());
+            println!("stale-row id={} tickets={} left_estimate={est}", r.id, r.tickets.len());
+            rows += 1;
+        }
+    }
+    println!("stale-notes notes={notes} rows={rows} files={}", files.len());
+    i32::from(notes > 0 || rows > 0)
+}
+
 pub fn plan_cmd(a: &[String]) -> i32 {
+    if a.first().map(String::as_str) == Some("stale-notes") {
+        return stale_notes(&a[1..]);
+    }
     let Some(args) = parse_args(a) else {
         eprintln!("{USAGE}");
         return 2;

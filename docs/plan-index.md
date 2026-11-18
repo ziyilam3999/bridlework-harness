@@ -118,8 +118,42 @@ Points come from the ticket `size`: S=1, M=3, L=9. A ticket counts once, however
 
 0 ok (check green, or status); 1 check red; 2 usage error or an input refusal.
 
+## plan stale-notes
+
+```
+harness plan stale-notes --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> <absolute-file> [<absolute-file> ...]
+```
+
+A line such as "until ticket G-3 is built" goes stale when G-3 is built, and a stale line sends the next agent on a side quest. This sub-verb lists such lines in the named files, and lists in-build rows with nothing left to do. It reports; it writes and decides nothing. Flags and files come in any order; a word that starts with `--` is a flag. The code is `core/rust/harness/src/plan.rs`.
+
+Inputs: the three plan inputs are read as for `plan check`, then each named file in argument order. Done ids are the names of the done records; built ids are the ids of rows in state `built`. Rows in state `not-built`, `in-build`, `deviation`, `later` or `unknown` give no id.
+
+**Pending phrases** (a fixed list, ASCII letter case ignored): `until`, `being built`, `not built`, `not yet built`, `waits for`, `todo`. The words of a phrase are split by one or more ASCII spaces or tabs; a hyphen does not split them (`not-built` is not a phrase). No ASCII letter, digit or underscore may stand directly before or after a phrase, so `untill`, `todos`, `xuntil` and `notbuilt` are not phrases.
+
+**Id hit.** An id hits in exact letter case when the character before it is not an ASCII letter, digit, dot, underscore or hyphen, and the character after it is not an ASCII letter, digit, underscore or hyphen and is not a dot followed by one of those. So `T-1.` at a sentence end, `(T-1)` and a backticked `T-1` hit; `T-10`, `T-1.5`, `T-1.done`, `xT-1` and `T-1-b` do not hit `T-1`.
+
+A line (split on LF, a CR at its end dropped, numbered from 1) is listed when it holds a pending phrase and a done or built id. An id found twice on one line gives one output line.
+
+Output, in this order:
+
+- `stale-note id=<id> by=<done|built|done,built> line=<n> file=<path as given, control characters as blanks>`, one per hit, in file argument order, then line order, then id byte order;
+- `stale-row id=<row id> tickets=<count> left_estimate=<n|none>`, one per in-build row (one per sighting) that lists one or more tickets, each with a done record, and whose `left_estimate` is 0 or absent, in index order;
+- last, `stale-notes notes=<a> rows=<b> files=<f>`.
+
+Refusals (exit 2, stdout empty, no partial list): a missing flag, a flag given twice, a flag with no value, an unknown flag, `--ticket`, a flag or file path that is not absolute or holds a `..` part, no file, and one file given twice (same argument text) print exactly the usage line above on stderr. An input refusal of the plan readers prints its usual stderr line. A named file that is missing, a folder, unreadable, over 4 MiB (4194304 bytes is read, 4194305 is refused) or not valid UTF-8 prints `harness: error: file <n>: <what>`, with no path; n counts files only, from 1. Order of checks: usage, the three plan inputs, then the files in argument order; the files are read before the first stdout line.
+
+Exit codes: 0 none found, 1 found (a or b above 0), 2 usage or input error.
+
+Known gaps:
+
+- A stale line that uses a phrase outside the list (for example the state word `not-built`) is not found.
+- A phrase and an id on one line that are not about each other are listed; a human or the review judges. A long paragraph line gives many such hits, so run it on short-line pages such as the day card.
+- A note split over two lines is not found.
+- Neither `plan::USAGE` nor the top-level usage line names the sub-verb.
+
 ## What it does not do
 
+- `plan stale-notes` reports and changes no file.
 - It does not check that a row fits the work. Intake with `--plan-index` checks that each `main_plan_ref` element is an id of the index.
 - `plan check` reads links and states. It does not read whether code does what a row says.
 - The `progress` line counts linked tickets only; the `progress-estimated` line adds the row estimates. An estimate is a number kept by hand in the index: it is not checked against the work, and a ticket filed for estimated work counts twice until the estimate is lowered.
