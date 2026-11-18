@@ -8,7 +8,7 @@ v2 adds two optional plan link keys, `main_plan_ref` and `off_plan`. A v1 ticket
 
 ## The eleven required fields
 
-The ticket has 11 required keys and two optional plan link keys (below). There are no defaults.
+The ticket has 11 required keys, two optional plan link keys and the optional `removed_tests` (below). There are no defaults.
 
 | Field | Shape |
 |---|---|
@@ -49,7 +49,7 @@ A ticket may carry the optional key `removed_tests`: an array of 1 to 200 string
 
 The reader refuses an empty array, a non-string element, null, a string in place of the array, an element with no separator, a bad test id or reason, more than 200 elements, and a repeated test id, naming `removed_tests`. The key given twice is refused like the other keys. A ticket without it reads as before.
 
-`harness ticket gate` hands the test ids to each head-only gate program as `HARNESS_GATE_REMOVED_TESTS` (joined by a newline, in ticket order; set and empty when the ticket has no key), beside `HARNESS_GATE_BASE` (the `--base` sha) and `HARNESS_GATE_HEAD` (the head judged). A value of these names in the caller environment does not reach the program. Both-ends programs get none of the three.
+`harness ticket gate` hands the test ids to each head-only gate program as `HARNESS_GATE_REMOVED_TESTS` (joined by a newline, in ticket order; set and empty when the ticket has no key), beside `HARNESS_GATE_BASE` (the `--base` sha) and `HARNESS_GATE_HEAD` (the head judged). A value of these names in the caller environment does not reach the program. For a both-ends program the engine sets none of the three; a value inherited from the caller is not removed.
 
 An engine built before this key existed refuses a ticket that holds it (unknown key).
 

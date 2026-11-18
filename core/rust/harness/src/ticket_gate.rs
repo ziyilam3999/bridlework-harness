@@ -5,7 +5,7 @@
 //! Every value is checked once against its one root, then only the checked value is used: the repo folder is canonicalized once, the base is a
 //! full sha, the result folder is canonicalized once and must lie outside the repo, the file name comes only from the validated ticket id.
 //! No error or stdout line repeats a mapped or result folder.
-//! A head-only program starts with HARNESS_GATE_BASE, HARNESS_GATE_HEAD and HARNESS_GATE_REMOVED_TESTS (the ticket's removed test ids, newline joined) set; a both-ends program gets none.
+//! A head-only program starts with HARNESS_GATE_BASE, HARNESS_GATE_HEAD and HARNESS_GATE_REMOVED_TESTS (the ticket's removed test ids, newline joined) set; for a both-ends program the engine sets none (an inherited value is not removed).
 //! `--log <absolute path>` (optional): a FAIL verdict appends ONE `gate_fail` event to that event log, through the events module's own record
 //! writer. The order is fixed and fails closed: the round and streak records first, THEN the log append, THEN the result file. A failed append
 //! is an error (exit 2, `EVENT NOT RECORDED`, no result file written by this run), never a quiet FAIL: the round stays counted, so the ticket is

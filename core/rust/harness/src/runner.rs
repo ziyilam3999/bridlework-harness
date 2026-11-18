@@ -109,7 +109,7 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
     run_ended(repo_root, check, head_sha).0
 }
 
-/// Like `run`, also reporting how the process ended. The child gets the inherited environment minus every `GIT_*` name.
+/// Like `run`, also reporting how the process ended. The child gets the inherited environment minus the `GIT_*` names, then the check's `set_env` values.
 pub fn run_ended(repo_root: &Path, check: &Check, head_sha: &str) -> (GateResult, Ended) {
     // The budget clock starts before spawn, so spawn and reader setup count against it.
     let start = Instant::now();
