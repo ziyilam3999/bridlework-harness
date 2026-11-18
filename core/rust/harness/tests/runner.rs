@@ -25,6 +25,11 @@ fn load(dir: &Path, prog: &str, budget_ms: u64, cap: usize) -> Result<Check, Str
     Check::load(dir, "smoke", prog, &[], Duration::from_millis(budget_ms), cap)
 }
 
+// Failure text of a run result: the status and the class name the wait that failed; the message holds the run's output.
+fn why(what: &str, r: &GateResult) -> String {
+    format!("{what}: status {:?}, class {:?}, message {:?}", r.status, r.failure_class, r.message)
+}
+
 #[test]
 fn a_clean_exit_after_the_budget_is_still_fail() {
     let d = scratch("late");
@@ -52,20 +57,21 @@ fn a_malformed_check_id_is_refused_at_load() {
 #[test]
 fn past_budget_is_fail_and_inside_budget_is_pass() {
     let d = scratch("budget");
-    script(&d, "slow.sh", "exec sleep 5");
+    // The child sleeps 60 s; the run returns soon after the 300 ms budget (under 1 s with 36 busy loops on a copy), far under 30 s.
+    script(&d, "slow.sh", "exec sleep 60");
     let t = Instant::now();
     let r = run(&d, &load(&d, "slow.sh", 300, 1000).unwrap(), SHA);
-    assert_eq!(r.status, Status::Fail);
-    assert_eq!(r.failure_class.as_deref(), Some("timeout"));
-    assert!(t.elapsed() < Duration::from_secs(3));
-    assert!(r.validate().is_ok());
+    assert_eq!(r.status, Status::Fail, "{}", why("slow.sh status", &r));
+    assert_eq!(r.failure_class.as_deref(), Some("timeout"), "{}", why("slow.sh class", &r));
+    assert!(t.elapsed() < Duration::from_secs(30), "{} after {:?}", why("slow.sh waited the child out", &r), t.elapsed());
+    assert!(r.validate().is_ok(), "{}", why("slow.sh validate", &r));
 
     script(&d, "quick.sh", "echo fine");
-    let r = run(&d, &load(&d, "quick.sh", 5000, 1000).unwrap(), SHA);
-    assert_eq!(r.status, Status::Pass);
-    assert_eq!(r.failure_class, None);
-    assert_eq!(r.head_sha, SHA);
-    assert!(r.message.contains("fine"));
+    let r = run(&d, &load(&d, "quick.sh", 60000, 1000).unwrap(), SHA);
+    assert_eq!(r.status, Status::Pass, "{}", why("quick.sh status", &r));
+    assert_eq!(r.failure_class, None, "{}", why("quick.sh class", &r));
+    assert_eq!(r.head_sha, SHA, "{}", why("quick.sh head", &r));
+    assert!(r.message.contains("fine"), "{}", why("quick.sh missing output line fine", &r));
     assert_eq!(GateResult::from_json(&r.to_json().unwrap()).unwrap(), r);
     let _ = std::fs::remove_dir_all(d);
 }
@@ -74,12 +80,12 @@ fn past_budget_is_fail_and_inside_budget_is_pass() {
 fn nonzero_exit_and_missing_binary_are_fail() {
     let d = scratch("exit");
     script(&d, "bad.sh", "echo oops >&2; exit 3");
-    let r = run(&d, &load(&d, "bad.sh", 5000, 1000).unwrap(), SHA);
-    assert_eq!((r.status, r.failure_class.as_deref()), (Status::Fail, Some("check-failed")));
-    assert!(r.message.contains("oops"));
+    let r = run(&d, &load(&d, "bad.sh", 60000, 1000).unwrap(), SHA);
+    assert_eq!((&r.status, r.failure_class.as_deref()), (&Status::Fail, Some("check-failed")), "{}", why("bad.sh", &r));
+    assert!(r.message.contains("oops"), "{}", why("bad.sh missing output line oops", &r));
     std::fs::write(d.join("noexec.sh"), "echo x\n").unwrap();
-    let r = run(&d, &load(&d, "noexec.sh", 5000, 1000).unwrap(), SHA);
-    assert_eq!((r.status, r.failure_class.as_deref()), (Status::Fail, Some("spawn-error")));
+    let r = run(&d, &load(&d, "noexec.sh", 60000, 1000).unwrap(), SHA);
+    assert_eq!((&r.status, r.failure_class.as_deref()), (&Status::Fail, Some("spawn-error")), "{}", why("noexec.sh", &r));
     let _ = std::fs::remove_dir_all(d);
 }
 

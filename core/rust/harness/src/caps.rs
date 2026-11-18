@@ -646,6 +646,9 @@ impl Caps {
 /// Test-only gate between tests that start child processes (read side) and tests that lock a ticket and expect the lock to be free again after
 /// the guard drops (write side). A child forked while a lock file is open holds a copy of it until it execs, so a re-lock in that window reads as
 /// busy. Many readers may spawn at once; the write side runs alone, so no child can be mid-fork while it checks.
+/// The gate covers only children started by tests that take it; many lib tests start children without it, so the two lock-release tests
+/// (children_started_by_other_tests_never_make_a_released_lock_look_busy and a_write_then_a_read_round_trips_and_a_second_lock_is_busy)
+/// run alone in a child process of the test binary.
 #[cfg(test)]
 pub(crate) mod spawn_gate {
     use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -946,12 +949,38 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// Run one ignored helper test alone in a child process of this test binary, started while the read side of the gate is held.
+    /// Green only when the child exits 0 and its output shows one test ran and passed (a filter that matches nothing exits 0 too).
+    #[cfg(unix)]
+    fn run_alone_in_child(name: &str) {
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe().expect("the test binary path");
+        let child = {
+            let _spawn_gate = spawn_gate::read();
+            Command::new(exe).args([name, "--ignored", "--exact", "--test-threads=1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+        };
+        let out = child.expect("the child test process starts").wait_with_output().expect("the child test process ends");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let one_ran = stdout.contains("running 1 test\n") && stdout.contains("1 passed; 0 failed");
+        assert!(out.status.success() && one_ran, "child {name}: status {:?}, one test ran and passed: {one_ran}\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+    }
+
     /// Load test for the cause of the flake: child processes started by other threads must never make a released lock look busy.
-    /// Four threads start children (each holding the read side of the gate); the main thread locks, drops and re-locks under the write side.
-    /// Without the write side this fails within a few rounds on a normal machine; with it, never.
+    /// The spawn gate covers only children started by tests that take it, and many lib tests start children without it, so the rounds run
+    /// alone in a child process of this test binary (the helper below): no ungated child of another test can hold the lock file.
     #[cfg(unix)]
     #[test]
     fn children_started_by_other_tests_never_make_a_released_lock_look_busy() {
+        run_alone_in_child("caps::tests::helper_released_lock_is_free_under_loader_children");
+    }
+
+    /// Body of the test above. Four threads start children (each holding the read side of the gate); this thread locks, drops and re-locks
+    /// under the write side, 50 rounds. Without the write side this failed in 9 of 10 runs of 50 rounds on a copy; with it, 0 of 50 in the runs made.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn helper_released_lock_is_free_under_loader_children() {
         use std::process::{Command, Stdio};
         use std::sync::atomic::AtomicBool;
         let d = scratch();
@@ -984,9 +1013,19 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    // Same exposure as above (the re-lock after the guard drops). The spawn gate covers only children started by tests that take it, so the
+    // body runs alone in a child process of this test binary.
+    #[cfg(unix)]
     #[test]
     fn a_write_then_a_read_round_trips_and_a_second_lock_is_busy() {
-        let _spawn_gate = spawn_gate::write();
+        run_alone_in_child("caps::tests::helper_write_then_read_round_trips_alone");
+    }
+
+    /// Body of the test above.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn helper_write_then_read_round_trips_alone() {
         let d = scratch();
         let caps = Caps::open(&d, Path::new("/nonexistent-root")).unwrap();
         assert_eq!(caps.read("EX-1", "r"), Ok(None));
