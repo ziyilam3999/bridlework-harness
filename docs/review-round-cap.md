@@ -1,6 +1,6 @@
 # Review-round cap
 
-A ticket gets at most **3** review FAILs. After the third, a further fix round is refused and the ticket waits for the operator. The engine keeps its own count because bw keeps one review record per ticket and overwrites it, so no history of FAILs exists there.
+After the third recorded review FAIL on a ticket, a further fix round is refused and the ticket waits for the operator. The engine keeps its own count because bw keeps one review record per ticket and overwrites it, so no history of FAILs exists there.
 
 Code: `core/rust/harness/src/review_cap.rs`; the verbs are wired in `core/rust/harness/src/cli.rs`.
 
@@ -32,7 +32,7 @@ Both take `<ticket-file> --repo-map <repo_id>=<absolute-dir> --caps-dir <absolut
 `harness ticket fix-round-check ... --role <token> --model <token>`:
 
 - Fewer than 3 FAILs: `ticket=<id> result=allowed fails=<n>`, exit 0, nothing written.
-- 3 or more: appends one escalation event to `<caps>/events.jsonl` with reason `review-round-cap`, prints `ticket=<id> result=refused reason=review-round-cap fails=<n> next=operator-waiting`, exit 1. Each refused call appends one event.
+- 3 or more: appends one escalation event to `<caps>/events.jsonl` (plus a `run_issued` line first when the run id is self-issued) with reason `review-round-cap`, prints `ticket=<id> result=refused reason=review-round-cap fails=<n> next=operator-waiting`, exit 1. Each refused call appends one escalation event.
 - The append fails: exit 2, `ESCALATION NOT RECORDED` on stderr, no refused line.
 
 A ticket whose repo id is not in the map is a ticket refusal (exit 1). Usage faults, a relative or dot-dot `--caps-dir`, a caps folder inside the repo, a bad `--head`, and a bad role or model token are exit 2. No folder is printed.

@@ -6,7 +6,7 @@
 //! exactly the canonical bytes for the expected ticket and repo (so a copied, reordered, widened or out-of-range record is refused, never read as 0).
 //! `rounds = fix_rounds + (1 if in_flight)`. This module owns the ONE parser (`Caps::read`), the lock, the record writer and the refusal writer, so
 //! later per-ticket caps (re-plan threshold, budgets) extend it: a refusal carries an event kind and a reason token, and the writer takes the kind.
-//! The review-FAIL count lives in `<id>.reviews` (module `review_cap`): the heads that failed review, read by `ticket fix-round-check`.
+//! The review-FAIL count lives in `<id>.reviews` (module `review_cap`): the heads that failed review, read and written by the two review-cap verbs.
 //! Every name comes from the validated ticket id or is fixed; a link is never followed or created through. No error repeats a folder.
 
 use crate::events::{self, Event, Kind};

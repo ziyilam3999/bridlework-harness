@@ -77,7 +77,7 @@ fn record_name(id: &str) -> String {
     format!("{}.reviews", id)
 }
 
-/// A differently-cased twin of the record name is a collision (by name, on every filesystem).
+/// A differently-cased twin of the record name is a collision (by name, ASCII case-insensitive).
 fn check_case_twin(caps: &Caps, id: &str) -> Result<(), String> {
     let want = record_name(id);
     let rd = fs::read_dir(caps.dir()).map_err(|_| "the caps directory could not be listed".to_string())?;
