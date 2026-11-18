@@ -8,7 +8,7 @@
 //!
 //! Replay: a failing case panics with its seed, its case number and the input as escaped bytes. `replay(prop, seed,
 //! case)` runs one seed and case of one property (`prop` is one of the `w1`, `w2`, `w3`, `c1`, `c2`, `c3` functions);
-//! each test runs its cases through it.
+//! each property test runs its cases through it.
 //!
 //! Words-only: W1 raw bytes do not panic and give the same answer twice; W2 text with no plain comment is unchanged;
 //! W3 a plain `//` comment added at a line end is removed, and a line of only blanks and a plain comment is dropped.
