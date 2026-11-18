@@ -18,4 +18,11 @@ Folder rules (`the_gates_folder_contract_is_enforced`, `a_gate_file_or_program_o
 - A subdirectory or any other non-regular entry is refused. A gate file that resolves outside the repo root is refused.
 - A gate file is at most 1 MiB and valid UTF-8. (`malformed_gate_values_are_refused`)
 
+Gate programs:
+
+- A gate program may live in `gates/` (`test-ratchet.sh`): files that do not end in `.json` are ignored by the loader, so the program is not a gate file.
+- A head-only gate program (`both_ends` false) starts with three values set by `harness ticket gate`: `HARNESS_GATE_BASE` (the base sha), `HARNESS_GATE_HEAD` (the head sha) and `HARNESS_GATE_REMOVED_TESTS` (the test ids the ticket key `removed_tests` names, newline joined, empty when none).
+- For a both-ends program the engine sets none of the three. A value inherited from the caller is not removed, so a both-ends program must not read them.
+- `test-ratchet` (`test-ratchet.sh`, head only) lists the tests of `core/rust` at the head and at the base with `cargo test --locked --offline -- --list`. A test id is the source path from the cargo `Running` line (for example `tests/ticket_gate.rs` or `src/lib.rs`) plus `::` plus the listed test path (for example `tests/ticket_gate.rs::a_lost_test`, `src/lib.rs::caps::tests::x`); doc tests are not listed. A base id that is gone at the head must be named in `removed_tests` (`<id> -- <reason>`), else class `lost-test`; a named id that is not lost is class `named-not-removed`. It fails closed when an env value is unset, empty or not a full lowercase sha (`HARNESS_GATE_REMOVED_TESTS` may be empty, not unset), when the base is not a commit, when the head value is not the folder HEAD, when a list cannot be built at either end, and when the base list holds no test id.
+
 The machine-readable mirror of the six-key shape is `schemas/gate.schema.json`; `the_committed_seed_gate_and_schema_match_the_loader` keeps its `required` set equal to the loader's.
