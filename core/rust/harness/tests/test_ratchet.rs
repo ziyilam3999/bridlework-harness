@@ -1,6 +1,6 @@
 //! Tests of the test-list ratchet gate (`gates/test-ratchet.sh`). Most run the real program, and for the engine arms the real
 //! binary, on a scratch repo holding a tiny no-dependency crate at `core/rust`. This file reads no environment variable by name; the
-//! three gate names are removed on every child before any is set, because the suite itself may run under a gate run that sets them.
+//! three gate names are removed on each child that runs the program or the engine before any is set, because the suite itself may run under a gate run that sets them.
 #![cfg(unix)]
 use harness::gate_result::{GateResult, Status};
 use std::fs;
