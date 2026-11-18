@@ -247,7 +247,7 @@ enum Found {
     Last(ErrorRow),
 }
 
-/// Read line by line until the end or the first bad line, which is refused. Errors are the text after `reason=unreadable`.
+/// Read line by line. A bad line, an empty file or a read error is refused. Errors are the text after `reason=unreadable`.
 fn read_rows<R: BufRead>(mut r: R) -> Result<Found, String> {
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
