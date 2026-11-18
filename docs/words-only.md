@@ -155,3 +155,13 @@ words-only yes from=<from> to=<to> files=<count of changed entries>
 - It reads shell files as `not-words-file` (a later change).
 - It reads two commits, not the work tree.
 - A fix round that was rebased onto a new base is refused as `not-ancestor`.
+
+## Seeded tests
+
+`core/rust/harness/src/seeded.rs` feeds the reader random inputs from a fixed seed list (a std-only splitmix64
+generator, no clock and no environment value, so two runs see the same inputs). W1: raw bytes do not panic and
+give the same answer twice. W2: text with no plain comment is unchanged. W3: a plain `//` comment added at a line
+end is removed, and a line of only blanks and a plain comment is dropped. A failing case panics with its seed, its
+case number and the input as escaped bytes; to replay it, add a temporary test in `src/seeded.rs` that calls `replay(w2, <seed>,
+<case>)` (use the property that failed) and run `cargo test --lib seeded` from `core/rust`. Run the whole set with
+`cargo test --locked --offline --manifest-path core/rust/Cargo.toml --lib seeded`.

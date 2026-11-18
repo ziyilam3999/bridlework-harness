@@ -56,6 +56,8 @@ pub mod repo_id;
 pub mod review_cap;
 pub mod runner;
 pub mod scan;
+#[cfg(all(test, unix))]
+mod seeded;
 #[cfg(unix)]
 pub mod session_close;
 pub mod session_name;

@@ -311,7 +311,7 @@ fn shebang(s: &[u8]) -> bool {
 
 /// Reads Rust source and returns it with plain comments removed; each doc comment (line or block) is kept as
 /// code, whole. None: the lexer cannot read it to its end.
-fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn strip_comments(s: &[u8]) -> Option<Vec<u8>> {
     if shebang(s) {
         return None;
     }
