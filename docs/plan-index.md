@@ -124,7 +124,7 @@ Points come from the ticket `size`: S=1, M=3, L=9. A ticket counts once, however
 harness plan stale-notes --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> <absolute-file> [<absolute-file> ...]
 ```
 
-A line such as "until ticket G-3 is built" goes stale when G-3 is built, and a stale line sends the next agent on a side quest. This sub-verb lists such lines in the named files, and lists in-build rows with nothing left to do. It reports; it writes and decides nothing. Flags and files come in any order; a word that starts with `--` is a flag. The code is `core/rust/harness/src/plan.rs`.
+A line such as "until ticket G-3 is built" goes stale when G-3 is built, and a stale line sends the next agent on a side quest. This sub-verb lists such lines in the named files, and lists in-build rows that list tickets, all with done records, and carry no estimated work (`left_estimate` 0 or absent). It reports; it writes and decides nothing. Flags and files come in any order; a word that starts with `--` is a flag. The code is `core/rust/harness/src/plan.rs`.
 
 Inputs: the three plan inputs are read as for `plan check`, then each named file in argument order. Done ids are the names of the done records; built ids are the ids of rows in state `built`. Rows in state `not-built`, `in-build`, `deviation`, `later` or `unknown` give no id.
 

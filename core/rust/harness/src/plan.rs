@@ -7,7 +7,7 @@
 //! with no estimate is red. Both read only. They read links and states, not code.
 //! One unparsable ticket or bad done record makes check, status and ticket mode exit 2. Details: `docs/plan-index.md`.
 //! `harness plan stale-notes` (read only) lists lines in named files that hold a pending phrase and a done or built id, and
-//! in-build rows with all tickets done and no work left.
+//! in-build rows that list tickets, all done, with no estimated work left.
 
 use crate::plan_index::{self, Row, State};
 use crate::ticket::Ticket;
