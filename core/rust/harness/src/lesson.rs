@@ -1,5 +1,7 @@
 //! `harness lesson lint <path> [<path> ...]`: checks the shape of lesson pages (see `docs/lesson-lint.md`).
-//! `harness lesson lookup` lists the pages that match a ticket (same docs page). The lint
+//! `harness lesson lookup` lists the pages that match a ticket (ticket mode: --ticket and --scope-file) or the
+//! committed diff between two commits of one repo (diff mode: --repo-dir, --from, --to; changed paths and added
+//! lines); same docs page. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
 
@@ -8,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>";
+const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>";
+/// The read limit of a git answer (the diff).
+const MAX_DIFF: usize = 8 * 1024 * 1024;
 /// The read limit of the ticket and the scope file (as `lane claim` reads them).
 const MAX_FILE: u64 = 1024 * 1024;
 
@@ -578,7 +582,156 @@ fn heading(lines: &[&str], close: usize, name: &str) -> String {
     }
 }
 
-/// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`. Exit 0 the matching pages (stdout), 1 a page or the ticket is
+fn sha_ok(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What a diff gives the lookup: the changed paths and the added lines (each with its lower-case form).
+struct Diff {
+    paths: Vec<String>,
+    lines: Vec<(String, String)>,
+}
+
+/// One token hits a diff: its path parts lead a changed path, or it is a word of an added line.
+fn diff_hits(tok: &str, d: &Diff) -> bool {
+    let tp = path_parts(tok);
+    if !tp.is_empty() && d.paths.iter().any(|p| path_parts(p).starts_with(&tp)) {
+        return true;
+    }
+    let low = tok.to_lowercase();
+    d.lines.iter().any(|(l, orig)| l.contains(&low) && word_in(tok, orig))
+}
+
+/// One read-only git call: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch, no stderr. The
+/// answer is read to `limit` bytes; Err(true) is an answer over it, Err(false) a call that cannot run or fails.
+fn git_read(repo: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, bool> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut c = Command::new("git");
+    c.arg("--no-replace-objects").arg("--no-lazy-fetch").arg("-C").arg(repo);
+    c.args(["-c", "color.ui=false", "-c", "diff.relative=false", "-c", "diff.external=", "-c", "core.fsmonitor=false"]);
+    c.args(args);
+    for (k, _) in std::env::vars_os() {
+        if k.as_encoded_bytes().starts_with(b"GIT_") {
+            c.env_remove(&k);
+        }
+    }
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| false)?;
+    let mut buf = Vec::new();
+    let read = child.stdout.take().map(|o| o.take(limit as u64 + 1).read_to_end(&mut buf));
+    if buf.len() > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(true);
+    }
+    let st = child.wait().map_err(|_| false)?;
+    if read.is_some_and(|r| r.is_err()) || !st.success() {
+        return Err(false);
+    }
+    Ok(buf)
+}
+
+/// The changed paths of a raw `-z` tree compare. None: the bytes are not a raw compare.
+fn raw_paths(raw: &[u8]) -> Option<Vec<String>> {
+    let mut toks = raw.split(|&b| b == 0);
+    let mut out = Vec::new();
+    while let Some(head) = toks.next() {
+        if head.is_empty() && toks.next().is_none() {
+            break;
+        }
+        if !head.starts_with(b":") {
+            return None;
+        }
+        out.push(String::from_utf8_lossy(toks.next()?).to_string());
+    }
+    Some(out)
+}
+
+/// The added lines of a `-U0` patch, read by the hunk counts so a line that only looks like a file header is
+/// still a line. A gitlink change has no line read. None: the patch cannot be read.
+fn added_lines(patch: &[u8]) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut gitlink = false;
+    let mut it = patch.split(|&b| b == b'\n');
+    while let Some(l) = it.next() {
+        if l.starts_with(b"diff --git ") {
+            gitlink = false;
+        } else if l.starts_with(b"new file mode 160000")
+            || l.starts_with(b"deleted file mode 160000")
+            || l.starts_with(b"new mode 160000")
+            || l.starts_with(b"old mode 160000")
+            || (l.starts_with(b"index ") && l.ends_with(b" 160000"))
+        {
+            gitlink = true;
+        } else if l.starts_with(b"@@ ") {
+            let h = std::str::from_utf8(l).ok()?;
+            let mut f = h.split(' ');
+            let count = |s: Option<&str>, c: char| -> Option<usize> {
+                let s = s?.strip_prefix(c)?;
+                match s.split_once(',') {
+                    Some((_, n)) => n.parse().ok(),
+                    None => Some(1),
+                }
+            };
+            f.next();
+            let (mut old, mut new) = (count(f.next(), '-')?, count(f.next(), '+')?);
+            while old > 0 || new > 0 {
+                let l = it.next()?;
+                match l.first() {
+                    Some(b'-') if old > 0 => old -= 1,
+                    Some(b'+') if new > 0 => {
+                        new -= 1;
+                        if !gitlink {
+                            let t = String::from_utf8_lossy(&l[1..]);
+                            let t = t.strip_suffix('\r').unwrap_or(&t).to_string();
+                            out.push((t.to_lowercase(), t));
+                        }
+                    }
+                    Some(b'\\') => {}
+                    _ => return None,
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The git checks and the diff read of diff mode; Err is the one message line for exit 2.
+fn read_diff(repo: &Path, from: &str, to: &str) -> Result<Diff, String> {
+    if !std::fs::metadata(repo).map(|m| m.is_dir()).unwrap_or(false) {
+        return Err("the repo dir is missing or not a folder".to_string());
+    }
+    let big = "the diff is over 8 MiB";
+    let small = |args: &[&str]| git_read(repo, args, MAX_FILE as usize).map_err(|_| "a git call failed".to_string());
+    if git_read(repo, &["rev-parse", "--git-dir"], 4096).is_err() {
+        return Err("the repo dir is not a git repo".to_string());
+    }
+    for (flag, sha) in [("--from", from), ("--to", to)] {
+        if !matches!(small(&["cat-file", "-t", sha]), Ok(o) if o == b"commit\n") {
+            return Err(format!("{} is not a commit of the repo", flag));
+        }
+    }
+    if from == to {
+        return Err("--from and --to are the same commit".to_string());
+    }
+    if git_read(repo, &["merge-base", "--is-ancestor", from, to], 4096).is_err() {
+        return Err("--from is not an ancestor of --to".to_string());
+    }
+    let tree = ["--no-renames", "--ignore-submodules=none"];
+    let mut raw = vec!["diff-tree", "-r", "-z", "--raw"];
+    raw.extend(tree);
+    raw.extend([from, to]);
+    let raw = git_read(repo, &raw, MAX_DIFF).map_err(|o| if o { big.to_string() } else { "a git call failed".to_string() })?;
+    let paths = raw_paths(&raw).ok_or("the tree compare could not be read")?;
+    let mut patch = vec!["diff-tree", "-p", "-r", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short"];
+    patch.extend(tree);
+    patch.extend([from, to]);
+    let patch = git_read(repo, &patch, MAX_DIFF).map_err(|o| if o { big.to_string() } else { "a git call failed".to_string() })?;
+    let lines = added_lines(&patch).ok_or("the diff could not be read")?;
+    Ok(Diff { paths, lines })
+}
+
+/// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`, or `--repo-dir <dir> --from <sha> --to <sha>` (diff mode). Exit 0 the matching pages (stdout), 1 a page or the ticket is
 /// refused, 2 usage or read error or a page-shaped entry that is not a page and not a folder. The exit 1 lines are printed after all pages are read.
 fn lookup_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
@@ -586,11 +739,15 @@ fn lookup_cmd(a: &[String]) -> i32 {
         2
     };
     let (mut dir, mut ticket, mut scope) = (None, None, None);
+    let (mut repo, mut from, mut to) = (None, None, None);
     let mut it = a.iter();
     while let Some(arg) = it.next() {
         let slot = match arg.as_str() {
             "--ticket" => &mut ticket,
             "--scope-file" => &mut scope,
+            "--repo-dir" => &mut repo,
+            "--from" => &mut from,
+            "--to" => &mut to,
             s if s.starts_with("--") => return fail(&format!("unknown option {}", s)),
             _ => {
                 if dir.replace(arg).is_some() {
@@ -608,24 +765,47 @@ fn lookup_cmd(a: &[String]) -> i32 {
         eprintln!("{}", LESSON_USAGE);
         return 2;
     };
-    let Some(ticket) = ticket else { return fail("--ticket is required") };
-    let Some(scope) = scope else { return fail("--scope-file is required") };
-    let ticket_bytes = match read_limited(ticket, "ticket file") {
-        Ok(b) => b,
-        Err(m) => return fail(&m),
-    };
-    let scope = match read_limited(scope, "scope file") {
-        Ok(b) if b.len() as u64 > MAX_FILE => return fail("the scope file is over 1 MiB"),
-        Ok(b) => match String::from_utf8(b) {
-            Ok(t) => crate::lane::parse_scope(&t),
-            Err(_) => return fail("the scope file is not valid UTF-8"),
-        },
-        Err(m) => return fail(&m),
-    };
-    let scope = match scope {
-        Ok(s) => s,
-        Err(m) => return fail(&format!("scope file: {}", m)),
-    };
+    let mut ticket_in: Option<(Vec<u8>, Vec<String>)> = None;
+    let mut diff_in: Option<Diff> = None;
+    if repo.is_some() || from.is_some() || to.is_some() {
+        if ticket.is_some() || scope.is_some() {
+            eprintln!("{}", LESSON_USAGE);
+            return 2;
+        }
+        let (Some(repo), Some(from), Some(to)) = (repo, from, to) else {
+            eprintln!("{}", LESSON_USAGE);
+            return 2;
+        };
+        let p = Path::new(repo.as_str());
+        if !p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) || !sha_ok(from) || !sha_ok(to) {
+            eprintln!("{}", LESSON_USAGE);
+            return 2;
+        }
+        match read_diff(p, from, to) {
+            Ok(d) => diff_in = Some(d),
+            Err(m) => return fail(&m),
+        }
+    } else {
+        let Some(ticket) = ticket else { return fail("--ticket is required") };
+        let Some(scope) = scope else { return fail("--scope-file is required") };
+        let ticket_bytes = match read_limited(ticket, "ticket file") {
+            Ok(b) => b,
+            Err(m) => return fail(&m),
+        };
+        let scope = match read_limited(scope, "scope file") {
+            Ok(b) if b.len() as u64 > MAX_FILE => return fail("the scope file is over 1 MiB"),
+            Ok(b) => match String::from_utf8(b) {
+                Ok(t) => crate::lane::parse_scope(&t),
+                Err(_) => return fail("the scope file is not valid UTF-8"),
+            },
+            Err(m) => return fail(&m),
+        };
+        let scope = match scope {
+            Ok(s) => s,
+            Err(m) => return fail(&format!("scope file: {}", m)),
+        };
+        ticket_in = Some((ticket_bytes, scope));
+    }
     let names = match walk(dir) {
         Ok(n) => n,
         Err(ms) => {
@@ -647,11 +827,22 @@ fn lookup_cmd(a: &[String]) -> i32 {
         }
     }
     let mut refused: Vec<String> = Vec::new();
-    let ticket = match crate::ticket::Ticket::parse_bytes(&ticket_bytes) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            refused.push(format!("harness: ticket refused: {}", esc(&e)));
-            None
+    let ticket = match &ticket_in {
+        Some((b, _)) => match crate::ticket::Ticket::parse_bytes(b) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                refused.push(format!("harness: ticket refused: {}", esc(&e)));
+                None
+            }
+        },
+        None => None,
+    };
+    // Does a token hit: by the ticket and the scope, or by the diff.
+    let hits = |tok: &str| -> Option<bool> {
+        match (&ticket, &ticket_in, &diff_in) {
+            (Some(t), Some((_, scope)), _) => Some(token_hits(tok, t, scope)),
+            (_, _, Some(d)) => Some(diff_hits(tok, d)),
+            _ => None,
         }
     };
     let (mut out, mut ids) = (Vec::new(), Vec::new());
@@ -679,8 +870,11 @@ fn lookup_cmd(a: &[String]) -> i32 {
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }
-        let (Some(close), Some(t)) = (close, &ticket) else { continue };
-        if problems.is_empty() && tokens.iter().any(|tok| token_hits(tok, t, &scope)) {
+        let Some(close) = close else { continue };
+        if ticket.is_none() && diff_in.is_none() {
+            continue;
+        }
+        if problems.is_empty() && tokens.iter().any(|tok| hits(tok) == Some(true)) {
             let id = &name[..9];
             out.push(format!("lesson: {} {} {}", id, esc(&heading(&lines, close, name)), esc(name)));
             ids.push(id);

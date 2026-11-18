@@ -127,6 +127,47 @@ flag it. A page matches when one token hits in one of three ways:
 - word: the token occurs in the title or in one acceptance criterion, letter case ignored per character
   (`char::to_lowercase`), with no word character (`char::is_alphanumeric` or `_`) directly before or after it.
 
+### Diff mode
+
+```
+harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>
+```
+
+Lists the pages that match the committed diff between two commits of one repo, with the two output line shapes above.
+A caller such as a review brief can list the matched lessons as checks. Tokens are read as above (quotes removed, an empty
+token refused). A token hits when:
+
+- path: its parts (split on `/`, empty parts dropped, letter case included) equal the first parts of one changed path. A
+  changed path is added, changed, deleted or type-changed; a rename reads as a delete plus an add; a gitlink change counts.
+  A path is read whole (a blank in a path is part of it).
+- word: it occurs, by the word rule above, in one added line of the diff. A removed line, a context line, a file header
+  line and a no-newline marker line do not count. An added line whose text starts with `++` is an added line, and a
+  removed line whose text starts with `--` is a removed line (the patch is read by its hunk counts). A CR at the end of an
+  added line is not part of a word.
+- a file git reads as binary counts by its path only (no line of it is read).
+- the repo rule does not apply (there is no ticket). Two different commits with equal trees give no changed path and no
+  added line. Repo and user git settings do not change the result.
+
+Refusals, usage (exit 2, the usage text): `--repo-dir` relative or with a `..` part, a sha that is not 40 or 64 lowercase
+hex, a flag given twice, a missing flag, `--ticket` or `--scope-file` beside the diff flags. Git faults (exit 2, one
+`harness: error: <message>` line, no partial list): a folder that is not a git repo, a sha that is not a commit of the repo,
+`--from` equal to `--to`, a `--from` that is not an ancestor of `--to`, a failed git call, a diff over 8 MiB. A bad page is
+refused as in ticket mode (exit 1).
+
+Order: the usage checks, then the git checks and the diff read, then the lessons folder and the pages. A git or size
+fault exits 2 even when a page is bad.
+
+Git runs read only (as `harness ticket words-only` does): no inherited `GIT_` name, no stdin, no replace refs, no lazy
+fetch, no hook, no external diff, no textconv, no color, submodules not ignored. Nothing is written: no file in the repo
+folder, its `.git` folder, the lessons folder or the current folder.
+
+Known gaps:
+
+- a token matches added text only, so a lesson about a removal is not offered
+- a base that is not an ancestor exits 2, so a caller passes the merge base of the branch and its target
+
+### Ticket mode and the wrapper lookup
+
 Where the verb is stricter than the wrapper lookup it replaces:
 
 - a page with no or a bad front matter, a bad or repeated `match` line, an empty token
