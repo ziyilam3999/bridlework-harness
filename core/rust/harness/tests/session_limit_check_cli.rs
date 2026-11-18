@@ -491,13 +491,13 @@ fn a_claude_text_with_weekly_or_session_as_the_name_is_unknown() {
 fn a_now_ms_above_year_9999_is_refused() {
     let t = "You've hit your weekly limit · resets 11am (Etc/UTC)";
     let body = lines(&[rl(t)]);
-    for big in ["253402300800000", "170141183460469231731687303715884105727", "999999999999999999999999999999999999999999"] {
+    for big in ["253401609600000", "253402300800000", "170141183460469231731687303715884105727", "999999999999999999999999999999999999999999"] {
         let o = run_bytes(body.as_bytes(), &["--provider", "claude", "--utc-offset", OFF, "--now-ms", big]);
         refused(&o, 2, "usage: harness session limit-check --transcript");
     }
     // the largest value is read
-    let o = run_bytes(body.as_bytes(), &["--provider", "claude", "--utc-offset", OFF, "--now-ms", "253402300799000"]);
-    expect(&o, 0, "class=limit provider=claude scope=provider code=weekly resets=");
+    let o = run_bytes(body.as_bytes(), &["--provider", "claude", "--utc-offset", OFF, "--now-ms", "253401609599000"]);
+    expect(&o, 0, "class=limit provider=claude scope=provider code=weekly resets=9999-12-24T03:00:00Z text=");
 }
 
 #[test]

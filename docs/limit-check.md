@@ -13,7 +13,7 @@ harness session limit-check --transcript <file> --provider <claude|zai> [--utc-o
 - `--transcript <file>`: required. The seat transcript, a JSON-lines file.
 - `--provider <claude|zai>`: required. The provider of the seat, taken from the launch record.
 - `--utc-offset <+HH:MM|-HH:MM>`: optional. A sign, hours 00 to 14, a colon, minutes 00 to 59. The zone of the Claude reset text.
-- `--now-ms <n>`: optional. The clock in milliseconds since the epoch, digits only, at most 253402300799000 (9999-12-31T23:59:59Z); a larger value is refused with exit 2. Without it the system clock is used.
+- `--now-ms <n>`: optional. The clock in milliseconds since the epoch, digits only, at most 253401609599000 (9999-12-23T23:59:59Z, so a kept reset has a four-digit year); a larger value is refused with exit 2. Without it the system clock is used.
 
 Each flag is given at most once. No environment variable is read, no file is written, no event is logged.
 

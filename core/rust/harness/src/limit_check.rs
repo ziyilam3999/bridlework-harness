@@ -8,8 +8,9 @@ const MAX_DEPTH: usize = 128;
 const MAX_AHEAD_MS: i128 = 691_200_000;
 /// The provider zone of z.ai texts, +08:00, in seconds.
 const ZAI_OFFSET_S: i128 = 8 * 3600;
-/// The largest `--now-ms` taken: 9999-12-31T23:59:59Z. A larger value is a bad value.
-const MAX_NOW_MS: i128 = 253_402_300_799_000;
+/// The largest `--now-ms` taken: 9999-12-23T23:59:59Z, 8 days before the end of year 9999, so a kept reset has a
+/// four-digit year. A larger value is a bad value.
+const MAX_NOW_MS: i128 = 253_401_609_599_000;
 
 const USAGE: &str = "usage: harness session limit-check --transcript <file> --provider <claude|zai> [--utc-offset <+HH:MM|-HH:MM>] [--now-ms <n>]";
 
