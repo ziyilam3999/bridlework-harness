@@ -110,8 +110,12 @@ fn record(ticket: &str, heads: &[String]) -> String {
 }
 
 fn run(verb: &str, args: &[String]) -> Output {
+    run_in(verb, args, &std::env::temp_dir())
+}
+
+fn run_in(verb: &str, args: &[String], cwd: &Path) -> Output {
     let mut c = Command::new(BIN);
-    c.arg("ticket").arg(verb).args(args).current_dir(std::env::temp_dir()).stdin(Stdio::null());
+    c.arg("ticket").arg(verb).args(args).current_dir(cwd).stdin(Stdio::null());
     for k in ["HARNESS_ROLE", "HARNESS_MODEL", "HARNESS_RUN_ID"] {
         c.env_remove(k);
     }
@@ -348,6 +352,23 @@ fn usage_faults_exit_2() {
         errored(&o);
         assert!(err(&o).contains("harness: error:"), "{verb}: {}", err(&o));
         assert!(!err(&o).contains(Path::new(&fx.caps).to_str().unwrap()), "no folder is printed");
+    }
+    assert!(fx.files().iter().all(|n| n != "T-1.reviews"), "nothing was written");
+}
+
+#[test]
+fn a_relative_or_dot_dot_caps_dir_is_refused_where_it_would_resolve() {
+    // Run in the fixture root, where a folder named caps exists outside the repo, so only the path check can refuse.
+    let fx = Fx::new();
+    let dot_dot = format!("{}/r/../caps", fx.root.display());
+    for caps in ["caps", dot_dot.as_str()] {
+        for (verb, tail) in [("review-fail", vec!["--head".to_string(), sha(11)]), ("fix-round-check", vec!["--role".into(), "gov".into(), "--model".into(), "m-1".into()])] {
+            let mut a: Vec<String> = vec![fx.tf.to_str().unwrap().into(), "--repo-map".into(), format!("r={}", fx.repo.display()), "--caps-dir".into(), caps.into()];
+            a.extend(tail);
+            let o = run_in(verb, &a, &fx.root);
+            errored(&o);
+            assert!(err(&o).contains("--caps-dir must be an absolute path"), "{verb} {caps}: {}", err(&o));
+        }
     }
     assert!(fx.files().iter().all(|n| n != "T-1.reviews"), "nothing was written");
 }
