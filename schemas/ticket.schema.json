@@ -1,6 +1,6 @@
 {
   "title": "ticket",
-  "description": "One ticket file. A human and tool mirror of the ticket shape in docs/ticket-contract.md (eleven required keys, two optional plan link keys); the crate does not interpret this file, and a later test pins its required set to the reader's.",
+  "description": "One ticket file. A human and tool mirror of the ticket shape in docs/ticket-contract.md (eleven required keys, two optional plan link keys, the optional removed_tests); the crate does not interpret this file, and a later test pins its required set to the reader's.",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "repo_id", "title", "group", "size", "objective", "acceptance_criteria", "dependencies", "risk", "owner_role", "evidence_links"],
@@ -32,6 +32,13 @@
       "maxLength": 300,
       "pattern": "^[^\\u0000-\\u001f\\u007f]*[^ \\t\\u0000-\\u001f\\u007f][^\\u0000-\\u001f\\u007f]*$",
       "description": "Optional. One line saying why the ticket is off plan. Not beside main_plan_ref."
+    },
+    "removed_tests": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": { "type": "string", "pattern": "^[^\\s\\u0000-\\u001f\\u007f]{1,300} -- .{1,300}$" },
+      "description": "Optional. Tests this ticket removes, each '<test id> -- <reason>' (split at the first ' -- '). A test id appears once. The engine hands the ids to head-only gate programs as HARNESS_GATE_REMOVED_TESTS."
     }
   },
   "not": { "allOf": [{ "required": ["main_plan_ref"] }, { "required": ["off_plan"] }] }

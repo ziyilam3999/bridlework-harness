@@ -24,7 +24,7 @@ The ticket has 11 required keys and two optional plan link keys (below). There a
 | `owner_role` | exactly one of the six role ids below |
 | `evidence_links` | array of strings, may be empty |
 
-No key outside these 11 and the two plan link keys below is allowed, and no key may appear twice.
+No key outside these 11, the two plan link keys and `removed_tests` below is allowed, and no key may appear twice.
 
 ## The plan link (optional)
 
@@ -38,6 +38,20 @@ A ticket may carry one of two optional keys, not both:
 The reader refuses a bad link shape with an error that names the field, so each caller that parses a ticket refuses it. A ticket with neither key parses as before.
 
 At this version only `harness ticket intake --plan-index <file>` checks the link against an index (see `docs/plan-index.md`): it requires one of the two keys and requires each `main_plan_ref` element to be an id of the index. The other callers check its shape (through the ticket parser), not the index.
+
+## Removed tests (optional)
+
+A ticket may carry the optional key `removed_tests`: an array of 1 to 200 strings, each `<test id> -- <reason>`, split at the first space-dash-dash-space (a reason may hold a second one).
+
+- The test id is 1 to 300 bytes with no blank and no control character; a test id is given once.
+- The reason is 1 to 300 bytes, not blank, with no control character.
+- Control characters are U+0000 to U+001F and U+007F, also when written as an escape.
+
+The reader refuses an empty array, a non-string element, null, a string in place of the array, an element with no separator, a bad test id or reason, more than 200 elements, and a repeated test id, naming `removed_tests`. The key given twice is refused like the other keys. A ticket without it reads as before.
+
+`harness ticket gate` hands the test ids to each head-only gate program as `HARNESS_GATE_REMOVED_TESTS` (joined by a newline, in ticket order; set and empty when the ticket has no key), beside `HARNESS_GATE_BASE` (the `--base` sha) and `HARNESS_GATE_HEAD` (the head judged). A value of these names in the caller environment does not reach the program. Both-ends programs get none of the three.
+
+An engine built before this key existed refuses a ticket that holds it (unknown key).
 
 ## The repo id
 
@@ -64,7 +78,7 @@ The plan for this work assumed five roles; the spec lists six, so all six are al
 
 ## Refusal
 
-A reader of this contract refuses, and runs nothing, on: a missing field, an unknown or duplicate field, both plan link keys, a bad plan link value, a wrongly typed value, a value outside a closed list, a malformed repo id, trailing text after the object, input that is not UTF-8, and a file over 1 MiB. A refusal names the field.
+A reader of this contract refuses, and runs nothing, on: a missing field, an unknown or duplicate field, both plan link keys, a bad plan link value, a bad `removed_tests` value, a wrongly typed value, a value outside a closed list, a malformed repo id, trailing text after the object, input that is not UTF-8, and a file over 1 MiB. A refusal names the field.
 
 ## Future fields
 

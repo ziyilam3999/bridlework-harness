@@ -5,6 +5,7 @@
 //! Every value is checked once against its one root, then only the checked value is used: the repo folder is canonicalized once, the base is a
 //! full sha, the result folder is canonicalized once and must lie outside the repo, the file name comes only from the validated ticket id.
 //! No error or stdout line repeats a mapped or result folder.
+//! A head-only program starts with HARNESS_GATE_BASE, HARNESS_GATE_HEAD and HARNESS_GATE_REMOVED_TESTS (the ticket's removed test ids, newline joined) set; a both-ends program gets none.
 //! `--log <absolute path>` (optional): a FAIL verdict appends ONE `gate_fail` event to that event log, through the events module's own record
 //! writer. The order is fixed and fails closed: the round and streak records first, THEN the log append, THEN the result file. A failed append
 //! is an error (exit 2, `EVENT NOT RECORDED`, no result file written by this run), never a quiet FAIL: the round stays counted, so the ticket is
@@ -415,7 +416,9 @@ fn run(a: &[String]) -> Result<Ran, Stop> {
                 gates::with_spec(gate, |spec| both_ends::judge(&root, &args.base, &head, &head, spec)).and_then(|x| x).map_err(err2)?
             } else {
                 let check = checks.get(id).ok_or_else(|| err2("a selected check is missing"))?;
-                let r = runner::run(&root, check, &head);
+                let removed = ticket.removed_tests.iter().flatten().filter_map(|e| e.split_once(" -- ").map(|(id, _)| id)).collect::<Vec<_>>().join("\n");
+                let check = check.with_env(&[("HARNESS_GATE_BASE", &args.base), ("HARNESS_GATE_HEAD", &head), ("HARNESS_GATE_REMOVED_TESTS", &removed)]);
+                let r = runner::run(&root, &check, &head);
                 clean_tree(&root)?;
                 r
             };

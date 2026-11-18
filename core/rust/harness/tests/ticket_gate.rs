@@ -928,3 +928,88 @@ fn a_no_checks_fail_logs_the_gates_own_id() {
     assert_eq!(lr.events[0].field("gate_id"), Some(&Field::Str("ticket-gate".to_string())));
     assert_eq!(lr.events[0].field("failure_class"), Some(&Field::Str("no-checks".to_string())));
 }
+
+const GATE_ENV: [&str; 3] = ["HARNESS_GATE_BASE", "HARNESS_GATE_HEAD", "HARNESS_GATE_REMOVED_TESTS"];
+
+/// A head-only gate `p` that writes its three env values to `<out>.base`, `.head`, `.removed` (`.set` when the list is set), out named in its args.
+fn env_fx(out: &Path) -> Fx {
+    let gate = format!("{{\"id\":\"p\",\"program\":\"ci/p.sh\",\"args\":[\"{}\"],\"timeout_ms\":20000,\"max_output_bytes\":4096,\"both_ends\":false}}", out.display());
+    let body = "o=\"$1\"\nprintf '%s' \"$HARNESS_GATE_BASE\" > \"$o.base\"\nprintf '%s' \"$HARNESS_GATE_HEAD\" > \"$o.head\"\nprintf '%s' \"$HARNESS_GATE_REMOVED_TESTS\" > \"$o.removed\"\nif [ \"${HARNESS_GATE_REMOVED_TESTS+x}\" = x ]; then echo set > \"$o.set\"; fi\n[ -s docs/x.txt ]";
+    Fx::with(Cfg::new().file("gates/p.json", &gate, false).file("ci/p.sh", &script("p", body), true))
+}
+
+/// Run the gate with a ticket body; the three names are removed on the child first, then `set` is applied.
+fn gate_env(fx: &Fx, body: &str, base: &str, set: &[(&str, &str)]) -> Output {
+    let tf = ticket_file(fx, body);
+    let mut c = Command::new(BIN);
+    c.arg("ticket").arg("gate").args(args_for(&tf, &fx.repo, base, fx.res.to_str().unwrap(), &fx.caps)).current_dir(&fx.other).stdin(Stdio::null());
+    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"].iter().chain(GATE_ENV.iter()) {
+        c.env_remove(k);
+    }
+    c.env("GATE_MARKER", &fx.marker);
+    for (k, v) in set {
+        c.env(k, v);
+    }
+    c.output().unwrap()
+}
+
+fn with_removed(list: &str) -> String {
+    let t = ticket_json("r", "T-1", false);
+    format!("{},\"removed_tests\":{}}}", t.trim_end_matches('}'), list)
+}
+
+fn seen(out: &Path, ext: &str) -> Option<String> {
+    fs::read_to_string(format!("{}.{}", out.display(), ext)).ok()
+}
+
+#[test]
+fn a_head_only_gate_sees_base_head_and_removed_tests() {
+    let dir = Tmp::new();
+    let out = dir.0.join("seen");
+    let fx = env_fx(&out);
+    let head = fx.commit(&[("docs/x.txt", "doc1")]);
+    let o = gate_env(&fx, &with_removed("[\"a::one -- gone\",\"b::two -- moved\"]"), &fx.c0, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(seen(&out, "base"), Some(fx.c0.clone()));
+    assert_eq!(seen(&out, "head"), Some(head));
+    assert_eq!(seen(&out, "removed"), Some("a::one\nb::two".to_string()));
+    assert_eq!(seen(&out, "set"), Some("set\n".to_string()));
+}
+
+#[test]
+fn an_inherited_gate_env_is_replaced() {
+    let dir = Tmp::new();
+    let out = dir.0.join("seen");
+    let fx = env_fx(&out);
+    let head = fx.commit(&[("docs/x.txt", "doc1")]);
+    let bogus = [("HARNESS_GATE_BASE", "bogus-base"), ("HARNESS_GATE_HEAD", "bogus-head"), ("HARNESS_GATE_REMOVED_TESTS", "bogus-test")];
+    let o = gate_env(&fx, &with_removed("[\"a::one -- gone\"]"), &fx.c0, &bogus);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(seen(&out, "base"), Some(fx.c0.clone()));
+    assert_eq!(seen(&out, "head"), Some(head));
+    assert_eq!(seen(&out, "removed"), Some("a::one".to_string()));
+}
+
+#[test]
+fn a_ticket_with_no_removed_tests_gives_an_empty_list() {
+    let dir = Tmp::new();
+    let out = dir.0.join("seen");
+    let fx = env_fx(&out);
+    fx.commit(&[("docs/x.txt", "doc1")]);
+    let o = gate_env(&fx, &ticket_json("r", "T-1", false), &fx.c0, &[("HARNESS_GATE_REMOVED_TESTS", "bogus-test")]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(seen(&out, "removed"), Some(String::new()));
+    assert_eq!(seen(&out, "set"), Some("set\n".to_string()), "set and empty");
+}
+
+#[test]
+fn a_both_ends_gate_gets_no_gate_env() {
+    let dir = Tmp::new();
+    let out = dir.0.join("env.txt");
+    let body = format!("env | grep '^HARNESS_GATE_' > \"{}\"\n[ \"$(cat src/value.txt)\" = ok ]", out.display());
+    let fx = Fx::with(Cfg::new().file("ci/t.sh", &script("t", &body), true));
+    fx.commit(&[("src/value.txt", "ok")]);
+    let o = gate_env(&fx, &with_removed("[\"a::one -- gone\"]"), &fx.c0, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(fs::read_to_string(&out).ok(), Some(String::new()), "the program ran and saw no gate name");
+}
