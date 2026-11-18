@@ -22,7 +22,7 @@ One JSON object per line, with these 8 required keys and one optional key `left_
 
 A `left_estimate` that is a string, a decimal, negative, `-0`, written with an exponent, `null`, a boolean, an array, an object or over 1000000 is refused as `line <n>: field `left_estimate`: wrong type or value`. A repeated one is refused as `line <n>: field `left_estimate`: given twice`. Rows with and without the key may be mixed.
 
-`dropped` means the operator decided not to build the row (`later` means deferred). A dropped row is not open work: it needs the `deviation` object with `reason`, `decided_by` (`operator` or `orchestrator-reading`, as for a `deviation` row) and `date`, and `harness ticket intake --plan-index` refuses a ticket that names it. The reader does not judge the object; `plan check` does.
+`dropped` means a recorded decision not to build the row (`later` means deferred). A dropped row is not open work: it needs the `deviation` object with `reason`, `decided_by` (`operator` or `orchestrator-reading`, as for a `deviation` row) and `date`, and `harness ticket intake --plan-index` refuses a ticket that names it. The reader does not judge the object; `plan check` does.
 
 `unknown` means no source shows the state yet. `null` is told apart from a number, `true`, `false`, an array and an object: a `deviation` of `1.5`, `true` or `[]` is a wrong type, not `null`.
 
@@ -164,7 +164,7 @@ Known gaps:
 - On an index with rows marked `built` with no linked done ticket (by either direction), or rows in state `unknown`, `plan check` is red.
 - One ticket that does not parse or one bad done record in the folders makes check, status and ticket mode exit 2.
 - The MCP intake tool passes no index, so it does not refuse a ticket that names a dropped row.
-- `plan check`, whole index and `--ticket`, does not flag a ticket that names a complete dropped row; intake does.
+- `plan check`, whole index and `--ticket`, does not flag a ticket that names a complete dropped row; `harness ticket intake --plan-index` refuses it when the row is in `main_plan_ref`.
 - Intake reads `main_plan_ref` only, so an `off_plan` ticket that a dropped row lists passes.
 - The `progress` line still counts a ticket linked to a dropped row.
 - An engine binary older than this change refuses an index with a dropped row (exit 2), so a row is set to `dropped` only after the bw engine binary is rebuilt.

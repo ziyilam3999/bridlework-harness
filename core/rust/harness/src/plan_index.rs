@@ -3,7 +3,7 @@
 //! repo. The reader runs nothing and writes nothing. A refusal of a line names the line, and the field when it has one; no refusal prints a value or a path.
 //! It does not check whether a row is built; `harness ticket intake --plan-index` checks that each `main_plan_ref` element is an
 //! id of the index, and refuses an index with a repeated id. The seven states are not-built, in-build, built, deviation, later,
-//! dropped (the operator decided not to build the row) and unknown; the reader does not judge the deviation object of a deviation or dropped row.
+//! dropped (a recorded decision not to build the row) and unknown; the reader does not judge the deviation object of a deviation or dropped row.
 
 use std::io::Read;
 use std::path::Path;
@@ -29,7 +29,7 @@ pub enum State {
     Built,
     Deviation,
     Later,
-    /// The operator decided not to build the row; it needs a deviation object like state deviation.
+    /// A recorded decision not to build the row (decided_by operator or orchestrator-reading); it needs a deviation object like state deviation.
     Dropped,
     /// No source shows the state yet.
     Unknown,
