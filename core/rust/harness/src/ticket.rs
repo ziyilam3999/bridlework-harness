@@ -1,4 +1,4 @@
-//! The ticket reader (std only). One ticket is one JSON file with eleven required keys and two optional plan link keys (`docs/ticket-contract.md`); `Ticket::parse` turns
+//! The ticket reader (std only). One ticket is one JSON file with eleven required keys, two optional plan link keys and the optional `removed_tests` (`docs/ticket-contract.md`); `Ticket::parse` turns
 //! the text into data and runs nothing. Reading fails closed: anything the contract does not name is a refusal that names the field.
 //! The repo comes from the ticket's `repo_id` through `RepoId`, never from the folder the reader runs in.
 
@@ -32,10 +32,47 @@ pub struct Ticket {
     pub main_plan_ref: Option<Vec<String>>,
     /// Optional plan link: one line saying why the ticket is off plan. Not judged.
     pub off_plan: Option<String>,
+    /// Optional: tests this ticket removes, each `<test id> -- <reason>`. As read by `parse`: 1 to 200 elements, shape checked, ids unique.
+    pub removed_tests: Option<Vec<String>>,
 }
 
 /// Longest `off_plan` reason, in bytes.
 const MAX_OFF_PLAN_BYTES: usize = 300;
+/// Most `removed_tests` elements, and the longest test id and reason, in bytes.
+const MAX_REMOVED_TESTS: usize = 200;
+const MAX_REMOVED_PART_BYTES: usize = 300;
+
+fn has_control(s: &str) -> bool {
+    s.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}')
+}
+
+/// The shape rules of `removed_tests`. Each Err names the field.
+fn check_removed(list: &Option<Vec<String>>) -> Result<(), String> {
+    let Some(list) = list else { return Ok(()) };
+    if list.is_empty() {
+        return Err("`removed_tests`: must not be empty".to_string());
+    }
+    if list.len() > MAX_REMOVED_TESTS {
+        return Err("`removed_tests`: at most 200 elements".to_string());
+    }
+    let mut ids: Vec<&str> = Vec::new();
+    for el in list {
+        let Some((id, reason)) = el.split_once(" -- ") else {
+            return Err("`removed_tests`: each element must be `<test id> -- <reason>`".to_string());
+        };
+        if id.is_empty() || id.len() > MAX_REMOVED_PART_BYTES || id.chars().any(char::is_whitespace) || has_control(id) {
+            return Err("`removed_tests`: a test id must be 1 to 300 bytes with no blank and no control character".to_string());
+        }
+        if reason.trim().is_empty() || reason.len() > MAX_REMOVED_PART_BYTES || has_control(reason) {
+            return Err("`removed_tests`: a reason must be 1 to 300 bytes, not blank, with no control character".to_string());
+        }
+        if ids.contains(&id) {
+            return Err("`removed_tests`: a test id is given twice".to_string());
+        }
+        ids.push(id);
+    }
+    Ok(())
+}
 
 /// The shape rules of the two optional link keys. Each Err names the field.
 fn check_links(plan_ref: &Option<Vec<String>>, off_plan: &Option<String>) -> Result<(), String> {
@@ -185,7 +222,7 @@ fn one_of(name: &str, s: &str, list: &[&str]) -> Result<(), String> {
 }
 
 impl Ticket {
-    /// Strict parse of the ticket shape: eleven keys, each exactly once, plus the optional `main_plan_ref` and `off_plan` (not both),
+    /// Strict parse of the ticket shape: eleven keys, each exactly once, plus the optional `main_plan_ref` and `off_plan` (not both) and `removed_tests`,
     /// no unknown key, no default. The Err names the field. Text over 1 MiB is refused.
     pub fn parse(text: &str) -> Result<Ticket, String> {
         if text.len() > MAX_TICKET_BYTES {
@@ -196,7 +233,7 @@ impl Ticket {
         let (mut id, mut repo_id, mut title, mut group) = (None, None, None, None);
         let (mut size, mut objective, mut acceptance_criteria) = (None, None, None);
         let (mut dependencies, mut risk, mut owner_role, mut evidence_links) = (None, None, None, None);
-        let (mut main_plan_ref, mut off_plan) = (None, None);
+        let (mut main_plan_ref, mut off_plan, mut removed_tests) = (None, None, None);
         if p.peek() == Some(b'}') {
             p.i += 1;
         } else {
@@ -217,6 +254,7 @@ impl Ticket {
                     "evidence_links" => once(&mut evidence_links, "evidence_links", field("evidence_links", p.string_array())?)?,
                     "main_plan_ref" => once(&mut main_plan_ref, "main_plan_ref", field("main_plan_ref", p.string_array())?)?,
                     "off_plan" => once(&mut off_plan, "off_plan", field("off_plan", p.string())?)?,
+                    "removed_tests" => once(&mut removed_tests, "removed_tests", field("removed_tests", p.string_array())?)?,
                     _ => return Err(format!("unknown key `{}`", key)),
                 }
                 match p.peek() {
@@ -256,7 +294,8 @@ impl Ticket {
         one_of("risk", &risk, &RISKS)?;
         one_of("owner_role", &owner_role, &OWNER_ROLES)?;
         check_links(&main_plan_ref, &off_plan)?;
-        Ok(Ticket { id, repo_id, title, group, size, objective, acceptance_criteria, dependencies, risk, owner_role, evidence_links, main_plan_ref, off_plan })
+        check_removed(&removed_tests)?;
+        Ok(Ticket { id, repo_id, title, group, size, objective, acceptance_criteria, dependencies, risk, owner_role, evidence_links, main_plan_ref, off_plan, removed_tests })
     }
 
     /// Read from raw bytes: over 1 MiB and not UTF-8 are refused before any parsing.
@@ -422,6 +461,7 @@ mod tests {
         let mut want: Vec<String> = FIELDS.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "the schema's required set equals the reader's eleven fields");
+        assert!(!got.iter().any(|k| k == "removed_tests"), "removed_tests is not required");
         // Planted failing twin of the comparison: a drifted set must differ.
         let drifted = schema.replacen("\"evidence_links\"]", "]", 1);
         let mut drift = required_of(&drifted);
@@ -492,6 +532,77 @@ mod tests {
         let mut want: Vec<String> = FIELDS.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(got, want, "the required set is still the eleven");
-        assert!(!got.iter().any(|k| k == "main_plan_ref" || k == "off_plan"));
+        assert!(!got.iter().any(|k| k == "main_plan_ref" || k == "off_plan" || k == "removed_tests"));
+    }
+
+    #[test]
+    fn the_schema_names_the_removed_tests_property() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let schema = std::fs::read_to_string(repo.join("schemas/ticket.schema.json")).unwrap();
+        assert!(schema.contains("\"removed_tests\": {"), "removed_tests is a property");
+        assert!(!required_of(&schema).iter().any(|k| k == "removed_tests"), "removed_tests is not required");
+    }
+
+    fn removed(raw: &str) -> Result<Ticket, String> {
+        Ticket::parse(&plus("removed_tests", raw))
+    }
+
+    #[test]
+    fn a_ticket_with_removed_tests_reads() {
+        let t = removed("[\"mod::a_test -- moved to b\"]").unwrap();
+        assert_eq!(t.removed_tests, Some(vec!["mod::a_test -- moved to b".to_string()]));
+        let many: Vec<String> = (0..200).map(|i| format!("\"t{i} -- r\"")).collect();
+        let t = removed(&format!("[{}]", many.join(","))).unwrap();
+        assert_eq!(t.removed_tests.map(|v| v.len()), Some(200));
+        let t = removed("[\"t -- a -- b\"]").unwrap();
+        assert_eq!(t.removed_tests, Some(vec!["t -- a -- b".to_string()]));
+        assert_eq!(Ticket::parse(&render(&base())).unwrap().removed_tests, None);
+    }
+
+    #[test]
+    fn a_bad_removed_tests_is_refused() {
+        let long_id = format!("[\"{} -- r\"]", "i".repeat(301));
+        let long_reason = format!("[\"t -- {}\"]", "r".repeat(301));
+        let ok_edge = format!("[\"{} -- {}\"]", "i".repeat(300), "r".repeat(300));
+        assert!(removed(&ok_edge).is_ok(), "300 bytes is the limit");
+        let many: Vec<String> = (0..201).map(|i| format!("\"t{i} -- r\"")).collect();
+        let too_many = format!("[{}]", many.join(","));
+        let cases: Vec<&str> = vec![
+            "[]",
+            "[1]",
+            "[null]",
+            "null",
+            "\"t -- r\"",
+            "[\"t\"]",
+            "[\"t --r\"]",
+            "[\" -- r\"]",
+            "[\"   -- r\"]",
+            "[\"t -- \"]",
+            "[\"t --    \"]",
+            "[\"a b -- r\"]",
+            "[\"a\\tb -- r\"]",
+            "[\"a\\u0001b -- r\"]",
+            "[\"t -- a\\nb\"]",
+            "[\"t -- a\\u007fb\"]",
+            "[\"t -- a\\u0000b\"]",
+            &long_id,
+            &long_reason,
+            &too_many,
+            "[\"t -- r\",\"t -- other\"]",
+        ];
+        for raw in cases {
+            let shown: String = raw.chars().take(60).collect();
+            let err = removed(raw).expect_err(&shown);
+            assert!(err.contains("`removed_tests`"), "names the field for {shown}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_removed_tests_key_is_refused() {
+        let mut twice = base();
+        twice.push(("removed_tests", "[\"t -- r\"]"));
+        twice.push(("removed_tests", "[\"u -- r\"]"));
+        let err = Ticket::parse(&render(&twice)).expect_err("key twice");
+        assert!(err.contains("duplicate key `removed_tests`"), "{err}");
     }
 }

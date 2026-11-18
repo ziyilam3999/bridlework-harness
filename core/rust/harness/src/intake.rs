@@ -180,6 +180,7 @@ mod tests {
             evidence_links: vec![],
             main_plan_ref: None,
             off_plan: None,
+            removed_tests: None,
         }
     }
 

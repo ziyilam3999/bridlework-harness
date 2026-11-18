@@ -1,6 +1,7 @@
 //! Gate runner core (std only). Runs one declared check as a child process and returns a normalized `GateResult`.
 //! A check past its time budget is FAIL (class timeout), never PASS. Captured output is capped in bytes and marked as cut.
 //! A check path is resolved with realpath when loaded; a path that leaves the repo (dot-dot, absolute, or a symlink out) is refused.
+//! A check may carry env values (`with_env`) that replace an inherited value; the ticket gate sets the three HARNESS_GATE_* names on head-only checks, other callers set none.
 //! Known limits: the resolved path is not re-checked at run time (load-to-run swap is not closed), and only the direct child is killed, not its descendants.
 
 use crate::gate_result::{GateResult, Status};
@@ -21,9 +22,18 @@ pub struct Check {
     budget: Duration,
     max_output: usize,
     poll: Duration,
+    /// Names set on the child after the GIT_* removal; they replace an inherited value of the same name.
+    set_env: Vec<(String, String)>,
 }
 
 impl Check {
+    /// A copy that starts its program with these env values set (the ticket gate passes the base, the head and the removed tests).
+    pub fn with_env(&self, vars: &[(&str, &str)]) -> Check {
+        let mut c = self.clone();
+        c.set_env = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        c
+    }
+
     /// The id, budget and output cap, checked on their own (so a caller can refuse a bad spec before it creates anything).
     pub fn load_limits(id: &str, budget: Duration, max_output: usize) -> Result<(), String> {
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')) {
@@ -52,7 +62,7 @@ impl Check {
         if !real.is_file() {
             return Err("check path is not a file".to_string());
         }
-        Ok(Check { id: id.to_string(), program: real, args: args.iter().map(|s| s.to_string()).collect(), budget, max_output, poll: Duration::from_millis(10) })
+        Ok(Check { id: id.to_string(), program: real, args: args.iter().map(|s| s.to_string()).collect(), budget, max_output, poll: Duration::from_millis(10), set_env: Vec::new() })
     }
 }
 
@@ -99,7 +109,7 @@ pub fn run(repo_root: &Path, check: &Check, head_sha: &str) -> GateResult {
     run_ended(repo_root, check, head_sha).0
 }
 
-/// Like `run`, also reporting how the process ended. The child gets the inherited environment minus every `GIT_*` name.
+/// Like `run`, also reporting how the process ended. The child gets the inherited environment minus the `GIT_*` names, then the check's `set_env` values.
 pub fn run_ended(repo_root: &Path, check: &Check, head_sha: &str) -> (GateResult, Ended) {
     // The budget clock starts before spawn, so spawn and reader setup count against it.
     let start = Instant::now();
@@ -109,6 +119,9 @@ pub fn run_ended(repo_root: &Path, check: &Check, head_sha: &str) -> (GateResult
         if k.to_string_lossy().starts_with("GIT_") {
             cmd.env_remove(k);
         }
+    }
+    for (k, v) in &check.set_env {
+        cmd.env(k, v);
     }
     // A file written just before the run can be briefly "text file busy" while another thread forks; retry a few times, then fail.
     let mut tries = 0;
