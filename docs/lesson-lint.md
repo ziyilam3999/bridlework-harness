@@ -84,8 +84,8 @@ Output (exit 0): one line `lesson: <id> <heading> <file name>` per matching page
 Retired pages: both modes skip a page with `status: retired` (a lesson that no longer holds is not offered). The page is
 still checked as any page (a `FRONT-MATTER`, `STATUS` or `MATCH` problem refuses it) and still counts in `scanned`. When
 `r` pages read are retired (they hit or not, with a match key or not), the receipt ends with a last field:
-`lessons: scanned=<n> matched=<ids|none> retired=<r>`; with no retired page the field is not printed. A reader of the
-receipt accepts the optional last field.
+`lessons: scanned=<n> matched=<ids|none> retired=<r>`; with no retired page the field is not printed. A caller that parses
+the receipt line has to accept the optional last field `retired=<r>`; no reader in this repo parses it.
 
 Heading: the text after `# ` of the first line below the front matter that starts with `# `, trimmed of Unicode white
 space. With no such line, or an empty text, it is the part of the file name between `ISSUE-<3 digits>-` and `.md` with
@@ -178,7 +178,7 @@ folder, its `.git` folder, the lessons folder or the current folder.
 Known gaps:
 
 - a token matches added text only, so a lesson about a removal is not offered
-- a page with no `status` key is offered (the lint flags it)
+- a page with no `status` key is matched like an active page (the lint flags it)
 - a status key in other letter case (`Status:`) is another key, so that page reads as having no status
 - a base that is not an ancestor exits 2, so a caller passes the merge base of the branch and its target
 - the patch is read as text (`--text`), so a large binary file counts toward the 8 MiB limit
