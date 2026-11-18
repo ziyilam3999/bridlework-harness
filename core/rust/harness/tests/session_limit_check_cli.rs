@@ -454,6 +454,53 @@ fn feb_29_is_read_only_in_a_leap_year() {
 }
 
 #[test]
+fn a_non_transient_row_with_no_text_item_is_unknown() {
+    let o = go(&[err(Some(403), Some("authentication_failed"), None, None)], "claude");
+    expect(&o, 5, "class=unknown provider=- scope=- code=403 resets=unknown text=\n");
+}
+
+#[test]
+fn a_line_that_is_json_but_not_an_object_exits_3_and_names_the_line() {
+    for bad in ["[1]", "5", "\"x\"", "null"] {
+        let body = format!("{}\n{bad}\n{}\n", zai("2026-11-20 23:35:47"), zai("2026-11-20 23:35:47"));
+        let o = run_bytes(body.as_bytes(), &["--provider", "zai", "--now-ms", NOW]);
+        refused(&o, 3, "harness: limit-check refused: reason=unreadable");
+        assert!(errs(&o).contains("line 2"), "{}", errs(&o));
+    }
+}
+
+#[test]
+fn a_non_429_row_with_the_1308_marker_is_unknown() {
+    let t = "Usage limit reached for 5 hour [1308] [req-test]";
+    let o = go(&[err(Some(403), Some("authentication_failed"), None, Some(t))], "zai");
+    expect(&o, 5, "class=unknown provider=- scope=- code=403");
+}
+
+#[test]
+fn a_claude_text_with_weekly_or_session_as_the_name_is_unknown() {
+    for t in [
+        "You've hit your Weekly limit · resets Nov 19 at 11am (Etc/UTC)",
+        "You've reached your weekly limit · resets Nov 19 at 11am (Etc/UTC)",
+        "You've reached your SESSION limit. Run /usage-credits to continue",
+    ] {
+        expect(&go(&[rl(t)], "claude"), 5, "class=unknown provider=- scope=- code=429");
+    }
+}
+
+#[test]
+fn a_now_ms_above_year_9999_is_refused() {
+    let t = "You've hit your weekly limit · resets 11am (Etc/UTC)";
+    let body = lines(&[rl(t)]);
+    for big in ["253402300800000", "170141183460469231731687303715884105727", "999999999999999999999999999999999999999999"] {
+        let o = run_bytes(body.as_bytes(), &["--provider", "claude", "--utc-offset", OFF, "--now-ms", big]);
+        refused(&o, 2, "usage: harness session limit-check --transcript");
+    }
+    // the largest value is read
+    let o = run_bytes(body.as_bytes(), &["--provider", "claude", "--utc-offset", OFF, "--now-ms", "253402300799000"]);
+    expect(&o, 0, "class=limit provider=claude scope=provider code=weekly resets=");
+}
+
+#[test]
 fn a_negative_offset_crosses_the_date() {
     let t = "You've hit your session limit · resets 11pm (Etc/UTC)";
     let o = go_at(&[rl(t)], "claude", "1794880800000", "-05:00");

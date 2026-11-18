@@ -8,6 +8,8 @@ const MAX_DEPTH: usize = 128;
 const MAX_AHEAD_MS: i128 = 691_200_000;
 /// The provider zone of z.ai texts, +08:00, in seconds.
 const ZAI_OFFSET_S: i128 = 8 * 3600;
+/// The largest `--now-ms` taken: 9999-12-31T23:59:59Z. A larger value is a bad value.
+const MAX_NOW_MS: i128 = 253_402_300_799_000;
 
 const USAGE: &str = "usage: harness session limit-check --transcript <file> --provider <claude|zai> [--utc-offset <+HH:MM|-HH:MM>] [--now-ms <n>]";
 
@@ -245,7 +247,7 @@ enum Found {
     Last(ErrorRow),
 }
 
-/// Read every line. Errors are the text after `reason=unreadable`.
+/// Read line by line until the end or the first bad line, which is refused. Errors are the text after `reason=unreadable`.
 fn read_rows<R: BufRead>(mut r: R) -> Result<Found, String> {
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
@@ -498,7 +500,8 @@ enum Verdict {
 fn classify(row: &ErrorRow, provider: &str, offset_s: Option<i128>, now_ms: i128) -> Verdict {
     if row.transient {
         return Verdict::Other;
-    }    let Some(text) = row.text.as_deref() else { return Verdict::Unknown };
+    }
+    let Some(text) = row.text.as_deref() else { return Verdict::Unknown };
     let is429 = row.status.as_deref() == Some("429");
     let rate = row.error.as_deref() == Some("rate_limit");
     if is429 && rate {
@@ -582,8 +585,8 @@ pub fn limit_check_cmd(a: &[String]) -> i32 {
     };
     let now_ms: i128 = match now {
         Some(t) => match digits_to(t) {
-            Some(n) => n,
-            None => return usage(),
+            Some(n) if n <= MAX_NOW_MS => n,
+            _ => return usage(),
         },
         None => match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => d.as_millis() as i128,

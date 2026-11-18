@@ -13,7 +13,7 @@ harness session limit-check --transcript <file> --provider <claude|zai> [--utc-o
 - `--transcript <file>`: required. The seat transcript, a JSON-lines file.
 - `--provider <claude|zai>`: required. The provider of the seat, taken from the launch record.
 - `--utc-offset <+HH:MM|-HH:MM>`: optional. A sign, hours 00 to 14, a colon, minutes 00 to 59. The zone of the Claude reset text.
-- `--now-ms <n>`: optional. The clock in milliseconds since the epoch, digits only. Without it the system clock is used.
+- `--now-ms <n>`: optional. The clock in milliseconds since the epoch, digits only, at most 253402300799000 (9999-12-31T23:59:59Z); a larger value is refused with exit 2. Without it the system clock is used.
 
 Each flag is given at most once. No environment variable is read, no file is written, no event is logged.
 
@@ -93,7 +93,7 @@ class=unknown provider=- scope=- code=429 resets=unknown text=Too many requests
 |---|---|---|---|
 | 0 | the last error row is a limit | one line | empty |
 | 2 | usage: missing, repeated or unknown flag, bad value, stray word; or the system clock is before the epoch | empty | the usage text, or `harness: error: clock is before the epoch` |
-| 3 | the transcript is unreadable: missing, not a regular file, empty, not UTF-8, a line that is not a JSON object | empty | `harness: limit-check refused: reason=unreadable` and the cause, with the 1-based line number for a line problem |
+| 3 | the transcript is unreadable: missing, not a regular file, empty, not UTF-8, a line that is not valid JSON, a line that is valid JSON but not an object | empty | `harness: limit-check refused: reason=unreadable` and the cause, with the 1-based line number for a line problem |
 | 4 | other | one line | empty |
 | 5 | unknown | one line | empty |
 | 6 | no error row, or the seat recovered | empty | `harness: limit-check: reason=no-error-row` or `reason=recovered` |
