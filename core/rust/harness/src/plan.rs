@@ -1,7 +1,8 @@
 //! `harness plan check|status` (std only, no cfg(unix); it does not use launcher.rs or ticket_gate.rs). It reads three private
 //! inputs passed by path: the plan index (`plan_index.rs`), the folder of ticket files (`<id>.json`) and the folder of done records
 //! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
-//! done ticket, a done ticket with no row and no reason, an incomplete deviation, a repeated id, an unknown state); `status`
+//! done ticket, a done ticket with no row and no reason, an incomplete deviation or dropped row, a repeated id, an unknown
+//! state); a dropped row (a recorded decision not to build it) is not open and needs no estimate; `status`
 //! reports rows per state and progress weighted by size (S=1, M=3, L=9); progress counts linked tickets. In whole-index
 //! status the last line `progress-estimated` adds the optional `left_estimate` of open rows; in whole-index check an open row
 //! with no estimate is red. Both read only. They read links and states, not code.
@@ -153,6 +154,7 @@ fn state_name(s: State) -> &'static str {
         State::Built => "built",
         State::Deviation => "deviation",
         State::Later => "later",
+        State::Dropped => "dropped",
         State::Unknown => "unknown",
     }
 }
@@ -182,10 +184,10 @@ fn pct(part: u64, whole: u64) -> String {
     (100 * part).checked_div(whole).map_or("none".to_string(), |p| p.to_string())
 }
 
-/// The deviation classes of one row (none unless its state is deviation).
+/// The deviation classes of one row (none unless its state is deviation or dropped).
 fn deviation_classes(r: &Row) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if r.state != State::Deviation {
+    if !matches!(r.state, State::Deviation | State::Dropped) {
         return out;
     }
     let field = |f: fn(&plan_index::Deviation) -> &Option<String>| r.deviation.as_ref().and_then(|d| f(d).as_deref()).filter(|s| !s.trim().is_empty());
@@ -299,6 +301,11 @@ fn status(inp: &Inputs) -> i32 {
         let ids: Vec<&str> = rows.iter().filter(|r| r.state == s).map(|r| r.id.as_str()).collect();
         let list = if ids.is_empty() { "-".to_string() } else { ids.join(",") };
         println!("state {} rows={} ids={}", state_name(s), ids.len(), list);
+    }
+    // The dropped line is printed only when a row is dropped, so an index without one reads as before.
+    let dropped: Vec<&str> = rows.iter().filter(|r| r.state == State::Dropped).map(|r| r.id.as_str()).collect();
+    if !dropped.is_empty() {
+        println!("state dropped rows={} ids={}", dropped.len(), dropped.join(","));
     }
     let links: Vec<Vec<usize>> = tickets.iter().map(|t| linked(rows, t)).collect();
     let listed = |t: &Ticket| rows.iter().any(|r| r.tickets.contains(&t.id));

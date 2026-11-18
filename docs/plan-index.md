@@ -13,7 +13,7 @@ One JSON object per line, with these 8 required keys and one optional key `left_
 | `id` | 1 to 64 bytes of ASCII letters, digits, `.`, `_` or `-` |
 | `title` | non-empty string |
 | `plan_line` | JSON integer from 0 to 2^64-1, written with digits only |
-| `state` | one of `not-built`, `in-build`, `built`, `deviation`, `later`, `unknown` |
+| `state` | one of `not-built`, `in-build`, `built`, `deviation`, `later`, `dropped`, `unknown` (exact letter case) |
 | `tickets` | array of strings with the id character rule, may be empty |
 | `deviation` | `null`, or an object whose keys are among `reason`, `decided_by`, `date`, `source`, each once and each a string |
 | `trigger` | `null` or a string |
@@ -21,6 +21,8 @@ One JSON object per line, with these 8 required keys and one optional key `left_
 | `left_estimate` (optional) | JSON integer from 0 to 1000000, written with digits only: points of work on the row that has no ticket file yet (S=1, M=3, L=9) |
 
 A `left_estimate` that is a string, a decimal, negative, `-0`, written with an exponent, `null`, a boolean, an array, an object or over 1000000 is refused as `line <n>: field `left_estimate`: wrong type or value`. A repeated one is refused as `line <n>: field `left_estimate`: given twice`. Rows with and without the key may be mixed.
+
+`dropped` means a recorded decision not to build the row (`later` means deferred). A dropped row is not open work: it needs the `deviation` object with `reason`, `decided_by` (`operator` or `orchestrator-reading`, as for a `deviation` row) and `date`, and `harness ticket intake --plan-index` refuses a ticket that names it. The reader does not judge the object; `plan check` does.
 
 `unknown` means no source shows the state yet. `null` is told apart from a number, `true`, `false`, an array and an object: a `deviation` of `1.5`, `true` or `[]` is a wrong type, not `null`.
 
@@ -32,7 +34,7 @@ A `left_estimate` that is a string, a decimal, negative, `-0`, written with an e
 - An empty or blanks-only line is refused (a lone newline is one).
 - A line must be one JSON object with nothing after it.
 - Refused in any object: a repeated key, a lone surrogate escape, a raw control byte or NUL in a string, a byte order mark, a trailing comma, nesting deeper than 32.
-- Refused: a missing required key, an unknown key (any key outside the nine), a wrong type, an `id` outside the character rule, a `state` outside the six.
+- Refused: a missing required key, an unknown key (any key outside the nine), a wrong type, an `id` outside the character rule, a `state` outside the seven.
 - Refused for the file: missing, a folder or not readable; over 1 MiB; not UTF-8; zero rows.
 - A function lists the ids that appear on more than one row. Intake refuses an index with one.
 
@@ -52,7 +54,7 @@ Order, with the exit code of each step:
 2. The index read (each refusal of the reader, and an index with a repeated id): exit 2, stderr `harness: error: plan index: <reason>`.
 3. The ticket file read: exit 2.
 4. The ticket parse (both link keys, an empty list, a bad element or reason): exit 1.
-5. The plan link, only when `--plan-index` is given: exit 1 with `harness: ticket refused: no plan link: main_plan_ref or off_plan is required`, or with `harness: ticket refused: main_plan_ref names <element>, which is not in the plan index` for the first element that is not an id of the index. An `off_plan` ticket passes this step.
+5. The plan link, only when `--plan-index` is given: exit 1 with `harness: ticket refused: no plan link: main_plan_ref or off_plan is required`, or with `harness: ticket refused: main_plan_ref names <element>, which is not in the plan index` for the first element that is not an id of the index, or with `harness: ticket refused: main_plan_ref names <element>, which is a dropped row of the plan index` for the first element that names a dropped row. The elements are read in list order in one pass, so the first bad element of either kind gives the line; it names the element only, no title and no reason. An `off_plan` ticket passes this step, also when a dropped row lists its id.
 6. The repo lookup.
 
 Without `--plan-index`, no link is required and none is checked against an index; the shape of a link that is given is still checked at step 4. The accept line is the same in both modes: `ticket=<id> repo_id=<id> head=<sha>`.
@@ -88,7 +90,7 @@ One stdout line per finding, `red <class> <id>`, then the last line `plan check 
 | `unknown-state <row id>` | state `unknown` (fail closed: unknown is not a pass) |
 | `open-row-no-estimate <row id>` | state `not-built` or `in-build` and no `left_estimate` key (fail closed: a missing number is not zero; `0` passes); whole-index mode only, named after the other findings of the same row, once per sighting |
 | `built-no-done-ticket <row id>` | state `built` and no linked ticket has a done record (a listed ticket with no ticket file does not count) |
-| `deviation-no-reason`, `deviation-no-decided-by`, `deviation-no-date <row id>` | state `deviation` and that key missing, empty or blanks only, or the `deviation` null |
+| `deviation-no-reason`, `deviation-no-decided-by`, `deviation-no-date <row id>` | state `deviation` or `dropped` and that key missing, empty or blanks only, or the `deviation` null |
 | `deviation-bad-decided-by <row id>` | `decided_by` is given and is not `operator` or `orchestrator-reading` |
 | `ticket-names-unknown-row <ticket id> <element>` | a `main_plan_ref` element that is not an index id, on any ticket |
 | `done-ticket-no-row <ticket id>` | a done ticket with no `off_plan` and no linked row |
@@ -96,23 +98,24 @@ One stdout line per finding, `red <class> <id>`, then the last line `plan check 
 
 ### Ticket mode
 
-`plan check --ticket <id>` is meant for the `bw finish --merge` wrapper (a later ticket), to be called before the merge and before the done record is written. `<tickets>/<id>.json` must be a ticket file (else exit 2). The three inputs are read and refused as above, so one broken file in either folder is exit 2. Findings are only about this ticket and the rows it links to: `no-plan-link <ticket id>` (no `off_plan` and no linked row), `ticket-names-unknown-row`, and for each linked row `duplicate-id`, `unknown-state` and the four `deviation-` classes. A done record is not needed. Red ends with `plan check red findings=<n>` (exit 1); green is exactly `plan check ok ticket=<id>` (exit 0). A finding about another row or ticket does not change the answer.
+`plan check --ticket <id>` is meant for the `bw finish --merge` wrapper (a later ticket), to be called before the merge and before the done record is written. `<tickets>/<id>.json` must be a ticket file (else exit 2). The three inputs are read and refused as above, so one broken file in either folder is exit 2. Findings are only about this ticket and the rows it links to: `no-plan-link <ticket id>` (no `off_plan` and no linked row), `ticket-names-unknown-row`, and for each linked row `duplicate-id`, `unknown-state` and the four `deviation-` classes (these fire for a linked row in state `deviation` or `dropped`; a ticket that names a complete dropped row gives no finding). A done record is not needed. Red ends with `plan check red findings=<n>` (exit 1); green is exactly `plan check ok ticket=<id>` (exit 0). A finding about another row or ticket does not change the answer.
 
 ### plan status
 
 Exit 0 when the inputs read; it does not go red. Lines, in this order:
 
 - six lines `state <s> rows=<n> ids=<id,id,...>` for `not-built`, `in-build`, `built`, `deviation`, `later`, `unknown` (ids in index order, `-` when none);
+- after the `unknown` line, one line `state dropped rows=<n> ids=<id,id,...>`, only when n is 1 or more (an index with no dropped row prints the output of before; an engine that does not read the state refuses an index with a dropped row, exit 2);
 - one line `off-plan ticket=<id> done=<yes|no> reason=<reason>` for each `off_plan` ticket that no row lists;
 - one line `leaned-on row=<id> tickets=<id,...>` for each `later` row that has a linked ticket;
 - `progress done=<points> left=<points> percent=<n|none>`: done is the points of linked tickets with a done record, left the points of linked tickets with none;
 - `on-plan done=<points> all-done=<points> percent=<n|none>`: done as above, all-done the points of the tickets with a done record, linked or not;
 - one line `no-estimate row=<id>` for each `not-built` or `in-build` row with no `left_estimate`, in index order;
-- last, `progress-estimated done=<D> left=<L> estimate=<E> percent=<n|none>`: D is the done of the progress line, E the sum of `left_estimate` over rows in state `not-built` or `in-build` (a row counts once per sighting), L the left of the progress line plus E. Percent is the floor of 100 x D / (D + L); it is `none` when D + L is 0 or when at least one `no-estimate` line was printed. Estimates on rows in other states are read and not added.
+- last, `progress-estimated done=<D> left=<L> estimate=<E> percent=<n|none>`: D is the done of the progress line, E the sum of `left_estimate` over rows in state `not-built` or `in-build` (a row counts once per sighting), L the left of the progress line plus E. Percent is the floor of 100 x D / (D + L); it is `none` when D + L is 0 or when at least one `no-estimate` line was printed. Estimates on rows in other states, a dropped row among them, are read and not added; a dropped row gets no `no-estimate` line.
 
 Points come from the ticket `size`: S=1, M=3, L=9. A ticket counts once, however many rows link it and in either direction. Percent is the floor of 100 x done / (done + left), or of 100 x done / all-done; `none` when the divisor is 0. A printed title or reason has each control character replaced by one blank.
 
-`plan status --ticket <id>` prints one line `row=<id> state=<s> plan_line=<n> title=<title>` per linked row in index order; with no linked row, `off-plan reason=<reason>` or `no-plan-link ticket=<id>`. A missing ticket file is exit 2.
+`plan status --ticket <id>` prints one line `row=<id> state=<s> plan_line=<n> title=<title>` per linked row in index order (`state=dropped` for a dropped row); with no linked row, `off-plan reason=<reason>` or `no-plan-link ticket=<id>`. A missing ticket file is exit 2.
 
 ### Exit codes
 
@@ -126,7 +129,7 @@ harness plan stale-notes --index <absolute-file> --tickets <absolute-dir> --done
 
 A line such as "until ticket G-3 is built" goes stale when G-3 is built, and a stale line sends the next agent on a side quest. This sub-verb lists such lines in the named files, and lists in-build rows that list tickets, all with done records, and carry no estimated work (`left_estimate` 0 or absent). It reports; it writes and decides nothing. Flags and files come in any order; a word that starts with `--` is a flag. The code is `core/rust/harness/src/plan.rs`.
 
-Inputs: the three plan inputs are read as for `plan check`, then each named file in argument order. Done ids are the names of the done records; built ids are the ids of rows in state `built`. Rows in state `not-built`, `in-build`, `deviation`, `later` or `unknown` give no id.
+Inputs: the three plan inputs are read as for `plan check`, then each named file in argument order. Done ids are the names of the done records; built ids are the ids of rows in state `built`. Rows in state `not-built`, `in-build`, `deviation`, `later`, `dropped` or `unknown` give no id.
 
 **Pending phrases** (a fixed list, ASCII letter case ignored): `until`, `being built`, `not built`, `not yet built`, `waits for`, `todo`. The words of a phrase are split by one or more ASCII spaces or tabs; a hyphen does not split them (`not-built` is not a phrase). No ASCII letter, digit or underscore may stand directly before or after a phrase, so `untill`, `todos`, `xuntil` and `notbuilt` are not phrases.
 
@@ -160,5 +163,9 @@ Known gaps:
 - A ticket made before intake took a plan link carries no link, so it counts only when a row lists it.
 - On an index with rows marked `built` with no linked done ticket (by either direction), or rows in state `unknown`, `plan check` is red.
 - One ticket that does not parse or one bad done record in the folders makes check, status and ticket mode exit 2.
-- The MCP intake tool passes no index.
+- The MCP intake tool passes no index, so it does not refuse a ticket that names a dropped row.
+- `plan check`, whole index and `--ticket`, does not flag a ticket that names a complete dropped row; `harness ticket intake --plan-index` refuses it when the row is in `main_plan_ref`.
+- Intake reads `main_plan_ref` only, so an `off_plan` ticket that a dropped row lists passes.
+- The `progress` line still counts a ticket linked to a dropped row.
+- An engine binary older than this change refuses an index with a dropped row (exit 2), so a row is set to `dropped` only after the bw engine binary is rebuilt.
 - An `off_plan` reason is not judged.
