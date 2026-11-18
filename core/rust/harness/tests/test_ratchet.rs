@@ -1,5 +1,5 @@
-//! Tests of the test-list ratchet gate (`gates/test-ratchet.sh`). Each runs the real program, and for the engine arms the real
-//! binary, on a scratch repo holding a tiny no-dependency crate at `core/rust`. This file never reads an environment variable; the
+//! Tests of the test-list ratchet gate (`gates/test-ratchet.sh`). Most run the real program, and for the engine arms the real
+//! binary, on a scratch repo holding a tiny no-dependency crate at `core/rust`. This file reads no environment variable by name; the
 //! three gate names are removed on every child before any is set, because the suite itself may run under a gate run that sets them.
 #![cfg(unix)]
 use harness::gate_result::{GateResult, Status};
@@ -254,6 +254,20 @@ fn a_lost_unit_test_is_named_by_its_source_path() {
     r.change(&[("src/lib.rs", Some("pub mod caps {}\n"))]);
     failed(&r.gate(&[]).1, "src/lib.rs::caps::tests::x");
     passed(&r.gate(&["src/lib.rs::caps::tests::x -- dropped"]).1);
+}
+
+#[test]
+fn a_base_crate_that_reads_a_file_outside_core_rust_builds() {
+    // The base export holds the whole commit, so an include_str! of a file outside core/rust builds at the base.
+    let mut r = Repo::new(&BASE_FILES);
+    put(&r.dir.join("data/outside.txt"), "x\n", false);
+    put(&r.dir.join("core/rust/src/lib.rs"), "pub const D: &str = include_str!(\"../../../data/outside.txt\");\n", false);
+    git(&r.dir, &["add", "-A"]);
+    git(&r.dir, &["commit", "-q", "-m", "base reads outside"]);
+    r.base = git(&r.dir, &["rev-parse", "HEAD"]);
+    r.change(&[("tests/t.rs", Some("#[test]\nfn a_lost_test() {}\n#[test]\nfn kept() {}\n#[test]\nfn added() {}\n"))]);
+    let (_, res) = r.gate(&[]);
+    passed(&res);
 }
 
 #[test]

@@ -1,10 +1,11 @@
 #!/bin/sh
 # Test-list ratchet gate (head only). Usage: gates/test-ratchet.sh
-# Lists the tests of core/rust at the head (in place) and at the base (an export in a temp folder), then
+# Lists the tests of core/rust at the head (in place) and at the base (an export of the whole base commit in a temp folder), then
 # fails when a base test is gone and the ticket does not name it (lost-test), or when the ticket names a
 # test that is not lost (named-not-removed). A test id is <source path>::<listed test path>.
 # Env from the engine: HARNESS_GATE_BASE, HARNESS_GATE_HEAD (full lowercase sha), HARNESS_GATE_REMOVED_TESTS
-# (newline joined ids, may be empty but must be set). Any other state fails closed.
+# (newline joined ids, may be empty but must be set). A bad env value, a failed export or build, an empty base
+# list or a failed compare step fails closed.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 fail() {
     echo "test-ratchet: $*" >&2
@@ -46,20 +47,22 @@ list_tests() {
         /^ +Running / { s = $0; sub(/^ +Running /, "", s); sub(/ \(.*$/, "", s); sub(/^unittests /, "", s); cur = s; next }
         /^ +Doc-tests / { cur = ""; next }
         /: test$/ { if (cur != "") { t = $0; sub(/: test$/, "", t); print cur "::" t } }
-    ' "$tmp/raw" | sort -u >"$3"
+    ' "$tmp/raw" >"$tmp/ids" || return 1
+    sort -u "$tmp/ids" >"$3" || return 1
 }
 
 mkdir "$tmp/base" || fail "cannot make the base folder"
-git -C "$root" archive --format=tar -o "$tmp/base.tar" "$base" core/rust || fail "cannot export the base"
+git -C "$root" archive --format=tar -o "$tmp/base.tar" "$base" || fail "cannot export the base"
 tar -xf "$tmp/base.tar" -C "$tmp/base" || fail "cannot unpack the base"
 list_tests "$tmp/base" "$tmp/target-base" "$tmp/base.ids" || fail "the test list cannot be built at the base"
 [ -s "$tmp/base.ids" ] || fail "the base test list holds no test id"
 list_tests "$root" "" "$tmp/head.ids" || fail "the test list cannot be built at the head"
 
-printf '%s\n' "$HARNESS_GATE_REMOVED_TESTS" | sed '/^$/d' | sort -u >"$tmp/named.ids"
-comm -23 "$tmp/base.ids" "$tmp/head.ids" >"$tmp/lost.ids"
-comm -23 "$tmp/lost.ids" "$tmp/named.ids" >"$tmp/unnamed.ids"
-comm -23 "$tmp/named.ids" "$tmp/lost.ids" >"$tmp/kept.ids"
+printf '%s\n' "$HARNESS_GATE_REMOVED_TESTS" | sed '/^$/d' >"$tmp/named.raw" || fail "cannot read the named removals"
+sort -u "$tmp/named.raw" >"$tmp/named.ids" || fail "cannot sort the named removals"
+comm -23 "$tmp/base.ids" "$tmp/head.ids" >"$tmp/lost.ids" || fail "cannot compare the lists"
+comm -23 "$tmp/lost.ids" "$tmp/named.ids" >"$tmp/unnamed.ids" || fail "cannot compare the lists"
+comm -23 "$tmp/named.ids" "$tmp/lost.ids" >"$tmp/kept.ids" || fail "cannot compare the lists"
 bad=0
 if [ -s "$tmp/unnamed.ids" ]; then
     echo "test-ratchet: class lost-test: a base test is gone and the ticket does not name it:" >&2
