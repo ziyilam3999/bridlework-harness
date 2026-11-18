@@ -2,8 +2,9 @@
 //! inputs passed by path: the plan index (`plan_index.rs`), the folder of ticket files (`<id>.json`) and the folder of done records
 //! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
 //! done ticket, a done ticket with no row and no reason, an incomplete deviation, a repeated id, an unknown state); `status`
-//! reports rows per state and progress weighted by size (S=1, M=3, L=9); progress counts linked tickets, and the last line
-//! `progress-estimated` adds the optional `left_estimate` of open rows. An open row with no estimate is red in check. Both read only. They read links and states, not code.
+//! reports rows per state and progress weighted by size (S=1, M=3, L=9); progress counts linked tickets. In whole-index
+//! status the last line `progress-estimated` adds the optional `left_estimate` of open rows; in whole-index check an open row
+//! with no estimate is red. Both read only. They read links and states, not code.
 //! One unparsable ticket or bad done record makes check, status and ticket mode exit 2. Details: `docs/plan-index.md`.
 
 use crate::plan_index::{self, Row, State};
