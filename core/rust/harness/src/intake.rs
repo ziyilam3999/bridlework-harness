@@ -105,14 +105,23 @@ fn head_sha(dir: &Path) -> Option<String> {
 }
 
 /// The plan link step, run only when an index is given. A ticket with neither key is refused; each `main_plan_ref` element must be an
-/// id of the index; an `off_plan` ticket passes. The Err is the text after `ticket refused: `.
+/// id of the index and not a row in state dropped (read in list order, one pass: the first bad element is named); an `off_plan`
+/// ticket passes. The Err is the text after `ticket refused: `.
 pub fn plan_link(ticket: &Ticket, rows: &[crate::plan_index::Row]) -> Result<(), String> {
+    use crate::plan_index::State;
     match (&ticket.main_plan_ref, &ticket.off_plan) {
         (None, None) => Err("no plan link: main_plan_ref or off_plan is required".to_string()),
-        (Some(list), _) => match list.iter().find(|el| !rows.iter().any(|r| &r.id == *el)) {
-            Some(el) => Err(format!("main_plan_ref names {el}, which is not in the plan index")),
-            None => Ok(()),
-        },
+        (Some(list), _) => {
+            for el in list {
+                if !rows.iter().any(|r| &r.id == el) {
+                    return Err(format!("main_plan_ref names {el}, which is not in the plan index"));
+                }
+                if rows.iter().any(|r| &r.id == el && r.state == State::Dropped) {
+                    return Err(format!("main_plan_ref names {el}, which is a dropped row of the plan index"));
+                }
+            }
+            Ok(())
+        }
         (None, Some(_)) => Ok(()),
     }
 }

@@ -385,6 +385,113 @@ fn each_of_the_six_states_is_read() {
     }
 }
 
+const DEV_OK: &str = r#"{"reason":"r","decided_by":"operator","date":"2026-01-01"}"#;
+
+/// A dropped row with the given raw deviation and title.
+fn dropped_row(id: &str, dev: &str, title: &str) -> String {
+    render(
+        &pairs(id)
+            .into_iter()
+            .map(|(k, v)| match k.as_str() {
+                "state" => (k, "\"dropped\"".to_string()),
+                "deviation" => (k, dev.to_string()),
+                "title" => (k, format!("\"{title}\"")),
+                _ => (k, v),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn dropped_line(el: &str) -> String {
+    format!("harness: ticket refused: main_plan_ref names {el}, which is a dropped row of the plan index")
+}
+
+#[test]
+fn the_dropped_state_is_read() {
+    index_read("dropped", two(&dropped_row("R-1", DEV_OK, "t")));
+    index_read("dropped null deviation", two(&dropped_row("R-1", "null", "t")));
+}
+
+#[test]
+fn a_ticket_naming_a_dropped_row_is_refused() {
+    let fx = Fx::new();
+    let idx = fx.file("idx.jsonl", two(&dropped_row("R-1", DEV_OK, "t")));
+    let t = fx.ticket(&[("main_plan_ref", "[\"R-1\"]")]);
+    expect(&fx.intake(&t, Some(&idx)), 1, &dropped_line("R-1"));
+}
+
+#[test]
+fn a_ticket_naming_a_live_row_and_a_dropped_row_is_refused() {
+    let fx = Fx::new();
+    let idx = fx.file("idx.jsonl", two(&dropped_row("R-1", DEV_OK, "t")));
+    let t = fx.ticket(&[("main_plan_ref", "[\"R-2\",\"R-1\"]")]);
+    expect(&fx.intake(&t, Some(&idx)), 1, &dropped_line("R-1"));
+}
+
+#[test]
+fn the_first_bad_element_names_the_refusal() {
+    let fx = Fx::new();
+    let idx = fx.file("idx.jsonl", two(&dropped_row("R-1", DEV_OK, "t")));
+    let t = fx.ticket(&[("main_plan_ref", "[\"HO-999\",\"R-1\"]")]);
+    expect(&fx.intake(&t, Some(&idx)), 1, "harness: ticket refused: main_plan_ref names HO-999, which is not in the plan index");
+    let t = fx.ticket(&[("main_plan_ref", "[\"R-1\",\"HO-999\"]")]);
+    expect(&fx.intake(&t, Some(&idx)), 1, &dropped_line("R-1"));
+}
+
+#[test]
+fn an_index_state_close_to_dropped_exits_2() {
+    for raw in ["\"Dropped\"", "\"DROPPED\"", "\"drop\"", "\"dropped \"", "\"\""] {
+        index_refused(raw, two(&row_set("state", raw)), "line 1: field `state`: wrong type or value");
+    }
+}
+
+#[test]
+fn a_dropped_refusal_runs_no_git() {
+    let fx = Fx::new();
+    let not_repo = fx.root.join("plain");
+    fs::create_dir_all(&not_repo).unwrap();
+    let idx = fx.file("idx.jsonl", two(&dropped_row("R-1", DEV_OK, "t")));
+    let t = fx.ticket(&[("main_plan_ref", "[\"R-1\"]")]);
+    let r = run(&[
+        "ticket".to_string(),
+        "intake".to_string(),
+        t.display().to_string(),
+        "--repo-map".to_string(),
+        format!("{REPO_ID}={}", not_repo.display()),
+        "--plan-index".to_string(),
+        idx.display().to_string(),
+    ]);
+    expect(&r, 1, &dropped_line("R-1"));
+}
+
+#[test]
+fn a_dropped_refusal_prints_no_row_text() {
+    let fx = Fx::new();
+    let dev = r#"{"reason":"zqreason9","decided_by":"operator","date":"2026-01-01"}"#;
+    let idx = fx.file("idx.jsonl", two(&dropped_row("R-1", dev, "zqtitle9")));
+    let t = fx.ticket(&[("main_plan_ref", "[\"R-1\"]")]);
+    let r = fx.intake(&t, Some(&idx));
+    expect(&r, 1, &dropped_line("R-1"));
+    for text in [&r.out, &r.err] {
+        assert!(!text.contains("zqtitle9") && !text.contains("zqreason9"), "no row text: {text}");
+    }
+}
+
+#[test]
+fn without_the_flag_a_ticket_naming_a_dropped_row_is_accepted() {
+    let fx = Fx::new();
+    expect_ok(&fx, &fx.intake(&fx.ticket(&[("main_plan_ref", "[\"R-1\"]")]), None));
+}
+
+#[test]
+fn an_off_plan_ticket_listed_by_a_dropped_row_is_accepted() {
+    // Known gap: intake reads main_plan_ref only.
+    let fx = Fx::new();
+    let row1 = dropped_row("R-1", DEV_OK, "t").replace("\"tickets\":[]", "\"tickets\":[\"T-1\"]");
+    let idx = fx.file("idx.jsonl", two(&row1));
+    expect_ok(&fx, &fx.intake(&fx.ticket(&[("off_plan", "\"why\"")]), Some(&idx)));
+}
+
 #[test]
 fn an_index_with_an_unknown_field_exits_2() {
     let extra = row("R-1").replacen('{', "{\"extra\":1,", 1);

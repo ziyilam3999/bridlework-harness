@@ -757,6 +757,111 @@ progress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\nno-
     is(&e.status(), 0, want);
 }
 
+// ---- dropped rows
+
+fn dropped_case(dev: &str, want: &str) {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "dropped", &[], dev)]);
+    is(&e.check(), 1, want);
+}
+
+#[test]
+fn a_complete_dropped_row_is_green() {
+    let e = Env::new();
+    e.index(&[
+        row_bare("R-1", "dropped", &[], DEV_OK),
+        row_bare("R-2", "dropped", &[], r#"{"reason":"r","decided_by":"orchestrator-reading","date":"d"}"#),
+    ]);
+    is(&e.check(), 0, "plan check ok rows=2 tickets=0 done=0\n");
+}
+
+#[test]
+fn a_dropped_row_with_a_null_deviation_is_red() {
+    dropped_case("null", "red deviation-no-reason R-1\nred deviation-no-decided-by R-1\nred deviation-no-date R-1\nplan check red findings=3\n");
+}
+
+#[test]
+fn a_dropped_row_missing_one_deviation_field_is_red() {
+    dropped_case(r#"{"decided_by":"operator","date":"d"}"#, "red deviation-no-reason R-1\nplan check red findings=1\n");
+    dropped_case(r#"{"reason":"r","date":"d"}"#, "red deviation-no-decided-by R-1\nplan check red findings=1\n");
+    dropped_case(r#"{"reason":"r","decided_by":"operator"}"#, "red deviation-no-date R-1\nplan check red findings=1\n");
+    dropped_case(r#"{"reason":"   ","decided_by":"operator","date":"d"}"#, "red deviation-no-reason R-1\nplan check red findings=1\n");
+}
+
+#[test]
+fn a_dropped_row_with_an_unknown_decided_by_is_red() {
+    dropped_case(r#"{"reason":"r","decided_by":"me","date":"d"}"#, "red deviation-bad-decided-by R-1\nplan check red findings=1\n");
+}
+
+#[test]
+fn a_dropped_row_needs_no_estimate() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "dropped", &[], DEV_OK)]);
+    is(&e.check(), 0, "plan check ok rows=1 tickets=0 done=0\n");
+    e.index(&[row_est("R-1", "dropped", &[], DEV_OK, Some(5))]);
+    is(&e.check(), 0, "plan check ok rows=1 tickets=0 done=0\n");
+}
+
+#[test]
+fn a_done_ticket_linked_to_a_dropped_row_is_not_red() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "dropped", &["T-1"], DEV_OK)]);
+    e.ticket("T-1", "S", "");
+    e.ticket("T-2", "S", &names(r#""R-1""#));
+    e.ticket("T-3", "S", &names(r#""R-1""#));
+    e.done("T-1");
+    e.done("T-2");
+    is(&e.check(), 0, "plan check ok rows=1 tickets=3 done=2\n");
+}
+
+#[test]
+fn ticket_mode_is_red_when_its_dropped_row_is_incomplete() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "dropped", &[], "null")]);
+    e.ticket("T-1", "S", &names(r#""R-1""#));
+    is(
+        &e.run("check", &["--ticket", "T-1"]),
+        1,
+        "red deviation-no-reason R-1\nred deviation-no-decided-by R-1\nred deviation-no-date R-1\nplan check red findings=3\n",
+    );
+}
+
+#[test]
+fn ticket_mode_passes_a_ticket_naming_a_complete_dropped_row() {
+    // Known gap: check does not flag a ticket that names a dropped row (intake does).
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "dropped", &[], DEV_OK)]);
+    e.ticket("T-1", "S", &names(r#""R-1""#));
+    is(&e.run("check", &["--ticket", "T-1"]), 0, "plan check ok ticket=T-1\n");
+}
+
+#[test]
+fn status_lists_dropped_rows() {
+    let e = Env::new();
+    e.index(&[r("R-1", "not-built"), row_bare("R-2", "dropped", &[], DEV_OK), row_bare("R-3", "dropped", &[], DEV_OK)]);
+    let want = only_not_built("R-1", 1)
+        + "state dropped rows=2 ids=R-2,R-3\nprogress done=0 left=0 percent=none\non-plan done=0 all-done=0 percent=none\nprogress-estimated done=0 left=0 estimate=0 percent=none\n";
+    is(&e.status(), 0, &want);
+}
+
+#[test]
+fn status_does_not_add_the_estimate_of_a_dropped_row() {
+    let e = Env::new();
+    e.index(&[row_est("R-1", "not-built", &[], "null", Some(2)), row_est("R-2", "dropped", &[], DEV_OK, Some(7)), row_bare("R-3", "dropped", &[], DEV_OK)]);
+    e.ticket("T-1", "M", &names(r#""R-2""#));
+    let want = only_not_built("R-1", 1)
+        + "state dropped rows=2 ids=R-2,R-3\nprogress done=0 left=3 percent=0\non-plan done=0 all-done=0 percent=none\nprogress-estimated done=0 left=5 estimate=2 percent=0\n";
+    is(&e.status(), 0, &want);
+}
+
+#[test]
+fn status_ticket_prints_state_dropped() {
+    let e = Env::new();
+    e.index(&[row_bare("R-1", "dropped", &[], DEV_OK)]);
+    e.ticket("T-1", "S", &names(r#""R-1""#));
+    is(&e.run("status", &["--ticket", "T-1"]), 0, "row=R-1 state=dropped plan_line=3 title=t\n");
+}
+
 // ---- usage
 
 #[test]

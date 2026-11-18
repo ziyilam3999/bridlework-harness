@@ -2,7 +2,8 @@
 //! row with eight required keys and one optional key, `left_estimate` (`docs/plan-index.md`). It is private data of the operator, passed by path; none of it is kept in this
 //! repo. The reader runs nothing and writes nothing. A refusal of a line names the line, and the field when it has one; no refusal prints a value or a path.
 //! It does not check whether a row is built; `harness ticket intake --plan-index` checks that each `main_plan_ref` element is an
-//! id of the index, and refuses an index with a repeated id.
+//! id of the index, and refuses an index with a repeated id. The seven states are not-built, in-build, built, deviation, later,
+//! dropped (the operator decided not to build the row) and unknown; the reader does not judge the deviation object of a deviation or dropped row.
 
 use std::io::Read;
 use std::path::Path;
@@ -28,6 +29,8 @@ pub enum State {
     Built,
     Deviation,
     Later,
+    /// The operator decided not to build the row; it needs a deviation object like state deviation.
+    Dropped,
     /// No source shows the state yet.
     Unknown,
 }
@@ -40,6 +43,7 @@ impl State {
             "built" => State::Built,
             "deviation" => State::Deviation,
             "later" => State::Later,
+            "dropped" => State::Dropped,
             "unknown" => State::Unknown,
             _ => return None,
         })
@@ -438,6 +442,22 @@ mod tests {
         let rows = parse(format!("{ROW}\n{ROW}").as_bytes()).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(repeated_ids(&rows), vec!["R-1".to_string()]);
+    }
+
+    #[test]
+    fn a_dropped_row_reads() {
+        let line = ROW.replace("\"unknown\"", "\"dropped\"").replace(
+            "\"deviation\":null",
+            "\"deviation\":{\"reason\":\"why\",\"decided_by\":\"operator\",\"date\":\"2026-01-02\"}",
+        );
+        let rows = parse(line.as_bytes()).unwrap();
+        assert_eq!(rows[0].state, State::Dropped);
+        let d = rows[0].deviation.as_ref().unwrap();
+        assert_eq!(d.reason.as_deref(), Some("why"));
+        assert_eq!(d.decided_by.as_deref(), Some("operator"));
+        assert_eq!(d.date.as_deref(), Some("2026-01-02"));
+        let null_dev = ROW.replace("\"unknown\"", "\"dropped\"");
+        assert!(parse(null_dev.as_bytes()).unwrap()[0].deviation.is_none());
     }
 
     fn with(extra: &str) -> String {
