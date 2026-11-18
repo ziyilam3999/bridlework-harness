@@ -81,6 +81,12 @@ Output (exit 0): one line `lesson: <id> <heading> <file name>` per matching page
 `lessons: scanned=<n> matched=<ids joined by a comma>` (`matched=none` when no page matches). `<id>` is the
 `ISSUE-<3 digits>` start of the file name; `<n>` is the number of pages read. Two pages with one id are both listed.
 
+Retired pages: both modes skip a page with `status: retired` (a lesson that no longer holds is not offered). The page is
+still checked as any page (a `FRONT-MATTER`, `STATUS` or `MATCH` problem refuses it) and still counts in `scanned`. When
+`r` pages read are retired (they hit or not, with a match key or not), the receipt ends with a last field:
+`lessons: scanned=<n> matched=<ids|none> retired=<r>`; with no retired page the field is not printed. A reader of the
+receipt accepts the optional last field.
+
 Heading: the text after `# ` of the first line below the front matter that starts with `# `, trimmed of Unicode white
 space. With no such line, or an empty text, it is the part of the file name between `ISSUE-<3 digits>-` and `.md` with
 each `-` turned into a blank. A code fence is not looked at. The heading and the file name are printed through the escape
@@ -113,8 +119,11 @@ valid UTF-8), then the exit 1 refusals (the ticket line first, then the pages in
 folder, a file given as the folder, a page that is not valid UTF-8 and a folder with no page exit 2.
 
 Front matter: read with the reader of the lint. A page for which the lint lists a `FRONT-MATTER` or a `MATCH` problem is
-refused with the rule word and detail the lint prints. No other lint rule is checked. A page with no `match` key is
-counted and matches nothing. The ticket goes through the ticket reader; only `repo_id`, `title` and `acceptance_criteria`
+refused with the rule word and detail the lint prints. The `STATUS` check is made too: a `status` value that is not
+`unvalidated`, `validated` or `retired` (an empty value, a quoted value and `Retired` included) is refused with the
+lint line, not read as active and not read as retired; a missing `status` key reads as active (the lint reports it). On
+one page the lines come in the lint order: `FRONT-MATTER`, `STATUS`, `MATCH`. No other lint rule is checked. A page with
+no `match` key is counted and matches nothing. The ticket goes through the ticket reader; only `repo_id`, `title` and `acceptance_criteria`
 are used. The scope file is read as `lane claim` reads it (at most 1 MiB, UTF-8, `parse_scope`).
 
 Tokens: the parts of the `match` list split on commas, trimmed, then with the leading and trailing `"` and `'` removed. A
@@ -169,6 +178,8 @@ folder, its `.git` folder, the lessons folder or the current folder.
 Known gaps:
 
 - a token matches added text only, so a lesson about a removal is not offered
+- a page with no `status` key is offered (the lint flags it)
+- a status key in other letter case (`Status:`) is another key, so that page reads as having no status
 - a base that is not an ancestor exits 2, so a caller passes the merge base of the branch and its target
 - the patch is read as text (`--text`), so a large binary file counts toward the 8 MiB limit
 
@@ -182,6 +193,8 @@ Where the verb is stricter than the wrapper lookup it replaces:
   symbolic link, another digit count and a non-regular file; it reads a name that is not UTF-8 as a page)
 - a missing or empty scope file, and what `parse_scope` refuses (a blank-only line, a `..` part, a leading `/`, a control
   character, `a//b`)
+- a page with an unknown `status` value (the verb refuses it; the wrapper does not read status)
+- a page with `status: retired` (the verb skips it and counts it in `retired=<r>`; the wrapper still offers it)
 
 Where the verb reads more than the wrapper:
 

@@ -1,7 +1,8 @@
 //! `harness lesson lint <path> [<path> ...]`: checks the shape of lesson pages (see `docs/lesson-lint.md`).
 //! `harness lesson lookup` lists the pages that match a ticket (ticket mode: --ticket and --scope-file) or the
 //! committed diff between two commits of one repo (diff mode: --repo-dir, --from, --to; changed paths and added
-//! lines); same docs page. The lint
+//! lines); same docs page. Both modes skip a page with status retired (still checked, counted in scanned, and
+//! counted in the receipt field retired=<r>) and refuse an unknown status. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
 
@@ -216,6 +217,15 @@ fn match_tokens<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<Vec<&'a s
     Ok(Some(tokens))
 }
 
+/// The status of a page: Ok(None) when the key is absent; Err is the STATUS problem line of an unknown value.
+fn status_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&'a str>, String> {
+    match keys.get("status").copied() {
+        None => Ok(None),
+        Some(v @ ("unvalidated" | "validated" | "retired")) => Ok(Some(v)),
+        Some(v) => Err(format!("STATUS status {} is not unvalidated, validated or retired", v)),
+    }
+}
+
 /// Check one page (`file` is its file name, not its path) and return its `<RULE> <detail>` lines. `seen` maps an id to the first file that carried it.
 fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
@@ -262,10 +272,10 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
     }
     // STATUS
     let mut status: Option<&str> = None;
-    match keys.get("status").copied() {
-        None => out.push("STATUS status is missing".to_string()),
-        Some(v @ ("unvalidated" | "validated" | "retired")) => status = Some(v),
-        Some(v) => out.push(format!("STATUS status {} is not unvalidated, validated or retired", v)),
+    match status_of(&keys) {
+        Ok(None) => out.push("STATUS status is missing".to_string()),
+        Ok(s) => status = s,
+        Err(p) => out.push(p),
     }
     // TIER (the six values the G8.3 reader accepts for this field, docs/fix-tier.md)
     match keys.get("minimum_proven_tier") {
@@ -945,13 +955,20 @@ fn lookup_cmd(a: &[String]) -> i32 {
         }
     };
     let (mut out, mut ids) = (Vec::new(), Vec::new());
+    let mut retired = 0usize;
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
         let mut problems = Vec::new();
         let close = front_close(&lines, &mut problems);
+        let mut is_retired = false;
         let tokens = match close {
             Some(close) => {
                 let keys = front_pairs(&lines, close, &mut problems);
+                // STATUS before MATCH, as the lint orders them; a missing key reads as active.
+                match status_of(&keys) {
+                    Ok(s) => is_retired = s == Some("retired"),
+                    Err(p) => problems.push(p),
+                }
                 match match_tokens(&keys) {
                     Ok(t) => t,
                     Err(p) => {
@@ -973,6 +990,10 @@ fn lookup_cmd(a: &[String]) -> i32 {
         if ticket.is_none() && diff_in.is_none() {
             continue;
         }
+        if is_retired {
+            retired += 1;
+            continue;
+        }
         if problems.is_empty() && tokens.iter().any(|tok| hits(tok) == Some(true)) {
             let id = &name[..9];
             out.push(format!("lesson: {} {} {}", id, esc(&heading(&lines, close, name)), esc(name)));
@@ -989,7 +1010,11 @@ fn lookup_cmd(a: &[String]) -> i32 {
         println!("{}", l);
     }
     let matched = if ids.is_empty() { "none".to_string() } else { ids.join(",") };
-    println!("lessons: scanned={} matched={}", names.len(), matched);
+    if retired == 0 {
+        println!("lessons: scanned={} matched={}", names.len(), matched);
+    } else {
+        println!("lessons: scanned={} matched={} retired={}", names.len(), matched, retired);
+    }
     0
 }
 
