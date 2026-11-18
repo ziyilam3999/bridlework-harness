@@ -106,7 +106,7 @@ Exit 0 when the inputs read; it does not go red. Lines, in this order:
 - one line `off-plan ticket=<id> done=<yes|no> reason=<reason>` for each `off_plan` ticket that no row lists;
 - one line `leaned-on row=<id> tickets=<id,...>` for each `later` row that has a linked ticket;
 - `progress done=<points> left=<points> percent=<n|none>`: done is the points of linked tickets with a done record, left the points of linked tickets with none;
-- `on-plan done=<points> all-done=<points> percent=<n|none>`: done as above, all-done the points of every ticket with a done record, linked or not;
+- `on-plan done=<points> all-done=<points> percent=<n|none>`: done as above, all-done the points of the tickets with a done record, linked or not;
 - one line `no-estimate row=<id>` for each `not-built` or `in-build` row with no `left_estimate`, in index order;
 - last, `progress-estimated done=<D> left=<L> estimate=<E> percent=<n|none>`: D is the done of the progress line, E the sum of `left_estimate` over rows in state `not-built` or `in-build` (a row counts once per sighting), L the left of the progress line plus E. Percent is the floor of 100 x D / (D + L); it is `none` when D + L is 0 or when at least one `no-estimate` line was printed. Estimates on rows in other states are read and not added.
 
