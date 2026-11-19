@@ -1,7 +1,8 @@
 //! `harness lesson lint <path> [<path> ...]`: checks the shape of lesson pages (see `docs/lesson-lint.md`).
 //! `harness lesson lookup` lists the pages that match a ticket (ticket mode: --ticket and --scope-file) or the
 //! committed diff between two commits of one repo (diff mode: --repo-dir, --from, --to; changed paths and added
-//! lines); same docs page. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
+//! lines); same docs page. A page that carries the front matter key `always` (one rule sentence, no `match`)
+//! is listed on an `always:` line in both modes. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
 //! folder of tickets and counts the offered pages. Both modes skip a page with status retired (still checked, counted in scanned, and
 //! counted in the receipt field retired=<r>) and refuse an unknown status. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
@@ -159,12 +160,13 @@ fn lint(args: &[String]) -> Result<(usize, Vec<String>), String> {
     let pages = expand(args)?;
     let mut out = Vec::new();
     let mut seen: HashMap<String, String> = HashMap::new();
+    let mut always_count = 0usize;
     for p in &pages {
         let path = p.to_string_lossy().to_string();
         let file = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
         let bytes = std::fs::read(p).map_err(|_| format!("the file {} cannot be read", path))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("the file {} is not valid UTF-8", path))?;
-        for problem in check_page(&text, &file, &mut seen) {
+        for problem in check_page(&text, &file, &mut seen, &mut always_count) {
             out.push(format!("{}: {}", file, problem));
         }
     }
@@ -218,6 +220,26 @@ pub(crate) fn match_tokens<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Optio
     Ok(Some(tokens))
 }
 
+/// The ALWAYS rule of the `always` key: Ok(None) when the key is absent, Ok(Some) with the rule sentence when
+/// it passes; Err is the ALWAYS problem line. The value is read as the front matter reader gives it (ASCII
+/// spaces and tabs trimmed), retired pages included.
+pub(crate) fn always_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&'a str>, String> {
+    let Some(&v) = keys.get("always") else { return Ok(None) };
+    if v.is_empty() {
+        return Err("ALWAYS always is empty".to_string());
+    }
+    if v.len() > 200 {
+        return Err("ALWAYS always is over 200 bytes".to_string());
+    }
+    if v.chars().any(|c| c.is_control() || (c.is_whitespace() && c != ' ')) {
+        return Err("ALWAYS always holds a control character or a blank other than a space".to_string());
+    }
+    if keys.contains_key("match") {
+        return Err("ALWAYS always and match on one page".to_string());
+    }
+    Ok(Some(v))
+}
+
 /// The status of a page: Ok(None) when the key is absent; Err is the STATUS problem line of an unknown value.
 pub(crate) fn status_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&'a str>, String> {
     match keys.get("status").copied() {
@@ -227,8 +249,10 @@ pub(crate) fn status_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&
     }
 }
 
-/// Check one page (`file` is its file name, not its path) and return its `<RULE> <detail>` lines. `seen` maps an id to the first file that carried it.
-fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec<String> {
+/// Check one page (`file` is its file name, not its path) and return its `<RULE> <detail>` lines. `seen` maps
+/// an id to the first file that carried it; `always_count` is raised by each page that carries the key `always`
+/// and is not retired (for ALWAYS-CAP, counted in check order, a page reached twice counts once).
+fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>, always_count: &mut usize) -> Vec<String> {
     let mut out = Vec::new();
     let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
     // FRONT-MATTER: line 1 opens, a later `---` closes; without a well-formed block nothing later can be checked.
@@ -310,6 +334,18 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
     // MATCH
     if let Err(p) = match_tokens(&keys) {
         out.push(p);
+    }
+    // ALWAYS, then ALWAYS-CAP (the cap counts pages that are not retired, a refused value included)
+    if keys.contains_key("always") {
+        if let Err(p) = always_of(&keys) {
+            out.push(p);
+        }
+        if status != Some("retired") {
+            *always_count += 1;
+            if *always_count > 5 {
+                out.push("ALWAYS-CAP more than 5 pages carry always".to_string());
+            }
+        }
     }
     // DUPLICATE-ID (any two pages of one run with the same id value)
     if let Some(&v) = keys.get("id") {
@@ -845,11 +881,14 @@ fn read_diff(repo: &Path, from: &str, to: &str) -> Result<Diff, String> {
 }
 
 /// What the lookup reads from one page: the closing front matter line, the retired flag, the match tokens
-/// (quotes trimmed) and the problems found.
+/// (quotes trimmed), the `always` rule sentence (None when the key is absent or its value is refused),
+/// whether the `always` key is present (a refused value included, for the cap) and the problems found.
 pub(crate) struct PageRead {
     pub close: Option<usize>,
     pub retired: bool,
     pub tokens: Vec<String>,
+    pub always: Option<String>,
+    pub has_always: bool,
     pub problems: Vec<String>,
 }
 
@@ -858,21 +897,29 @@ pub(crate) fn read_page(lines: &[&str]) -> PageRead {
     let mut problems = Vec::new();
     let close = front_close(lines, &mut problems);
     let mut retired = false;
+    let mut always = None;
+    let mut has_always = false;
     let tokens = match close {
         Some(close) => {
             let keys = front_pairs(lines, close, &mut problems);
-            // STATUS before MATCH, as the lint orders them; a missing key reads as active.
+            // STATUS before MATCH before ALWAYS, as the lint orders them; a missing key reads as active.
             match status_of(&keys) {
                 Ok(s) => retired = s == Some("retired"),
                 Err(p) => problems.push(p),
             }
-            match match_tokens(&keys) {
+            has_always = keys.contains_key("always");
+            let t = match match_tokens(&keys) {
                 Ok(t) => t,
                 Err(p) => {
                     problems.push(p);
                     None
                 }
+            };
+            match always_of(&keys) {
+                Ok(a) => always = a.map(str::to_string),
+                Err(p) => problems.push(p),
             }
+            t
         }
         None => None,
     };
@@ -880,7 +927,7 @@ pub(crate) fn read_page(lines: &[&str]) -> PageRead {
     if tokens.iter().any(|t| t.is_empty()) {
         problems.push("MATCH match has a token with no text between its quotes".to_string());
     }
-    PageRead { close, retired, tokens, problems }
+    PageRead { close, retired, tokens, always, has_always, problems }
 }
 
 /// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`, or `--repo-dir <dir> --from <sha> --to <sha>` (diff mode). Exit 0 the matching pages (stdout), 1 a page or the ticket is
@@ -998,19 +1045,31 @@ fn lookup_cmd(a: &[String]) -> i32 {
         }
     };
     let (mut out, mut ids) = (Vec::new(), Vec::new());
-    let mut retired = 0usize;
+    let (mut always_out, mut always_ids) = (Vec::new(), Vec::new());
+    let (mut retired, mut always_pages) = (0usize, 0usize);
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-        let PageRead { close, retired: is_retired, tokens, problems } = read_page(&lines);
+        let PageRead { close, retired: is_retired, tokens, always, has_always, problems } = read_page(&lines);
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }
         let Some(close) = close else { continue };
+        // The cap counts each page that carries the key always and is not retired, a refused value included.
+        if has_always && !is_retired {
+            always_pages += 1;
+        }
         if ticket.is_none() && diff_in.is_none() {
             continue;
         }
         if is_retired {
             retired += 1;
+            continue;
+        }
+        // An always page is listed on its own line, never as a lesson: line and not in matched=.
+        if let Some(rule) = &always {
+            let id = &name[..9];
+            always_out.push(format!("always: {} {}", id, esc(rule)));
+            always_ids.push(id);
             continue;
         }
         if problems.is_empty() && tokens.iter().any(|tok| hits(tok.as_str()) == Some(true)) {
@@ -1019,21 +1078,33 @@ fn lookup_cmd(a: &[String]) -> i32 {
             ids.push(id);
         }
     }
+    if always_pages > 5 {
+        refused.push(format!(
+            "harness: lesson lookup refused: ALWAYS-CAP {} pages carry always, at most 5",
+            always_pages
+        ));
+    }
     if !refused.is_empty() {
         for l in refused {
             eprintln!("{}", l);
         }
         return 1;
     }
+    for l in always_out {
+        println!("{}", l);
+    }
     for l in out {
         println!("{}", l);
     }
     let matched = if ids.is_empty() { "none".to_string() } else { ids.join(",") };
-    if retired == 0 {
-        println!("lessons: scanned={} matched={}", names.len(), matched);
-    } else {
-        println!("lessons: scanned={} matched={} retired={}", names.len(), matched, retired);
+    let mut last = format!("lessons: scanned={} matched={}", names.len(), matched);
+    if !always_ids.is_empty() {
+        last.push_str(&format!(" always={}", always_ids.join(",")));
     }
+    if retired > 0 {
+        last.push_str(&format!(" retired={}", retired));
+    }
+    println!("{}", last);
     0
 }
 

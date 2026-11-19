@@ -92,7 +92,7 @@ fn read_pages(names: &[(String, PathBuf)], refused: &mut Vec<String>) -> Result<
     let mut retired = 0usize;
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-        let PageRead { close, retired: is_retired, tokens, problems } = read_page(&lines);
+        let PageRead { close, retired: is_retired, tokens, problems, .. } = read_page(&lines);
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }
