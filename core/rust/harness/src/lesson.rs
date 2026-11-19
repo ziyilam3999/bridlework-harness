@@ -844,6 +844,45 @@ fn read_diff(repo: &Path, from: &str, to: &str) -> Result<Diff, String> {
     Ok(Diff { paths, lines })
 }
 
+/// What the lookup reads from one page: the closing front matter line, the retired flag, the match tokens
+/// (quotes trimmed) and the problems found.
+pub(crate) struct PageRead {
+    pub close: Option<usize>,
+    pub retired: bool,
+    pub tokens: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+/// Read one page (its lines, line ends cut) as the lookup does; shared by `lookup` and `replay`.
+pub(crate) fn read_page(lines: &[&str]) -> PageRead {
+    let mut problems = Vec::new();
+    let close = front_close(lines, &mut problems);
+    let mut retired = false;
+    let tokens = match close {
+        Some(close) => {
+            let keys = front_pairs(lines, close, &mut problems);
+            // STATUS before MATCH, as the lint orders them; a missing key reads as active.
+            match status_of(&keys) {
+                Ok(s) => retired = s == Some("retired"),
+                Err(p) => problems.push(p),
+            }
+            match match_tokens(&keys) {
+                Ok(t) => t,
+                Err(p) => {
+                    problems.push(p);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let tokens: Vec<String> = tokens.unwrap_or_default().into_iter().map(|t| t.trim_matches(['"', '\'']).to_string()).collect();
+    if tokens.iter().any(|t| t.is_empty()) {
+        problems.push("MATCH match has a token with no text between its quotes".to_string());
+    }
+    PageRead { close, retired, tokens, problems }
+}
+
 /// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`, or `--repo-dir <dir> --from <sha> --to <sha>` (diff mode). Exit 0 the matching pages (stdout), 1 a page or the ticket is
 /// refused, 2 usage or read error or a page-shaped entry that is not a page and not a folder. The exit 1 lines are printed after all pages are read.
 fn lookup_cmd(a: &[String]) -> i32 {
@@ -962,31 +1001,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
     let mut retired = 0usize;
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-        let mut problems = Vec::new();
-        let close = front_close(&lines, &mut problems);
-        let mut is_retired = false;
-        let tokens = match close {
-            Some(close) => {
-                let keys = front_pairs(&lines, close, &mut problems);
-                // STATUS before MATCH, as the lint orders them; a missing key reads as active.
-                match status_of(&keys) {
-                    Ok(s) => is_retired = s == Some("retired"),
-                    Err(p) => problems.push(p),
-                }
-                match match_tokens(&keys) {
-                    Ok(t) => t,
-                    Err(p) => {
-                        problems.push(p);
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let tokens: Vec<&str> = tokens.unwrap_or_default().into_iter().map(|t| t.trim_matches(['"', '\''])).collect();
-        if tokens.iter().any(|t| t.is_empty()) {
-            problems.push("MATCH match has a token with no text between its quotes".to_string());
-        }
+        let PageRead { close, retired: is_retired, tokens, problems } = read_page(&lines);
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }
@@ -998,7 +1013,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
             retired += 1;
             continue;
         }
-        if problems.is_empty() && tokens.iter().any(|tok| hits(tok) == Some(true)) {
+        if problems.is_empty() && tokens.iter().any(|tok| hits(tok.as_str()) == Some(true)) {
             let id = &name[..9];
             out.push(format!("lesson: {} {} {}", id, esc(&heading(&lines, close, name)), esc(name)));
             ids.push(id);

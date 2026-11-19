@@ -4,7 +4,7 @@
 //! current folder. The pages are read once as the lookup reads them, then matched against each ticket.
 //! Ticket mode only. std only.
 
-use crate::lesson::{esc, front_close, front_pairs, match_tokens, status_of, token_hits, walk, LESSON_USAGE, MAX_FILE};
+use crate::lesson::{esc, read_page, token_hits, walk, PageRead, LESSON_USAGE, MAX_FILE};
 use crate::ticket::Ticket;
 use std::path::{Component, Path, PathBuf};
 
@@ -87,31 +87,7 @@ fn read_pages(names: &[(String, PathBuf)], refused: &mut Vec<String>) -> Result<
     let mut retired = 0usize;
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-        let mut problems = Vec::new();
-        let close = front_close(&lines, &mut problems);
-        let mut is_retired = false;
-        let tokens = match close {
-            Some(close) => {
-                let keys = front_pairs(&lines, close, &mut problems);
-                // STATUS before MATCH, as the lookup orders them; a missing key reads as active.
-                match status_of(&keys) {
-                    Ok(s) => is_retired = s == Some("retired"),
-                    Err(p) => problems.push(p),
-                }
-                match match_tokens(&keys) {
-                    Ok(t) => t,
-                    Err(p) => {
-                        problems.push(p);
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let tokens: Vec<String> = tokens.unwrap_or_default().into_iter().map(|t| t.trim_matches(['"', '\'']).to_string()).collect();
-        if tokens.iter().any(|t| t.is_empty()) {
-            problems.push("MATCH match has a token with no text between its quotes".to_string());
-        }
+        let PageRead { close, retired: is_retired, tokens, problems } = read_page(&lines);
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }

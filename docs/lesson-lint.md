@@ -240,7 +240,13 @@ over the 1 MiB reader limit is refused the same way, with one line `harness: les
 (the file name only, no folder); stdout is empty and no partial count is printed; `2` a usage or read error: a
 `<lessons-dir>`, `--tickets` or `--scopes` value that is relative or holds a `..` part (the usage text), a flag
 given twice, a missing folder, a lessons folder the lookup's folder walk refuses (its own `harness: error:` lines),
-a tickets folder with no `<id>.json` file, or no ticket left after the no-scope skip. When a cause of `2` and a
-cause of `1` are both present, the run exits `2`.
+a tickets folder with no `<id>.json` file, or no ticket left after the no-scope skip. A tickets argument or a scopes
+argument that names a file is a `2` too. A refused ticket file or scope file (`1`) is reported before the check "no
+ticket left after the no-scope skip" (`2`): one ticket with no scope file plus one ticket file that is a symbolic
+link exits `1`.
 
-Known limit: ticket mode only — the diff-mode lookup has no replay.
+A `<id>.json` that is a symbolic link or a folder is refused (`1`) also when it has no scope file. A tickets folder
+given as a symbolic link is followed.
+
+Known limit: ticket mode only — the diff-mode lookup has no replay. An empty ticket id (a file named `.json`) and a
+ticket file name that is not UTF-8 are not handled apart.

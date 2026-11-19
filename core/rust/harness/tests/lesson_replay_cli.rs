@@ -109,7 +109,8 @@ fn link(target: &std::path::Path, at: &std::path::Path) {
 }
 
 /// The shared fixture: a retired page whose token hits a ticket, a page that hits no ticket, and a ticket
-/// with no scope file (skipped_no_scope=1 on the last line).
+/// with no scope file (skipped_no_scope=1 on the last line). Page 105 has a path token, and ticket dd-4 hits
+/// it only through its scope file (the ticket text holds no such word).
 fn fixture() -> PathBuf {
     rsetup(
         &[
@@ -117,19 +118,22 @@ fn fixture() -> PathBuf {
             ("ISSUE-102-b.md", fm("match: [hello]")),
             ("ISSUE-103-c.md", fm("match: [zzzmiss]")),
             ("ISSUE-104-d.md", fm("status: retired\nmatch: [example]")),
+            ("ISSUE-105-e.md", fm("match: [src/x]")),
         ],
-        &[("aa-1.json", hello_ticket()), ("bb-2.json", other_ticket()), ("cc-3.json", hello_ticket())],
-        &[("aa-1.paths", "src/\n".to_string()), ("bb-2.paths", "docs/\n".to_string())],
+        &[("aa-1.json", hello_ticket()), ("bb-2.json", other_ticket()), ("cc-3.json", hello_ticket()), ("dd-4.json", other_ticket())],
+        &[("aa-1.paths", "src/\n".to_string()), ("bb-2.paths", "docs/\n".to_string()), ("dd-4.paths", "src/x/y.rs\n".to_string())],
     )
 }
 
 const FIXTURE_OUT: &str = "replay: ticket=aa-1 offered=2 pages=ISSUE-101,ISSUE-102\n\
 replay: ticket=bb-2 offered=0 pages=none\n\
+replay: ticket=dd-4 offered=1 pages=ISSUE-105\n\
 page: ISSUE-101 hits=1\n\
 page: ISSUE-102 hits=1\n\
 page: ISSUE-103 hits=0\n\
 page: ISSUE-104 hits=0\n\
-replay ok tickets=2 skipped_no_scope=1 pages=4 offered_total=2 offered_max=2 zero=1 retired=1\n";
+page: ISSUE-105 hits=1\n\
+replay ok tickets=3 skipped_no_scope=1 pages=5 offered_total=3 offered_max=2 zero=1 retired=1\n";
 
 #[test]
 fn the_fixture_prints_the_exact_lines() {
@@ -147,7 +151,8 @@ fn replay_lists_what_lookup_lists() {
     let o = replay_in(&d);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     let out = stdout(&o);
-    for tid in ["aa-1", "bb-2"] {
+    // dd-4 reaches page 105 only through its scope file
+    for tid in ["aa-1", "bb-2", "dd-4"] {
         let lo = lookup_one(&d, tid);
         assert_eq!(lo.status.code(), Some(0), "{}: {}", tid, stderr(&lo));
         // the receipt may end with the optional retired= field, so only the first word is matched=
@@ -161,6 +166,7 @@ fn replay_lists_what_lookup_lists() {
     let last = out.lines().last().unwrap();
     assert!(last.contains("skipped_no_scope=1"), "{}", last);
     assert!(last.ends_with("retired=1"), "{}", last);
+    assert!(out.contains("ticket=dd-4 offered=1 pages=ISSUE-105\n"), "{}", out);
     let _ = fs::remove_dir_all(&d);
 }
 
@@ -312,7 +318,8 @@ fn a_symlinked_ticket_file_is_refused() {
     let _ = fs::remove_dir_all(&d);
 }
 
-/// A ticket file over the reader limit is refused with its file name.
+/// A ticket file over the reader limit is refused with its file name. The 1 MiB limit sits inside
+/// Ticket::parse_bytes, so no valid oversize ticket reaches a check of its own.
 #[test]
 fn a_ticket_over_the_reader_limit_is_refused() {
     let d = rsetup(one_page().as_slice(), &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "src/\n".to_string())]);
@@ -338,11 +345,13 @@ fn a_symlinked_scope_file_is_refused() {
     let _ = fs::remove_dir_all(&d);
 }
 
-/// A scope file over the reader limit is refused with its file name.
+/// A valid scope file over the reader limit is refused with its file name (it would parse if read whole).
 #[test]
 fn a_scope_file_over_the_reader_limit_is_refused() {
     let d = rsetup(one_page().as_slice(), &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "src/\n".to_string())]);
-    fs::write(d.join("scopes/aa-1.paths"), vec![b' '; 1024 * 1024 + 8]).unwrap();
+    let big: String = (0..70_000).map(|i| format!("src/f{:07}.rs\n", i)).collect();
+    assert!(big.len() > 1024 * 1024);
+    fs::write(d.join("scopes/aa-1.paths"), big).unwrap();
     let o = replay_in(&d);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     assert_eq!(stdout(&o), "");
@@ -436,6 +445,48 @@ fn replay_no_ticket_left_after_the_skip_exits_2() {
     let _ = fs::remove_dir_all(&d);
 }
 
+/// A refused ticket file or scope file (exit 1) is reported before the check "no ticket left after the
+/// no-scope skip" (exit 2).
+#[test]
+fn replay_a_refusal_comes_before_no_ticket_left() {
+    // one ticket with no scope file, one ticket file that is a symlink (it has no scope file either)
+    let d = rsetup(one_page().as_slice(), &[("aa-1.json", hello_ticket())], &[]);
+    fs::write(d.join("away.json"), hello_ticket()).unwrap();
+    link(&d.join("away.json"), &d.join("tickets/zz-9.json"));
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(stderr(&o), "harness: lesson replay refused: zz-9.json\n");
+    let _ = fs::remove_dir_all(&d);
+
+    // one ticket with no scope file, one ticket whose scope file parse_scope refuses
+    let d = rsetup(
+        one_page().as_slice(),
+        &[("aa-1.json", hello_ticket()), ("bb-2.json", hello_ticket())],
+        &[("bb-2.paths", "   \n".to_string())],
+    );
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(stderr(&o), "harness: lesson replay refused: bb-2.paths\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A tickets or scopes argument that names a file, not a folder, exits 2.
+#[test]
+fn replay_a_tickets_or_scopes_file_exits_2() {
+    for which in ["tickets", "scopes"] {
+        let d = rsetup(one_page().as_slice(), &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "src/\n".to_string())]);
+        fs::remove_dir_all(d.join(which)).unwrap();
+        fs::write(d.join(which), "x").unwrap();
+        let o = replay_in(&d);
+        assert_eq!(o.status.code(), Some(2), "{}", which);
+        assert_eq!(stdout(&o), "", "{}", which);
+        assert!(stderr(&o).contains(&format!("the {} argument is a file, not a folder", which)), "{}: {}", which, stderr(&o));
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
 // ---- read only, same answer twice ----
 
 /// One line per path under `p`: its type, and for a file its size and bytes, for a link its target.
@@ -463,10 +514,14 @@ fn snap(d: &std::path::Path) -> Vec<String> {
 
 /// Run the replay in `cwd`: the three folders stay byte-identical, nothing is created in them or in `cwd`.
 fn run_read_only(d: &std::path::Path, want: i32) -> Output {
-    let before = snap(d);
     let (l, t, s) = (d.join("lessons"), d.join("tickets"), d.join("scopes"));
+    run_read_only_args(d, &["lesson", "replay", l.to_str().unwrap(), "--tickets", t.to_str().unwrap(), "--scopes", s.to_str().unwrap()], want)
+}
+
+fn run_read_only_args(d: &std::path::Path, args: &[&str], want: i32) -> Output {
+    let before = snap(d);
     let o = Command::new(BIN)
-        .args(["lesson", "replay", l.to_str().unwrap(), "--tickets", t.to_str().unwrap(), "--scopes", s.to_str().unwrap()])
+        .args(args)
         .current_dir(d.join("cwd"))
         .stdin(Stdio::null())
         .output()
@@ -508,5 +563,16 @@ fn replay_writes_nothing_and_prints_the_same_twice() {
     fs::write(d.join("outside.md"), fm("match: [example]")).unwrap();
     link(&d.join("outside.md"), &d.join("lessons/ISSUE-902-b.md"));
     run_read_only(&d, 2);
+    let _ = fs::remove_dir_all(&d);
+
+    // a refused scope file (1)
+    let d = rsetup(one_page().as_slice(), &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "   \n".to_string())]);
+    run_read_only(&d, 1);
+    let _ = fs::remove_dir_all(&d);
+
+    // a usage error (2): a relative tickets folder
+    let d = rsetup(one_page().as_slice(), &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "src/\n".to_string())]);
+    let (l, s) = (d.join("lessons"), d.join("scopes"));
+    run_read_only_args(&d, &["lesson", "replay", l.to_str().unwrap(), "--tickets", "tickets", "--scopes", s.to_str().unwrap()], 2);
     let _ = fs::remove_dir_all(&d);
 }
