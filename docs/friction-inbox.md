@@ -10,7 +10,7 @@ operational text, so it is private data. This repo holds the contract, the reade
 
 Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
 `repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
-`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), and the read-only `controls-check` verb. The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, and the read-only `suggest` verb (ask A32, unix only). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
@@ -472,6 +472,28 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   itself cannot loop or grow past its bound (one pass over the already-capped inbox, one line per root).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
   append): reported by `lint` with its line number, never read as a row; `add` refuses to append onto it.
+
+### `friction suggest` (ask A32)
+
+`harness friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>]`
+ranks the existing groups against a row that is not stored yet, so the new row can be filed with `--breaks`.
+One line per group, best first: `suggest: rank=<n> group=<group id> row=<best row id> score=<2 decimals> via=bm25`
+(default `--top 3`; an empty inbox, or no row before `--before`, prints `suggest: none`; exit 0). The group ids are
+the ones `friction rank` prints (a hand or pattern root's row id, an event group's signature); `row=` is always a
+stored row id. Free: no model, no network.
+
+- Token: a run of `[a-z0-9]` in the lowercased text after `f-YYYYMMDD-NN`, `issue-N` and `#N` are removed, kept
+  when longer than 2 and not all digits. The query is the DISTINCT tokens of `text + ' ' + why`; each ranked row
+  is a document over its own `text + ' ' + why`. N, df and the average length are over the ranked rows only (all
+  stored rows, or the rows before `--before`), never the query.
+- Row score = sum over query tokens of `ln(1 + (N - df + 0.5)/(df + 0.5)) * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 *
+  len/avg))`; group score = its best row's score (max, not sum); a tie goes to the group seen first in inbox
+  order. `--before <row id>` ranks only the rows before that row (an unknown id refuses, exit 1).
+- The query is scanned by the privacy engine before ranking (a hit refuses, exit 1, naming the field and class,
+  never the bytes); a damaged inbox refuses like `rank` (exit 1); no privacy list configured is exit 2.
+- Read-only on the inbox. `--record <file>` appends one line `{ts, query_sha256, top, via}` (sha256 of
+  `text + newline + why`, the top group ids, `bm25`) and never any text; a `--record` naming the inbox, by path, by a symbolic link, or by a hard link (the same
+  device and inode), is exit 2. The same check guards `friction rank --record`. The verb exists on unix only.
 
 ## 5. Not in slice 1 (where each piece went)
 
