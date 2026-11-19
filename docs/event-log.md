@@ -82,7 +82,7 @@ Every event belongs to exactly one run, named by its `run_id`.
 
 - **Self-issue.** An invocation that writes an event and has no `HARNESS_RUN_ID` in its environment issues its own id (`run-<ms>-<pid>-<seq>`, unique per issue — the timestamp is never the id alone) and appends a `run_issued` line first, carrying the same `ts_ms`, `ticket`, `repo`, `role` and `model` as the event. Read-only commands (`events list`, `events verify`, `status`) issue nothing and write nothing.
 - **Inheritance.** An invocation with `HARNESS_RUN_ID` set writes under that id only when the same log already holds a `run_issued` line for exactly that id. An id that was never issued in this log — or is malformed — is refused with `EVENT NOT RECORDED` and nothing is written. Passing the variable down to children is each spawner's job, not the log's.
-- **Role and model.** `role` and `model` come from the caller (`--role`/`--model` flags on `events append`, or `HARNESS_ROLE`/`HARNESS_MODEL` in the environment for the caps' refusals); missing or not a plain token refuses the event. They are never defaulted.
+- **Role and model.** `role` and `model` come from the caller (`--role`/`--model` flags on `events append`, or `HARNESS_ROLE`/`HARNESS_MODEL` in the environment for the refusals of `ticket gate`, and `--role`/`--model` flags for `ticket fix-round-check`); missing or not a plain token refuses the event. They are not defaulted.
 - A cap's refusal stays a refusal when its event is not recorded: a failed write never turns a refusal into a pass.
 
 ## Reading: torn tail versus corruption
