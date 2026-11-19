@@ -170,7 +170,7 @@ fn key_setup(lessons: &str, config: &str, controls: &str, rows_file: Option<&str
         2
     };
     let cfg = load_cfg(Some(config))?;
-    let list = load_list("an unscanned inbox is never replayed")?;
+    let list = load_list("the inbox is not replayed unscanned")?;
     let ctx = crate::scan::Ctx { list: &list, testmode: false };
     let rows = lint_rows(&cfg, &ctx)?;
     let all = match groups(&rows) {

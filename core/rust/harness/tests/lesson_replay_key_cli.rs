@@ -200,6 +200,42 @@ fn a_breaks_chain_three_deep_counts_under_the_root() {
     assert!(out(&o).contains("key: ISSUE-101 rows=3 offered=3\n"), "{}", out(&o));
 }
 
+/// The key lines come in byte order of the page id, not in the order the inbox meets the pages.
+#[test]
+fn key_lines_are_in_byte_order_of_the_page_id() {
+    let f = fix(
+        &[("ISSUE-101-a.md", fm("match: [example]")), ("ISSUE-102-b.md", fm("match: [nosuchword]"))],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-2", "2026-11-02", "", "aa-1"), row_on("g-1", "2026-11-03", "", "aa-1")],
+        "g-2 | control: a guard | lesson: ISSUE-102\ng-1 | control: a guard | lesson: ISSUE-101\n",
+    );
+    let o = with_key(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "replay: ticket=aa-1 offered=1 pages=ISSUE-101\n\
+         page: ISSUE-101 hits=1\n\
+         page: ISSUE-102 hits=0\n\
+         key: ISSUE-101 rows=1 offered=1\n\
+         key: ISSUE-102 rows=1 offered=0\n\
+         key ok rows=2 offered=1 no_ticket=0 no_line=0\n\
+         replay ok tickets=1 skipped_no_scope=0 pages=2 offered_total=1 offered_max=1 zero=0\n"
+    );
+}
+
+/// A flag of the three with no value is a setup error: exit 2, stdout empty.
+#[test]
+fn a_key_flag_with_no_value_exits_2() {
+    let f = standard();
+    for flag in ["--config", "--controls", "--rows"] {
+        let o = replay_args(&f, &[flag]);
+        assert_eq!(code(&o), 2, "{flag}: {}", err(&o));
+        assert_eq!(out(&o), "", "{flag}");
+        assert!(err(&o).contains("needs a value"), "{flag}: {}", err(&o));
+    }
+}
+
 /// A row whose own id (not its group id) is on a controls line is not counted through that line.
 #[test]
 fn a_line_naming_a_row_id_is_not_counted_through() {
@@ -693,8 +729,24 @@ fn the_key_writes_nothing_and_prints_the_same_twice() {
     // a rows-line refusal (1)
     let bad = f.t.file("rows-bad.txt", "zz-9\n");
     run_read_only(&f, &["--config", p(&f.cfg), "--controls", p(&f.controls), "--rows", p(&bad)], 1);
-    // a controls refusal (1)
+    // a controls file that is missing (2)
     run_read_only(&f, &["--config", p(&f.cfg), "--controls", p(&f.t.0.join("nope.txt"))], 2);
     // a config refusal (2)
     run_read_only(&f, &["--config", p(&f.t.0.join("nope.yaml")), "--controls", p(&f.controls)], 2);
+    // a usage error (2): --rows without the other two
+    run_read_only(&f, &["--rows", p(&rf)], 2);
+    // an inbox refusal (1): a torn last line
+    let inbox = fs::read_to_string(f.t.inbox()).unwrap();
+    fs::write(f.t.inbox(), inbox.trim_end_matches('\n')).unwrap();
+    run_read_only(&f, &extra, 1);
+    fs::write(f.t.inbox(), inbox).unwrap();
+    // a controls refusal (1): a malformed line
+    let good = fs::read_to_string(&f.controls).unwrap();
+    fs::write(&f.controls, "not a line\n").unwrap();
+    run_read_only(&f, &extra, 1);
+    fs::write(&f.controls, good).unwrap();
+    // a rows-file refusal (2): a folder
+    let d = f.t.0.join("rdir");
+    fs::create_dir_all(&d).unwrap();
+    run_read_only(&f, &["--config", p(&f.cfg), "--controls", p(&f.controls), "--rows", p(&d)], 2);
 }

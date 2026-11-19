@@ -215,7 +215,8 @@ harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-
 ```
 
 Replays the ticket-mode lookup over a folder of tickets and counts the offered pages. Read only: the run writes no
-file in the lessons folder, the tickets folder, the scopes folder or the current folder, and the same input twice
+file in the lessons folder, the tickets folder, the scopes folder, the folders of the config, the controls file and
+the rows file, or the current folder, and the same input twice
 gives the same stdout. A ticket is one `<id>.json` file directly inside the tickets folder (other entries are
 skipped); its scope file is `<id>.paths` directly inside the scopes folder, read as the lookup reads a scope file. A
 ticket whose scope file is missing is skipped, not run. The pages are read once, as the lookup reads them (the walk,
