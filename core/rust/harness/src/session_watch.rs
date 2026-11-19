@@ -161,10 +161,17 @@ fn load_launch(o: &Opts) -> R<Launch> {
         return Err("the launch record short id is not a plain token".into());
     }
     // read_launches already refuses a non-uuid session id; this keeps the path safe if that rule changes.
-    if !l.session_id.as_deref().is_some_and(token_ok) {
-        return Err("the launch record session id is not a plain token".into());
-    }
+    session_id_ok(l.session_id.as_deref().unwrap_or(""))?;
     Ok(l.clone())
+}
+
+/// The session id becomes a file name under the transcript root, so it must be a plain token.
+fn session_id_ok(s: &str) -> R<()> {
+    if token_ok(s) {
+        Ok(())
+    } else {
+        Err("the launch record session id is not a plain token".into())
+    }
 }
 
 fn git(tree: &Path, args: &[&str]) -> R<String> {
@@ -458,6 +465,14 @@ pub fn watch_cmd(a: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_id_that_is_not_a_token_is_refused() {
+        for bad in ["../evil", "a/b", "", "a b", "x\0y"] {
+            assert!(session_id_ok(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(session_id_ok("11111111-2222-4333-8444-555555555555").is_ok(), "twin: a uuid is accepted");
+    }
 
     #[test]
     fn the_walk_stops_past_its_cap() {

@@ -540,16 +540,19 @@ fn t11_an_unknown_state_is_a_refusal() {
 }
 
 #[test]
-fn t11_a_session_id_that_is_not_a_token_is_a_refusal() {
+fn t11_read_launches_refuses_a_session_id_that_is_not_a_uuid() {
     let fx = Fx::new();
     let bad = "../evil";
     fx.records(&launch_rows(NAME, "r1", SHORT, bad, fx.launch_ms));
     fx.list(&[fx.entry(SHORT, bad, "working", Some("busy"), &fx.cwd(), None)]);
-    // the file the path would reach outside the transcript folder of the cwd, so a missing check would judge it working
+    // the file the path would reach outside the transcript folder of the cwd, so a missing refusal would judge it working
     fs::create_dir_all(fx.tpath(&fx.cwd(), "x").parent().unwrap()).unwrap();
     fx.mk_file(&fx.root.join("tr/evil.jsonl"), 30);
     fx.age_tree(5);
-    refused(&fx.run(), "session id with ../");
+    let r = fx.run();
+    refused(&r, "session id with ../");
+    // the refusal comes from read_launches (uuid rule); the token check of session_watch.rs has its own unit test
+    assert!(r.err.contains("is not a uuid"), "unexpected refusal text: {}", r.err);
 }
 
 #[test]
