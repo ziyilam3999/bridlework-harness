@@ -24,6 +24,8 @@ pub mod fixtures;
 pub mod friction;
 pub mod friction_event;
 pub mod friction_loop;
+#[cfg(unix)]
+pub mod friction_suggest;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;
