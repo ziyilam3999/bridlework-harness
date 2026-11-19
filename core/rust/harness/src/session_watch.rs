@@ -160,6 +160,10 @@ fn load_launch(o: &Opts) -> R<Launch> {
     if !l.short_id.as_deref().is_some_and(token_ok) {
         return Err("the launch record short id is not a plain token".into());
     }
+    // read_launches already refuses a non-uuid session id; this keeps the path safe if that rule changes.
+    if !l.session_id.as_deref().is_some_and(token_ok) {
+        return Err("the launch record session id is not a plain token".into());
+    }
     Ok(l.clone())
 }
 

@@ -540,6 +540,19 @@ fn t11_an_unknown_state_is_a_refusal() {
 }
 
 #[test]
+fn t11_a_session_id_that_is_not_a_token_is_a_refusal() {
+    let fx = Fx::new();
+    let bad = "../evil";
+    fx.records(&launch_rows(NAME, "r1", SHORT, bad, fx.launch_ms));
+    fx.list(&[fx.entry(SHORT, bad, "working", Some("busy"), &fx.cwd(), None)]);
+    // the file the path would reach outside the transcript folder of the cwd, so a missing check would judge it working
+    fs::create_dir_all(fx.tpath(&fx.cwd(), "x").parent().unwrap()).unwrap();
+    fx.mk_file(&fx.root.join("tr/evil.jsonl"), 30);
+    fx.age_tree(5);
+    refused(&fx.run(), "session id with ../");
+}
+
+#[test]
 fn t11_a_status_refusal_is_a_refusal() {
     let fx = Fx::new();
     fx.commit_at(900);

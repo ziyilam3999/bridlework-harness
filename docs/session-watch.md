@@ -58,8 +58,10 @@ working, done, blocked, idle, stopped. A refusal is never printed as working or 
 
 Path: `<transcript root>/<entry cwd with each character outside [A-Za-z0-9] made ->/<sessionId>.jsonl`. It is read by metadata only
 (`symlink_metadata`: kind and mtime, what `ls -l` shows). The code opens no transcript and reads no byte of it. It must be a regular
-file (a link, a folder or a missing file is a refusal) and its mtime must not be more than 5 s ahead of the clock. This is the reading
-the operator approved on 2026-11-16 for the 10-minute silence watch (plan 5.14 Seat watch).
+file (a link, a folder or a missing file is a refusal) and its mtime must not be more than 5 s ahead of the clock. The operator
+approved a 10-minute silence watch on 2026-11-16, built on the session file mtime (plan rev 9g), and ruled by menu on 2026-11-19
+(WAITING-67) that this approval covers this metadata (plan 5.14 Seat watch). The session id must be a plain token (letters, digits,
+`-`, `_`), else the verb refuses, so the path cannot leave the transcript root.
 
 ## Follow mode
 
