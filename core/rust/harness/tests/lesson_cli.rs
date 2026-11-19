@@ -2194,3 +2194,350 @@ fn diff_a_git_fault_wins_over_an_unknown_status() {
     refused2(&o, "same commit");
     assert!(!stderr(&o).contains("refused"));
 }
+
+// ---- the always key: one rule sentence, no match token ----
+
+/// A rule sentence of a synthetic always page.
+const RULE: &str = "Read the whole error text before the fix.";
+
+/// A full good page with the given id whose `match` line is replaced by `always: <rule>`.
+fn apage(id: &str, rule: &str) -> String {
+    good_page().replace("ISSUE-101", id).replace("match: [svc-a, svc-b]", &format!("always: {}", rule))
+}
+
+#[test]
+fn lint_an_always_page_passes_and_a_200_byte_rule_passes() {
+    let d = tmp("alw-good");
+    fs::write(d.join("ISSUE-101-a.md"), apage("ISSUE-101", RULE)).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    // 200 bytes pass; a retired always page passes too (it just does not count toward the cap)
+    fs::write(d.join("ISSUE-102-b.md"), apage("ISSUE-102", &"x".repeat(200))).unwrap();
+    fs::write(d.join("ISSUE-103-c.md"), apage("ISSUE-103", RULE).replace("status: validated", "status: retired")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=3\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_an_empty_always_value_is_refused() {
+    for rule in ["", "   "] {
+        let d = tmp("alw-empty");
+        fs::write(d.join("ISSUE-101-e.md"), apage("ISSUE-101", rule)).unwrap();
+        let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{:?}: {}", rule, stderr(&o));
+        assert_eq!(stdout(&o), "ISSUE-101-e.md: ALWAYS always is empty\n", "{:?}", rule);
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn lint_an_always_value_over_200_bytes_is_refused() {
+    let d = tmp("alw-len");
+    fs::write(d.join("ISSUE-101-l.md"), apage("ISSUE-101", &"x".repeat(201))).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ISSUE-101-l.md: ALWAYS always is over 200 bytes\n");
+    // 200 bytes pass
+    fs::write(d.join("ISSUE-101-l.md"), apage("ISSUE-101", &"x".repeat(200))).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=1\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_an_always_value_with_a_tab_a_nbsp_or_a_control_character_is_refused() {
+    for bad in ["one\ttwo", "one\u{a0}two", "one\u{7}two"] {
+        let d = tmp("alw-blank");
+        fs::write(d.join("ISSUE-101-b.md"), apage("ISSUE-101", bad)).unwrap();
+        let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{:?}: {}", bad, stderr(&o));
+        assert_eq!(
+            stdout(&o),
+            "ISSUE-101-b.md: ALWAYS always holds a control character or a blank other than a space\n",
+            "{:?}",
+            bad
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn lint_a_page_with_always_and_match_is_refused() {
+    let d = tmp("alw-both");
+    let page = apage("ISSUE-101", RULE).replace(&format!("always: {}", RULE), &format!("always: {}\nmatch: [svc-a]", RULE));
+    fs::write(d.join("ISSUE-101-m.md"), page).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ISSUE-101-m.md: ALWAYS always and match on one page\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_always_is_checked_on_a_retired_page() {
+    let d = tmp("alw-ret");
+    fs::write(d.join("ISSUE-101-r.md"), apage("ISSUE-101", "").replace("status: validated", "status: retired")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ISSUE-101-r.md: ALWAYS always is empty\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_six_always_pages_give_one_cap_line() {
+    let d = tmp("alw-cap6");
+    for i in 1..=6 {
+        let id = format!("ISSUE-{}", 100 + i);
+        fs::write(d.join(format!("{}-a.md", id)), apage(&id, RULE)).unwrap();
+    }
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ISSUE-106-a.md: ALWAYS-CAP more than 5 pages carry always\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_seven_always_pages_give_two_cap_lines() {
+    let d = tmp("alw-cap7");
+    for i in 1..=7 {
+        let id = format!("ISSUE-{}", 100 + i);
+        fs::write(d.join(format!("{}-a.md", id)), apage(&id, RULE)).unwrap();
+    }
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "ISSUE-106-a.md: ALWAYS-CAP more than 5 pages carry always\nISSUE-107-a.md: ALWAYS-CAP more than 5 pages carry always\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_five_always_pages_and_a_retired_one_pass() {
+    let d = tmp("alw-cap5r");
+    for i in 1..=5 {
+        let id = format!("ISSUE-{}", 100 + i);
+        fs::write(d.join(format!("{}-a.md", id)), apage(&id, RULE)).unwrap();
+    }
+    fs::write(d.join("ISSUE-106-a.md"), apage("ISSUE-106", RULE).replace("status: validated", "status: retired")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "lesson-lint ok pages=6\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_the_cap_line_comes_after_the_always_line_of_that_page() {
+    let d = tmp("alw-capord");
+    for i in 1..=5 {
+        let id = format!("ISSUE-{}", 100 + i);
+        fs::write(d.join(format!("{}-a.md", id)), apage(&id, RULE)).unwrap();
+    }
+    // the sixth page has a bad always value: its ALWAYS line first, the cap line directly after it
+    fs::write(d.join("ISSUE-106-a.md"), apage("ISSUE-106", "")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "ISSUE-106-a.md: ALWAYS always is empty\nISSUE-106-a.md: ALWAYS-CAP more than 5 pages carry always\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_the_always_line_comes_directly_after_the_match_line() {
+    let d = tmp("alw-ord-match");
+    let page = good_page().replace("match: [svc-a, svc-b]", "match: []\nalways:");
+    fs::write(d.join("ISSUE-101-o.md"), page).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ISSUE-101-o.md: MATCH match is an empty list\nISSUE-101-o.md: ALWAYS always is empty\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_the_always_line_comes_before_the_duplicate_id_line() {
+    let d = tmp("alw-ord-dup");
+    fs::write(d.join("ISSUE-101-a.md"), apage("ISSUE-101", RULE)).unwrap();
+    fs::write(d.join("ISSUE-101-b.md"), apage("ISSUE-101", "")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "ISSUE-101-b.md: ALWAYS always is empty\nISSUE-101-b.md: DUPLICATE-ID id ISSUE-101 also in ISSUE-101-a.md\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+// ---- the always key: lookup, both modes ----
+
+/// A ticket-mode lookup over `n` always pages (ids ISSUE-001..ISSUE-00n, no status key) plus extra pages.
+fn alw_look(n: usize, extra: &[(&str, &str)]) -> Output {
+    let mut pages: Vec<(String, String)> = (1..=n).map(|i| (format!("ISSUE-{:03}-a.md", i), fm("always: One habit page."))).collect();
+    for (name, text) in extra {
+        pages.push((name.to_string(), text.to_string()));
+    }
+    let refs: Vec<(&str, &str)> = pages.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    look(&setup(default_ticket("t").as_bytes(), b"src/\n", &refs))
+}
+
+#[test]
+fn lookup_always_lines_come_before_the_lesson_lines() {
+    let o = slook(&[
+        ("ISSUE-001-a.md", &fm("match: [example]")),
+        ("ISSUE-002-b.md", &fm("always: One habit page.")),
+        ("ISSUE-003-c.md", &fm(&format!("always: {}", RULE))),
+    ]);
+    assert_eq!(
+        ok_out(&o),
+        "always: ISSUE-002 One habit page.\nalways: ISSUE-003 Read the whole error text before the fix.\nlesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=3 matched=ISSUE-001 always=ISSUE-002,ISSUE-003\n"
+    );
+}
+
+#[test]
+fn lookup_a_retired_always_page_prints_no_line_and_counts_as_retired() {
+    let o = slook(&[
+        ("ISSUE-001-a.md", &fm("match: [example]")),
+        ("ISSUE-002-b.md", &fm("status: retired\nalways: One habit page.")),
+    ]);
+    assert_eq!(ok_out(&o), "lesson: ISSUE-001 a ISSUE-001-a.md\nlessons: scanned=2 matched=ISSUE-001 retired=1\n");
+}
+
+#[test]
+fn lookup_the_always_field_stands_before_the_retired_field() {
+    let o = slook(&[
+        ("ISSUE-002-b.md", &fm("always: One habit page.")),
+        ("ISSUE-003-c.md", &fm("status: retired\nmatch: [example]")),
+    ]);
+    assert_eq!(ok_out(&o), "always: ISSUE-002 One habit page.\nlessons: scanned=2 matched=none always=ISSUE-002 retired=1\n");
+}
+
+#[test]
+fn diff_always_lines_come_before_the_lesson_lines() {
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", b"one\ntokenx\n")], &[], &["tokenx"]);
+    fs::write(c.root.join("lessons/ISSUE-002-q.md"), fm("always: One habit page.")).unwrap();
+    fs::write(c.root.join("lessons/ISSUE-004-s.md"), fm(&format!("always: {}", RULE))).unwrap();
+    assert_eq!(
+        ok_out(&dlook(&c)),
+        "always: ISSUE-002 One habit page.\nalways: ISSUE-004 Read the whole error text before the fix.\nlesson: ISSUE-001 p ISSUE-001-p.md\nlessons: scanned=3 matched=ISSUE-001 always=ISSUE-002,ISSUE-004\n"
+    );
+}
+
+#[test]
+fn lookup_always_lines_follow_the_file_name_order_not_the_rule_order() {
+    let o = slook(&[
+        ("ISSUE-002-b.md", &fm("always: Zebra rule.")),
+        ("ISSUE-003-c.md", &fm("always: Alpha rule.")),
+    ]);
+    assert_eq!(
+        ok_out(&o),
+        "always: ISSUE-002 Zebra rule.\nalways: ISSUE-003 Alpha rule.\nlessons: scanned=2 matched=none always=ISSUE-002,ISSUE-003\n"
+    );
+}
+
+#[test]
+fn diff_always_lines_follow_the_file_name_order_not_the_rule_order() {
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", b"one\ntokenx\n")], &[], &["tokenx"]);
+    fs::write(c.root.join("lessons/ISSUE-002-q.md"), fm("always: Zebra rule.")).unwrap();
+    fs::write(c.root.join("lessons/ISSUE-004-s.md"), fm("always: Alpha rule.")).unwrap();
+    assert_eq!(
+        ok_out(&dlook(&c)),
+        "always: ISSUE-002 Zebra rule.\nalways: ISSUE-004 Alpha rule.\nlesson: ISSUE-001 p ISSUE-001-p.md\nlessons: scanned=3 matched=ISSUE-001 always=ISSUE-002,ISSUE-004\n"
+    );
+}
+
+#[test]
+fn lookup_an_always_value_over_200_bytes_is_refused() {
+    refused_page(&format!("---\nalways: {}\n---\n", "x".repeat(201)), &["ALWAYS always is over 200 bytes"]);
+}
+
+#[test]
+fn lookup_a_blank_only_always_value_is_refused() {
+    refused_page("---\nalways:  \t \n---\n", &["ALWAYS always is empty"]);
+}
+
+#[test]
+fn diff_a_retired_always_page_prints_no_line_and_counts_as_retired() {
+    let c = dc_with_page(&fm("status: retired\nalways: One habit page."));
+    assert_eq!(ok_out(&dlook(&c)), "lessons: scanned=1 matched=none retired=1\n");
+}
+
+#[test]
+fn lookup_a_page_the_always_rule_refuses_is_refused() {
+    refused_page("---\nalways:\n---\n", &["ALWAYS always is empty"]);
+}
+
+#[test]
+fn lookup_a_retired_page_with_a_bad_always_value_is_refused() {
+    refused_page("---\nstatus: retired\nalways:\n---\n", &["ALWAYS always is empty"]);
+}
+
+#[test]
+fn lookup_a_page_with_always_and_match_is_refused() {
+    refused_page("---\nmatch: [example]\nalways: One habit page.\n---\n", &["ALWAYS always and match on one page"]);
+}
+
+#[test]
+fn lookup_problems_on_one_page_come_in_the_order_status_match_always() {
+    refused_page(
+        "---\nstatus: draft\nmatch: []\nalways:\n---\n",
+        &[
+            "STATUS status draft is not unvalidated, validated or retired",
+            "MATCH match is an empty list",
+            "ALWAYS always is empty",
+        ],
+    );
+}
+
+#[test]
+fn diff_a_page_the_always_rule_refuses_is_refused_as_in_ticket_mode() {
+    let c = dc_with_page("---\nalways:\n---\n");
+    let o = dlook(&c);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-001-p.md: ALWAYS always is empty\n");
+}
+
+#[test]
+fn lookup_six_always_pages_are_refused_with_the_cap_line() {
+    let o = alw_look(6, &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ALWAYS-CAP 6 pages carry always, at most 5\n");
+}
+
+#[test]
+fn lookup_five_always_pages_and_a_retired_one_pass() {
+    let o = alw_look(5, &[("ISSUE-006-b.md", fm("status: retired\nalways: One habit page.").as_str())]);
+    assert_eq!(
+        ok_out(&o),
+        "always: ISSUE-001 One habit page.\nalways: ISSUE-002 One habit page.\nalways: ISSUE-003 One habit page.\nalways: ISSUE-004 One habit page.\nalways: ISSUE-005 One habit page.\nlessons: scanned=6 matched=none always=ISSUE-001,ISSUE-002,ISSUE-003,ISSUE-004,ISSUE-005 retired=1\n"
+    );
+}
+
+#[test]
+fn lookup_six_pages_with_one_bad_value_print_the_page_line_then_the_cap_line() {
+    let o = alw_look(5, &[("ISSUE-006-b.md", fm("always:").as_str())]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(
+        stderr(&o),
+        "harness: lesson lookup refused: ISSUE-006-b.md: ALWAYS always is empty\nharness: lesson lookup refused: ALWAYS-CAP 6 pages carry always, at most 5\n"
+    );
+}
+
+#[test]
+fn diff_six_always_pages_are_refused_with_the_cap_line() {
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", b"two\n")], &[], &["tokenx"]);
+    fs::write(c.root.join("lessons/ISSUE-001-p.md"), fm("always: One habit page.")).unwrap();
+    for i in 2..=6 {
+        fs::write(c.root.join("lessons").join(format!("ISSUE-{:03}-q.md", i)), fm("always: One habit page.")).unwrap();
+    }
+    let o = dlook(&c);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ALWAYS-CAP 6 pages carry always, at most 5\n");
+}

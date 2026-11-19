@@ -52,6 +52,16 @@ inside a code fence is never a heading.
 - `CONTROLS`: `controls` is missing, is not an inline list `[...]` (an empty list, `[]` or `[ ]`, is fine), or holds
   an empty token.
 - `MATCH`: `match` is present but is not an inline list, is an empty list (`[]` or `[ ]`), or holds an empty token (a missing `match` is fine).
+- `ALWAYS`: `always` is present but its value is empty, is over 200 bytes, or holds a control character or a
+  white-space character other than a plain space (the value is read as the front matter reader gives it, ASCII
+  spaces and tabs trimmed, and a retired page is checked as any page), or the page carries both `always` and
+  `match` (`ALWAYS always and match on one page`). The value is one rule sentence, a habit that holds for most
+  changes: no `match` token picks the tickets such a page fits, so it says so with this key instead of a loose
+  token that would offer it by chance. A page with neither key is fine.
+- `ALWAYS-CAP`: more than 5 pages that are not retired carry `always`. The cap counts pages, not rule
+  sentences, in the order the lint checks them (a page reached twice counts once); the sixth and each later
+  such page gets one problem line `ALWAYS-CAP more than 5 pages carry always`, placed directly after its
+  `ALWAYS` line or where that line would be. A retired page with `always` does not count.
 - `DUPLICATE-ID`: two pages of one run carry the same `id`; the problem names the later page.
 
 ## Body rules
@@ -81,11 +91,22 @@ Output (exit 0): one line `lesson: <id> <heading> <file name>` per matching page
 `lessons: scanned=<n> matched=<ids joined by a comma>` (`matched=none` when no page matches). `<id>` is the
 `ISSUE-<3 digits>` start of the file name; `<n>` is the number of pages read. Two pages with one id are both listed.
 
+Always pages: a page that carries the front matter key `always` (one rule sentence, at most 5 such pages that are not
+retired, see `ALWAYS` and `ALWAYS-CAP` above) is listed by both modes with its own line shape: one line
+`always: <id> <rule>` per such page, in byte order of the file names, printed before the `lesson:` lines; `<id>` is the
+start of the file name as on a `lesson:` line and `<rule>` the `always` value, printed through the escape of the lint.
+Such a page is not listed as a `lesson:` line and is not in `matched=` (a page that carries both `always` and `match`
+is refused, see the refusals below). When one or more `always:` lines were printed, the receipt holds one more field,
+`always=<ids joined by a comma>`, directly after `matched=<...>` and before `retired=<r>`; with no `always` page the
+stdout of both modes is as before.
+
 Retired pages: both modes skip a page with `status: retired` (a lesson that no longer holds is not offered). The page is
-still checked as any page (a `FRONT-MATTER`, `STATUS` or `MATCH` problem refuses it) and still counts in `scanned`. When
-`r` pages read are retired (they hit or not, with a match key or not), the receipt ends with a last field:
-`lessons: scanned=<n> matched=<ids|none> retired=<r>`; with no retired page the field is not printed. A caller that parses
-the receipt line has to accept the optional last field `retired=<r>`; no reader in this repo parses it.
+still checked as any page (a `FRONT-MATTER`, `STATUS`, `MATCH` or `ALWAYS` problem refuses it) and still counts in
+`scanned`; a retired `always` page prints no `always:` line, does not count toward the cap and counts in `retired=<r>`.
+When `r` pages read are retired (they hit or not, with a match key or not), the receipt ends with the last field
+`retired=<r>` (`lessons: scanned=<n> matched=<ids|none> [always=<ids>] retired=<r>`); with no retired page the field is
+not printed. A caller that parses the receipt line has to accept the optional fields in this order: `always=<ids>` (only
+when an `always:` line was printed), then `retired=<r>`; no reader in this repo parses it.
 
 Heading: the text after `# ` of the first line below the front matter that starts with `# `, trimmed of Unicode white
 space. With no such line, or an empty text, it is the part of the file name between `ISSUE-<3 digits>-` and `.md` with
@@ -118,11 +139,15 @@ entries are all bad prints these and not the no-page line), the no-page check, t
 valid UTF-8), then the exit 1 refusals (the ticket line first, then the pages in byte order of their names). A missing
 folder, a file given as the folder, a page that is not valid UTF-8 and a folder with no page exit 2.
 
-Front matter: read with the reader of the lint. A page for which the lint lists a `FRONT-MATTER` or a `MATCH` problem is
-refused with the rule word and detail the lint prints. The `STATUS` check is made too: a `status` value that is not
-`unvalidated`, `validated` or `retired` (an empty value, a quoted value and `Retired` included) is refused with the
-lint line, not read as active and not read as retired; a missing `status` key reads as active (the lint reports it). On
-one page the lines come in the lint order: `FRONT-MATTER`, `STATUS`, `MATCH`. No other lint rule is checked. A page with
+Front matter: read with the reader of the lint. A page for which the lint lists a `FRONT-MATTER`, `MATCH` or `ALWAYS`
+problem is refused with the rule word and detail the lint prints. The `STATUS` check is made too: a `status` value that
+is not `unvalidated`, `validated` or `retired` (an empty value, a quoted value and `Retired` included) is refused with
+the lint line, not read as active and not read as retired; a missing `status` key reads as active (the lint reports it).
+On one page the lines come in the lint order: `FRONT-MATTER`, `STATUS`, `MATCH`, `ALWAYS`. The `ALWAYS-CAP` check is
+made too: more than 5 pages that carry `always` and are not retired (a missing `status` and a refused `always` value
+count, a retired page does not) refuse the run with one line
+`harness: lesson lookup refused: ALWAYS-CAP <n> pages carry always, at most 5`, printed after the ticket line and the
+page lines. No other lint rule is checked. A page with
 no `match` key is counted and matches nothing. The ticket goes through the ticket reader; only `repo_id`, `title` and `acceptance_criteria`
 are used. The scope file is read as `lane claim` reads it (at most 1 MiB, UTF-8, `parse_scope`).
 
@@ -142,7 +167,9 @@ flag it. A page matches when one token hits in one of three ways:
 harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>
 ```
 
-Lists the pages that match the committed diff between two commits of one repo, with the two output line shapes above.
+Lists the pages that match the committed diff between two commits of one repo, with the two output line shapes above
+(the `always:` line of an always page, the `always=` field of the receipt and the `ALWAYS` refusals apply here as in
+ticket mode).
 A later review brief is meant to list the matched lessons as checks (that brief line is not built). Tokens are read as above (quotes removed, an empty
 token refused). A token hits when:
 
@@ -195,6 +222,8 @@ Where the verb is stricter than the wrapper lookup it replaces:
   character, `a//b`)
 - a page with an unknown `status` value (the verb refuses it; the wrapper does not read status)
 - a page with `status: retired` (the verb skips it and counts it in `retired=<r>`; the wrapper still offers it)
+- a page with an `always` key: the wrapper matcher does not read `always`, the verb lists it on an `always:` line
+  and refuses it when the `ALWAYS` rule does
 
 Where the verb reads more than the wrapper:
 
@@ -249,7 +278,15 @@ link exits `1`.
 A `<id>.json` that is a symbolic link or a folder is refused (`1`) also when it has no scope file. A tickets folder
 given as a symbolic link is followed.
 
-Known limit: ticket mode only — the diff-mode lookup has no replay. An empty ticket id (a file named `.json`) and a
+Known limit: ticket mode only — the diff-mode lookup has no replay. The replay does not yet count `always` pages
+apart (the replay fields for them are a later change); in plain words:
+
+- A page with `always` has no match tokens, so the replay shows it with `hits=0` and does not count it as offered.
+- The replay refuses a page the `ALWAYS` rule refuses (it reads pages with the same page reader as the lookup).
+- The replay does not check `ALWAYS-CAP`: with 6 such pages that are not retired the replay exits 0 where the lookup
+  exits 1.
+
+An empty ticket id (a file named `.json`) and a
 ticket file name that is not UTF-8 are not handled apart.
 
 ### The answer key of `harness lesson replay`
