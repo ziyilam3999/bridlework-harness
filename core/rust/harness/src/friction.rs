@@ -707,7 +707,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -965,13 +965,22 @@ pub(crate) fn today_utc() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// True when two path strings name one file: the same text, or both exist and canonicalize (symlinks
-/// resolved) to the same file. A record file that does not exist yet only matches its own text, so a
-/// fresh `--record` path is never mistaken for the inbox.
+/// True when two path strings name one file: the same text, or both exist and are the same file by device and
+/// inode (so a hard link counts), or both canonicalize (symlinks resolved) to the same path. A record file that
+/// does not exist yet only matches its own text, so a fresh `--record` path is never mistaken for the inbox.
 pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
     let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
     if pa == pb {
         return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(pa), std::fs::metadata(pb)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
     }
     match (std::fs::canonicalize(pa), std::fs::canonicalize(pb)) {
         (Ok(ca), Ok(cb)) => ca == cb,

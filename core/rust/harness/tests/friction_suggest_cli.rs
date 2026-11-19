@@ -170,14 +170,20 @@ fn a_privacy_hit_in_the_query_refuses_and_names_the_field_never_the_bytes() {
     let before = fs::read(t.inbox()).unwrap();
     let home = ["/Us", "ers/", "zztester", "/proj"].concat();
     let cred = ["AK", "IA", "ZZZZ", "ZZZZ", "ZZZZ", "ZZZZ"].concat();
-    for (flag, needle) in [("--text", home.as_str()), ("--text", cred.as_str()), ("--why", home.as_str()), ("--why", cred.as_str()), ("--why", DENY)] {
+    for (flag, needle, class) in [
+        ("--text", home.as_str(), "home-path"),
+        ("--text", cred.as_str(), "credential"),
+        ("--why", home.as_str(), "home-path"),
+        ("--why", cred.as_str(), "credential"),
+        ("--why", DENY, "deny-token"),
+    ] {
         let value = format!("cache {needle} here");
         let args: Vec<&str> = if flag == "--text" { vec!["--text", &value] } else { vec!["--text", "cache", "--why", &value] };
         let o = suggest(&t, &args);
         assert_eq!(code(&o), 1, "{flag}: {}", err(&o));
         assert!(out(&o).is_empty(), "stdout must be empty: {}", out(&o));
         let field = flag.trim_start_matches("--");
-        assert!(err(&o).contains(&format!("field {field} has a privacy hit")), "{}", err(&o));
+        assert!(err(&o).contains(&format!("field {field} has a privacy hit ({class})")), "{}", err(&o));
         assert!(!err(&o).contains(needle) && !err(&o).contains(&value), "the bytes must not be echoed: {}", err(&o));
     }
     assert_eq!(fs::read(t.inbox()).unwrap(), before);
@@ -248,6 +254,49 @@ fn record_naming_the_inbox_is_refused_exit_2_even_through_a_link() {
         assert!(err(&o).contains("--record"), "{}", err(&o));
         assert_eq!(fs::read(t.inbox()).unwrap(), before);
     }
+}
+
+#[test]
+fn record_naming_the_inbox_through_a_hard_link_is_refused_exit_2() {
+    let t = Tmp::new();
+    t.write_inbox(&t1_rows());
+    let before = fs::read(t.inbox()).unwrap();
+    let hard = t.0.join("hard.jsonl");
+    fs::hard_link(t.inbox(), &hard).unwrap();
+    let o = suggest(&t, &["--text", "cache", "--record", p(&hard)]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert!(err(&o).contains("--record"), "{}", err(&o));
+    assert_eq!(fs::read(t.inbox()).unwrap(), before, "the inbox is byte-identical");
+    assert_eq!(fs::read(&hard).unwrap(), before, "the hard link shows the same bytes");
+}
+
+#[test]
+fn rank_record_naming_the_inbox_through_a_hard_link_is_refused_exit_2() {
+    let t = Tmp::new();
+    t.write_inbox(&t1_rows());
+    let before = fs::read(t.inbox()).unwrap();
+    let hard = t.0.join("hard-rank.jsonl");
+    fs::hard_link(t.inbox(), &hard).unwrap();
+    let cfg = t.config();
+    let o = run(&["friction", "rank", "--record", p(&hard), "--config", p(&cfg)]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert_eq!(fs::read(t.inbox()).unwrap(), before, "the inbox is byte-identical");
+}
+
+#[test]
+fn an_empty_or_blank_text_is_a_usage_error() {
+    let t = Tmp::new();
+    t.write_inbox(&t1_rows());
+    let before = fs::read(t.inbox()).unwrap();
+    for text in ["", "   "] {
+        let o = suggest(&t, &["--text", text, "--why", "cache"]);
+        assert_eq!(code(&o), 2, "{text:?}: {}", err(&o));
+        assert!(out(&o).is_empty());
+        assert!(err(&o).contains("--text must not be empty"), "{}", err(&o));
+    }
+    assert_eq!(fs::read(t.inbox()).unwrap(), before);
 }
 
 #[test]

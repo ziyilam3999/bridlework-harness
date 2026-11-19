@@ -10,7 +10,7 @@ operational text, so it is private data. This repo holds the contract, the reade
 
 Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
 `repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
-`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), and the read-only `controls-check` verb. The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, and the read-only `suggest` verb (ask A32, unix only). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
@@ -492,7 +492,8 @@ stored row id. Free: no model, no network.
 - The query is scanned by the privacy engine before ranking (a hit refuses, exit 1, naming the field and class,
   never the bytes); a damaged inbox refuses like `rank` (exit 1); no privacy list configured is exit 2.
 - Read-only on the inbox. `--record <file>` appends one line `{ts, query_sha256, top, via}` (sha256 of
-  `text + newline + why`, the top group ids, `bm25`) and never any text; a `--record` naming the inbox is exit 2.
+  `text + newline + why`, the top group ids, `bm25`) and never any text; a `--record` naming the inbox, by path, by a symbolic link, or by a hard link (the same
+  device and inode), is exit 2. The same check guards `friction rank --record`. The verb exists on unix only.
 
 ## 5. Not in slice 1 (where each piece went)
 
