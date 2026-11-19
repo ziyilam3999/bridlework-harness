@@ -4,7 +4,8 @@
 //! lines); same docs page. A page that carries the front matter key `always` (one rule sentence, no `match`)
 //! is listed, when not retired, on an `always:` line in both modes. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
 //! folder of tickets and counts the offered pages with the `always` pages apart (an `always` page that is not
-//! retired is in no `pages=` list; over the cap below the replay refuses as the lookup does). Both modes skip a page with status retired (still checked, counted in scanned, and
+//! retired is in no `pages=` list; over the cap below the replay refuses as the lookup does). `harness lesson
+//! brief` (lesson_brief.rs) writes the lessons block of a builder brief and the copies of the matched pages. Both modes skip a page with status retired (still checked, counted in scanned, and
 //! counted in the receipt field retired=<r>) and refuse an unknown status. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
@@ -14,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-pub(crate) const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>\n       harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir> [--config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]]";
+pub(crate) const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>\n       harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir> [--config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]]\n       harness lesson brief <lessons-dir> --ticket <ticket-file> --scope-file <file> --out <absolute-dir>";
 /// The read limit of a git answer (the diff).
 const MAX_DIFF: usize = 8 * 1024 * 1024;
 /// The read limit of the ticket and the scope file (as `lane claim` reads them).
@@ -477,14 +478,18 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>, always
 }
 
 /// `harness lesson lint <path> [<path> ...]`. Exit 0 all pages pass (one stdout line); 1 one stdout line per problem;
-/// 2 usage or read error (nothing on stdout). `lookup` goes to `lookup_cmd`, `replay` to `lesson_replay::replay_cmd`.
-/// Any verb but `lint`, `lookup` and `replay`, or no path, prints the usage and exits 2.
+/// 2 usage or read error (nothing on stdout). `lookup` goes to `lookup_cmd`, `replay` to `lesson_replay::replay_cmd`,
+/// `brief` to `lesson_brief::brief_cmd`. Any verb but `lint`, `lookup`, `replay` and `brief`, or no path, prints
+/// the usage and exits 2.
 pub fn lesson_cmd(a: &[String]) -> i32 {
     if a.first().map(|s| s.as_str()) == Some("lookup") {
         return lookup_cmd(&a[1..]);
     }
     if a.first().map(|s| s.as_str()) == Some("replay") {
         return crate::lesson_replay::replay_cmd(&a[1..]);
+    }
+    if a.first().map(|s| s.as_str()) == Some("brief") {
+        return crate::lesson_brief::brief_cmd(&a[1..]);
     }
     if a.first().map(|s| s.as_str()) != Some("lint") || a.len() < 2 {
         eprintln!("{}", LESSON_USAGE);
@@ -938,6 +943,26 @@ pub(crate) fn read_page(lines: &[&str]) -> PageRead {
     PageRead { close, retired, tokens, always, has_always, problems }
 }
 
+/// Read the ticket file and the scope file of ticket mode, as `lookup_cmd` does (the ticket to the reader limit,
+/// the scope file as `lane claim` reads it); shared with `lesson_brief`. Err holds the exit code (2) with its
+/// stderr lines.
+pub(crate) fn read_ticket_scope(ticket: &str, scope: &str) -> Result<Input, (i32, Vec<String>)> {
+    let one = |m: String| (2, vec![format!("harness: error: {}", esc(&m))]);
+    let ticket_bytes = match read_limited(ticket, "ticket file") {
+        Ok(b) => b,
+        Err(m) => return Err(one(m)),
+    };
+    let scope = match read_limited(scope, "scope file") {
+        Ok(b) if b.len() as u64 > MAX_FILE => return Err(one("the scope file is over 1 MiB".to_string())),
+        Ok(b) => match String::from_utf8(b) {
+            Ok(t) => crate::lane::parse_scope(&t).map_err(|m| one(format!("scope file: {}", m))),
+            Err(_) => return Err(one("the scope file is not valid UTF-8".to_string())),
+        },
+        Err(m) => return Err(one(m)),
+    }?;
+    Ok(Input::Ticket(ticket_bytes, scope))
+}
+
 /// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`, or `--repo-dir <dir> --from <sha> --to <sha>` (diff mode). Exit 0 the matching pages (stdout), 1 a page or the ticket is
 /// refused, 2 usage or read error or a page-shaped entry that is not a page and not a folder. The exit 1 lines are printed after all pages are read.
 fn lookup_cmd(a: &[String]) -> i32 {
@@ -993,29 +1018,22 @@ fn lookup_cmd(a: &[String]) -> i32 {
     } else {
         let Some(ticket) = ticket else { return fail("--ticket is required") };
         let Some(scope) = scope else { return fail("--scope-file is required") };
-        let ticket_bytes = match read_limited(ticket, "ticket file") {
-            Ok(b) => b,
-            Err(m) => return fail(&m),
-        };
-        let scope = match read_limited(scope, "scope file") {
-            Ok(b) if b.len() as u64 > MAX_FILE => return fail("the scope file is over 1 MiB"),
-            Ok(b) => match String::from_utf8(b) {
-                Ok(t) => crate::lane::parse_scope(&t),
-                Err(_) => return fail("the scope file is not valid UTF-8"),
-            },
-            Err(m) => return fail(&m),
-        };
-        let scope = match scope {
-            Ok(s) => s,
-            Err(m) => return fail(&format!("scope file: {}", m)),
-        };
-        Input::Ticket(ticket_bytes, scope)
+        match read_ticket_scope(ticket, scope) {
+            Ok(i) => i,
+            Err((c, ls)) => {
+                for l in ls {
+                    eprintln!("{}", l);
+                }
+                return c;
+            }
+        }
     };
     match match_pages(dir, &input) {
-        Ok(lines) => {
-            for l in lines {
-                println!("{}", l);
+        Ok(answer) => {
+            for p in &answer.pages {
+                println!("{}", p.line);
             }
+            println!("{}", answer.receipt);
             0
         }
         Err((code, lines)) => {
@@ -1033,10 +1051,27 @@ pub(crate) enum Input {
     Diff(Diff),
 }
 
+/// One listed page of the lookup: its printed line, its id (the `ISSUE-<3 digits>` start of the file name), its
+/// file name, whether it is an `always:` page, and — a matched page only — the page text as it was read.
+pub(crate) struct ListedPage {
+    pub line: String,
+    pub id: String,
+    pub name: String,
+    pub always: bool,
+    pub text: Option<String>,
+}
+
+/// The exit 0 answer of the page loop: the listed pages in print order (the `always:` pages, then the `lesson:`
+/// pages, each group in byte order of the file names) and the receipt line.
+pub(crate) struct PagesAnswer {
+    pub pages: Vec<ListedPage>,
+    pub receipt: String,
+}
+
 /// The one loop over the pages of a lessons folder, for both modes. Takes the folder and the input. Ok holds
-/// the stdout lines of exit 0; Err holds the exit code (1 a page or the ticket is refused, 2 a read error or an entry the walk refuses)
-/// with its stderr lines in print order.
-pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32, Vec<String>)> {
+/// the listed pages and the receipt line of exit 0; Err holds the exit code (1 a page or the ticket is refused,
+/// 2 a read error or an entry the walk refuses) with its stderr lines in print order.
+pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<PagesAnswer, (i32, Vec<String>)> {
     let fail = |m: &str| (2, vec![format!("harness: error: {}", esc(m))]);
     let names = match walk(dir) {
         Ok(n) => n,
@@ -1071,8 +1106,9 @@ pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32,
             _ => None,
         }
     };
-    let (mut out, mut ids) = (Vec::new(), Vec::new());
-    let (mut always_out, mut always_ids) = (Vec::new(), Vec::new());
+    let (mut listed_always, mut listed_matched) = (Vec::new(), Vec::new());
+    let mut ids: Vec<&str> = Vec::new();
+    let mut always_ids: Vec<&str> = Vec::new();
     let (mut retired, mut always_pages) = (0usize, 0usize);
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
@@ -1095,13 +1131,25 @@ pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32,
         // An always page is listed on its own line, not as a lesson: line and not in matched=.
         if let Some(rule) = &always {
             let id = &name[..9];
-            always_out.push(format!("always: {} {}", id, esc(rule)));
+            listed_always.push(ListedPage {
+                line: format!("always: {} {}", id, esc(rule)),
+                id: id.to_string(),
+                name: name.clone(),
+                always: true,
+                text: None,
+            });
             always_ids.push(id);
             continue;
         }
         if problems.is_empty() && tokens.iter().any(|tok| hits(tok.as_str()) == Some(true)) {
             let id = &name[..9];
-            out.push(format!("lesson: {} {} {}", id, esc(&heading(&lines, close, name)), esc(name)));
+            listed_matched.push(ListedPage {
+                line: format!("lesson: {} {} {}", id, esc(&heading(&lines, close, name)), esc(name)),
+                id: id.to_string(),
+                name: name.clone(),
+                always: false,
+                text: Some(text.clone()),
+            });
             ids.push(id);
         }
     }
@@ -1111,8 +1159,6 @@ pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32,
     if !refused.is_empty() {
         return Err((1, refused));
     }
-    let mut res = always_out;
-    res.extend(out);
     let matched = if ids.is_empty() { "none".to_string() } else { ids.join(",") };
     let mut last = format!("lessons: scanned={} matched={}", names.len(), matched);
     if !always_ids.is_empty() {
@@ -1121,8 +1167,8 @@ pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32,
     if retired > 0 {
         last.push_str(&format!(" retired={}", retired));
     }
-    res.push(last);
-    Ok(res)
+    listed_always.extend(listed_matched);
+    Ok(PagesAnswer { pages: listed_always, receipt: last })
 }
 
 #[cfg(test)]
