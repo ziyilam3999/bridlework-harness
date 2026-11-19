@@ -257,14 +257,23 @@ Output (exit 0), three line shapes in this order:
   the id; `<n>` counts page files (retired pages are not offered) and the `pages=` list is the `matched=` list of the
   lookup over that ticket.
 - one line `page: <page id> hits=<n>` per page read, in byte order of the file names; a page offered to no ticket
-  and a retired page are listed with `hits=0`.
-- the last line `replay ok tickets=<n> skipped_no_scope=<k> pages=<p> offered_total=<t> offered_max=<m> zero=<z>`;
-  `pages=` counts the pages read (the lookup's `scanned`, retired ones included); `offered_total=` is the sum and
-  `offered_max=` the maximum of the per-ticket `offered=`; `zero=` counts the tickets with `offered=0`; with at
-  least one retired page the line ends with ` retired=<r>`. No decimal number, no median and no mean is printed (a
-  caller computes those from the lines).
+  and a retired page are listed with `hits=0`. An `always` page that is not retired is listed with `hits=0 always`
+  in its place in the byte order (it is in no `pages=` list and adds nothing to `offered=`, `offered_total=` or
+  `offered_max=`); a retired page, an `always` page included, keeps the line `hits=0` and counts in `retired=<r>`
+  only.
+- the last line `replay ok tickets=<n> skipped_no_scope=<k> pages=<p> offered_total=<t> offered_max=<m> zero=<z>`,
+  which gains ` always=<a>` directly after `zero=<z>` and before ` retired=<r>` when `a` is 1 or more (`a` counts
+  the pages read that carry `always` and are not retired); `pages=` counts the pages read (the lookup's `scanned`,
+  retired ones and `always` pages included); `offered_total=` is the sum and `offered_max=` the maximum of the
+  per-ticket `offered=`; `zero=` counts the tickets with `offered=0`, a ticket whose only pages are `always` pages
+  among them; with at least one retired page the line ends with ` retired=<r>`. No decimal number, no median and
+  no mean is printed (a caller computes those from the lines). A caller that parses a page line has to accept the
+  optional last word `always`, and `always=` is an id list on the lookup receipt and a count on the replay last
+  line.
 
-Exit codes: `0` done; `1` a page the lookup refuses (its own `harness: lesson lookup refused:` lines), a ticket file
+Exit codes: `0` done; `1` a page the lookup refuses (its own `harness: lesson lookup refused:` lines), more than 5
+pages that carry `always` and are not retired (the lookup's own cap line `harness: lesson lookup refused:
+ALWAYS-CAP <n> pages carry always, at most 5`, printed after the ticket, scope file and page lines), a ticket file
 the ticket reader refuses, or a scope file `parse_scope` refuses — a ticket or scope file that is a symbolic link or
 over the 1 MiB reader limit is refused the same way, with one line `harness: lesson replay refused: <file name>`
 (the file name only, no folder); stdout is empty and no partial count is printed; `2` a usage or read error: a
@@ -278,13 +287,15 @@ link exits `1`.
 A `<id>.json` that is a symbolic link or a folder is refused (`1`) also when it has no scope file. A tickets folder
 given as a symbolic link is followed.
 
-Known limit: ticket mode only — the diff-mode lookup has no replay. The replay does not yet count `always` pages
-apart (the replay fields for them are a later change); in plain words:
+Known limit: ticket mode only — the diff-mode lookup has no replay. The `always` pages in plain words:
 
-- A page with `always` has no match tokens, so the replay shows it with `hits=0` and does not count it as offered.
-- The replay refuses a page the `ALWAYS` rule refuses (it reads pages with the same page reader as the lookup).
-- The replay does not check `ALWAYS-CAP`: with 6 such pages that are not retired the replay exits 0 where the lookup
-  exits 1.
+- A page with `always` has no match tokens, so the replay shows it with `hits=0 always`, keeps it out of the
+  `pages=` lists and counts it in `always=<a>`; a ticket whose only pages are `always` pages prints `offered=0
+  pages=none` and counts in `zero=`.
+- The replay refuses a page the `ALWAYS` rule refuses (it reads pages with the same page reader as the lookup), a
+  retired page with an empty `always` value included.
+- The replay checks `ALWAYS-CAP` as the lookup counts it: each page that carries the key `always` and is not
+  retired, a refused value included; over 5 the replay refuses with the lookup's own cap line and exits 1.
 
 An empty ticket id (a file named `.json`) and a
 ticket file name that is not UTF-8 are not handled apart.
@@ -311,15 +322,21 @@ not a group edge), and a line that names a row id that is not a group id covers 
 the controls file are opened as their readers open them today (a symbolic link is followed).
 
 Output (after the `page:` lines and before the last line): one line `key: <page id> rows=<n> offered=<h>` per page
-named by a counted row, in byte order of the page id, then one line `key ok rows=<n> offered=<h> no_ticket=<t>
-no_line=<u>`, which ends with ` listed=<k>` when `--rows` was given. The rule: a row is tied to the ticket its
+named by a counted row, in byte order of the page id (`always` pages are not grouped); a counted row whose page is
+an `always` page that is not retired is not added to `offered=`, and that page's line is
+`key: <page id> rows=<n> offered=0 always=<n>` (the two numbers are the same). Then one line
+`key ok rows=<n> offered=<h> offered_always=<v> no_ticket=<t> no_line=<u>`, where `offered_always=<v>` (the counted
+rows on `always` pages that are not retired) is printed directly after `offered=<h>` when `v` is 1 or more; the
+line ends with ` listed=<k>` when `--rows` was given. The rule: a row is tied to the ticket its
 `ticket` field names, byte for byte; a ticket was replayed when it has a `replay:` line (a ticket skipped for no
 scope file was not); a row counts when the group of the row (its `breaks` root) has a controls line and its ticket
 was replayed, and it is offered when the page id of that line is in the `pages=` list of that ticket's replay
 line; `no_ticket=` counts the rows whose group has a line but whose ticket was not replayed, and `no_line=` the
 rows whose group has no line. Each row looked at lands in exactly one of `rows`, `no_ticket` and `no_line`, so the
 three add up to the number of inbox rows (with `--rows`, to `listed=<k>`). A row of a line that names a retired
-page counts in `rows=` and is not offered (a retired page is in no `pages=` list). A run without the three flags
+page counts in `rows=` and is not offered (a retired page is in no `pages=` list). A row on a retired `always` page
+keeps the line `key: <page id> rows=<n> offered=0` and counts in neither offered field. A row on an `always` page
+whose ticket was not replayed counts in `no_ticket=`. A run without the three flags
 prints no `key:` line and no `key ok` line. No row text and no ticket text is printed.
 
 `--rows <absolute-file>` names a file of row ids, one id per line; only the named rows are looked at, and the

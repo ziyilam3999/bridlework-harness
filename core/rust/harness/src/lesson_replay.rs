@@ -1,5 +1,6 @@
 //! `harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>`: replays the
-//! ticket-mode lookup over a folder of tickets and counts the offered pages (see `docs/lesson-lint.md`).
+//! ticket-mode lookup over a folder of tickets and counts the offered pages with the `always` pages apart
+//! (see `docs/lesson-lint.md`).
 //! With `--config` and `--controls` (and `--rows`) it also prints the answer key: whether the page a friction
 //! row's group was bound to was offered on that row's own ticket. Read only: the run writes no file in the
 //! lessons folder, the tickets folder, the scopes folder, the folders of the three flag files or the current
@@ -8,7 +9,7 @@
 
 use crate::friction::Row;
 use crate::friction_loop::{groups, lint_rows, load_cfg, load_list, read_controls};
-use crate::lesson::{esc, read_page, token_hits, walk, PageRead, LESSON_USAGE, MAX_FILE};
+use crate::lesson::{always_cap, esc, read_page, token_hits, walk, PageRead, LESSON_USAGE, MAX_FILE};
 use crate::ticket::Ticket;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -19,10 +20,12 @@ struct TicketFile {
     path: PathBuf,
 }
 
-/// One page read once: its file name, its id, its tokens and its retired flag.
+/// One page read once: its file name, its id, its tokens, its retired flag and whether it carries the key
+/// `always` and is not retired (the cap count and the `always=` count read it the same way).
 struct Page {
     id: String,
     retired: bool,
+    always: bool,
     tokens: Vec<String>,
 }
 
@@ -92,14 +95,14 @@ fn read_pages(names: &[(String, PathBuf)], refused: &mut Vec<String>) -> Result<
     let mut retired = 0usize;
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-        let PageRead { close, retired: is_retired, tokens, problems, .. } = read_page(&lines);
+        let PageRead { close, retired: is_retired, tokens, has_always, problems, .. } = read_page(&lines);
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }
         if close.is_some() && is_retired {
             retired += 1;
         }
-        pages.push(Page { id: name[..9].to_string(), retired: is_retired, tokens });
+        pages.push(Page { id: name[..9].to_string(), retired: is_retired, always: has_always && !is_retired, tokens });
     }
     Ok((pages, retired))
 }
@@ -226,7 +229,8 @@ fn key_setup(lessons: &str, config: &str, controls: &str, rows_file: Option<&str
 /// [--config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]]`: exit 0 the counts
 /// (one `replay:` line per ticket, one `page:` line per page, the `key:` lines and the `key ok` line when the
 /// answer-key flags are given, then the `replay ok` line); 1 a refused page, ticket file, scope file, inbox,
-/// controls file or rows file (stdout empty, no partial count); 2 a usage or read error.
+/// controls file or rows file, or more than 5 `always` pages that are not retired (the lookup's own cap line,
+/// stdout empty, no partial count); 2 a usage or read error.
 pub fn replay_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", esc(m));
@@ -362,6 +366,11 @@ pub fn replay_cmd(a: &[String]) -> i32 {
         }
     }
     refused.extend(page_refused);
+    // The cap counts as the lookup counts, its line comes last; a page with a refused value counts too.
+    let always_pages = pages.iter().filter(|p| p.always).count();
+    if let Some(line) = always_cap(always_pages) {
+        refused.push(line);
+    }
     if !refused.is_empty() {
         for l in refused {
             eprintln!("{}", l);
@@ -397,14 +406,21 @@ pub fn replay_cmd(a: &[String]) -> i32 {
         println!("{}", l);
     }
     for (i, pg) in pages.iter().enumerate() {
-        println!("page: {} hits={}", esc(&pg.id), hits[i]);
+        // An always page is in no pages= list, so its hits stay 0; a retired one keeps today's line.
+        if pg.always {
+            println!("page: {} hits=0 always", esc(&pg.id));
+        } else {
+            println!("page: {} hits={}", esc(&pg.id), hits[i]);
+        }
     }
     if let Some(key) = &key {
         // A row is tied to its ticket byte for byte; it counts when its group has a controls line and its
-        // ticket was replayed, and is offered when that line's page is in the ticket's pages= list.
+        // ticket was replayed, and is offered when that line's page is in the ticket's pages= list. A row on
+        // an always page that is not retired counts in offered_always= and is not offered.
         let replayed: HashMap<&str, &Vec<String>> = offered.iter().map(|(id, ids)| (id.as_str(), ids)).collect();
-        let mut per_page: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        let (mut n_rows, mut n_off, mut no_ticket, mut no_line) = (0usize, 0usize, 0usize, 0usize);
+        let always_ids: HashSet<&str> = pages.iter().filter(|p| p.always).map(|p| p.id.as_str()).collect();
+        let mut per_page: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+        let (mut n_rows, mut n_off, mut n_always, mut no_ticket, mut no_line) = (0usize, 0usize, 0usize, 0usize, 0usize);
         for &i in &key.considered {
             let r = &key.rows[i];
             let Some(page) = key.page_of.get(&r.id) else {
@@ -415,48 +431,57 @@ pub fn replay_cmd(a: &[String]) -> i32 {
                 None => no_ticket += 1,
                 Some(pages) => {
                     let hit = pages.iter().any(|p| p == page);
+                    let on_always = always_ids.contains(page.as_str());
                     n_rows += 1;
                     if hit {
                         n_off += 1;
                     }
-                    let e = per_page.entry(page.as_str()).or_insert((0, 0));
+                    if on_always {
+                        n_always += 1;
+                    }
+                    let e = per_page.entry(page.as_str()).or_insert((0, 0, 0));
                     e.0 += 1;
                     if hit {
                         e.1 += 1;
                     }
+                    if on_always {
+                        e.2 += 1;
+                    }
                 }
             }
         }
-        for (page, (n, h)) in &per_page {
-            println!("key: {} rows={} offered={}", esc(page), n, h);
+        for (page, (n, h, a)) in &per_page {
+            if *a > 0 {
+                println!("key: {} rows={} offered=0 always={}", esc(page), n, a);
+            } else {
+                println!("key: {} rows={} offered={}", esc(page), n, h);
+            }
         }
-        let mut last = format!("key ok rows={} offered={} no_ticket={} no_line={}", n_rows, n_off, no_ticket, no_line);
+        let mut last = format!("key ok rows={} offered={}", n_rows, n_off);
+        if n_always > 0 {
+            last.push_str(&format!(" offered_always={}", n_always));
+        }
+        last.push_str(&format!(" no_ticket={} no_line={}", no_ticket, no_line));
         if let Some(k) = key.listed {
             last.push_str(&format!(" listed={}", k));
         }
         println!("{}", last);
     }
-    if retired > 0 {
-        println!(
-            "replay ok tickets={} skipped_no_scope={} pages={} offered_total={} offered_max={} zero={} retired={}",
-            runs.len(),
-            skipped,
-            pages.len(),
-            total,
-            maxo,
-            zero,
-            retired
-        );
-    } else {
-        println!(
-            "replay ok tickets={} skipped_no_scope={} pages={} offered_total={} offered_max={} zero={}",
-            runs.len(),
-            skipped,
-            pages.len(),
-            total,
-            maxo,
-            zero
-        );
+    let mut last = format!(
+        "replay ok tickets={} skipped_no_scope={} pages={} offered_total={} offered_max={} zero={}",
+        runs.len(),
+        skipped,
+        pages.len(),
+        total,
+        maxo,
+        zero
+    );
+    if always_pages > 0 {
+        last.push_str(&format!(" always={}", always_pages));
     }
+    if retired > 0 {
+        last.push_str(&format!(" retired={}", retired));
+    }
+    println!("{}", last);
     0
 }

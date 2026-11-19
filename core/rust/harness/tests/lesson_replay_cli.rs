@@ -212,6 +212,175 @@ replay ok tickets=1 skipped_no_scope=0 pages=2 offered_total=1 offered_max=1 zer
     let _ = fs::remove_dir_all(&d);
 }
 
+// ---- always pages ----
+
+/// An always page between two matched pages keeps its place in the byte order of the file names, is in no
+/// pages= list and adds nothing to the offered counts; the last line counts it in always=.
+#[test]
+fn an_always_page_between_matched_pages_keeps_its_place() {
+    let d = rsetup(
+        &[
+            ("ISSUE-601-a.md", fm("match: [example]")),
+            ("ISSUE-602-b.md", fm("always: a rule that holds for most changes")),
+            ("ISSUE-603-c.md", fm("match: [hello]")),
+        ],
+        &[("aa-1.json", hello_ticket())],
+        &[("aa-1.paths", "src/\n".to_string())],
+    );
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "replay: ticket=aa-1 offered=2 pages=ISSUE-601,ISSUE-603\n\
+page: ISSUE-601 hits=1\n\
+page: ISSUE-602 hits=0 always\n\
+page: ISSUE-603 hits=1\n\
+replay ok tickets=1 skipped_no_scope=0 pages=3 offered_total=2 offered_max=2 zero=0 always=1\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A ticket whose only pages are always pages prints offered=0 pages=none and counts in zero=; the page
+/// line is 'hits=0 always'.
+#[test]
+fn a_ticket_with_only_always_pages_offers_nothing() {
+    let d = rsetup(
+        &[("ISSUE-610-a.md", fm("always: a rule that holds for most changes"))],
+        &[("aa-1.json", other_ticket())],
+        &[("aa-1.paths", "src/\n".to_string())],
+    );
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+page: ISSUE-610 hits=0 always\n\
+replay ok tickets=1 skipped_no_scope=0 pages=1 offered_total=0 offered_max=0 zero=1 always=1\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A retired always page keeps today's page line and counts in retired= only; always= counts the pages
+/// that are not retired.
+#[test]
+fn a_retired_always_page_keeps_today_line() {
+    let d = rsetup(
+        &[
+            ("ISSUE-620-a.md", fm("always: a rule that holds for most changes")),
+            ("ISSUE-621-b.md", fm("status: retired\nalways: a rule that holds for most changes")),
+        ],
+        &[("aa-1.json", hello_ticket())],
+        &[("aa-1.paths", "src/\n".to_string())],
+    );
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+page: ISSUE-620 hits=0 always\n\
+page: ISSUE-621 hits=0\n\
+replay ok tickets=1 skipped_no_scope=0 pages=2 offered_total=0 offered_max=0 zero=1 always=1 retired=1\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A word of the rule text that is also a ticket word does not make the page hit: the page line stays
+/// 'hits=0 always'.
+#[test]
+fn an_always_rule_word_does_not_hit() {
+    let d = rsetup(
+        &[("ISSUE-630-a.md", fm("always: the example repo needs a guard"))],
+        &[("aa-1.json", hello_ticket())],
+        &[("aa-1.paths", "src/\n".to_string())],
+    );
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+page: ISSUE-630 hits=0 always\n\
+replay ok tickets=1 skipped_no_scope=0 pages=1 offered_total=0 offered_max=0 zero=1 always=1\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// A page the ALWAYS rule refuses refuses the replay as today, a retired page with an empty value too.
+#[test]
+fn a_page_the_always_rule_refuses_refuses_the_replay() {
+    for body in ["always:", "status: retired\nalways:"] {
+        let d = rsetup(
+            &[("ISSUE-640-a.md", fm(body))],
+            &[("aa-1.json", hello_ticket())],
+            &[("aa-1.paths", "src/\n".to_string())],
+        );
+        let o = replay_in(&d);
+        assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+        assert_eq!(stdout(&o), "");
+        assert_eq!(stderr(&o), "harness: lesson lookup refused: ISSUE-640-a.md: ALWAYS always is empty\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+/// Six always pages that are not retired refuse the replay with the lookup's own cap line.
+#[test]
+fn six_always_pages_refuse_the_replay() {
+    let names = ["ISSUE-641-a.md", "ISSUE-642-b.md", "ISSUE-643-c.md", "ISSUE-644-d.md", "ISSUE-645-e.md", "ISSUE-646-f.md"];
+    let pages: Vec<(&str, String)> = names.iter().map(|n| (*n, fm("always: a rule that holds for most changes"))).collect();
+    let d = rsetup(&pages, &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "src/\n".to_string())]);
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(stderr(&o), "harness: lesson lookup refused: ALWAYS-CAP 6 pages carry always, at most 5\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// Five always pages and one retired always page pass: the cap counts the pages that are not retired.
+#[test]
+fn five_always_pages_and_one_retired_pass() {
+    let names = ["ISSUE-641-a.md", "ISSUE-642-b.md", "ISSUE-643-c.md", "ISSUE-644-d.md", "ISSUE-645-e.md"];
+    let mut pages: Vec<(&str, String)> = names.iter().map(|n| (*n, fm("always: a rule that holds for most changes"))).collect();
+    pages.push(("ISSUE-646-f.md", fm("status: retired\nalways: a rule that holds for most changes")));
+    let d = rsetup(&pages, &[("aa-1.json", hello_ticket())], &[("aa-1.paths", "src/\n".to_string())]);
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+page: ISSUE-641 hits=0 always\n\
+page: ISSUE-642 hits=0 always\n\
+page: ISSUE-643 hits=0 always\n\
+page: ISSUE-644 hits=0 always\n\
+page: ISSUE-645 hits=0 always\n\
+page: ISSUE-646 hits=0\n\
+replay ok tickets=1 skipped_no_scope=0 pages=6 offered_total=0 offered_max=0 zero=1 always=5 retired=1\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The cap line comes last, after the ticket lines and the page lines; the sixth always page has an empty
+/// value, and a refused value counts toward the cap.
+#[test]
+fn the_cap_line_comes_after_the_ticket_and_page_lines() {
+    let names = ["ISSUE-651-a.md", "ISSUE-652-b.md", "ISSUE-653-c.md", "ISSUE-654-d.md", "ISSUE-655-e.md"];
+    let mut pages: Vec<(&str, String)> = names.iter().map(|n| (*n, fm("always: a rule that holds for most changes"))).collect();
+    pages.push(("ISSUE-656-f.md", fm("always:")));
+    let d = rsetup(
+        &pages,
+        &[("aa-1.json", hello_ticket()), ("zz-9.json", "{\"no\": \"ticket\"}".to_string())],
+        &[("aa-1.paths", "src/\n".to_string()), ("zz-9.paths", "src/\n".to_string())],
+    );
+    let o = replay_in(&d);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(
+        stderr(&o),
+        "harness: lesson replay refused: zz-9.json\n\
+harness: lesson lookup refused: ISSUE-656-f.md: ALWAYS always is empty\n\
+harness: lesson lookup refused: ALWAYS-CAP 6 pages carry always, at most 5\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
 /// A ticket with no scope file is skipped: no replay line of its own, tickets=<n> leaves it out, and
 /// skipped_no_scope counts it (the zz-9 ticket offers nothing, so a run of it would print offered=0).
 #[test]
