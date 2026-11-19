@@ -645,7 +645,7 @@ fn sha_ok(s: &str) -> bool {
 }
 
 /// What a diff gives the lookup: the changed paths and the added lines (each with its lower-case form).
-struct Diff {
+pub(crate) struct Diff {
     paths: Vec<String>,
     lines: Vec<(String, String)>,
 }
@@ -1028,15 +1028,15 @@ fn lookup_cmd(a: &[String]) -> i32 {
 }
 
 /// What the lookup matches the tokens against: the ticket bytes with its scope, or the diff.
-enum Input {
+pub(crate) enum Input {
     Ticket(Vec<u8>, Vec<String>),
     Diff(Diff),
 }
 
 /// The one loop over the pages of a lessons folder, for both modes. Takes the folder and the input. Ok holds
-/// the stdout lines of exit 0; Err holds the exit code (1 a page or the ticket is refused, 2 a read error)
+/// the stdout lines of exit 0; Err holds the exit code (1 a page or the ticket is refused, 2 a read error or an entry the walk refuses)
 /// with its stderr lines in print order.
-fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32, Vec<String>)> {
+pub(crate) fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32, Vec<String>)> {
     let fail = |m: &str| (2, vec![format!("harness: error: {}", esc(m))]);
     let names = match walk(dir) {
         Ok(n) => n,
