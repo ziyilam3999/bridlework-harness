@@ -351,6 +351,34 @@ fn a_rows_file_with_a_row_on_an_always_page() {
     );
 }
 
+/// Two counted rows on one always page and one on a second: the key lines carry the real counts
+/// (rows=2 always=2 and rows=1 always=1) and offered_always= is the sum.
+#[test]
+fn the_always_count_on_a_key_line_grows_with_the_rows() {
+    let f = fix(
+        &[
+            ("ISSUE-101-a.md", fm("always: a rule that holds for most changes")),
+            ("ISSUE-102-b.md", fm("always: another rule that holds for most changes")),
+        ],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-1", "2026-11-02", "", "aa-1"), row_on("g-2", "2026-11-03", "", "aa-1"), row_on("g-3", "2026-11-04", "", "aa-1")],
+        "g-1 | control: a guard | lesson: ISSUE-101\ng-2 | control: a guard | lesson: ISSUE-101\ng-3 | control: a guard | lesson: ISSUE-102\n",
+    );
+    let o = with_key(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+         page: ISSUE-101 hits=0 always\n\
+         page: ISSUE-102 hits=0 always\n\
+         key: ISSUE-101 rows=2 offered=0 always=2\n\
+         key: ISSUE-102 rows=1 offered=0 always=1\n\
+         key ok rows=3 offered=0 offered_always=3 no_ticket=0 no_line=0\n\
+         replay ok tickets=1 skipped_no_scope=0 pages=2 offered_total=0 offered_max=0 zero=1 always=2\n"
+    );
+}
+
 /// A row on a retired always page keeps today's key line and counts in neither offered field.
 #[test]
 fn a_row_on_a_retired_always_page_keeps_today_key_line() {
