@@ -269,6 +269,125 @@ fn no_row_text_and_no_ticket_text_is_printed() {
     assert!(!out(&o).contains(W) && !err(&o).contains(W), "{}{}", out(&o), err(&o));
 }
 
+// ---------------------------------------------------------------- always pages
+
+/// One row on an always page and one on a matched page: the always row is not offered, its key line is
+/// 'offered=0 always=<n>' and the key ok line gains offered_always= directly after offered=.
+#[test]
+fn a_row_on_an_always_page_is_not_offered() {
+    let f = fix(
+        &[("ISSUE-101-a.md", fm("match: [example]")), ("ISSUE-102-b.md", fm("always: a rule that holds for most changes"))],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-1", "2026-11-02", "", "aa-1"), row_on("g-2", "2026-11-03", "", "aa-1")],
+        "g-1 | control: a guard | lesson: ISSUE-102\ng-2 | control: a guard | lesson: ISSUE-101\n",
+    );
+    let o = with_key(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "replay: ticket=aa-1 offered=1 pages=ISSUE-101\n\
+         page: ISSUE-101 hits=1\n\
+         page: ISSUE-102 hits=0 always\n\
+         key: ISSUE-101 rows=1 offered=1\n\
+         key: ISSUE-102 rows=1 offered=0 always=1\n\
+         key ok rows=2 offered=1 offered_always=1 no_ticket=0 no_line=0\n\
+         replay ok tickets=1 skipped_no_scope=0 pages=2 offered_total=1 offered_max=1 zero=0 always=1\n"
+    );
+}
+
+/// Three pages with rows, always ISSUE-101, matched ISSUE-102, always ISSUE-103, met in the inbox as
+/// 103, 102, 101: the key lines print in byte order of the page id, the always pages are not grouped.
+#[test]
+fn the_always_key_lines_are_not_grouped() {
+    let f = fix(
+        &[
+            ("ISSUE-101-a.md", fm("always: a rule that holds for most changes")),
+            ("ISSUE-102-b.md", fm("match: [example]")),
+            ("ISSUE-103-c.md", fm("always: another rule that holds for most changes")),
+        ],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-3", "2026-11-02", "", "aa-1"), row_on("g-2", "2026-11-03", "", "aa-1"), row_on("g-1", "2026-11-04", "", "aa-1")],
+        "g-3 | control: a guard | lesson: ISSUE-103\ng-2 | control: a guard | lesson: ISSUE-102\ng-1 | control: a guard | lesson: ISSUE-101\n",
+    );
+    let o = with_key(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "replay: ticket=aa-1 offered=1 pages=ISSUE-102\n\
+         page: ISSUE-101 hits=0 always\n\
+         page: ISSUE-102 hits=1\n\
+         page: ISSUE-103 hits=0 always\n\
+         key: ISSUE-101 rows=1 offered=0 always=1\n\
+         key: ISSUE-102 rows=1 offered=1\n\
+         key: ISSUE-103 rows=1 offered=0 always=1\n\
+         key ok rows=3 offered=1 offered_always=2 no_ticket=0 no_line=0\n\
+         replay ok tickets=1 skipped_no_scope=0 pages=3 offered_total=1 offered_max=1 zero=0 always=2\n"
+    );
+}
+
+/// With --rows and one row on an always page, the key ok line holds offered_always= directly after
+/// offered= and ends with listed=.
+#[test]
+fn a_rows_file_with_a_row_on_an_always_page() {
+    let f = fix(
+        &[("ISSUE-101-a.md", fm("always: a rule that holds for most changes"))],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-1", "2026-11-02", "", "aa-1"), row_on("g-2", "2026-11-03", "", "aa-1")],
+        "g-1 | control: a guard | lesson: ISSUE-101\ng-2 | control: a guard | lesson: ISSUE-101\n",
+    );
+    let rf = f.t.file("rows.txt", "g-1\n");
+    let o = with_rows(&f, &rf);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+         page: ISSUE-101 hits=0 always\n\
+         key: ISSUE-101 rows=1 offered=0 always=1\n\
+         key ok rows=1 offered=0 offered_always=1 no_ticket=0 no_line=0 listed=1\n\
+         replay ok tickets=1 skipped_no_scope=0 pages=1 offered_total=0 offered_max=0 zero=1 always=1\n"
+    );
+}
+
+/// A row on a retired always page keeps today's key line and counts in neither offered field.
+#[test]
+fn a_row_on_a_retired_always_page_keeps_today_key_line() {
+    let f = fix(
+        &[("ISSUE-103-r.md", fm("status: retired\nalways: a rule that holds for most changes"))],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-1", "2026-11-02", "", "aa-1")],
+        "g-1 | control: a guard | lesson: ISSUE-103\n",
+    );
+    let o = with_key(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "replay: ticket=aa-1 offered=0 pages=none\n\
+         page: ISSUE-103 hits=0\n\
+         key: ISSUE-103 rows=1 offered=0\n\
+         key ok rows=1 offered=0 no_ticket=0 no_line=0\n\
+         replay ok tickets=1 skipped_no_scope=0 pages=1 offered_total=0 offered_max=0 zero=1 retired=1\n"
+    );
+}
+
+/// A row on an always page whose ticket was not replayed counts in no_ticket as today.
+#[test]
+fn a_row_on_an_always_page_without_a_ticket_file_counts_in_no_ticket() {
+    let f = fix(
+        &[("ISSUE-101-a.md", fm("always: a rule that holds for most changes"))],
+        &[("aa-1.json", hello())],
+        &[("aa-1.paths", "src/\n".to_string())],
+        &[row_on("g-1", "2026-11-02", "", "cc-3")],
+        "g-1 | control: a guard | lesson: ISSUE-101\n",
+    );
+    let o = with_key(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(key_ok(&o), "key ok rows=0 offered=0 no_ticket=1 no_line=0");
+}
+
 // ---------------------------------------------------------------- --rows
 
 /// With a 4-row inbox and a file naming 2 rows, rows= counts those 2 only; without --rows it counts 4.

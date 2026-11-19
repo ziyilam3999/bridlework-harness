@@ -3,7 +3,8 @@
 //! committed diff between two commits of one repo (diff mode: --repo-dir, --from, --to; changed paths and added
 //! lines); same docs page. A page that carries the front matter key `always` (one rule sentence, no `match`)
 //! is listed, when not retired, on an `always:` line in both modes. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
-//! folder of tickets and counts the offered pages. Both modes skip a page with status retired (still checked, counted in scanned, and
+//! folder of tickets and counts the offered pages with the `always` pages apart (an `always` page that is not
+//! retired is in no `pages=` list; over the cap below the replay refuses as the lookup does). Both modes skip a page with status retired (still checked, counted in scanned, and
 //! counted in the receipt field retired=<r>) and refuse an unknown status. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
@@ -238,6 +239,13 @@ pub(crate) fn always_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&
         return Err("ALWAYS always and match on one page".to_string());
     }
     Ok(Some(v))
+}
+
+/// The ALWAYS-CAP refusal shared by the lookup and the replay: `count` is the number of pages read that carry
+/// the key `always` and are not retired (a refused value included); over 5 the run is refused with this line,
+/// else None.
+pub(crate) fn always_cap(count: usize) -> Option<String> {
+    (count > 5).then(|| format!("harness: lesson lookup refused: ALWAYS-CAP {} pages carry always, at most 5", count))
 }
 
 /// The status of a page: Ok(None) when the key is absent; Err is the STATUS problem line of an unknown value.
@@ -1078,11 +1086,8 @@ fn lookup_cmd(a: &[String]) -> i32 {
             ids.push(id);
         }
     }
-    if always_pages > 5 {
-        refused.push(format!(
-            "harness: lesson lookup refused: ALWAYS-CAP {} pages carry always, at most 5",
-            always_pages
-        ));
+    if let Some(line) = always_cap(always_pages) {
+        refused.push(line);
     }
     if !refused.is_empty() {
         for l in refused {
