@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/bridlework-logo.svg">
+    <img src="docs/brand/bridlework-logo-light.svg" alt="bridlework" width="420">
+  </picture>
+</p>
+
 # harness
 
 bridlework-harness is a Rust engine (`harness`) plus a Claude Code plugin that runs fail-closed gates around a ticket: hooks
