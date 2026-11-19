@@ -36,6 +36,11 @@ pub struct Entry {
     pub id: String,
     pub name: String,
     pub state: Option<String>,
+    /// The host's `sessionId`, `cwd`, `status` and `pid` when the entry has them (a pid may be a number or a string).
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub status: Option<String>,
+    pub pid: Option<String>,
 }
 
 fn id_ok(tok: &str) -> bool {
@@ -79,6 +84,14 @@ pub fn listing(host: &Path) -> Result<Vec<Entry>, String> {
             id: id.to_string(),
             name: name.to_string(),
             state: e.str("state").map(|s| s.to_string()),
+            session_id: e.str("sessionId").map(|s| s.to_string()),
+            cwd: e.str("cwd").map(|s| s.to_string()),
+            status: e.str("status").map(|s| s.to_string()),
+            pid: match e.get("pid") {
+                Some(J::Num(n)) => Some(n.to_string()),
+                Some(J::Str(s)) => Some(s.clone()),
+                _ => None,
+            },
         });
     }
     Ok(v)

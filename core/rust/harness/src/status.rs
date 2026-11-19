@@ -24,7 +24,7 @@ const READ_LIMIT: u64 = 1024 * 1024 + 1;
 const MAX_BYTES: usize = 1024 * 1024;
 
 /// A stop: the exit code and the full stderr line. Code 1 is a ticket refusal, code 2 is every other error. Stdout stays empty.
-struct Stop(i32, String);
+pub(crate) struct Stop(pub(crate) i32, pub(crate) String);
 
 fn err2(m: impl AsRef<str>) -> Stop {
     Stop(2, format!("harness: error: {}", m.as_ref()))
@@ -179,7 +179,7 @@ fn status_line(ticket_id: &str, repo_id: &str, head: &str, note: Option<&GateRes
     )
 }
 
-fn run(a: &[String]) -> Result<String, Stop> {
+pub(crate) fn run(a: &[String]) -> Result<String, Stop> {
     // 1. Command line.
     let args = parse_args(a)?;
 

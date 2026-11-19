@@ -156,7 +156,7 @@ fn real_dir(opt: &str, p: &Path) -> Result<(), String> {
 }
 
 /// Open the launch records without following a link and without blocking; the handle must be a regular file.
-fn open_launch_records(p: &Path) -> Result<fs::File, String> {
+pub(crate) fn open_launch_records(p: &Path) -> Result<fs::File, String> {
     let f = fs::OpenOptions::new().read(true).custom_flags(OPEN_NOFOLLOW_NONBLOCK).open(p).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "the launch records file is missing".to_string()

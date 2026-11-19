@@ -61,6 +61,8 @@ mod seeded;
 #[cfg(unix)]
 pub mod session_close;
 pub mod session_name;
+#[cfg(unix)]
+pub mod session_watch;
 pub mod session_tokens;
 #[cfg(unix)]
 pub mod signoff;
