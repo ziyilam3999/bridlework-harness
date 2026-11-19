@@ -972,9 +972,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
         eprintln!("{}", LESSON_USAGE);
         return 2;
     };
-    let mut ticket_in: Option<(Vec<u8>, Vec<String>)> = None;
-    let mut diff_in: Option<Diff> = None;
-    if repo.is_some() || from.is_some() || to.is_some() {
+    let input = if repo.is_some() || from.is_some() || to.is_some() {
         if ticket.is_some() || scope.is_some() {
             eprintln!("{}", LESSON_USAGE);
             return 2;
@@ -989,7 +987,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
             return 2;
         }
         match read_diff(p, from, to) {
-            Ok(d) => diff_in = Some(d),
+            Ok(d) => Input::Diff(d),
             Err(m) => return fail(&m),
         }
     } else {
@@ -1011,44 +1009,65 @@ fn lookup_cmd(a: &[String]) -> i32 {
             Ok(s) => s,
             Err(m) => return fail(&format!("scope file: {}", m)),
         };
-        ticket_in = Some((ticket_bytes, scope));
+        Input::Ticket(ticket_bytes, scope)
+    };
+    match match_pages(dir, &input) {
+        Ok(lines) => {
+            for l in lines {
+                println!("{}", l);
+            }
+            0
+        }
+        Err((code, lines)) => {
+            for l in lines {
+                eprintln!("{}", l);
+            }
+            code
+        }
     }
+}
+
+/// What the lookup matches the tokens against: the ticket bytes with its scope, or the diff.
+enum Input {
+    Ticket(Vec<u8>, Vec<String>),
+    Diff(Diff),
+}
+
+/// The one loop over the pages of a lessons folder, for both modes. Takes the folder and the input. Ok holds
+/// the stdout lines of exit 0; Err holds the exit code (1 a page or the ticket is refused, 2 a read error)
+/// with its stderr lines in print order.
+fn match_pages(dir: &str, input: &Input) -> Result<Vec<String>, (i32, Vec<String>)> {
+    let fail = |m: &str| (2, vec![format!("harness: error: {}", esc(m))]);
     let names = match walk(dir) {
         Ok(n) => n,
-        Err(ms) => {
-            for m in &ms {
-                fail(m);
-            }
-            return 2;
-        }
+        Err(ms) => return Err((2, ms.iter().flat_map(|m| fail(m).1).collect())),
     };
     let mut texts: Vec<String> = Vec::new();
     for (n, p) in &names {
         let b = match std::fs::read(p) {
             Ok(b) => b,
-            Err(_) => return fail(&format!("the file {} cannot be read", n)),
+            Err(_) => return Err(fail(&format!("the file {} cannot be read", n))),
         };
         match String::from_utf8(b) {
             Ok(t) => texts.push(t),
-            Err(_) => return fail(&format!("the file {} is not valid UTF-8", n)),
+            Err(_) => return Err(fail(&format!("the file {} is not valid UTF-8", n))),
         }
     }
     let mut refused: Vec<String> = Vec::new();
-    let ticket = match &ticket_in {
-        Some((b, _)) => match crate::ticket::Ticket::parse_bytes(b) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                refused.push(format!("harness: ticket refused: {}", esc(&e)));
-                None
-            }
+    let mut ticket = None;
+    let mut diff_in: Option<&Diff> = None;
+    match input {
+        Input::Ticket(b, scope) => match crate::ticket::Ticket::parse_bytes(b) {
+            Ok(t) => ticket = Some((t, scope)),
+            Err(e) => refused.push(format!("harness: ticket refused: {}", esc(&e))),
         },
-        None => None,
-    };
+        Input::Diff(d) => diff_in = Some(d),
+    }
     // Does a token hit: by the ticket and the scope, or by the diff.
     let hits = |tok: &str| -> Option<bool> {
-        match (&ticket, &ticket_in, &diff_in) {
-            (Some(t), Some((_, scope)), _) => Some(token_hits(tok, t, scope)),
-            (_, _, Some(d)) => Some(diff_hits(tok, d)),
+        match (&ticket, diff_in) {
+            (Some((t, scope)), _) => Some(token_hits(tok, t, scope)),
+            (_, Some(d)) => Some(diff_hits(tok, d)),
             _ => None,
         }
     };
@@ -1090,17 +1109,10 @@ fn lookup_cmd(a: &[String]) -> i32 {
         refused.push(line);
     }
     if !refused.is_empty() {
-        for l in refused {
-            eprintln!("{}", l);
-        }
-        return 1;
+        return Err((1, refused));
     }
-    for l in always_out {
-        println!("{}", l);
-    }
-    for l in out {
-        println!("{}", l);
-    }
+    let mut res = always_out;
+    res.extend(out);
     let matched = if ids.is_empty() { "none".to_string() } else { ids.join(",") };
     let mut last = format!("lessons: scanned={} matched={}", names.len(), matched);
     if !always_ids.is_empty() {
@@ -1109,8 +1121,8 @@ fn lookup_cmd(a: &[String]) -> i32 {
     if retired > 0 {
         last.push_str(&format!(" retired={}", retired));
     }
-    println!("{}", last);
-    0
+    res.push(last);
+    Ok(res)
 }
 
 #[cfg(test)]
