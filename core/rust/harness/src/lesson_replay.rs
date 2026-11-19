@@ -1,11 +1,16 @@
 //! `harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>`: replays the
 //! ticket-mode lookup over a folder of tickets and counts the offered pages (see `docs/lesson-lint.md`).
-//! Read only: the run writes no file in the lessons folder, the tickets folder, the scopes folder or the
-//! current folder. The pages are read once as the lookup reads them, then matched against each ticket.
+//! With `--config` and `--controls` (and `--rows`) it also prints the answer key: whether the page a friction
+//! row's group was bound to was offered on that row's own ticket. Read only: the run writes no file in the
+//! lessons folder, the tickets folder, the scopes folder, the folders of the three flag files or the current
+//! folder. The pages are read once as the lookup reads them, then matched against each ticket.
 //! Ticket mode only. std only.
 
+use crate::friction::Row;
+use crate::friction_loop::{groups, lint_rows, load_cfg, load_list, read_controls};
 use crate::lesson::{esc, read_page, token_hits, walk, PageRead, LESSON_USAGE, MAX_FILE};
 use crate::ticket::Ticket;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 /// One ticket of the run: the id (the file name without `.json`) and its path.
@@ -99,9 +104,129 @@ fn read_pages(names: &[(String, PathBuf)], refused: &mut Vec<String>) -> Result<
     Ok((pages, retired))
 }
 
-/// `harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>`: exit 0 the counts
-/// (one `replay:` line per ticket, one `page:` line per page, then the `replay ok` line); 1 a refused page,
-/// ticket file or scope file (stdout empty, no partial count); 2 a usage or read error.
+// ---------------------------------------------------------------- the answer key (--config, --controls, --rows)
+
+/// A rows file is read no further than this; past it the run refuses (exit 2).
+const ROWS_CAP: u64 = 1024 * 1024;
+
+/// The answer key half of a replay run: the inbox rows, the row indexes looked at, the page id of each
+/// looked-at row's group's controls line (absent when its group has no line), and the id count of a --rows file.
+struct KeyInput {
+    rows: Vec<Row>,
+    considered: Vec<usize>,
+    page_of: HashMap<String, String>,
+    listed: Option<usize>,
+}
+
+/// The id lines of a --rows file: one id per line, the final line feed optional, nothing trimmed. A blank
+/// line and an empty file refuse (1); a missing path, a non-regular entry (a symbolic link included), a file
+/// over the cap or a file that is not UTF-8 refuse (2). No id is echoed by the caller.
+fn read_rows_lines(path: &str) -> Result<Vec<String>, (i32, String)> {
+    let p = Path::new(path);
+    let md = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(_) => return Err((2, "the rows file cannot be read".to_string())),
+    };
+    if !md.file_type().is_file() {
+        return Err((2, "the rows path is not a regular file".to_string()));
+    }
+    let mut b = Vec::new();
+    let read = std::fs::File::open(p).map_err(|_| (2, "the rows file cannot be read".to_string())).and_then(|f| {
+        use std::io::Read;
+        f.take(ROWS_CAP + 1).read_to_end(&mut b).map_err(|_| (2, "the rows file cannot be read".to_string()))
+    });
+    read?;
+    if b.len() as u64 > ROWS_CAP {
+        return Err((2, format!("the rows file is over the {ROWS_CAP}-byte cap")));
+    }
+    let text = String::from_utf8(b).map_err(|_| (2, "the rows file is not utf-8".to_string()))?;
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return Err((1, "rows line 1 the file holds no row id".to_string()));
+    }
+    for (i, l) in lines.iter().enumerate() {
+        if l.is_empty() {
+            return Err((1, format!("rows line {} is blank", i + 1)));
+        }
+    }
+    Ok(lines.into_iter().map(String::from).collect())
+}
+
+/// Load the answer key: the config and the privacy list as `friction rank` loads them, the inbox after the
+/// full lint (the privacy scan of stored rows runs with the test mode off), the groups of
+/// `friction_loop::groups` (they follow `breaks` links only), the controls lines read over the run's lessons
+/// folder, and with `--rows` the rows the file picks out of the whole-inbox groups. Err is the exit code
+/// after the refusal lines are printed.
+fn key_setup(lessons: &str, config: &str, controls: &str, rows_file: Option<&str>) -> Result<KeyInput, i32> {
+    let refuse = |m: &str| {
+        eprintln!("harness: lesson replay refused: {}", esc(m));
+        1
+    };
+    let setup_err = |m: &str| {
+        eprintln!("harness: error: {}", esc(m));
+        2
+    };
+    let cfg = load_cfg(Some(config))?;
+    let list = load_list("an unscanned inbox is never replayed")?;
+    let ctx = crate::scan::Ctx { list: &list, testmode: false };
+    let rows = lint_rows(&cfg, &ctx)?;
+    let all = match groups(&rows) {
+        Ok(g) => g,
+        Err(m) => {
+            eprintln!("{m}");
+            return Err(1);
+        }
+    };
+    let lines = match read_controls(Path::new(controls), Path::new(lessons)) {
+        Ok(v) => v,
+        Err((c, m)) => return Err(if c == 1 { refuse(&m) } else { setup_err(&m) }),
+    };
+    // Two lines that name one group id would make the page of a row ambiguous: the later line refuses.
+    let mut page_of_group: HashMap<&str, &str> = HashMap::new();
+    for c in &lines {
+        if page_of_group.insert(c.id.as_str(), c.lesson.as_str()).is_some() {
+            return Err(refuse(&format!("controls line {} names the group of an earlier line", c.line)));
+        }
+    }
+    let (considered, listed) = match rows_file {
+        None => ((0..rows.len()).collect::<Vec<usize>>(), None),
+        Some(path) => match read_rows_lines(path) {
+            Ok(ids) => {
+                let mut picked: Vec<usize> = Vec::new();
+                let mut seen: HashSet<&str> = HashSet::new();
+                for (i, id) in ids.iter().enumerate() {
+                    let Some(ix) = rows.iter().position(|r| r.id == *id) else {
+                        return Err(refuse(&format!("rows line {} is not the id of an inbox row", i + 1)));
+                    };
+                    if !seen.insert(id.as_str()) {
+                        return Err(refuse(&format!("rows line {} names a row twice", i + 1)));
+                    }
+                    picked.push(ix);
+                }
+                (picked, Some(ids.len()))
+            }
+            Err((c, m)) => return Err(if c == 1 { refuse(&m) } else { setup_err(&m) }),
+        },
+    };
+    let mut page_of: HashMap<String, String> = HashMap::new();
+    for g in &all {
+        if let Some(page) = page_of_group.get(g.id.as_str()) {
+            for &m in &g.members {
+                page_of.insert(rows[m].id.clone(), page.to_string());
+            }
+        }
+    }
+    Ok(KeyInput { rows, considered, page_of, listed })
+}
+
+/// `harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>
+/// [--config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]]`: exit 0 the counts
+/// (one `replay:` line per ticket, one `page:` line per page, the `key:` lines and the `key ok` line when the
+/// answer-key flags are given, then the `replay ok` line); 1 a refused page, ticket file, scope file, inbox,
+/// controls file or rows file (stdout empty, no partial count); 2 a usage or read error.
 pub fn replay_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", esc(m));
@@ -112,8 +237,22 @@ pub fn replay_cmd(a: &[String]) -> i32 {
         2
     };
     let (mut dir, mut tickets, mut scopes) = (None, None, None);
+    let (mut config, mut controls, mut rowsf) = (None, None, None);
     let mut it = a.iter();
     while let Some(arg) = it.next() {
+        // The three answer-key flags go through their own slot rule: given twice is the usage text.
+        if matches!(arg.as_str(), "--config" | "--controls" | "--rows") {
+            let slot = match arg.as_str() {
+                "--config" => &mut config,
+                "--controls" => &mut controls,
+                _ => &mut rowsf,
+            };
+            let Some(v) = it.next() else { return fail(&format!("{} needs a value", arg)) };
+            if slot.replace(v).is_some() {
+                return usage();
+            }
+            continue;
+        }
         let slot = match arg.as_str() {
             "--tickets" => &mut tickets,
             "--scopes" => &mut scopes,
@@ -137,6 +276,26 @@ pub fn replay_cmd(a: &[String]) -> i32 {
     if !folder_ok(dir) || !folder_ok(tdir) || !folder_ok(sdir) {
         return usage();
     }
+    // --config and --controls only together, --rows only beside them; each names an absolute file with no
+    // `..` part, on pain of the usage text.
+    let key_flags = match (config, controls, rowsf) {
+        (None, None, None) => None,
+        (Some(c), Some(k), r) => {
+            if !folder_ok(c) || !folder_ok(k) || r.is_some_and(|v| !folder_ok(v)) {
+                return usage();
+            }
+            Some((c, k, r))
+        }
+        _ => return usage(),
+    };
+    // The key's own reads run before the pages walk, so its setup errors exit 2 before any replay refusal.
+    let key = match key_flags {
+        Some((c, k, r)) => match key_setup(dir, c, k, r.map(String::as_str)) {
+            Ok(k) => Some(k),
+            Err(code) => return code,
+        },
+        None => None,
+    };
     let names = match walk(dir) {
         Ok(n) => n,
         Err(ms) => {
@@ -213,6 +372,7 @@ pub fn replay_cmd(a: &[String]) -> i32 {
     let mut hits: Vec<usize> = vec![0; pages.len()];
     let (mut total, mut maxo, mut zero) = (0usize, 0usize, 0usize);
     let mut lines: Vec<String> = Vec::new();
+    let mut offered: Vec<(String, Vec<String>)> = Vec::new();
     for (id, tk, scope) in &runs {
         let mut ids: Vec<String> = Vec::new();
         for (i, pg) in pages.iter().enumerate() {
@@ -231,12 +391,50 @@ pub fn replay_cmd(a: &[String]) -> i32 {
         }
         let joined = if ids.is_empty() { "none".to_string() } else { ids.join(",") };
         lines.push(format!("replay: ticket={} offered={} pages={}", esc(id), ids.len(), joined));
+        offered.push((id.clone(), ids));
     }
     for l in lines {
         println!("{}", l);
     }
     for (i, pg) in pages.iter().enumerate() {
         println!("page: {} hits={}", esc(&pg.id), hits[i]);
+    }
+    if let Some(key) = &key {
+        // A row is tied to its ticket byte for byte; it counts when its group has a controls line and its
+        // ticket was replayed, and is offered when that line's page is in the ticket's pages= list.
+        let replayed: HashMap<&str, &Vec<String>> = offered.iter().map(|(id, ids)| (id.as_str(), ids)).collect();
+        let mut per_page: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        let (mut n_rows, mut n_off, mut no_ticket, mut no_line) = (0usize, 0usize, 0usize, 0usize);
+        for &i in &key.considered {
+            let r = &key.rows[i];
+            let Some(page) = key.page_of.get(&r.id) else {
+                no_line += 1;
+                continue;
+            };
+            match replayed.get(r.ticket.as_str()) {
+                None => no_ticket += 1,
+                Some(pages) => {
+                    let hit = pages.iter().any(|p| p == page);
+                    n_rows += 1;
+                    if hit {
+                        n_off += 1;
+                    }
+                    let e = per_page.entry(page.as_str()).or_insert((0, 0));
+                    e.0 += 1;
+                    if hit {
+                        e.1 += 1;
+                    }
+                }
+            }
+        }
+        for (page, (n, h)) in &per_page {
+            println!("key: {} rows={} offered={}", esc(page), n, h);
+        }
+        let mut last = format!("key ok rows={} offered={} no_ticket={} no_line={}", n_rows, n_off, no_ticket, no_line);
+        if let Some(k) = key.listed {
+            last.push_str(&format!(" listed={}", k));
+        }
+        println!("{}", last);
     }
     if retired > 0 {
         println!(
