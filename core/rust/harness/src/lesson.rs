@@ -2,7 +2,7 @@
 //! `harness lesson lookup` lists the pages that match a ticket (ticket mode: --ticket and --scope-file) or the
 //! committed diff between two commits of one repo (diff mode: --repo-dir, --from, --to; changed paths and added
 //! lines); same docs page. A page that carries the front matter key `always` (one rule sentence, no `match`)
-//! is listed on an `always:` line in both modes. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
+//! is listed, when not retired, on an `always:` line in both modes. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
 //! folder of tickets and counts the offered pages. Both modes skip a page with status retired (still checked, counted in scanned, and
 //! counted in the receipt field retired=<r>) and refuse an unknown status. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
@@ -1065,7 +1065,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
             retired += 1;
             continue;
         }
-        // An always page is listed on its own line, never as a lesson: line and not in matched=.
+        // An always page is listed on its own line, not as a lesson: line and not in matched=.
         if let Some(rule) = &always {
             let id = &name[..9];
             always_out.push(format!("always: {} {}", id, esc(rule)));

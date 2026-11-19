@@ -2347,6 +2347,31 @@ fn lint_the_cap_line_comes_after_the_always_line_of_that_page() {
     let _ = fs::remove_dir_all(&d);
 }
 
+#[test]
+fn lint_the_always_line_comes_directly_after_the_match_line() {
+    let d = tmp("alw-ord-match");
+    let page = good_page().replace("match: [svc-a, svc-b]", "match: []\nalways:");
+    fs::write(d.join("ISSUE-101-o.md"), page).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ISSUE-101-o.md: MATCH match is an empty list\nISSUE-101-o.md: ALWAYS always is empty\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn lint_the_always_line_comes_before_the_duplicate_id_line() {
+    let d = tmp("alw-ord-dup");
+    fs::write(d.join("ISSUE-101-a.md"), apage("ISSUE-101", RULE)).unwrap();
+    fs::write(d.join("ISSUE-101-b.md"), apage("ISSUE-101", "")).unwrap();
+    let o = run(&["lesson", "lint", d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(
+        stdout(&o),
+        "ISSUE-101-b.md: ALWAYS always is empty\nISSUE-101-b.md: DUPLICATE-ID id ISSUE-101 also in ISSUE-101-a.md\n"
+    );
+    let _ = fs::remove_dir_all(&d);
+}
+
 // ---- the always key: lookup, both modes ----
 
 /// A ticket-mode lookup over `n` always pages (ids ISSUE-001..ISSUE-00n, no status key) plus extra pages.
@@ -2399,6 +2424,39 @@ fn diff_always_lines_come_before_the_lesson_lines() {
         ok_out(&dlook(&c)),
         "always: ISSUE-002 One habit page.\nalways: ISSUE-004 Read the whole error text before the fix.\nlesson: ISSUE-001 p ISSUE-001-p.md\nlessons: scanned=3 matched=ISSUE-001 always=ISSUE-002,ISSUE-004\n"
     );
+}
+
+#[test]
+fn lookup_always_lines_follow_the_file_name_order_not_the_rule_order() {
+    let o = slook(&[
+        ("ISSUE-002-b.md", &fm("always: Zebra rule.")),
+        ("ISSUE-003-c.md", &fm("always: Alpha rule.")),
+    ]);
+    assert_eq!(
+        ok_out(&o),
+        "always: ISSUE-002 Zebra rule.\nalways: ISSUE-003 Alpha rule.\nlessons: scanned=2 matched=none always=ISSUE-002,ISSUE-003\n"
+    );
+}
+
+#[test]
+fn diff_always_lines_follow_the_file_name_order_not_the_rule_order() {
+    let c = dc(&[("a.txt", b"one\n")], &[("a.txt", b"one\ntokenx\n")], &[], &["tokenx"]);
+    fs::write(c.root.join("lessons/ISSUE-002-q.md"), fm("always: Zebra rule.")).unwrap();
+    fs::write(c.root.join("lessons/ISSUE-004-s.md"), fm("always: Alpha rule.")).unwrap();
+    assert_eq!(
+        ok_out(&dlook(&c)),
+        "always: ISSUE-002 Zebra rule.\nalways: ISSUE-004 Alpha rule.\nlesson: ISSUE-001 p ISSUE-001-p.md\nlessons: scanned=3 matched=ISSUE-001 always=ISSUE-002,ISSUE-004\n"
+    );
+}
+
+#[test]
+fn lookup_an_always_value_over_200_bytes_is_refused() {
+    refused_page(&format!("---\nalways: {}\n---\n", "x".repeat(201)), &["ALWAYS always is over 200 bytes"]);
+}
+
+#[test]
+fn lookup_a_blank_only_always_value_is_refused() {
+    refused_page("---\nalways:  \t \n---\n", &["ALWAYS always is empty"]);
 }
 
 #[test]

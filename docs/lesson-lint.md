@@ -95,7 +95,7 @@ Always pages: a page that carries the front matter key `always` (one rule senten
 retired, see `ALWAYS` and `ALWAYS-CAP` above) is listed by both modes with its own line shape: one line
 `always: <id> <rule>` per such page, in byte order of the file names, printed before the `lesson:` lines; `<id>` is the
 start of the file name as on a `lesson:` line and `<rule>` the `always` value, printed through the escape of the lint.
-Such a page is never listed as a `lesson:` line and is not in `matched=` (a page that carries both `always` and `match`
+Such a page is not listed as a `lesson:` line and is not in `matched=` (a page that carries both `always` and `match`
 is refused, see the refusals below). When one or more `always:` lines were printed, the receipt holds one more field,
 `always=<ids joined by a comma>`, directly after `matched=<...>` and before `retired=<r>`; with no `always` page the
 stdout of both modes is as before.
@@ -279,7 +279,14 @@ A `<id>.json` that is a symbolic link or a folder is refused (`1`) also when it 
 given as a symbolic link is followed.
 
 Known limit: ticket mode only — the diff-mode lookup has no replay. The replay does not yet count `always` pages
-apart (the replay fields for them are a later change). An empty ticket id (a file named `.json`) and a
+apart (the replay fields for them are a later change); in plain words:
+
+- A page with `always` has no match tokens, so the replay shows it with `hits=0` and does not count it as offered.
+- The replay refuses a page the `ALWAYS` rule refuses (it reads pages with the same page reader as the lookup).
+- The replay does not check `ALWAYS-CAP`: with 6 such pages that are not retired the replay exits 0 where the lookup
+  exits 1.
+
+An empty ticket id (a file named `.json`) and a
 ticket file name that is not UTF-8 are not handled apart.
 
 ### The answer key of `harness lesson replay`
