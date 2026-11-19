@@ -207,3 +207,46 @@ with `the file <name> cannot be read` for a dangling link, a link loop, a FIFO a
 Other differences: the escape writes a tab, a no-break space and other control characters of a heading or file name as
 `\u{<hex>}` where the wrapper prints them raw; the word-character and letter-case rules are the Rust ones above, which
 differ from the wrapper for a few letters outside ASCII (for example the long s).
+
+## `harness lesson replay`
+
+```
+harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>
+```
+
+Replays the ticket-mode lookup over a folder of tickets and counts the offered pages. Read only: the run writes no
+file in the lessons folder, the tickets folder, the scopes folder or the current folder, and the same input twice
+gives the same stdout. A ticket is one `<id>.json` file directly inside the tickets folder (other entries are
+skipped); its scope file is `<id>.paths` directly inside the scopes folder, read as the lookup reads a scope file. A
+ticket whose scope file is missing is skipped, not run. The pages are read once, as the lookup reads them (the walk,
+the front matter rules, the retired skip with `retired=<r>` counted once per run), then matched against each ticket.
+
+Output (exit 0), three line shapes in this order:
+
+- one line `replay: ticket=<id> offered=<n> pages=<ids joined by a comma, or none>` per ticket run, in byte order of
+  the id; `<n>` counts page files (retired pages are not offered) and the `pages=` list is the `matched=` list of the
+  lookup over that ticket.
+- one line `page: <page id> hits=<n>` per page read, in byte order of the file names; a page offered to no ticket
+  and a retired page are listed with `hits=0`.
+- the last line `replay ok tickets=<n> skipped_no_scope=<k> pages=<p> offered_total=<t> offered_max=<m> zero=<z>`;
+  `pages=` counts the pages read (the lookup's `scanned`, retired ones included); `offered_total=` is the sum and
+  `offered_max=` the maximum of the per-ticket `offered=`; `zero=` counts the tickets with `offered=0`; with at
+  least one retired page the line ends with ` retired=<r>`. No decimal number, no median and no mean is printed (a
+  caller computes those from the lines).
+
+Exit codes: `0` done; `1` a page the lookup refuses (its own `harness: lesson lookup refused:` lines), a ticket file
+the ticket reader refuses, or a scope file `parse_scope` refuses — a ticket or scope file that is a symbolic link or
+over the 1 MiB reader limit is refused the same way, with one line `harness: lesson replay refused: <file name>`
+(the file name only, no folder); stdout is empty and no partial count is printed; `2` a usage or read error: a
+`<lessons-dir>`, `--tickets` or `--scopes` value that is relative or holds a `..` part (the usage text), a flag
+given twice, a missing folder, a lessons folder the lookup's folder walk refuses (its own `harness: error:` lines),
+a tickets folder with no `<id>.json` file, or no ticket left after the no-scope skip. A tickets argument or a scopes
+argument that names a file is a `2` too. A refused ticket file or scope file (`1`) is reported before the check "no
+ticket left after the no-scope skip" (`2`): one ticket with no scope file plus one ticket file that is a symbolic
+link exits `1`.
+
+A `<id>.json` that is a symbolic link or a folder is refused (`1`) also when it has no scope file. A tickets folder
+given as a symbolic link is followed.
+
+Known limit: ticket mode only — the diff-mode lookup has no replay. An empty ticket id (a file named `.json`) and a
+ticket file name that is not UTF-8 are not handled apart.

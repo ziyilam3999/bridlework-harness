@@ -1,7 +1,8 @@
 //! `harness lesson lint <path> [<path> ...]`: checks the shape of lesson pages (see `docs/lesson-lint.md`).
 //! `harness lesson lookup` lists the pages that match a ticket (ticket mode: --ticket and --scope-file) or the
 //! committed diff between two commits of one repo (diff mode: --repo-dir, --from, --to; changed paths and added
-//! lines); same docs page. Both modes skip a page with status retired (still checked, counted in scanned, and
+//! lines); same docs page. `harness lesson replay` (lesson_replay.rs) replays the ticket-mode lookup over a
+//! folder of tickets and counts the offered pages. Both modes skip a page with status retired (still checked, counted in scanned, and
 //! counted in the receipt field retired=<r>) and refuse an unknown status. The lint
 //! checks shape only: it does not check that a sentence is true, that a link resolves, or that an eval result exists.
 //! std only; the front matter is parsed by hand (the crate has no dependency).
@@ -11,11 +12,11 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>";
+pub(crate) const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>\n       harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>";
 /// The read limit of a git answer (the diff).
 const MAX_DIFF: usize = 8 * 1024 * 1024;
 /// The read limit of the ticket and the scope file (as `lane claim` reads them).
-const MAX_FILE: u64 = 1024 * 1024;
+pub(crate) const MAX_FILE: u64 = 1024 * 1024;
 
 /// The seven level-2 headings, in the order they must appear, each once.
 const SECTIONS: [&str; 7] = [
@@ -88,7 +89,7 @@ fn split_list(v: &str) -> Vec<&str> {
 }
 
 /// A control character or a Unicode white-space character other than a plain space is written `\u{hex}`.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() || (c.is_whitespace() && c != ' ') {
             format!("\\u{{{:x}}}", c as u32)
@@ -171,7 +172,7 @@ fn lint(args: &[String]) -> Result<(usize, Vec<String>), String> {
 }
 
 /// The line index of the closing `---`; else a FRONT-MATTER problem is pushed and the result is None.
-fn front_close(lines: &[&str], out: &mut Vec<String>) -> Option<usize> {
+pub(crate) fn front_close(lines: &[&str], out: &mut Vec<String>) -> Option<usize> {
     if lines.first() != Some(&"---") {
         out.push("FRONT-MATTER line 1 is not ---".to_string());
         return None;
@@ -184,7 +185,7 @@ fn front_close(lines: &[&str], out: &mut Vec<String>) -> Option<usize> {
 }
 
 /// The key/value pairs between the opening and the closing `---`; a bad or repeated key pushes a FRONT-MATTER problem.
-fn front_pairs<'a>(lines: &[&'a str], close: usize, out: &mut Vec<String>) -> HashMap<&'a str, &'a str> {
+pub(crate) fn front_pairs<'a>(lines: &[&'a str], close: usize, out: &mut Vec<String>) -> HashMap<&'a str, &'a str> {
     let mut keys: HashMap<&str, &str> = HashMap::new();
     for (i, &l) in lines[1..close].iter().enumerate() {
         match l.split_once(':') {
@@ -202,7 +203,7 @@ fn front_pairs<'a>(lines: &[&'a str], close: usize, out: &mut Vec<String>) -> Ha
 }
 
 /// The tokens of the `match` key: None when the key is absent; Err is the MATCH problem line.
-fn match_tokens<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<Vec<&'a str>>, String> {
+pub(crate) fn match_tokens<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<Vec<&'a str>>, String> {
     let Some(&v) = keys.get("match") else { return Ok(None) };
     if !(v.starts_with('[') && v.ends_with(']')) {
         return Err(format!("MATCH match {} is not an inline list [..]", v));
@@ -218,7 +219,7 @@ fn match_tokens<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<Vec<&'a s
 }
 
 /// The status of a page: Ok(None) when the key is absent; Err is the STATUS problem line of an unknown value.
-fn status_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&'a str>, String> {
+pub(crate) fn status_of<'a>(keys: &HashMap<&'a str, &'a str>) -> Result<Option<&'a str>, String> {
     match keys.get("status").copied() {
         None => Ok(None),
         Some(v @ ("unvalidated" | "validated" | "retired")) => Ok(Some(v)),
@@ -432,11 +433,14 @@ fn check_page(text: &str, file: &str, seen: &mut HashMap<String, String>) -> Vec
 }
 
 /// `harness lesson lint <path> [<path> ...]`. Exit 0 all pages pass (one stdout line); 1 one stdout line per problem;
-/// 2 usage or read error (nothing on stdout). `lookup` goes to `lookup_cmd`. Any verb but `lint` and `lookup`, or
-/// no path, prints the usage and exits 2.
+/// 2 usage or read error (nothing on stdout). `lookup` goes to `lookup_cmd`, `replay` to `lesson_replay::replay_cmd`.
+/// Any verb but `lint`, `lookup` and `replay`, or no path, prints the usage and exits 2.
 pub fn lesson_cmd(a: &[String]) -> i32 {
     if a.first().map(|s| s.as_str()) == Some("lookup") {
         return lookup_cmd(&a[1..]);
+    }
+    if a.first().map(|s| s.as_str()) == Some("replay") {
+        return crate::lesson_replay::replay_cmd(&a[1..]);
     }
     if a.first().map(|s| s.as_str()) != Some("lint") || a.len() < 2 {
         eprintln!("{}", LESSON_USAGE);
@@ -496,7 +500,7 @@ fn name_kind(n: &OsStr) -> NameKind {
 
 /// The pages of the lookup: regular files directly inside `dir`, by file name in byte order. Err holds the
 /// messages for exit 2: one, or one per page-shaped entry that is not a page and not a folder (raw name byte order).
-fn walk(dir: &str) -> Result<Vec<(String, PathBuf)>, Vec<String>> {
+pub(crate) fn walk(dir: &str) -> Result<Vec<(String, PathBuf)>, Vec<String>> {
     let one = |m: &str| vec![m.to_string()];
     let p = Path::new(dir);
     let md = std::fs::metadata(p).map_err(|_| one("the lessons folder does not exist or cannot be read"))?;
@@ -573,7 +577,7 @@ fn path_parts(s: &str) -> Vec<&str> {
 }
 
 /// One token hits by repo, by path (whole leading parts of a scope entry) or by word (title or a criterion).
-fn token_hits(tok: &str, t: &crate::ticket::Ticket, scope: &[String]) -> bool {
+pub(crate) fn token_hits(tok: &str, t: &crate::ticket::Ticket, scope: &[String]) -> bool {
     if tok == t.repo_id.as_str() {
         return true;
     }
@@ -840,6 +844,45 @@ fn read_diff(repo: &Path, from: &str, to: &str) -> Result<Diff, String> {
     Ok(Diff { paths, lines })
 }
 
+/// What the lookup reads from one page: the closing front matter line, the retired flag, the match tokens
+/// (quotes trimmed) and the problems found.
+pub(crate) struct PageRead {
+    pub close: Option<usize>,
+    pub retired: bool,
+    pub tokens: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+/// Read one page (its lines, line ends cut) as the lookup does; shared by `lookup` and `replay`.
+pub(crate) fn read_page(lines: &[&str]) -> PageRead {
+    let mut problems = Vec::new();
+    let close = front_close(lines, &mut problems);
+    let mut retired = false;
+    let tokens = match close {
+        Some(close) => {
+            let keys = front_pairs(lines, close, &mut problems);
+            // STATUS before MATCH, as the lint orders them; a missing key reads as active.
+            match status_of(&keys) {
+                Ok(s) => retired = s == Some("retired"),
+                Err(p) => problems.push(p),
+            }
+            match match_tokens(&keys) {
+                Ok(t) => t,
+                Err(p) => {
+                    problems.push(p);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let tokens: Vec<String> = tokens.unwrap_or_default().into_iter().map(|t| t.trim_matches(['"', '\'']).to_string()).collect();
+    if tokens.iter().any(|t| t.is_empty()) {
+        problems.push("MATCH match has a token with no text between its quotes".to_string());
+    }
+    PageRead { close, retired, tokens, problems }
+}
+
 /// `harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>`, or `--repo-dir <dir> --from <sha> --to <sha>` (diff mode). Exit 0 the matching pages (stdout), 1 a page or the ticket is
 /// refused, 2 usage or read error or a page-shaped entry that is not a page and not a folder. The exit 1 lines are printed after all pages are read.
 fn lookup_cmd(a: &[String]) -> i32 {
@@ -958,31 +1001,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
     let mut retired = 0usize;
     for ((name, _), text) in names.iter().zip(&texts) {
         let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
-        let mut problems = Vec::new();
-        let close = front_close(&lines, &mut problems);
-        let mut is_retired = false;
-        let tokens = match close {
-            Some(close) => {
-                let keys = front_pairs(&lines, close, &mut problems);
-                // STATUS before MATCH, as the lint orders them; a missing key reads as active.
-                match status_of(&keys) {
-                    Ok(s) => is_retired = s == Some("retired"),
-                    Err(p) => problems.push(p),
-                }
-                match match_tokens(&keys) {
-                    Ok(t) => t,
-                    Err(p) => {
-                        problems.push(p);
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let tokens: Vec<&str> = tokens.unwrap_or_default().into_iter().map(|t| t.trim_matches(['"', '\''])).collect();
-        if tokens.iter().any(|t| t.is_empty()) {
-            problems.push("MATCH match has a token with no text between its quotes".to_string());
-        }
+        let PageRead { close, retired: is_retired, tokens, problems } = read_page(&lines);
         for p in &problems {
             refused.push(format!("harness: lesson lookup refused: {}: {}", esc(name), esc(p)));
         }
@@ -994,7 +1013,7 @@ fn lookup_cmd(a: &[String]) -> i32 {
             retired += 1;
             continue;
         }
-        if problems.is_empty() && tokens.iter().any(|tok| hits(tok) == Some(true)) {
+        if problems.is_empty() && tokens.iter().any(|tok| hits(tok.as_str()) == Some(true)) {
             let id = &name[..9];
             out.push(format!("lesson: {} {} {}", id, esc(&heading(&lines, close, name)), esc(name)));
             ids.push(id);
