@@ -39,7 +39,7 @@ A ticket whose repo id is not in the map is a ticket refusal (exit 1). Usage fau
 
 ## Role and model are flags
 
-The event needs a role and a model. `Caps::escalate` reads them from `HARNESS_ROLE` and `HARNESS_MODEL`, which bw does not set. So `fix-round-check` takes `--role` and `--model` and calls `Caps::escalate_with`; it does not read those two variables. Both are event tokens (lowercase letters, digits, `-`, `_`, `.`), the same rule as `ticket finalize`. The run id follows `Caps::escalate`: `HARNESS_RUN_ID` when set and issued in the log, else a self-issued id. `ticket gate` keeps the env gap for its own cap.
+The event needs a role and a model. `Caps::escalate` reads them from `HARNESS_ROLE` and `HARNESS_MODEL`. bw sets those two names on its engine `ticket gate` call only, from the `role=` and `model=` values of the seat record, and removes both when there is no seat record. `fix-round-check` takes `--role` and `--model` and calls `Caps::escalate_with`; it does not read those two variables. Both are event tokens (lowercase letters, digits, `-`, `_`, `.`), the same rule as `ticket finalize`. The run id follows `Caps::escalate`: `HARNESS_RUN_ID` when set and issued in the log, else a self-issued id. `ticket gate` reads the two names from its environment for its own refusals (the fix-round cap and the re-plan threshold); when either name is missing or not a plain token, such a refusal exits 2 with `ESCALATION NOT RECORDED`.
 
 ## How bw will call the verbs (not built)
 
