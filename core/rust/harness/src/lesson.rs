@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-pub(crate) const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>\n       harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>";
+pub(crate) const LESSON_USAGE: &str = "usage: harness lesson lint <path> [<path> ...]\n       harness lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file>\n       harness lesson lookup <lessons-dir> --repo-dir <absolute-dir> --from <full-sha> --to <full-sha>\n       harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir> [--config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]]";
 /// The read limit of a git answer (the diff).
 const MAX_DIFF: usize = 8 * 1024 * 1024;
 /// The read limit of the ticket and the scope file (as `lane claim` reads them).

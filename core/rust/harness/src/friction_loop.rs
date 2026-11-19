@@ -222,17 +222,17 @@ fn flag<'a>(f: &'a [(String, String)], k: &str) -> Option<&'a str> {
     f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
 }
 
-fn load_cfg(file: Option<&str>) -> Result<Config, i32> {
+pub(crate) fn load_cfg(file: Option<&str>) -> Result<Config, i32> {
     let path = friction::config_path(file).map_err(|e| fail(&e))?;
     Config::load(&path).map_err(|e| fail(&e))
 }
 
-fn load_list(what: &str) -> Result<crate::overlay::List, i32> {
+pub(crate) fn load_list(what: &str) -> Result<crate::overlay::List, i32> {
     crate::overlay::load().map_err(|_| fail(&format!("no privacy list configured: {what}")))
 }
 
 /// The inbox rows after the FULL lint (`friction lint`'s own refusal behaviour: nothing on stdout, same stderr).
-fn lint_rows(cfg: &Config, ctx: &crate::scan::Ctx) -> Result<Vec<Row>, i32> {
+pub(crate) fn lint_rows(cfg: &Config, ctx: &crate::scan::Ctx) -> Result<Vec<Row>, i32> {
     let inbox = friction::read_inbox(Path::new(cfg.friction_inbox())).map_err(|e| fail(&e))?;
     if let Some(n) = inbox.torn_tail {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
@@ -748,10 +748,11 @@ fn read_closed(path: &Path) -> Result<Vec<Closed>, (i32, String)> {
 /// The line shape `bw start` checks, named in the refusal (no line text is echoed: it is private prose).
 const CONTROL_SHAPE: &str = "<group id> | control: <pointer> | lesson: ISSUE-NNN or <group id> | not machine-checkable: <reason> | lesson: ISSUE-NNN";
 
-/// One valid controls line: its line number and the id it names.
-struct Control {
-    line: usize,
-    id: String,
+/// One valid controls line: its line number, the id it names, and the `ISSUE-<3 digits>` page of its lesson.
+pub(crate) struct Control {
+    pub(crate) line: usize,
+    pub(crate) id: String,
+    pub(crate) lesson: String,
 }
 
 /// The lesson number of `lesson: ISSUE-NNN` (exactly three ASCII digits), or None.
@@ -769,7 +770,7 @@ fn control_kind_ok(p: &str) -> bool {
 /// Read the controls file and check each line against the `bw start` shape (a little stricter); a lesson
 /// must have a regular file `ISSUE-NNN-*.md` (not a symbolic link) directly in `lessons`. Any bad line
 /// refuses the whole file (1).
-fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, String)> {
+pub(crate) fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, String)> {
     match fs::metadata(path) {
         Ok(m) if m.is_file() => {}
         Ok(_) => return Err((2, "the controls path is not a file".to_string())),
@@ -806,7 +807,7 @@ fn read_controls(path: &Path, lessons: &Path) -> Result<Vec<Control>, (i32, Stri
         if !names.iter().any(|f| f.starts_with(&prefix) && f.ends_with(".md")) {
             return Err((1, format!("controls line {n} names a lesson with no regular file ISSUE-NNN-*.md in the lessons folder")));
         }
-        out.push(Control { line: n, id: p[0].to_string() });
+        out.push(Control { line: n, id: p[0].to_string(), lesson: format!("ISSUE-{num}") });
     }
     Ok(out)
 }

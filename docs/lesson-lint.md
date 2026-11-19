@@ -211,11 +211,12 @@ differ from the wrapper for a few letters outside ASCII (for example the long s)
 ## `harness lesson replay`
 
 ```
-harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir>
+harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir> [--config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]]
 ```
 
 Replays the ticket-mode lookup over a folder of tickets and counts the offered pages. Read only: the run writes no
-file in the lessons folder, the tickets folder, the scopes folder or the current folder, and the same input twice
+file in the lessons folder, the tickets folder, the scopes folder, the folders of the config, the controls file and
+the rows file, or the current folder, and the same input twice
 gives the same stdout. A ticket is one `<id>.json` file directly inside the tickets folder (other entries are
 skipped); its scope file is `<id>.paths` directly inside the scopes folder, read as the lookup reads a scope file. A
 ticket whose scope file is missing is skipped, not run. The pages are read once, as the lookup reads them (the walk,
@@ -250,3 +251,51 @@ given as a symbolic link is followed.
 
 Known limit: ticket mode only — the diff-mode lookup has no replay. An empty ticket id (a file named `.json`) and a
 ticket file name that is not UTF-8 are not handled apart.
+
+### The answer key of `harness lesson replay`
+
+```
+harness lesson replay <lessons-dir> --tickets <absolute-dir> --scopes <absolute-dir> --config <absolute-file> --controls <absolute-file> [--rows <absolute-file>]
+```
+
+With `--config` and `--controls` (only together; `--rows` only beside them) the replay also prints the answer
+key: whether the page a friction row's group was bound to was offered on that row's own ticket, so a change of the
+pages can be judged on rows that were not used to make the change. The inbox named by the config is read as
+`harness friction rank` reads it (the full lint, the privacy scan of the stored rows with the test mode off, the
+`breaks` grouping): exit 2 for a config that is missing or refused, no privacy list configured, an inbox that is
+missing, a folder, over its cap or not UTF-8; exit 1 with the same stderr lines as `friction rank` for a bad inbox
+row, a torn last line, a privacy hit in a stored row and a `breaks` cycle. The controls file is read as
+`harness friction controls-check` reads it, over the same `<lessons-dir>`, with its refusals and exit codes kept
+(a path that is missing, not a file or over the cap exits 2; a malformed line, a line that is not UTF-8 or has a
+control character, a line whose lesson has no regular file in the lessons folder exit 1 with the line number and
+no line text), plus one more refusal: two lines that name one group id refuse the file (exit 1, the later line
+number). A line that names a retired page is read. The groups follow `breaks` links only (a `repeats` pointer is
+not a group edge), and a line that names a row id that is not a group id covers no row. The config, the inbox and
+the controls file are opened as their readers open them today (a symbolic link is followed).
+
+Output (after the `page:` lines and before the last line): one line `key: <page id> rows=<n> offered=<h>` per page
+named by a counted row, in byte order of the page id, then one line `key ok rows=<n> offered=<h> no_ticket=<t>
+no_line=<u>`, which ends with ` listed=<k>` when `--rows` was given. The rule: a row is tied to the ticket its
+`ticket` field names, byte for byte; a ticket was replayed when it has a `replay:` line (a ticket skipped for no
+scope file was not); a row counts when the group of the row (its `breaks` root) has a controls line and its ticket
+was replayed, and it is offered when the page id of that line is in the `pages=` list of that ticket's replay
+line; `no_ticket=` counts the rows whose group has a line but whose ticket was not replayed, and `no_line=` the
+rows whose group has no line. Each row looked at lands in exactly one of `rows`, `no_ticket` and `no_line`, so the
+three add up to the number of inbox rows (with `--rows`, to `listed=<k>`). A row of a line that names a retired
+page counts in `rows=` and is not offered (a retired page is in no `pages=` list). A run without the three flags
+prints no `key:` line and no `key ok` line. No row text and no ticket text is printed.
+
+`--rows <absolute-file>` names a file of row ids, one id per line; only the named rows are looked at, and the
+`key ok` line then ends with ` listed=<k>` (the ids in the file). The groups are built from the whole inbox
+first and the listed rows are picked after, so a listed row is counted under its root's controls line also when
+the root itself is not listed. Lines end with a line feed; one line feed at the end of the file is not a blank
+line; nothing is trimmed (a CR, a blank before or after an id makes the line not an id). The file is read as a
+regular file up to 1 MiB: a file that is missing, not a regular file, a symbolic link, over the cap or not UTF-8
+exits 2. A line that is not the id of an inbox row, an id given twice, a blank line and an empty file exit 1 with
+one line `harness: lesson replay refused: rows line <n> <reason>` (no id is printed).
+
+The three flags are usage errors (exit 2, the usage text): `--config` without `--controls`, `--controls` without
+`--config`, `--rows` without both, a flag given twice, and a value that is relative or holds a `..` part.
+
+Known limit (the answer key): a row is tied to the ticket it was written on, which may not be the change that
+caused it.
