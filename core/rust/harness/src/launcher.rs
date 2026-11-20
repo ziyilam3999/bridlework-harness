@@ -1161,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_refuses_a_plus_escape_and_reads_hex_escapes() {
+    fn parse_json_refuses_sign_and_blank_escapes_and_accepts_hex_escapes() {
         assert!(super::parse_json(br#"["\u+043"]"#).is_err());
         assert!(super::parse_json(br#"["\u-043"]"#).is_err());
         assert!(super::parse_json(br#"["\u 043"]"#).is_err());

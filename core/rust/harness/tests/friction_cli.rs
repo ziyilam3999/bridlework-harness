@@ -1233,17 +1233,3 @@ fn hex_unicode_escapes_in_a_row_value_are_read() {
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(out(&o), "inbox ok rows=1\n");
 }
-
-#[test]
-fn the_row_reader_decodes_hex_escapes() {
-    /* let mut p = friction::P { b: br#"{"k":"\u0043\u00e9\u00E9"}"#, i: 0 };
-    assert_eq!(p.object().unwrap(), vec![(s("k"), s("C\u{e9}\u{e9}"))]); */
-    let o = lint_row(&row_with_text("C\u{e9}"));
-    assert_eq!(code(&o), 0, "{}", err(&o));
-}
-
-#[test]
-fn the_row_reader_refuses_a_plus_escape_in_a_key_and_in_a_value() {
-    // Key and value forms are covered by the unit tests next to the reader.
-    assert_bad_u(&lint_row(&row_with_text("x\\u+043")));
-}
