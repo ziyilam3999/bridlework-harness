@@ -171,12 +171,30 @@ fn a_git_status_that_fails_is_refused_and_cargo_is_not_run() {
 }
 
 #[test]
-fn an_untracked_file_is_refused_whatever_the_git_config_says() {
+fn an_untracked_file_is_refused_whatever_status_show_untracked_files_says() {
     let f = fix();
     g(&f.dir, &["config", "status.showUntrackedFiles", "no"]);
     fs::write(f.dir.join("new.txt"), b"n\n").unwrap();
     assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the config hides the file from a plain status");
     f.assert_refused("an untracked file with showUntrackedFiles=no");
+}
+
+#[test]
+fn an_edit_hidden_by_assume_unchanged_is_refused_and_cargo_is_not_run() {
+    let f = fix();
+    g(&f.dir, &["update-index", "--assume-unchanged", "a.txt"]);
+    fs::write(f.dir.join("a.txt"), b"changed\n").unwrap();
+    assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the flag hides the edit from status");
+    f.assert_refused("an assume-unchanged entry");
+}
+
+#[test]
+fn an_edit_hidden_by_skip_worktree_is_refused_and_cargo_is_not_run() {
+    let f = fix();
+    g(&f.dir, &["update-index", "--skip-worktree", "a.txt"]);
+    fs::write(f.dir.join("a.txt"), b"changed\n").unwrap();
+    assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the flag hides the edit from status");
+    f.assert_refused("a skip-worktree entry");
 }
 
 #[test]

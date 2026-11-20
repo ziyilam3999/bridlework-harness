@@ -45,10 +45,13 @@ variable set to the commit of `HEAD` of the checkout it lives in, prints
 build, when `HEAD` has no commit, when the work tree has a tracked change or when it has an untracked
 file (`git status --porcelain --untracked-files=all` is not empty, whatever `status.showUntrackedFiles`
 says), or when that `git status` call itself fails (an unreadable or corrupt index). It also exits 1
-when the cargo build itself fails. `GIT_DIR`, `GIT_WORK_TREE` and the other repo-location variables
-are cleared before the git calls, so the stamp is the commit of `HEAD` of the checkout the script
-lives in. The
-work tree check does not list git-ignored files, so an ignored file can still change the build; the
+when an index entry is flagged assume-unchanged or skip-worktree (`git ls-files -v` prints a tag other
+than `H`; such a flag hides an edit from `git status`) or when `git ls-files` fails. It also exits 1
+when the cargo build itself fails. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` and
+`GIT_OBJECT_DIRECTORY` are cleared before the git calls, so the stamp is the commit of `HEAD` of the
+checkout the script lives in. The
+work tree check does not list files ignored by `.gitignore`, `.git/info/exclude` or
+`core.excludesFile`, so an ignored file can still change the build; the
 stamp names the commit of `HEAD`, which matches the built code when the tree is otherwise clean. A
 stamp set by hand to a commit that was not built is not seen by the verb; the script is the guard.
 
