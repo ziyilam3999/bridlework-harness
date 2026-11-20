@@ -54,8 +54,9 @@ The verb parses each transcript line in memory to count the lines of type `syste
 `session tokens` reports), and prints only the count. No byte of a line is printed. Which sessions a caller may run it on is the rule
 of the caller.
 
-A half-written last line while the session writes is `line <n> is not valid JSON` (exit 3). One assistant line with no message, no id
-or no usage gives exit 3 on every later call, until the handover.
+A half-written last line while the session writes is `line <n> is not valid JSON` (exit 3). An assistant line with no message, no id
+or no usage, or with a usage field that is not a whole number, gives exit 3 on each later call while that line stays
+in the transcript.
 
 The last part of the transcript path must be exactly `<session-id>.jsonl` (the id as given, lowercase). The name is checked before the
 file is touched, so the event log, or the transcript of another session, passed by mistake is refused and not counted as 0.
@@ -111,7 +112,7 @@ the transcript name, the transcript file.
 | transcript | `the transcript is a symbolic link` |
 | transcript | `the transcript is not a regular file` |
 | transcript | `the transcript is empty` |
-| transcript | `line <n> is not valid JSON`, or the reader text for an assistant line with no message, id or usage |
+| transcript | `line <n> is not valid JSON`, or the reader text for an assistant line with no message, no id, no usage or a bad usage field |
 
 The transcript path kind is checked without following links, and the opened file must be the file that check saw.
 
