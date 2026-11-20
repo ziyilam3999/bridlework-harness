@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
-const USAGE: &str = "usage: harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>]";
+const USAGE: &str = "usage: harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>] [--plan <absolute-file> --base-plan <absolute-file> --base-index <absolute-file>]";
 static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct Out {
@@ -903,4 +903,254 @@ fn the_top_level_usage_line_ends_with_the_plan_alternative() {
     let err = String::from_utf8(o.stderr).unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(err.ends_with(" | plan check|status ...\n"), "{err}");
+}
+
+// ---- plan-line comparison (--plan, --base-plan, --base-index)
+
+fn pl_row(id: &str, line: u64) -> String {
+    format!(r#"{{"id":"{id}","title":"t","plan_line":{line},"state":"later","tickets":[],"deviation":null,"trigger":null,"code":[]}}"#)
+}
+
+fn rows_at(v: &[(&str, u64)]) -> Vec<String> {
+    v.iter().map(|(i, l)| pl_row(i, *l)).collect()
+}
+
+/// Fixture F plan lines: 2, 3 and 5 are 60 characters, line 4 is short.
+fn f_lines() -> Vec<String> {
+    vec!["one first line".to_string(), format!("two-{}", "b".repeat(56)), format!("three-{}", "c".repeat(54)), "four".to_string(), format!("five-{}", "e".repeat(55)), "six last".to_string()]
+}
+
+fn join(v: &[String]) -> String {
+    v.iter().map(|l| format!("{l}\n")).collect()
+}
+
+const F_ROWS: [(&str, u64); 4] = [("R-a", 2), ("R-b", 3), ("R-c", 4), ("R-d", 5)];
+
+/// The scratch folder with base.md, head.md, base.jsonl and the head index.
+fn f_env(base: &str, head: &str, base_rows: &[(&str, u64)], head_rows: &[(&str, u64)]) -> Env {
+    let e = Env::named("planline");
+    fs::write(e.root.join("base.md"), base).unwrap();
+    fs::write(e.root.join("head.md"), head).unwrap();
+    fs::write(e.root.join("base.jsonl"), rows_at(base_rows).join("\n") + "\n").unwrap();
+    e.index(&rows_at(head_rows));
+    e
+}
+
+fn run3(e: &Env) -> Out {
+    let p = |n: &str| e.root.join(n).to_str().unwrap().to_string();
+    let (h, b, i) = (p("head.md"), p("base.md"), p("base.jsonl"));
+    e.run("check", &["--plan", &h, "--base-plan", &b, "--base-index", &i])
+}
+
+fn go(head: &str, head_rows: &[(&str, u64)]) -> Out {
+    run3(&f_env(&join(&f_lines()), head, &F_ROWS, head_rows))
+}
+
+fn go_lines(head: &[String], head_rows: &[(&str, u64)]) -> Out {
+    go(&join(head), head_rows)
+}
+
+fn with_line(n: usize, f: impl Fn(&str) -> String) -> Vec<String> {
+    let mut l = f_lines();
+    l[n - 1] = f(&l[n - 1]);
+    l
+}
+
+/// Replace the character at 1-based position `at`.
+fn swap_char(s: &str, at: usize, c: char) -> String {
+    s.chars().enumerate().map(|(i, x)| if i + 1 == at { c } else { x }).collect()
+}
+
+fn stale(ids: &[&str]) -> String {
+    let mut s: String = ids.iter().map(|i| format!("red plan-line-stale {i}\n")).collect();
+    s += &format!("plan check red findings={}\n", ids.len());
+    s
+}
+
+#[test]
+fn equal_copies_are_green_and_an_added_line_is_red_until_the_rows_move() {
+    is(&go(&join(&f_lines()), &F_ROWS), 0, "plan check ok rows=4 tickets=0 done=0 compared=4\n");
+    let mut added = f_lines();
+    added.insert(1, "inserted line with other first characters".to_string());
+    is(&go_lines(&added, &F_ROWS), 1, &stale(&["R-a", "R-b", "R-c", "R-d"]));
+    is(&go_lines(&added, &[("R-a", 3), ("R-b", 4), ("R-c", 5), ("R-d", 6)]), 0, "plan check ok rows=4 tickets=0 done=0 compared=0\n");
+}
+
+#[test]
+fn the_form_without_the_options_has_no_compared_count() {
+    let e = f_env("x\n", "y\n", &F_ROWS, &F_ROWS);
+    is(&e.check(), 0, "plan check ok rows=4 tickets=0 done=0\n");
+}
+
+#[test]
+fn rows_outside_the_rule_are_not_compared() {
+    let same = join(&f_lines());
+    let mut five = F_ROWS.to_vec();
+    five.push(("R-e", 9));
+    is(&go(&same, &five), 0, "plan check ok rows=5 tickets=0 done=0 compared=4\n");
+    is(&go(&same, &F_ROWS[..3]), 0, "plan check ok rows=3 tickets=0 done=0 compared=3\n");
+    // One moved row whose new line holds other text.
+    is(&go(&same, &[("R-a", 2), ("R-b", 3), ("R-c", 4), ("R-d", 6)]), 0, "plan check ok rows=4 tickets=0 done=0 compared=3\n");
+    // A moved or added row is not read against the files, whatever its line.
+    is(&go(&same, &[("R-a", 2), ("R-b", 3), ("R-c", 4), ("R-d", 0), ("R-e", u64::MAX)]), 0, "plan check ok rows=5 tickets=0 done=0 compared=3\n");
+    // No shared id.
+    let e = f_env(&same, &same, &[("Z-1", 2)], &F_ROWS);
+    is(&run3(&e), 0, "plan check ok rows=4 tickets=0 done=0 compared=0\n");
+}
+
+#[test]
+fn only_the_first_40_characters_count() {
+    is(&go_lines(&with_line(2, |l| swap_char(l, 41, 'Z')), &F_ROWS), 0, "plan check ok rows=4 tickets=0 done=0 compared=4\n");
+    is(&go_lines(&with_line(2, |l| swap_char(l, 40, 'Z')), &F_ROWS), 1, &stale(&["R-a"]));
+    is(&go_lines(&with_line(4, |l| format!("{l} ")), &F_ROWS), 0, "plan check ok rows=4 tickets=0 done=0 compared=4\n");
+    is(&go_lines(&with_line(4, |_| "fourth".to_string()), &F_ROWS), 1, &stale(&["R-c"]));
+    let crlf: String = f_lines().iter().map(|l| format!("{l}\r\n")).collect();
+    is(&go(&crlf, &F_ROWS), 0, "plan check ok rows=4 tickets=0 done=0 compared=4\n");
+}
+
+#[test]
+fn characters_are_counted_not_bytes() {
+    let wide = "é".repeat(60);
+    let (base, head) = (format!("a\n{wide}\n"), format!("a\n{}\n", swap_char(&wide, 35, 'ü')));
+    let e = f_env(&base, &head, &[("R-a", 2)], &[("R-a", 2)]);
+    is(&run3(&e), 1, &stale(&["R-a"]));
+    // A multi-byte 40th character, changed after it.
+    let b40 = format!("a\n{}é-one\n", "x".repeat(39));
+    let h40 = format!("a\n{}é-two\n", "x".repeat(39));
+    let e = f_env(&b40, &h40, &[("R-a", 2)], &[("R-a", 2)]);
+    is(&run3(&e), 0, "plan check ok rows=1 tickets=0 done=0 compared=1\n");
+}
+
+#[test]
+fn a_stale_line_comes_after_the_estimate_finding() {
+    let e = Env::named("planline");
+    fs::write(e.root.join("base.md"), "a\nb-one\n").unwrap();
+    fs::write(e.root.join("head.md"), "a\nb-two\n").unwrap();
+    let nb = r#"{"id":"R-a","title":"t","plan_line":2,"state":"not-built","tickets":[],"deviation":null,"trigger":null,"code":[]}"#;
+    fs::write(e.root.join("base.jsonl"), format!("{nb}\n")).unwrap();
+    e.index(&[nb.to_string()]);
+    is(&run3(&e), 1, "red open-row-no-estimate R-a\nred plan-line-stale R-a\nplan check red findings=2\n");
+}
+
+#[test]
+fn a_line_number_with_no_line_fails_closed() {
+    let same = join(&f_lines());
+    for n in [0u64, 7, u64::MAX] {
+        let e = f_env(&same, &same, &[("R-a", n)], &[("R-a", n)]);
+        is(&run3(&e), 1, &stale(&["R-a"]));
+    }
+    // Longer head, shorter base: the base line is missing.
+    let e = f_env("a\nb\n", &same, &[("R-a", 5)], &[("R-a", 5)]);
+    is(&run3(&e), 1, &stale(&["R-a"]));
+    // The last line, with and without a final LF.
+    for t in ["a\nlast line\n", "a\nlast line"] {
+        let e = f_env(t, t, &[("R-a", 2)], &[("R-a", 2)]);
+        is(&run3(&e), 0, "plan check ok rows=1 tickets=0 done=0 compared=1\n");
+    }
+}
+
+fn refused_usage(o: &Out, c: &[&str]) {
+    assert_eq!(o.out, "", "{c:?}");
+    assert_eq!(o.err, format!("{USAGE}\n"), "{c:?}");
+    assert_eq!(o.code, 2, "{c:?}");
+}
+
+fn refusal_of(o: &Out, what: &str) {
+    assert_eq!(o.out, "", "stdout");
+    assert_eq!(o.err, format!("harness: error: {what}\n"), "stderr");
+    assert_eq!(o.code, 2, "exit code");
+}
+
+#[test]
+fn partial_and_bad_option_sets_are_usage_errors() {
+    let e = f_env("a\n", "b\n", &F_ROWS, &F_ROWS);
+    let p = |n: &str| e.root.join(n).to_str().unwrap().to_string();
+    let (h, b, i) = (p("head.md"), p("base.md"), p("base.jsonl"));
+    let opts = [("--plan", h.as_str()), ("--base-plan", b.as_str()), ("--base-index", i.as_str())];
+    let mut cases: Vec<Vec<&str>> = Vec::new();
+    for mask in [1usize, 2, 4, 3, 5, 6] {
+        let mut v = Vec::new();
+        for (k, (f, val)) in opts.iter().enumerate() {
+            if mask & (1 << k) != 0 {
+                v.extend([*f, *val]);
+            }
+        }
+        cases.push(v);
+    }
+    let all: Vec<&str> = opts.iter().flat_map(|(f, v)| [*f, *v]).collect();
+    cases.push([all.clone(), vec!["--plan", h.as_str()]].concat());
+    cases.push([all.clone(), vec!["--base-index"]].concat());
+    cases.push([all.clone(), vec!["--ticket", "T-1"]].concat());
+    cases.push(vec!["--plan", "rel.md", "--base-plan", b.as_str(), "--base-index", i.as_str()]);
+    cases.push(vec!["--plan", "/a/../b", "--base-plan", b.as_str(), "--base-index", i.as_str()]);
+    for extra in cases {
+        refused_usage(&e.run("check", &extra), &extra);
+    }
+    refused_usage(&e.run("status", &all), &all);
+}
+
+#[test]
+fn a_bad_base_index_is_refused() {
+    let same = join(&f_lines());
+    let one = pl_row("R-a", 2);
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (b"not json\n".to_vec(), "base plan index: line 1: does not parse as one JSON object"),
+        (format!("{}\n", one.replace("\"code\":[]", "\"code\":[],\"zz\":1")).into_bytes(), "base plan index: line 1: an unknown key"),
+        (Vec::new(), "base plan index: the file has no rows"),
+        (format!("{one}\n{one}\n").into_bytes(), "base plan index: an id is on more than one row"),
+    ];
+    for (bytes, what) in cases {
+        let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+        fs::write(e.root.join("base.jsonl"), bytes).unwrap();
+        refusal_of(&run3(&e), what);
+    }
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    fs::remove_file(e.root.join("base.jsonl")).unwrap();
+    refusal_of(&run3(&e), "base plan index: the file is missing or cannot be read");
+    fs::create_dir(e.root.join("base.jsonl")).unwrap();
+    refusal_of(&run3(&e), "base plan index: the file is missing or cannot be read");
+}
+
+#[test]
+fn bad_plan_files_are_refused_with_their_own_words() {
+    use std::os::unix::fs::PermissionsExt;
+    let same = join(&f_lines());
+    for (file, label) in [("head.md", "plan file"), ("base.md", "base plan file")] {
+        let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+        let path = e.root.join(file);
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (vec![b'a'; 16_777_217], "is over 16777216 bytes"),
+            (vec![0xff, 0xfe, b'\n'], "is not valid UTF-8"),
+            (Vec::new(), "is empty"),
+        ];
+        for (bytes, what) in cases {
+            fs::write(&path, bytes).unwrap();
+            refusal_of(&run3(&e), &format!("{label}: {what}"));
+        }
+        // 16777216 bytes is read: the rows are stale, not refused.
+        fs::write(&path, vec![b'a'; 16_777_216]).unwrap();
+        assert_eq!(run3(&e).code, 1, "16777216 bytes is read");
+        fs::write(&path, &same).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        refusal_of(&run3(&e), &format!("{label}: cannot be read"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_file(&path).unwrap();
+        refusal_of(&run3(&e), &format!("{label}: is missing or cannot be read"));
+        fs::create_dir(&path).unwrap();
+        refusal_of(&run3(&e), &format!("{label}: is not a regular file"));
+    }
+}
+
+#[test]
+fn a_symlinked_plan_is_read_and_the_same_file_is_refused() {
+    let same = join(&f_lines());
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    std::os::unix::fs::symlink(e.root.join("head.md"), e.root.join("link.md")).unwrap();
+    let p = |n: &str| e.root.join(n).to_str().unwrap().to_string();
+    let (l, b, i, h) = (p("link.md"), p("base.md"), p("base.jsonl"), p("head.md"));
+    is(&e.run("check", &["--plan", &l, "--base-plan", &b, "--base-index", &i]), 0, "plan check ok rows=4 tickets=0 done=0 compared=4\n");
+    refusal_of(&e.run("check", &["--plan", &l, "--base-plan", &h, "--base-index", &i]), "plan file: is the same file as the base plan file");
+    // A bad base index is read before the same-file refusal.
+    fs::write(e.root.join("base.jsonl"), "x\n").unwrap();
+    refusal_of(&e.run("check", &["--plan", &l, "--base-plan", &h, "--base-index", &i]), "base plan index: line 1: does not parse as one JSON object");
 }
