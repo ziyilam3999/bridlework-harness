@@ -492,6 +492,8 @@ fn source_flag_on_add_stores_and_refuses() {
             s("memory"),
             s("--text"),
             s("clean synthetic text"),
+            s("--why"),
+            s("cause: system"),
         ];
         if !source.is_empty() {
             a.push(s("--source"));
@@ -503,7 +505,7 @@ fn source_flag_on_add_stores_and_refuses() {
     let o = add("l-1", "event");
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
     let inbox = fs::read_to_string(t.inbox()).unwrap();
-    assert!(inbox.ends_with(",\"source\":\"event\"}\n"), "the stored row must carry the source: {inbox}");
+    assert!(inbox.ends_with(",\"source\":\"event\",\"why\":\"cause: system\"}\n"), "the stored row must carry the source and the why, written last: {inbox}");
     // `--source x` is refused naming the field, stdout empty, the inbox byte-identical.
     let before = fs::read(t.inbox()).ok();
     let o = add("l-2", "x");

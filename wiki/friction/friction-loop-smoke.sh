@@ -59,7 +59,7 @@ EOF
 loop() { bash "$HERE/friction-loop.sh" --week "$1" --env "$S/loop.env" > "$S/out.txt" 2> "$S/err.txt"; }
 h() { "$HARNESS_BIN" "$@"; }
 addrow() { # id date breaks impact
-  local a=(friction add --id "$1" --date "$2" --ticket t-smoke --where-it-lives memory --text "synthetic lesson $1" --config "$S/config.yaml")
+  local a=(friction add --id "$1" --date "$2" --ticket t-smoke --where-it-lives memory --text "synthetic lesson $1" --why "cause: system" --config "$S/config.yaml")
   if [ -n "$3" ]; then a+=(--breaks "$3"); fi
   if [ -n "$4" ]; then a+=(--impact "$4"); fi
   h "${a[@]}" > /dev/null

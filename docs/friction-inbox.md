@@ -34,12 +34,12 @@ seven OPTIONAL keys — `kind` and `repeats` (ticket 192), `source` (ticket 193)
 | `where-it-lives` | exactly one of `skill`, `gate`, `memory`, `wiki` (K-1.1; see the table below) |
 | `breaks` | empty, or the `id` of a lesson this row says broke again (K-1 rule 3); it must name another row that exists in the inbox, never itself |
 | `text` | the lesson, non-empty; one line (a newline inside it is stored escaped, the file stays one row per line) |
-| `kind` (optional) | empty (= `friction`), `friction` or `pattern`; anything else is refused naming the field. `friction` is a lesson learned the hard way; `pattern` is a repeatable procedure that worked. Omitted at its default, so every six-key row written before this key existed re-encodes byte-identical |
+| `kind` (optional) | empty (= `friction`), `friction` or `pattern`; anything else is refused naming the field. `friction` is a lesson learned the hard way; `pattern` is a repeatable procedure that worked. Omitted at its default, so every six-key row written before this key existed re-encodes byte-identical. A `pattern` row needs no cause tag in `why` |
 | `repeats` (optional) | empty, or a plain row id token. The pointer rules mirror `breaks`: it must name a row that exists in the inbox, never itself; the row carrying it must itself be `kind: pattern`; and the row it names must be a `kind: pattern` row with an empty `repeats` — the chain ROOT — so a chain's repeat count is one unambiguous number. A `pattern` row with no `repeats` is legal: it is the root of its chain |
-| `source` (optional) | empty (= hand-written) or `event`; anything else is refused naming the field. `event` marks a row the T-9.3 mapper produced from an event (see "Event rows" below). Omitted at its default, so every row written before this key existed re-encodes byte-identical |
+| `source` (optional) | empty (= hand-written) or `event`; anything else is refused naming the field. `event` marks a row the T-9.3 mapper produced from an event (see "Event rows" below). Omitted at its default, so every row written before this key existed re-encodes byte-identical. An `event` row needs no cause tag in `why` |
 | `at` (optional) | empty (absent) or `YYYY-MM-DDTHH:MM:SSZ`: UTC, a real calendar instant (hour < 24, minute and second < 60). **The at/date rule:** its date part must equal the row's `date`, or the row is refused naming `at`. Omitted when absent |
 | `impact` (optional) | empty (= unrated) or exactly one of `low`, `medium`, `high`, `blocker`; anything else (`urgent`) is refused naming `impact`. Rank weights are 1, 3, 9, 27 (unrated counts as 1) |
-| `why` (optional) | one line, at most 1,000 bytes: the cause, stated as suspected or proven. A newline is stored escaped, as in `text`. Over the cap is refused naming `why` |
+| `why` (optional) | one line, at most 1,000 bytes: the cause, stated as suspected or proven. A newline is stored escaped, as in `text`. Over the cap is refused naming `why`. Optional in a stored row; at `add` a hand-written friction row must hold a cause tag (see "The cause tag" under `harness friction add`), while `pattern` rows, `event` rows and rows already stored are not checked |
 | `proof` (optional) | one line, at most 2,000 bytes: pointers separated by `; `. **Proof pointer grammar:** each pointer is exactly one of `<repo>@<7-40 lowercase hex>:<path>[:<line>]` (a commit and a repo-relative path, an optional line number), `session:<id-token>`, `pr:<owner>/<repo>#<n>`, `cmd:<text>` (free text, one line) or `~/<path>`. Anything else is refused naming `proof` (the reason never echoes the pointer) |
 
 **Privacy behaviour of the evidence keys.** All four pass through the UNCHANGED privacy engine like every other field
@@ -113,12 +113,13 @@ if the inbox did not exist yet, it is still not created.
 harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> \
   --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] \
   [--kind <friction|pattern>] [--repeats <row-id>] [--source event] \
-  [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] \
+  [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] --why <cause> [--proof <pointers>] \
   --text <lesson> [--config <file>]
 ```
 
 Appends one row. Everything is checked before anything is written, in this order: the flags, the row rules
-(section 1), every field of the new row through the same privacy engine as the rest of the harness, then — under
+(section 1), the cause tag of `why` (the next paragraph), every field of the new row through the same privacy
+engine as the rest of the harness, then — under
 one exclusive writer lock (section 4) — the same privacy engine over every stored row and the inbox cross rules
 (a duplicate `id`; a `breaks` naming no lesson or naming itself; the `repeats` pointer rules of section 1; the
 existing inbox must itself be clean, untorn and privacy-clean). Only then is one whole line (plus newline) appended and synced; the file is created when
@@ -127,6 +128,20 @@ absent, its folder is not; a refused row never creates the file (a first row who
 runs, so a refusal can never echo an unscanned byte of it. `--source` accepts only `event` (anything else is
 a row refusal naming the field); the flag exists so the T-9.3 mapper's rows are fileable exactly as the
 weekly sweep (`harness friction sweep`) files them.
+
+**The cause tag.** A hand-written friction row — `kind` empty or `friction`, `source` empty, a new row or a
+repeat filed with `--breaks` — must hold its cause in `why`: the FIRST `cause:` of the why (the byte before it
+is not checked), then one space, then `Orchestrator`, `builder` or `system` byte for byte (letter case
+included), then the end of the line or one byte that is not an ASCII letter, digit, underscore or hyphen. The
+text before and after the tag is free (`the brief was short. cause: builder.` holds a tag), a later `cause:` is
+not read (`cause: ticket; cause: system` holds no tag), and a wrong case (`cause: Builder`), no space
+(`cause:builder`), a second space or a non-breaking space holds no tag. A why that holds no tag is refused:
+exit 1, two stderr lines (`harness: friction refused: why must hold a cause tag: cause: Orchestrator, cause:
+builder or cause: system` and `harness: ROW NOT RECORDED`), the inbox byte-identical and still not created when
+absent. The check runs after the row rules and before the privacy list is loaded, and it reads only the why of
+the new row: a tag in `--text` or `--proof` does not count. A `kind: pattern` row and a `--source event` row
+need no tag, rows already stored are not re-checked, and `friction lint`, `sweep`, `suggest` and the other
+verbs are unchanged by this rule.
 
 **Recording a repeat.** A friction that happened again is filed as a new row with `--breaks <id of the first row>`;
 `harness friction rank` groups rows by that `breaks` chain, so the repeat counts toward the first row's group.
