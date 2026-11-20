@@ -461,3 +461,64 @@ fn ac12_default_records_path_is_the_process_cwd() {
     assert!(err(&o).contains("launch record not written"));
     assert!(!e2.p("a/missing-dir").exists() && !e2.marker());
 }
+
+// ---------------------------------------------------------------- \u escapes: four hex digits, no sign or blank
+
+/// A records file from one real launch with the first `from` text swapped for `to`.
+fn rewritten(e: &Env, from: &str, to: &str) -> PathBuf {
+    let rec = e.p("r.jsonl");
+    let o = e.ok_launch(&["--records", rec.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let body = fs::read_to_string(&rec).unwrap();
+    assert!(body.contains(from), "{body}");
+    let f = e.p("bad.jsonl");
+    fs::write(&f, body.replacen(from, to, 1)).unwrap();
+    f
+}
+
+#[test]
+fn a_plus_unicode_escape_in_a_record_is_refused() {
+    let e = Env::new();
+    let f = rewritten(&e, "\"role\":\"exec\"", "\"role\":\"\\u+065xec\"");
+    let o = e.launches(&f);
+    assert_eq!(code(&o), 2);
+    assert!(out(&o).is_empty());
+    assert_eq!(err(&o), "harness: error: line 1: bad \\u\n");
+    let o = Command::new(BIN).args(["session", "next-provider", "--providers", "claude", "--records"]).arg(&f).output().unwrap();
+    assert_eq!(code(&o), 3, "{}", err(&o));
+    assert!(out(&o).is_empty());
+    assert_eq!(err(&o), "harness: next-provider refused: reason=unreadable line 1: bad \\u\n");
+}
+
+#[test]
+fn a_hex_unicode_escape_in_a_record_reads_like_the_plain_letter() {
+    let e = Env::new();
+    let rec = e.p("r.jsonl");
+    let o = e.ok_launch(&["--records", rec.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let plain = out(&e.launches(&rec));
+    let body = fs::read_to_string(&rec).unwrap();
+    assert!(body.contains("\"role\":\"exec\""));
+    let f = e.p("alt.jsonl");
+    fs::write(&f, body.replacen("\"role\":\"exec\"", "\"role\":\"\\u0065xec\"", 1)).unwrap();
+    let o = e.launches(&f);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), plain);
+}
+
+#[test]
+fn other_bad_unicode_escapes_in_a_record_are_refused() {
+    for (from, to) in [
+        ("\"role\":\"exec\"", "\"role\":\"\\u-065xec\""),
+        ("\"role\":\"exec\"", "\"role\":\"\\u 065xec\""),
+        ("\"role\":\"exec\"", "\"role\":\"\\u0+65xec\""),
+        ("\"run_id\":", "\"\\u+072un_id\":"),
+    ] {
+        let e = Env::new();
+        let f = rewritten(&e, from, to);
+        let o = e.launches(&f);
+        assert_eq!(code(&o), 2, "{to}");
+        assert!(out(&o).is_empty());
+        assert_eq!(err(&o), "harness: error: line 1: bad \\u\n", "{to}");
+    }
+}

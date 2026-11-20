@@ -1185,3 +1185,51 @@ fn a_forward_breaks_in_a_hand_written_inbox_lints_clean_and_a_missing_one_does_n
     assert_eq!(code(&o), 1, "{}", err(&o));
     assert!(err(&o).contains("line 1") && err(&o).contains("breaks"), "{}", err(&o));
 }
+
+// ---------------------------------------------------------------- \u escapes: four hex digits, no sign or blank
+
+const BAD_U: &str = "harness: inbox line 1: a bad \\u escape\n";
+
+fn lint_row(row: &str) -> Output {
+    let t = Tmp::new();
+    fs::write(t.inbox(), format!("{row}\n")).unwrap();
+    lint(&t)
+}
+
+fn assert_bad_u(o: &Output) {
+    assert_eq!(code(o), 1, "{}", err(o));
+    assert!(out(o).is_empty(), "stdout: {}", out(o));
+    assert_eq!(err(o), BAD_U);
+}
+
+fn row_with_text(text: &str) -> String {
+    hand_written("u-1", "154", "memory", "", "TEXTHERE").replace("TEXTHERE", text)
+}
+
+#[test]
+fn a_plus_unicode_escape_in_a_row_value_is_refused() {
+    // Before the fix this printed `inbox ok rows=1` and exited 0.
+    assert_bad_u(&lint_row(&row_with_text("a\\u+043b")));
+}
+
+#[test]
+fn other_bad_unicode_escapes_in_a_row_value_are_refused() {
+    for bad in ["a\\u-043b", "a\\u 043b", "a\\u+04", "a\\u00+3b", "a\\u004+b", "a\\u00"] {
+        assert_bad_u(&lint_row(&row_with_text(bad)));
+    }
+}
+
+#[test]
+fn a_plus_unicode_escape_in_a_row_key_is_refused() {
+    let row = row_with_text("fine");
+    assert!(row.contains("\"id\":") && row.contains("\"text\":"), "{row}");
+    assert_bad_u(&lint_row(&row.replace("\"id\":", "\"\\u+069d\":")));
+    assert_bad_u(&lint_row(&row.replace("\"text\":", "\"\\u+074ext\":")));
+}
+
+#[test]
+fn hex_unicode_escapes_in_a_row_value_are_read() {
+    let o = lint_row(&row_with_text("a\\u0043 \\u00e9 \\u00E9"));
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "inbox ok rows=1\n");
+}

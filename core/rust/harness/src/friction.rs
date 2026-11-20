@@ -270,6 +270,10 @@ impl<'a> P<'a> {
                             if self.i + 4 >= self.b.len() {
                                 return Err("a short \\u escape".to_string());
                             }
+                            // from_str_radix takes a leading sign; JSON takes hex digits only.
+                            if !self.b[self.i + 1..self.i + 5].iter().all(u8::is_ascii_hexdigit) {
+                                return Err("a bad \\u escape".to_string());
+                            }
                             let hex = std::str::from_utf8(&self.b[self.i + 1..self.i + 5]).map_err(|_| "a bad \\u escape".to_string())?;
                             let v = u32::from_str_radix(hex, 16).map_err(|_| "a bad \\u escape".to_string())?;
                             out.push(char::from_u32(v).ok_or("a \\u escape that is not a scalar value".to_string())?);
@@ -1429,4 +1433,26 @@ pub(crate) fn sweep_cmd(rest: &[String], testmode: bool) -> i32 {
     }
     println!("sweep week={} filed={} already={}", week, to_file.len(), already);
     0
+}
+
+#[cfg(test)]
+mod uescape_tests {
+    use super::P;
+
+    fn object(body: &str) -> Result<Vec<(String, String)>, String> {
+        P { b: body.as_bytes(), i: 0 }.object()
+    }
+
+    #[test]
+    fn hex_escapes_decode() {
+        let body = format!("{{\"k\":\"{b}u0043{b}u00e9{b}u00E9\"}}", b = '\\');
+        assert_eq!(object(&body).unwrap(), vec![("k".to_string(), "C\u{e9}\u{e9}".to_string())]);
+    }
+
+    #[test]
+    fn a_plus_escape_in_a_key_or_a_value_is_an_err() {
+        let b = '\\';
+        assert!(object(&format!("{{\"{b}u+043\":\"v\"}}")).is_err());
+        assert!(object(&format!("{{\"k\":\"{b}u+043\"}}")).is_err());
+    }
 }
