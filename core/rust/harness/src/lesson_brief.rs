@@ -27,7 +27,10 @@ fn usage() -> i32 {
 /// (exit 2), (2) the privacy list (exit 2), (3) a thing at the `--out` path (exit 1), (4) the lookup with its
 /// own order (exit 2 or 1), (5) the NAME lines then the privacy hits (exit 1), (6) the out folder and the
 /// copies (exit 2 on a failure), (7) the block on stdout, exit 0. All reads, checks and scans end before the
-/// first write, so a refusal writes nothing.
+/// first write, so a refusal writes nothing. A failed copy ends the run at stage (6) before any stdout byte,
+/// and a failed stdout write ends it at stage (7); each removes the copies the run made, then the out folder
+/// (which stays when a file is left in it), and exits 2. A thing that appears at the `--out` path between
+/// stages (3) and (6) ends the run as stage (3) does.
 pub(crate) fn brief_cmd(a: &[String]) -> i32 {
     // (1) The arguments are read from left to right; the first bad one ends the run with the message of the
     // lookup (the diff mode flags are unknown options here).
@@ -129,24 +132,37 @@ pub(crate) fn brief_cmd(a: &[String]) -> i32 {
     }
     // (6) The out folder (a create call that fails when a thing is at the path; the parent is not made), then
     // one copy per matched page (a create call that fails when the name exists; the text as it was read).
-    if std::fs::create_dir(q).is_err() {
+    if let Err(e) = std::fs::create_dir(q) {
+        // A thing that appeared at the path since stage (3) ends the run as stage (3) does.
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            eprintln!("harness: lesson brief refused: the out folder exists already");
+            return 1;
+        }
         return fail("the out folder cannot be made");
     }
+    // A file counts as written once its create call worked, so a failed write is cleaned up too.
     let mut written: Vec<std::path::PathBuf> = Vec::new();
     let mut ok = true;
     for p in &matched {
         let path = q.join(&p.name);
-        let wrote = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => f.write_all(p.text.as_deref().unwrap_or("").as_bytes()).is_ok(),
-            Err(_) => false,
-        };
-        if !wrote {
-            ok = false;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                written.push(path);
+                if f.write_all(p.text.as_deref().unwrap_or("").as_bytes()).is_err() {
+                    ok = false;
+                }
+            }
+            Err(_) => ok = false,
+        }
+        if !ok {
             break;
         }
-        written.push(path);
     }
-    // (7) The block, in one write; a failed copy or a failed write removes what the run wrote.
+    // A failed copy ends the run before any stdout byte.
+    if !ok {
+        return clean_up(&written, q);
+    }
+    // (7) The block, in one write; a failed write removes what the run wrote.
     let mut block = format!("Lessons for this ticket (harness lesson brief): always={} matched={}\n", always.len(), matched.len());
     if !always.is_empty() {
         block.push_str("Rules from earlier mistakes, kept for this change:\n");
@@ -163,17 +179,18 @@ pub(crate) fn brief_cmd(a: &[String]) -> i32 {
             block.push('\n');
         }
     }
-    let printed = match std::io::stdout().lock().write_all(block.as_bytes()) {
-        Ok(()) => true,
-        Err(_) => false,
-    };
-    if !ok || !printed {
-        for path in written.iter().rev() {
-            let _ = std::fs::remove_file(path);
-        }
-        // remove_dir fails on a folder that is not empty, so a copy that escaped the list above stays.
-        let _ = std::fs::remove_dir(q);
-        return fail("the out folder cannot be written");
+    if std::io::stdout().lock().write_all(block.as_bytes()).is_err() {
+        return clean_up(&written, q);
     }
     0
+}
+
+/// Removes the copies the run made, then the folder with a call that fails on a folder that is not empty;
+/// exit 2 with the write line.
+fn clean_up(written: &[std::path::PathBuf], q: &Path) -> i32 {
+    for path in written.iter().rev() {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(q);
+    fail("the out folder cannot be written")
 }

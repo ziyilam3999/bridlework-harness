@@ -404,24 +404,30 @@ to a folder, a dangling symbolic link) refuses with exit 1, stdout empty and the
 brief refused: the out folder exists already`; the thing is left as it was (a link is not followed). A parent
 that is missing or is a file exits 2 with `harness: error: the out folder cannot be made`. A second run with
 the same arguments is refused the same way. A copy that cannot be written after the folder was made exits 2
-with `harness: error: the out folder cannot be written`; the run then removes the copies it wrote and the
-folder.
+with `harness: error: the out folder cannot be written`, before any stdout byte; the run then removes each
+file it created (a file whose create call worked counts, also when its write failed), then the folder with a
+call that fails on a folder that is not empty. A failed stdout write after the copies exits 2 with the same
+line and the same clean-up. A thing that appears at the `--out` path after the check of stage (3) makes the
+create call fail with the name existing: the run ends as for a thing found at stage (3), exit 1.
 
 Refusals of the verb itself:
 
-- usage (exit 2, the lesson usage text): the argument faults of the lookup (an unknown option — the three
-  diff mode flags are unknown here —, a flag with no value, a flag given twice, more than one lessons folder,
-  no lessons folder), a missing `--ticket`, `--scope-file` or `--out` (one `harness: error:` line each, in
-  this order after the argument reads), and an `--out` value that is not absolute, has a `..` part or holds a
-  character the escape of the lint would rewrite (a control character, a blank other than a plain space).
+- argument faults (exit 2): an unknown option (the three diff mode flags are unknown here), a flag with no
+  value, a flag given twice or more than one lessons folder prints the lookup's one `harness: error:` line;
+  no lessons folder prints the lesson usage text; then a missing `--ticket`, `--scope-file` or `--out` prints
+  one `harness: error:` line each, in that order; then an `--out` value that is not absolute, has a `..` part
+  or holds a character the escape of the lint would rewrite (a control character, a blank other than a plain
+  space) prints the lesson usage text.
 - the privacy list (exit 2, one line): `harness: error: no privacy list configured: a lesson brief is not
   written unscanned` — no list name set, a list file that cannot be read, a list with no entry, list drift.
   The list is loaded before a page, the ticket or the scope file is read.
-- exit 1, stdout empty, no out folder: a thing at the `--out` path (the line above); the lookup's own
-  refusals (a page or the ticket refused, the cap line, with the lookup's exit code); a matched page whose
-  file name the escape would rewrite: `harness: lesson brief refused: <page id>: NAME the file name cannot be
-  printed as it is`; a privacy hit (below). Two pages with one id cannot be told apart in a `NAME` line or a
-  privacy line: both print the `<ISSUE-<3 digits>>` id only.
+- stdout empty, no out folder: a thing at the `--out` path (exit 1, the `the out folder exists already` line above); the lookup's own
+  refusals (exit 1: a page or the ticket refused, the cap line) and its read errors (exit 2: a page-shaped
+  symbolic link, a scope file that cannot be read, a page that cannot be read), each with the lookup's
+  stderr lines and the lookup's exit code; then, exit 1, a matched page whose file name the escape would
+  rewrite: `harness: lesson brief refused: <page id>: NAME the file name cannot be printed as it is`; a
+  privacy hit (below). Two pages with one id cannot be told apart in a `NAME` line or a privacy line: both
+  print the `ISSUE-<3 digits>` id only.
 
 Order of the stages; the first that fails prints its lines and ends the run: (1) the arguments (exit 2);
 (2) the privacy list (exit 2); (3) a thing at the `--out` path (exit 1); (4) the lookup with its own order of
