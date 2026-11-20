@@ -1021,6 +1021,74 @@ pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
     }
 }
 
+/// The resolved form of a path (a relative one is taken against the working folder): a found path (a link counts,
+/// also a dangling one) must canonicalize; a missing path needs a folder that canonicalizes and a file name.
+fn resolved_form(p: &str) -> Option<std::path::PathBuf> {
+    let mut path = std::path::PathBuf::from(p);
+    if path.is_relative() {
+        path = std::env::current_dir().ok()?.join(path);
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => fs::canonicalize(&path).ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.file_name()?.to_os_string();
+            let dir = fs::canonicalize(path.parent()?).ok()?;
+            Some(dir.join(name))
+        }
+        Err(_) => None,
+    }
+}
+
+/// The one guard of `--record` for patterns, rank and suggest: an absolute path that resolves, names neither the
+/// inbox nor a config or privacy list file, and is a new file, an empty regular file or a regular file that starts
+/// with `{`. The file type is read before any open, so a FIFO cannot block the verb. Messages are constant.
+pub(crate) fn record_guard(record: &str, config_flag: Option<&str>, inbox: &str) -> Result<(), &'static str> {
+    if !record.starts_with('/') {
+        return Err("--record must be an absolute path");
+    }
+    let Some(rec) = resolved_form(record) else {
+        return Err("--record cannot be resolved");
+    };
+    let names = |other: &str| paths_name_one_file(record, other) || resolved_form(other).is_some_and(|o| o == rec);
+    if names(inbox) {
+        return Err("--record must not name the friction inbox");
+    }
+    let mut protected: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(c) = config_flag {
+        protected.push(c.into());
+    }
+    for var in ["HARNESS_CONFIG", "HARNESS_PRIVACY_LIST", "HARNESS_PRIVACY_OLD_LIST"] {
+        if let Some(v) = std::env::var_os(var) {
+            protected.push(v);
+        }
+    }
+    for v in &protected {
+        if let Some(s) = v.to_str().filter(|s| !s.is_empty()) {
+            if names(s) {
+                return Err("--record must not name a config file");
+            }
+        }
+    }
+    const NOT_RECORD: &str = "--record names a file that is not a JSON-lines record";
+    match fs::symlink_metadata(&rec) {
+        Ok(md) => {
+            if !md.file_type().is_file() {
+                return Err(NOT_RECORD);
+            }
+            if md.len() > 0 {
+                let mut first = [0u8; 1];
+                let ok = fs::File::open(&rec).and_then(|mut f| f.read_exact(&mut first)).is_ok();
+                if !ok || first[0] != b'{' {
+                    return Err(NOT_RECORD);
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("--record cannot be resolved"),
+    }
+}
+
 /// The mechanical pattern count (shared by `patterns` and `triage`): the chain roots (`kind: pattern`, empty
 /// `repeats`) whose count of `repeats` rows is at least `threshold`, as (id, count), sorted.
 pub(crate) fn pattern_roots(rows: &[Row], threshold: u64) -> Vec<(String, usize)> {
@@ -1093,8 +1161,8 @@ pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
     // before anything is read or written, or the appended record would corrupt the inbox the listing
     // is about to validate. Exit 2, one line, nothing written.
     if let Some(path) = record {
-        if paths_name_one_file(path, cfg.friction_inbox()) {
-            return fail("--record must not name the friction inbox");
+        if let Err(m) = record_guard(path, file, cfg.friction_inbox()) {
+            return fail(m);
         }
     }
     // The listing reads the inbox, so it runs the same privacy engine and fails closed without a list,

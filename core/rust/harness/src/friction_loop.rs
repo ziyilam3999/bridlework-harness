@@ -289,8 +289,8 @@ pub fn rank_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     let record = flag(&flags, "--record");
     if let Some(path) = record {
-        if friction::paths_name_one_file(path, cfg.friction_inbox()) {
-            return fail("--record must not name the friction inbox");
+        if let Err(m) = friction::record_guard(path, flag(&flags, "--config"), cfg.friction_inbox()) {
+            return fail(m);
         }
     }
     let list = match load_list("an unscanned inbox is never ranked") {
