@@ -346,11 +346,16 @@ fn claim_execd_by_worker_shell_counts() {
 #[test]
 fn claim_with_wrong_id_refused() {
     let mut f = Fx::new();
-    let rc = f.r.join("rc");
-    let prog = format!("\"$BIN\" process claim {T} --session {OTHER} --dir {} --log {} >/dev/null 2>&1; echo $? > {}; sleep 30", s(&f.d), s(&f.log()), s(&rc));
+    let (rc, ef) = (f.r.join("rc"), f.r.join("err"));
+    let prog = format!("\"$BIN\" process claim {T} --session {OTHER} --dir {} --log {} >/dev/null 2>{}; echo $? > {}; sleep 30", s(&f.d), s(&f.log()), s(&ef), s(&rc));
     let o = f.start("w", true, &prog);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(read_file(&rc), "2");
+    assert_eq!(
+        read_file(&ef),
+        "harness: error: session id mismatch: launched w holds a different session id",
+        "the refusal names the mismatch and nothing else"
+    );
     assert_eq!(f.log_text().lines().count(), 1);
     assert!(f.sessions().contains("counted 1"));
 }
@@ -376,11 +381,17 @@ fn claim_by_unlaunched_process_is_unmanaged() {
     assert_eq!(code(&v), 0, "{}{}", out(&v), err(&v));
     assert!(f.sessions().contains("counted 1"));
     // a process started WITHOUT --worker claims: not a worker
-    let rc = f.r.join("rc");
-    let prog = format!("\"$BIN\" process claim {T} --session {OTHER} --dir {} --log {} >/dev/null 2>&1; echo $? > {}; sleep 30", s(&f.d), s(&f.log()), s(&rc));
+    let (rc, outf, ef) = (f.r.join("rc"), f.r.join("out"), f.r.join("err"));
+    let prog = format!("\"$BIN\" process claim {T} --session {OTHER} --dir {} --log {} >{} 2>{}; echo $? > {}; sleep 30", s(&f.d), s(&f.log()), s(&outf), s(&ef), s(&rc));
     let o = f.start("plain", false, &prog);
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert_eq!(read_file(&rc), "7");
+    assert_eq!(read_file(&outf), "unmanaged: not counted");
+    assert_eq!(
+        fs::read_to_string(&ef).unwrap_or_default(),
+        "",
+        "the unmanaged answer prints its line on stdout and nothing on stderr"
+    );
 }
 
 #[test]

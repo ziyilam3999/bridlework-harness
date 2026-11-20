@@ -2416,6 +2416,71 @@ fn parse_claim(a: &[String]) -> Result<ClaimArgs, String> {
     })
 }
 
+/// The decision of the claim walk: what the first matching pid of the chain decided.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimWalk {
+    /// The first matching entry holds this session: counted (entry id, session id).
+    Counted(String, String),
+    /// The first matching entry holds a different session: refusal 2, this text.
+    Mismatch(String),
+    /// No pid of the chain is a live worker entry of the ticket: exit 7, logged.
+    Unmanaged,
+    /// A read the decision needed could not be made: refusal 2, nothing written.
+    Unknown(String),
+}
+
+/// The claim walk, lazy: each pid of the chain (the claimant itself first, then at most
+/// ANCESTOR_BOUND parents) is matched when it is reached, and the next parent is read only while no
+/// decision is made. The entry a claim needs sits at the claimant or its first parent (the exec case,
+/// the sh -c case), so a /proc read of a pid ABOVE the deciding entry (an exiting start process the
+/// kernel already reaped) is not made and cannot refuse the claim. The pids, their order, the bound
+/// and the pid <= 1 stop are the walk claim always made; what changes is only WHEN each parent is
+/// read. `parent` and `probe` are the readers of the release build (`parent_of`, `probe_identity`);
+/// a fake exists only as an argument a unit test passes.
+fn walk_claim<PR, PB>(claimant: u64, live: &[manifest::Entry], session: &str, parent: PR, probe: PB) -> ClaimWalk
+where
+    PR: Fn(u64) -> Result<u64, String>,
+    PB: Fn(u64, u64) -> Identity,
+{
+    let mut pid = claimant;
+    let mut reads = 0;
+    loop {
+        if let Some(e) = live
+            .iter()
+            .find(|e| matches!(&e.target, Target::Process { pid: p, .. } if *p == pid))
+        {
+            let Target::Process { pid_start_ms, .. } = &e.target else {
+                continue;
+            };
+            match probe(pid, *pid_start_ms) {
+                Identity::Same => {
+                    return match &e.session {
+                        Some(sid) if sid == session => ClaimWalk::Counted(e.id.clone(), sid.clone()),
+                        Some(_) => ClaimWalk::Mismatch(format!(
+                            "session id mismatch: launched {} holds a different session id",
+                            e.id
+                        )),
+                        None => ClaimWalk::Unmanaged,
+                    };
+                }
+                // The number was re-used by another process: this pid is not the launch.
+                Identity::Reused => {}
+                Identity::Unknown(why) => return ClaimWalk::Unknown(why),
+            }
+        }
+        if reads == ANCESTOR_BOUND {
+            return ClaimWalk::Unmanaged;
+        }
+        reads += 1;
+        match parent(pid) {
+            // A parent at or below 1 ends the chain here; that parent is not matched.
+            Ok(p) if p > 1 => pid = p,
+            Ok(_) => return ClaimWalk::Unmanaged,
+            Err(e) => return ClaimWalk::Unknown(e),
+        }
+    }
+}
+
 /// `harness process claim <ticket> --session <uuid>` (#3706): a process says "I am this ticket's worker, my
 /// session id is <uuid>". The claimant is identified by OS ancestry (itself, then up to 32 parents), never by an
 /// argument: the first pid that is a live `process` entry of the ticket AND passes the recorded start-time
@@ -2439,50 +2504,23 @@ fn claim_cmd(a: &[String]) -> i32 {
     if !read.is_clean() {
         return fail(&damage_msg(&read));
     }
-    // The chain: self first (a shell that exec'd the claim IS the entry's pid), then at most 32 parents.
-    let mut chain: Vec<u64> = vec![std::process::id() as u64];
-    while chain.len() <= ANCESTOR_BOUND {
-        let last = *chain.last().expect("the chain holds at least the claimant");
-        let parent = match parent_of(last) {
-            Ok(p) => p,
-            Err(e) => return fail(&format!("claim is unknown, nothing written: {e}")),
-        };
-        if parent <= 1 {
-            break;
+    // The chain: self first (a shell that exec'd the claim IS the entry's pid), then at most 32
+    // parents, each one matched as it is reached.
+    match walk_claim(
+        std::process::id() as u64,
+        &read.live,
+        &args.session,
+        parent_of,
+        probe_identity,
+    ) {
+        ClaimWalk::Counted(id, sid) => {
+            println!("counted {id} {sid}");
+            0
         }
-        chain.push(parent);
+        ClaimWalk::Mismatch(text) => fail(&text),
+        ClaimWalk::Unmanaged => unmanaged(&args),
+        ClaimWalk::Unknown(why) => fail(&format!("claim is unknown, nothing written: {why}")),
     }
-    for pid in chain {
-        let Some(e) = read
-            .live
-            .iter()
-            .find(|e| matches!(&e.target, Target::Process { pid: p, .. } if *p == pid))
-        else {
-            continue;
-        };
-        let Target::Process { pid_start_ms, .. } = &e.target else {
-            continue;
-        };
-        match probe_identity(pid, *pid_start_ms) {
-            Identity::Same => {}
-            Identity::Reused => continue,
-            Identity::Unknown(why) => {
-                return fail(&format!("claim is unknown, nothing written: {why}"))
-            }
-        }
-        return match &e.session {
-            Some(sid) if *sid == args.session => {
-                println!("counted {} {}", e.id, sid);
-                0
-            }
-            Some(_) => fail(&format!(
-                "session id mismatch: launched {} holds a different session id",
-                e.id
-            )),
-            None => unmanaged(&args),
-        };
-    }
-    unmanaged(&args)
 }
 
 fn unmanaged(args: &ClaimArgs) -> i32 {
@@ -3119,5 +3157,232 @@ mod prestage_tests {
         let mut c = c_shared.lock().unwrap();
         let _ = c.kill();
         let _ = c.wait();
+    }
+}
+
+// ---------------------------------------------------------------- claim walk (tests)
+
+/// The claim walk of #claim-walk-vanished-ancestor: each test drives `walk_claim` (the release build
+/// calls it with `parent_of` and `probe_identity`; the fakes here are arguments, so nothing in a
+/// release build reads one) through a table of parent answers and a table of identity answers. The
+/// two RED cases pin the lazy walk itself: with the whole chain built before the first match (the
+/// walk this ticket replaces), a vanished ancestor ABOVE the deciding entry refuses a launched
+/// worker's claim. Every other case pins a rule that stays as it was, red only if that rule moves.
+#[cfg(test)]
+mod claim_walk_tests {
+    use super::*;
+
+    const SID: &str = "11111111-2222-4333-8444-555555555555";
+    const OTHER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    /// The claimant of every case; its parent (when the chain goes on) is 4200.
+    const ME: u64 = 4100;
+    const PARENT: u64 = 4200;
+
+    fn process_entry(id: &str, pid: u64, session: Option<&str>) -> manifest::Entry {
+        manifest::Entry {
+            id: id.to_string(),
+            class: Class::Process,
+            target: Target::Process { pid, pid_start_ms: 1730000000000 },
+            limit: None,
+            session: session.map(str::to_string),
+        }
+    }
+
+    /// A fake parent reader from a pid -> answer table. A pid NOT in the table answers a fresh,
+    /// far-away parent, so an Err a test lists is the only vanished ancestor of the case.
+    fn reader(table: &[(u64, Result<u64, String>)]) -> impl Fn(u64) -> Result<u64, String> + '_ {
+        move |pid| {
+            table
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, r)| r.clone())
+                .unwrap_or(Ok(pid + 100_000))
+        }
+    }
+
+    /// A fake identity probe: the pids answered Reused and Unknown, every other pid Same.
+    fn probe<'a>(reused: &'a [u64], unknown: &'a [u64]) -> impl Fn(u64, u64) -> Identity + 'a {
+        move |pid, _| {
+            if unknown.contains(&pid) {
+                Identity::Unknown(format!("cannot read the start time of pid {pid}"))
+            } else if reused.contains(&pid) {
+                Identity::Reused
+            } else {
+                Identity::Same
+            }
+        }
+    }
+
+    /// The exec case: the claimant IS the launched pid, and the pid above the claimant is already
+    /// reaped (the reader errs on it). RED: a walk that builds the whole chain before the first
+    /// match reads the claimant's parent, meets the Err, and refuses a counted claim.
+    #[test]
+    fn supervisor_claim_walk_exec_case_decides_before_any_parent_read() {
+        let live = vec![process_entry("w", ME, Some(SID))];
+        let vanished: Vec<(u64, Result<u64, String>)> =
+            vec![(ME, Err("cannot read the parent of pid 4100: noent".to_string()))];
+        let r = walk_claim(ME, &live, SID, reader(&vanished), probe(&[], &[]));
+        assert_eq!(
+            r,
+            ClaimWalk::Counted("w".to_string(), SID.to_string()),
+            "the claimant itself is the deciding entry: no parent read is made"
+        );
+    }
+
+    /// The sh -c case: the launched pid is the claimant's parent, and every pid above THAT entry is
+    /// reaped. RED: a walk that builds the whole chain first reads past the parent, meets an Err,
+    /// and refuses a counted claim.
+    #[test]
+    fn supervisor_claim_walk_shell_case_decides_before_reading_above_the_entry() {
+        let live = vec![process_entry("w", PARENT, Some(SID))];
+        let vanished: Vec<(u64, Result<u64, String>)> = vec![
+            (ME, Ok(PARENT)),
+            (PARENT, Err("cannot read the parent of pid 4200: noent".to_string())),
+            (4300, Err("cannot read the parent of pid 4300: noent".to_string())),
+        ];
+        let r = walk_claim(ME, &live, SID, reader(&vanished), probe(&[], &[]));
+        assert_eq!(
+            r,
+            ClaimWalk::Counted("w".to_string(), SID.to_string()),
+            "one parent read reaches the deciding entry; no read above it is made"
+        );
+    }
+
+    /// The deciding entry sits at the claimant's parent, and THAT read fails: the read the decision
+    /// needs refuses with Unknown, so claim answers 2 ("claim is unknown, nothing written: ..." plus
+    /// this text) — the fail-closed rule below the entry, unchanged by this ticket.
+    #[test]
+    fn supervisor_claim_walk_unreadable_parent_below_the_entry_is_unknown() {
+        let live = vec![process_entry("w", PARENT, Some(SID))];
+        let vanished: Vec<(u64, Result<u64, String>)> =
+            vec![(ME, Err("cannot read the parent of pid 4100: noent".to_string()))];
+        let r = walk_claim(ME, &live, SID, reader(&vanished), probe(&[], &[]));
+        assert_eq!(
+            r,
+            ClaimWalk::Unknown("cannot read the parent of pid 4100: noent".to_string()),
+            "the parent read the decision needs is a refusal, not a guess"
+        );
+    }
+
+    /// No entry anywhere and a parent read that fails before any match: Unknown, so claim answers 2
+    /// and writes no unmanaged_session record against a process that may be a real worker.
+    #[test]
+    fn supervisor_claim_walk_no_entry_and_unreadable_parent_is_unknown() {
+        let vanished: Vec<(u64, Result<u64, String>)> =
+            vec![(ME, Err("cannot read the parent of pid 4100: noent".to_string()))];
+        let r = walk_claim(ME, &[], SID, reader(&vanished), probe(&[], &[]));
+        assert_eq!(
+            r,
+            ClaimWalk::Unknown("cannot read the parent of pid 4100: noent".to_string()),
+            "an unreadable chain with no match is unknown, not unmanaged"
+        );
+    }
+
+    /// The FIRST matching entry decides: a mismatch at the claimant wins over a matching session one
+    /// parent up.
+    #[test]
+    fn supervisor_claim_walk_the_first_matching_entry_decides() {
+        let live = vec![process_entry("w", ME, Some(OTHER)), process_entry("w2", PARENT, Some(SID))];
+        let r = walk_claim(ME, &live, SID, reader(&[(ME, Ok(PARENT))]), probe(&[], &[]));
+        assert_eq!(
+            r,
+            ClaimWalk::Mismatch(
+                "session id mismatch: launched w holds a different session id".to_string()
+            ),
+            "the first matching entry decides, the entry above it is not consulted"
+        );
+    }
+
+    /// A matching entry with no session (a plain start, not a worker) is unmanaged even when a
+    /// worker entry sits above it in the chain.
+    #[test]
+    fn supervisor_claim_walk_an_entry_without_a_session_is_unmanaged() {
+        let live = vec![process_entry("plain", ME, None), process_entry("w", PARENT, Some(SID))];
+        let r = walk_claim(ME, &live, SID, reader(&[(ME, Ok(PARENT))]), probe(&[], &[]));
+        assert_eq!(r, ClaimWalk::Unmanaged, "a plain start is not a worker launch");
+    }
+
+    /// A Reused identity does not decide: the walk reads a parent and goes on to the real entry.
+    #[test]
+    fn supervisor_claim_walk_a_reused_pid_number_is_not_the_launch() {
+        let live = vec![process_entry("w", ME, Some(SID)), process_entry("w2", PARENT, Some(SID))];
+        let r = walk_claim(ME, &live, SID, reader(&[(ME, Ok(PARENT))]), probe(&[ME], &[]));
+        assert_eq!(
+            r,
+            ClaimWalk::Counted("w2".to_string(), SID.to_string()),
+            "the walk goes past a re-used pid number and reads the parent"
+        );
+    }
+
+    /// An identity probe that cannot read the start time at the matching pid: Unknown, so claim
+    /// answers 2 with the probe's text — the read the decision needs, unchanged.
+    #[test]
+    fn supervisor_claim_walk_an_unreadable_start_time_is_unknown() {
+        let live = vec![process_entry("w", ME, Some(SID))];
+        let r = walk_claim(ME, &live, SID, reader(&[]), probe(&[], &[ME]));
+        assert_eq!(
+            r,
+            ClaimWalk::Unknown("cannot read the start time of pid 4100".to_string()),
+            "an inconclusive identity is a refusal, not a count"
+        );
+    }
+
+    /// The bound: an entry at the 33rd pid (32 parent reads) is counted; an entry one position
+    /// further is past the bound, the chain is not extended, and the claim is unmanaged.
+    #[test]
+    fn supervisor_claim_walk_the_bound_reaches_the_33rd_pid() {
+        let ladder: Vec<(u64, Result<u64, String>)> =
+            (0..32).map(|i| (ME + i, Ok(ME + i + 1))).collect();
+        let at_bound = walk_claim(
+            ME,
+            &[process_entry("w", ME + 32, Some(SID))],
+            SID,
+            reader(&ladder),
+            probe(&[], &[]),
+        );
+        assert_eq!(
+            at_bound,
+            ClaimWalk::Counted("w".to_string(), SID.to_string()),
+            "the 33rd pid of the chain (32 reads) is still matched"
+        );
+        let past = walk_claim(
+            ME,
+            &[process_entry("w", ME + 33, Some(SID))],
+            SID,
+            reader(&ladder),
+            probe(&[], &[]),
+        );
+        assert_eq!(past, ClaimWalk::Unmanaged, "the 34th position needs a 33rd read: the bound stops the walk");
+    }
+
+    /// A parent cycle (A to B to A) with no entry: the bound ends the walk, so it finishes instead
+    /// of spinning.
+    #[test]
+    fn supervisor_claim_walk_a_parent_cycle_ends_at_the_bound() {
+        let r = walk_claim(
+            ME,
+            &[],
+            SID,
+            reader(&[(ME, Ok(PARENT)), (PARENT, Ok(ME))]),
+            probe(&[], &[]),
+        );
+        assert_eq!(r, ClaimWalk::Unmanaged, "a cycle is walked to the bound, then unmanaged");
+    }
+
+    /// A parent answer of 1 (and of 0) ends the chain: that parent is not itself matched, so even a
+    /// session entry sitting at pid 1 does not turn the claim into a count.
+    #[test]
+    fn supervisor_claim_walk_pid_one_is_not_matched() {
+        let live = vec![process_entry("w", 1, Some(SID))];
+        assert_eq!(
+            walk_claim(ME, &live, SID, reader(&[(ME, Ok(1))]), probe(&[], &[])),
+            ClaimWalk::Unmanaged,
+            "a parent of 1 ends the chain"
+        );
+        assert_eq!(
+            walk_claim(ME, &live, SID, reader(&[(ME, Ok(0))]), probe(&[], &[])),
+            ClaimWalk::Unmanaged,
+            "a parent of 0 ends the chain"
+        );
     }
 }
