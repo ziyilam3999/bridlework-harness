@@ -932,6 +932,11 @@ fn a_missing_ledger_folder_is_made_with_mode_0700() {
     assert!(fs::read_dir(&j.ledger).unwrap().count() == 0);
 }
 
+// --text and --why that put the request over 199999 bytes, each argument under the 131072-byte argv bound.
+fn over_cap_pad() -> (String, String) {
+    (format!("cache {}", "x".repeat(130000)), format!("cause {}", "y".repeat(130000)))
+}
+
 #[test]
 fn the_checks_before_the_run_run_in_order() {
     let fence: String = ["`", "`", "`"].concat();
@@ -947,17 +952,18 @@ fn the_checks_before_the_run_run_in_order() {
         row("o-2", "2026-11-02", "", "other mko2", &[]),
         row("o-3", "2026-11-03", "", "third mko3", &[]),
     ];
-    let text = format!("cache {}", "x".repeat(200500));
+    let (text, why) = over_cap_pad();
+    let q = ["--text", text.as_str(), "--why", why.as_str()];
     let cfg = j.t.config();
     j.t.write_inbox(&rows);
     let mut c = base();
     c.env("HARNESS_PRIVACY_LIST", p(&phrase_list))
         .env_remove("HARNESS_PRIVACY_LIST_SECRET")
         .env("TMPDIR", p(&j.tmproot))
-        .args(["friction", "suggest", "--text", &text, "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
+        .args(["friction", "suggest", q[0], q[1], q[2], q[3], "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_jev(&j.t, &rows, &["--text", &text], &[], &o, "jev: skipped reason=payload\n");
+    assert_jev(&j.t, &rows, &q, &[], &o, "jev: skipped reason=payload\n");
     assert!(!j.ran());
     // the scan hit beats a missing key file.
     let j = J::new("answer");
@@ -978,8 +984,12 @@ fn the_checks_before_the_run_run_in_order() {
     assert_skip_before_run(&j, &[row("solo-1", "2026-11-01", "", "cache solo", &[])], &["--text", &format!("cache {fence}")], &[], "code-skipped", false);
     // an inbox of one group beats a request that would be over the cap.
     let j = J::new("answer");
-    let text = format!("cache {}", "x".repeat(200500));
-    assert_skip_before_run(&j, &[row("solo-1", "2026-11-01", "", "cache solo", &[])], &["--text", &text], &[], "no-candidates", false);
+    let (text, why) = over_cap_pad();
+    let q = ["--text", text.as_str(), "--why", why.as_str()];
+    assert_skip_before_run(&j, &[row("solo-1", "2026-11-01", "", "cache solo", &[])], &q, &[], "no-candidates", false);
+    // The same query over three groups is over the cap, so the order is what gave no-candidates.
+    let j = J::new("answer");
+    assert_skip_before_run(&j, &rows3(), &q, &[], "payload", false);
     // a missing key file beats a ledger path that is a file.
     let j = J::new("answer");
     fs::remove_file(&j.key).unwrap();
