@@ -1,8 +1,8 @@
 //! `harness plan check|status` (std only, no cfg(unix); it does not use launcher.rs or ticket_gate.rs). It reads three private
 //! inputs passed by path: the plan index (`plan_index.rs`), the folder of ticket files (`<id>.json`) and the folder of done records
-//! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
+//! (`<id>.done`, first line `ticket=<id>`); `check` with `--plan`, `--base-plan` and `--base-index` also reads two plan files and a base index. `check` is red when the index and the finished tickets disagree (a built row with no
 //! done ticket, a done ticket with no row and no reason, an incomplete deviation or dropped row, a repeated id, an unknown
-//! state); a dropped row (a recorded decision not to build it) is not open and needs no estimate; `status`
+//! state, or, in the three-input form, a row's line that changed at an unchanged plan_line); a dropped row (a recorded decision not to build it) is not open and needs no estimate; `status`
 //! reports rows per state and progress weighted by size (S=1, M=3, L=9); progress counts linked tickets. In whole-index
 //! status the last line `progress-estimated` adds the optional `left_estimate` of open rows; in whole-index check an open row
 //! with no estimate is red. Both read only. They read links and states, not code.
@@ -16,11 +16,22 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-pub const USAGE: &str = "usage: harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>]";
+pub const USAGE: &str = "usage: harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>] [--plan <absolute-file> --base-plan <absolute-file> --base-index <absolute-file>]";
 
 const MAX_TICKET_BYTES: u64 = 1024 * 1024 + 1;
 const DONE_READ_CAP: u64 = 256;
 const DECIDERS: [&str; 2] = ["operator", "orchestrator-reading"];
+/// Largest plan file read, in bytes.
+const MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
+/// Characters of a plan line that are compared.
+const LINE_CHARS: usize = 40;
+
+/// The three paths of the plan-line comparison: head plan, base plan, base index.
+struct CmpArgs {
+    plan: PathBuf,
+    base_plan: PathBuf,
+    base_index: PathBuf,
+}
 
 struct Args {
     check: bool,
@@ -28,6 +39,7 @@ struct Args {
     tickets: PathBuf,
     done: PathBuf,
     ticket: Option<String>,
+    cmp: Option<CmpArgs>,
 }
 
 /// A ticket id or a file stem: the link element rule, not starting with a dot, no two dots in a row.
@@ -48,6 +60,7 @@ fn parse_args(a: &[String]) -> Option<Args> {
         _ => return None,
     };
     let (mut index, mut tickets, mut done, mut ticket): (Option<&String>, Option<&String>, Option<&String>, Option<&String>) = (None, None, None, None);
+    let (mut plan, mut base_plan, mut base_index): (Option<&String>, Option<&String>, Option<&String>) = (None, None, None);
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
         let slot = match flag.as_str() {
@@ -55,6 +68,9 @@ fn parse_args(a: &[String]) -> Option<Args> {
             "--tickets" => &mut tickets,
             "--done" => &mut done,
             "--ticket" => &mut ticket,
+            "--plan" => &mut plan,
+            "--base-plan" => &mut base_plan,
+            "--base-index" => &mut base_index,
             _ => return None,
         };
         let v = it.next()?;
@@ -66,7 +82,15 @@ fn parse_args(a: &[String]) -> Option<Args> {
     if ![index, tickets, done].iter().all(|p| abs_ok(p)) || ticket.is_some_and(|t| !name_ok(t)) {
         return None;
     }
-    Some(Args { check, index: index.into(), tickets: tickets.into(), done: done.into(), ticket: ticket.cloned() })
+    // The three comparison options go together, with check and no --ticket.
+    let cmp = match (plan, base_plan, base_index) {
+        (None, None, None) => None,
+        (Some(p), Some(b), Some(i)) if check && ticket.is_none() && [p, b, i].iter().all(|x| abs_ok(x)) => {
+            Some(CmpArgs { plan: p.into(), base_plan: b.into(), base_index: i.into() })
+        }
+        _ => return None,
+    };
+    Some(Args { check, index: index.into(), tickets: tickets.into(), done: done.into(), ticket: ticket.cloned(), cmp })
 }
 
 /// One refusal text: the file name is shown only when it follows the id rule.
@@ -216,6 +240,73 @@ fn open_no_estimate(r: &Row) -> bool {
     matches!(r.state, State::NotBuilt | State::InBuild) && r.left_estimate.is_none()
 }
 
+/// The inputs of the plan-line comparison, read.
+struct Cmp {
+    base_rows: Vec<Row>,
+    head_lines: Vec<String>,
+    base_lines: Vec<String>,
+}
+
+/// One plan file as text, or the reason it is refused.
+fn read_plan(path: &Path) -> Result<String, &'static str> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err("is not a regular file"),
+        Err(_) => return Err("is missing or cannot be read"),
+    }
+    let mut bytes = Vec::new();
+    if std::fs::File::open(path).and_then(|f| f.take(MAX_PLAN_BYTES + 1).read_to_end(&mut bytes)).is_err() {
+        return Err("cannot be read");
+    }
+    if bytes.len() as u64 > MAX_PLAN_BYTES {
+        return Err("is over 16777216 bytes");
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "is not valid UTF-8")?;
+    if text.is_empty() {
+        return Err("is empty");
+    }
+    Ok(text)
+}
+
+/// Lines end at LF; a final LF adds no empty last line.
+fn plan_lines(text: &str) -> Vec<String> {
+    let mut v: Vec<&str> = text.split('\n').collect();
+    if v.last().is_some_and(|l| l.is_empty()) {
+        v.pop();
+    }
+    v.into_iter().map(str::to_string).collect()
+}
+
+/// Read the base index, the head plan file and the base plan file, in this order, then the same-file refusal.
+fn read_cmp(c: &CmpArgs) -> Result<Cmp, String> {
+    let base_rows = plan_index::read(&c.base_index).map_err(|e| format!("base plan index: {e}"))?;
+    if !plan_index::repeated_ids(&base_rows).is_empty() {
+        return Err("base plan index: an id is on more than one row".to_string());
+    }
+    let head = read_plan(&c.plan).map_err(|e| format!("plan file: {e}"))?;
+    let base = read_plan(&c.base_plan).map_err(|e| format!("base plan file: {e}"))?;
+    match (std::fs::canonicalize(&c.plan), std::fs::canonicalize(&c.base_plan)) {
+        (Ok(a), Ok(b)) if a == b => return Err("plan file: is the same file as the base plan file".to_string()),
+        _ => {}
+    }
+    Ok(Cmp { base_rows, head_lines: plan_lines(&head), base_lines: plan_lines(&base) })
+}
+
+/// The first 40 characters of a line, after a trailing run of CR, space and tab is dropped.
+fn key(l: &str) -> impl Iterator<Item = char> + '_ {
+    l.trim_end_matches(['\r', ' ', '\t']).chars().take(LINE_CHARS)
+}
+
+/// None when the row is not compared (no base row with the same id and plan_line); else whether its line is stale.
+fn line_stale(c: &Cmp, r: &Row) -> Option<bool> {
+    c.base_rows.iter().find(|b| b.id == r.id && b.plan_line == r.plan_line)?;
+    let at = |lines: &[String]| usize::try_from(r.plan_line).ok().and_then(|n| n.checked_sub(1)).and_then(|i| lines.get(i).cloned());
+    Some(match (at(&c.base_lines), at(&c.head_lines)) {
+        (Some(b), Some(h)) => !key(&b).eq(key(&h)),
+        _ => true,
+    })
+}
+
 fn red(findings: &[String]) -> i32 {
     for f in findings {
         println!("{f}");
@@ -224,9 +315,10 @@ fn red(findings: &[String]) -> i32 {
     1
 }
 
-fn check(inp: &Inputs) -> i32 {
+fn check(inp: &Inputs, cmp: Option<&Cmp>) -> i32 {
     let (rows, tickets) = (&inp.rows, &inp.tickets);
     let mut f: Vec<String> = Vec::new();
+    let mut compared = 0usize;
     for (i, r) in rows.iter().enumerate() {
         if second_of_id(rows, i) {
             f.push(format!("red duplicate-id {}", r.id));
@@ -244,6 +336,12 @@ fn check(inp: &Inputs) -> i32 {
         if open_no_estimate(r) {
             f.push(format!("red open-row-no-estimate {}", r.id));
         }
+        if let Some(stale) = cmp.and_then(|c| line_stale(c, r)) {
+            compared += 1;
+            if stale {
+                f.push(format!("red plan-line-stale {}", r.id));
+            }
+        }
     }
     for t in tickets {
         for el in t.main_plan_ref.iter().flatten().filter(|el| !rows.iter().any(|r| &r.id == *el)) {
@@ -258,7 +356,8 @@ fn check(inp: &Inputs) -> i32 {
     }
     if f.is_empty() {
         let done = tickets.iter().filter(|t| inp.done.contains(&t.id)).count();
-        println!("plan check ok rows={} tickets={} done={}", rows.len(), tickets.len(), done);
+        let tail = if cmp.is_some() { format!(" compared={compared}") } else { String::new() };
+        println!("plan check ok rows={} tickets={} done={}{tail}", rows.len(), tickets.len(), done);
         0
     } else {
         red(&f)
@@ -472,7 +571,7 @@ fn stale_args(a: &[String]) -> Option<(Args, Vec<String>)> {
     if files.is_empty() || ![index, tickets, done].iter().all(|p| abs_ok(p)) {
         return None;
     }
-    Some((Args { check: true, index: index.into(), tickets: tickets.into(), done: done.into(), ticket: None }, files))
+    Some((Args { check: true, index: index.into(), tickets: tickets.into(), done: done.into(), ticket: None, cmp: None }, files))
 }
 
 /// One named file as text, or the reason it is refused.
@@ -579,8 +678,16 @@ pub fn plan_cmd(a: &[String]) -> i32 {
         },
         None => None,
     };
+    let cmp = match args.cmp.as_ref().map(read_cmp) {
+        Some(Ok(c)) => Some(c),
+        Some(Err(e)) => {
+            eprintln!("harness: error: {e}");
+            return 2;
+        }
+        None => None,
+    };
     match (args.check, one) {
-        (true, None) => check(&inp),
+        (true, None) => check(&inp, cmp.as_ref()),
         (true, Some(t)) => check_ticket(&inp, t),
         (false, None) => status(&inp),
         (false, Some(t)) => status_ticket(&inp, t),

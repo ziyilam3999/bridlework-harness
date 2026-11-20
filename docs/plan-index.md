@@ -62,10 +62,16 @@ Without `--plan-index`, no link is required and none is checked against an index
 ## plan check and plan status
 
 ```
-harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>]
+harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>] [--plan <absolute-file> --base-plan <absolute-file> --base-index <absolute-file>]
 ```
 
-`--index`, `--tickets` and `--done` are required, each once. `--ticket` is optional, at most once, and its value follows the id rule below. An unknown flag, a flag with no value, a flag given twice, a path that is not absolute or holds a `..` part, a bad `--ticket` value, a missing subcommand or any other word: exit 2, the usage line on stderr, stdout empty. Both subcommands read only. The code is `core/rust/harness/src/plan.rs`.
+`--index`, `--tickets` and `--done` are required, each once. `--ticket` is optional, at most once, and its value follows the id rule below.
+
+- `--plan <absolute-file>`: the head plan file.
+- `--base-plan <absolute-file>`: the base plan file.
+- `--base-index <absolute-file>`: the base index (`--index` stays the head index).
+
+The three go with `check` only, not with `--ticket` and not with `status`; they are given all three or none, each once. Any other set is a usage error. An unknown flag, a flag with no value, a flag given twice, a path that is not absolute or holds a `..` part, a bad `--ticket` value, a missing subcommand or any other word: exit 2, the usage line on stderr, stdout empty. Both subcommands read only. The code is `core/rust/harness/src/plan.rs`.
 
 ### Inputs
 
@@ -82,19 +88,28 @@ A ticket links to a row when its `main_plan_ref` names the row id, or the row li
 
 ### plan check
 
-One stdout line per finding, `red <class> <id>`, then the last line `plan check red findings=<n>` and exit 1. Order: rows in index order, then tickets in byte order of the id, then done records in byte order of the name without `.done`. With no finding: one line `plan check ok rows=<n> tickets=<n> done=<n>` and exit 0. Stderr is empty.
+One stdout line per finding, `red <class> <id>`, then the last line `plan check red findings=<n>` and exit 1. Order: rows in index order, then tickets in byte order of the id, then done records in byte order of the name without `.done`. With no finding: one line `plan check ok rows=<n> tickets=<n> done=<n>` and exit 0; with the three plan-line inputs the line ends with ` compared=<c>`, the count of compared rows. Stderr is empty.
+
+**Plan-line rule** (three-input form). For each head row, in index order, that has a base row with the same id and the same `plan_line`, the line at that number (first line is 1) is read from the base plan file and the head plan file. Lines end at LF; a final LF adds no empty last line. From each line a trailing run of CR, space and tab is dropped, then the first 40 characters (Unicode characters, not bytes) are compared. A difference, or a line number that is 0 or past the end of either file, is red `plan-line-stale <row id>`, printed after the other findings of that row.
 
 | Class | Meaning |
 |---|---|
 | `duplicate-id <row id>` | an id on more than one row; named once, at its second row |
 | `unknown-state <row id>` | state `unknown` (fail closed: unknown is not a pass) |
-| `open-row-no-estimate <row id>` | state `not-built` or `in-build` and no `left_estimate` key (fail closed: a missing number is not zero; `0` passes); whole-index mode only, named after the other findings of the same row, once per sighting |
+| `open-row-no-estimate <row id>` | state `not-built` or `in-build` and no `left_estimate` key (fail closed: a missing number is not zero; `0` passes); whole-index mode only, named after the other findings of the same row except `plan-line-stale`, which comes after it, once per sighting |
+| `plan-line-stale <row id>` | three-input form only: the line at the row's `plan_line` differs between the base and head plan files in its first 40 characters, or is missing in either file |
 | `built-no-done-ticket <row id>` | state `built` and no linked ticket has a done record (a listed ticket with no ticket file does not count) |
 | `deviation-no-reason`, `deviation-no-decided-by`, `deviation-no-date <row id>` | state `deviation` or `dropped` and that key missing, empty or blanks only, or the `deviation` null |
 | `deviation-bad-decided-by <row id>` | `decided_by` is given and is not `operator` or `orchestrator-reading` |
 | `ticket-names-unknown-row <ticket id> <element>` | a `main_plan_ref` element that is not an index id, on any ticket |
 | `done-ticket-no-row <ticket id>` | a done ticket with no `off_plan` and no linked row |
 | `done-record-no-ticket <name>` | a `.done` file with no ticket file |
+
+Refusals of the three-input form (exit 2, stdout empty, one stderr line, no path and no file content). Read order: the `--index`, `--tickets` and `--done` inputs above, then the base index, the head plan file, the base plan file, then the same-file check; the first refusal is printed.
+
+- `harness: error: base plan index: <reason>`: the reasons of the index reader above; also `harness: error: base plan index: an id is on more than one row`.
+- `harness: error: plan file: <what>` for `--plan` and `harness: error: base plan file: <what>` for `--base-plan`, with `<what>` one of `is missing or cannot be read`, `is not a regular file`, `cannot be read`, `is over 16777216 bytes` (16777216 bytes is read), `is not valid UTF-8`, `is empty`. A symlink to a regular file is read.
+- `harness: error: plan file: is the same file as the base plan file`: both paths are the same path after symbolic links are resolved. A hard link to the base plan file, or two files with equal bytes, is not refused.
 
 ### Ticket mode
 
@@ -169,3 +184,4 @@ Known gaps:
 - The `progress` line still counts a ticket linked to a dropped row.
 - An engine binary older than this change refuses an index with a dropped row (exit 2), so a row is set to `dropped` only after the bw engine binary is rebuilt.
 - An `off_plan` reason is not judged.
+- Plan-line check: a row added, removed or moved (a changed `plan_line`) is not compared; an edit after character 40 of a line is not seen; a base index with no row of the same id and `plan_line` as a head row gives `compared=0`, and the exit is 0 when no other finding is red; no program calls the three new inputs yet, so a person runs the verb by hand on the two revisions; whole-index check can be red for other classes, so a caller reads the `plan-line-stale` lines, not the exit code.
