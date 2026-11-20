@@ -1,6 +1,6 @@
 //! Ticket friction-suggest-jev: the Jev arm of `harness friction suggest`. The real binary runs as a child on a
-//! scratch inbox with a fake send program (one fixture script, many cases); every row, key, needle and answer is
-//! synthetic, and every privacy needle is assembled from fragments at run time.
+//! scratch inbox with a fake send program (one fixture script, many cases); each row, key, needle and answer is
+//! synthetic, and each privacy needle is assembled from fragments at run time.
 #![cfg(unix)]
 mod friction_common;
 use friction_common::*;
@@ -1026,7 +1026,7 @@ fn the_child_environment_is_cleared_but_for_the_named_values() {
 }
 
 #[test]
-fn path_home_and_lang_pass_through_and_lc_all_does_not() {
+fn path_home_and_lang_pass_through_and_an_unset_lc_all_is_not_made() {
     let j = J::new("answer");
     j.t.write_inbox(&rows3());
     let mut c = jev_cmd(&j);
@@ -1171,7 +1171,7 @@ fn a_signal_end_is_send_signal() {
 }
 
 #[test]
-fn nothing_of_the_program_output_reaches_the_verb_streams() {
+fn a_marker_in_the_program_output_reaches_neither_verb_stream() {
     let marker = "ZZMARKERZZ";
     let j = J::new("exit10");
     j.stderr_text(&format!("{marker}\nsend.sh: HTTP 500\n"));
@@ -1588,19 +1588,47 @@ fn a_pick_appends_the_second_record_line() {
     assert_eq!(fs::read_to_string(&rec).unwrap().lines().count(), 4);
 }
 
+/// A pick whose answer holds the given raw usage.cost value: the second record line must book the estimate.
+fn assert_bad_usage_cost_books_the_estimate(cost: &str) {
+    let j = J::new("answer");
+    let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
+    j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], Some(&format!("\"cost\":{cost}"))));
+    let rec = j.t.0.join("suggest.jsonl");
+    let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let body = fs::read_to_string(&rec).unwrap();
+    assert!(body.contains("\"cost_usd\":0.001400"), "{cost}: {body}");
+    assert!(body.contains(&format!("\"letter\":\"{letter}\"")), "{cost}: {body}");
+}
+
 #[test]
-fn a_bad_usage_cost_books_the_estimate() {
-    for cost in ["\"0.5\"", "1e999", "7"] {
-        let j = J::new("answer");
-        let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
-        j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], Some(&format!("\"cost\":{cost}"))));
-        let rec = j.t.0.join("suggest.jsonl");
-        let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
-        assert_eq!(code(&o), 0, "{}", err(&o));
-        let body = fs::read_to_string(&rec).unwrap();
-        assert!(body.contains("\"cost_usd\":0.001400"), "{cost}: {body}");
-        assert!(body.contains(&format!("\"letter\":\"{letter}\"")), "{cost}: {body}");
-    }
+fn a_usage_cost_given_as_a_text_books_the_estimate() {
+    assert_bad_usage_cost_books_the_estimate("\"0.5\"");
+}
+
+#[test]
+fn a_usage_cost_of_1e999_books_the_estimate() {
+    assert_bad_usage_cost_books_the_estimate("1e999");
+}
+
+#[test]
+fn a_usage_cost_of_7_books_the_estimate() {
+    assert_bad_usage_cost_books_the_estimate("7");
+}
+
+#[test]
+fn a_bad_answer_with_a_good_usage_cost_books_that_cost() {
+    let j = J::new("answer");
+    // The letter C is missing from probabilities: bad-answer; usage.cost is a good number, so it is booked.
+    j.answer(&answer_json(&[("A", "0.9"), ("B", "0.1")], Some("\"cost\":0.000145194")));
+    let rec = j.t.0.join("suggest.jsonl");
+    let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    let body = fs::read_to_string(&rec).unwrap();
+    let second = body.lines().nth(1).unwrap();
+    assert!(second.contains("\"status\":\"skipped\",\"reason\":\"bad-answer\""), "{second}");
+    assert!(second.contains("\"p\":null,\"cost_usd\":0.000145,"), "{second}");
 }
 
 #[test]

@@ -2,10 +2,11 @@
 //!
 //! The caller has a lesson text (and maybe a cause) it is about to file; this verb says which existing groups it
 //! looks most like, so the new row can be filed with `--breaks <row id>` (or left alone). It is read-only on the
-//! inbox, pure given the inbox and the query, and prints ids and numbers only: no row text ever reaches stdout.
-//! With no `--jev` flag the verb is free: no model, no network. With `--jev-send <program>` the Jev arm (all of
-//! it in `friction_suggest_jev`) sends the cleaned query and cleaned candidate rows to that program only; the
-//! engine itself opens no socket and reads no key file.
+//! inbox; with no `--jev` flag it is pure given the inbox and the query; it prints ids, numbers and (with the Jev
+//! arm) one reason token: no row text reaches stdout.
+//! With no `--jev` flag the verb is free: no model, no network. With `--jev-send <program>` the Jev arm (its flag
+//! checks and candidate list are here, the rest is in `friction_suggest_jev`) sends the cleaned query and
+//! cleaned candidate rows to that program only; the engine itself opens no socket and reads no key file.
 //!
 //! The score, exactly (the contract is `docs/friction-inbox.md`):
 //! * a token is a run of `[a-z0-9]` in the lowercased text after `f-YYYYMMDD-NN`, `issue-N` and `#N` are removed,
@@ -314,7 +315,7 @@ pub fn suggest_cmd(rest: &[String], testmode: bool) -> i32 {
         })
         .collect();
     found.truncate(top);
-    // The record is appended BEFORE anything is printed (a failed append is a clean exit 2, empty stdout).
+    // The first record line is appended BEFORE anything is printed (a failed append is a clean exit 2, empty stdout).
     // The clock is read once: the Jev arm's second line reuses the same ts.
     let mut ts: Option<String> = None;
     if let Some(path) = record {

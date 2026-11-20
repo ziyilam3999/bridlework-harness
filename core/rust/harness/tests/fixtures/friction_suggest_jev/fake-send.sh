@@ -2,7 +2,7 @@
 # The fake send program of the friction suggest Jev tests (one fixture, many cases). It makes no network
 # call, holds no real key and speaks synthetic text only. The engine clears its environment, so it learns
 # its case from files beside its own copy: a `case` file, and where the case needs them `answer.json`,
-# `stderr.txt`, `sleep-secs` and `record-path`. On each start it writes down, in `notes/` beside it: that
+# `real-answer.json`, `stderr.txt`, `sleep-secs` and `record-path`. On each start it writes down, in `notes/` beside it: that
 # it ran, its arguments, its environment, the value of OPENROUTER_KEY_FILE, its current folder, the mode
 # strings of the temp folder and of the request file, a copy of the request, and a copy of the engine's
 # stdout file when a file named `engine-stdout` beside it holds that file's path.

@@ -2,9 +2,10 @@
 //!
 //! With no `--jev` flag the verb is free: no model, no network. With `--jev-send <program>` the arm builds one
 //! request from the cleaned query and the cleaned best row of at most 20 candidate groups, writes it to a fresh
-//! private temp folder, hands only its path to the named send program, and prints one more line: the pick of the
-//! model or a skip line with a closed reason token. The engine itself opens no socket and reads no key file:
-//! the send program makes the call and only it can spend; the key file path is passed to it, never opened here.
+//! private temp folder, runs the named send program with the path of that file (and the ledger path, the answer
+//! path and the key file path), and prints one more line: the pick of the model or a skip line with a closed
+//! reason token. The engine itself opens no socket and reads no key file: the send program makes the call and
+//! only it can spend; the key file path is passed to it and is not opened here.
 
 use crate::friction::jstr;
 use std::fs;
@@ -15,17 +16,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The deadline default, in milliseconds (the ticket's one constant).
+/// The deadline default, in milliseconds.
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 12000;
 /// How many candidate groups are offered, at most (the letters A to T).
 const MAX_LETTERS: usize = 20;
 /// A request over this many bytes is refused before anything is sent.
 const REQUEST_CAP: usize = 199999;
-/// The answer file is read no further than this.
+/// An answer file over this many bytes is bad-answer.
 const ANSWER_CAP: u64 = 1048576;
 /// How much of the program's stderr the engine keeps (the last bytes).
 const STDERR_KEEP: usize = 4096;
-/// The booked cost of a run whose real cost is unknown (an upper estimate).
+/// The cost written to the record for a run whose real cost is unknown (an upper estimate).
 const ESTIMATE_COST: f64 = 0.0014;
 /// The model the send program is asked for.
 const MODEL: &str = "typesafe/jev-1.13";
@@ -68,7 +69,7 @@ fn digits_at(b: &[u8], i: usize, n: usize) -> bool {
 
 /// The text as stored with the three id shapes (`f-YYYYMMDD-NN`, `issue-N`, `#N`, ASCII case folded) each replaced
 /// by one blank, then each run of 2 or more blanks or tabs folded to one blank, then blanks, tabs and line ends cut
-/// from both ends. The text is NOT lower-cased: every other byte is kept as it is.
+/// from both ends. The text is NOT lower-cased: each other byte is kept as it is.
 fn clean(s: &str) -> String {
     let b = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
@@ -130,7 +131,7 @@ fn clean(s: &str) -> String {
     String::from_utf8(folded[start..end].to_vec()).unwrap_or_default()
 }
 
-/// The shown text of a row or of the query: `clean(text)`, one line feed, `Why: `, `clean(why)` — the Why part is
+/// The shown text of a row or of the query: `clean(text)`, one line feed, `Why: `, `clean(why)`; the Why part is
 /// there also when why is empty.
 fn shown(text: &str, why: &str) -> String {
     format!("{}\nWhy: {}", clean(text), clean(why))
@@ -181,7 +182,8 @@ enum Jv {
     Obj(Vec<(String, Jv)>),
 }
 
-/// A strict whole-value JSON reader over bytes; `Err` on any bad shape.
+/// A strict whole-value JSON reader over bytes; `Err` on a bad shape, on nesting deeper than 16 and on a \u escape
+/// that is not one scalar value (a surrogate pair is refused).
 fn parse_json(b: &[u8]) -> Result<Jv, ()> {
     let mut p = P { b, i: 0 };
     let v = p.value(0)?;
@@ -371,7 +373,7 @@ struct AnswerRead {
     usage_cost: Option<f64>,
 }
 
-/// Read `<temp>/answer.json` under the cap and the five-object rules; a bad shape is bad-answer, never a panic.
+/// Read `<temp>/answer.json` under the cap and the five-object rules; a bad shape is bad-answer, not a panic.
 fn read_answer(path: &Path, letters: &[char]) -> AnswerRead {
     let bad = AnswerRead { values: None, usage_cost: None };
     let md = match fs::symlink_metadata(path) {
@@ -396,6 +398,24 @@ fn read_answer(path: &Path, letters: &[char]) -> AnswerRead {
     if dup_key(top) {
         return bad;
     }
+    // usage, when there, is read for the cost first: a good cost counts also when the probabilities part is bad;
+    // a duplicate key there is bad-answer with no cost.
+    let usage = top.iter().find(|(k, _)| k == "usage").and_then(|(_, v)| match v {
+        Jv::Obj(kv) => Some(kv),
+        _ => None,
+    });
+    if let Some(u) = usage {
+        if dup_key(u) {
+            return bad;
+        }
+    }
+    let usage_cost = usage
+        .and_then(|u| u.iter().find(|(k, _)| k == "cost").map(|(_, v)| v))
+        .and_then(|v| match v {
+            Jv::Num(f) if f.is_finite() && (0.0..=1.0).contains(f) => Some(*f),
+            _ => None,
+        });
+    let bad = AnswerRead { values: None, usage_cost };
     // answers, then group, then probabilities: each must be an object with no key given twice.
     fn as_obj(o: &Jv) -> Option<&Vec<(String, Jv)>> {
         match o {
@@ -418,14 +438,7 @@ fn read_answer(path: &Path, letters: &[char]) -> AnswerRead {
     if dup_key(probs) {
         return bad;
     }
-    // usage, when there, is read for the cost: a duplicate key there is bad-answer too.
-    let usage = level(top, "usage");
-    if let Some(u) = &usage {
-        if dup_key(u) {
-            return bad;
-        }
-    }
-    // The keys must be exactly the asked letters, byte-equal, and every value a number from 0 to 1.
+    // The keys must be exactly the asked letters, byte-equal, and each value a number from 0 to 1.
     let mut values = vec![f64::NAN; letters.len()];
     let mut seen = vec![false; letters.len()];
     for (k, val) in probs {
@@ -440,11 +453,7 @@ fn read_answer(path: &Path, letters: &[char]) -> AnswerRead {
     if !seen.iter().all(|s| *s) {
         return bad;
     }
-    let usage_cost = usage.and_then(|u| u.iter().find(|(k, _)| k == "cost").map(|(_, v)| v)).and_then(|v| match v {
-        Jv::Num(f) if f.is_finite() && (0.0..=1.0).contains(f) => Some(f),
-        _ => None,
-    });
-    AnswerRead { values: Some(values), usage_cost: usage_cost.copied() }
+    AnswerRead { values: Some(values), usage_cost }
 }
 
 // ---------------------------------------------------------------- the send run
@@ -517,7 +526,7 @@ fn run_send(run: &JevRun, temp: &Path) -> (End, u64) {
     loop {
         match child.try_wait() {
             Ok(Some(st)) => {
-                // After a normal end the engine does not wait for stderr to close: 1000 ms at the latest.
+                // After a normal end the engine waits at most 1000 ms for stderr to close; past that the kept stderr is empty.
                 let tail = rx.recv_timeout(Duration::from_millis(1000)).unwrap_or_default();
                 let end = match st.code() {
                     Some(code) => End::Code(code, tail),
@@ -636,8 +645,8 @@ fn finish(run: &JevRun, v: &Verdict, temp: Option<&Path>) -> i32 {
     0
 }
 
-/// The Jev arm proper. Runs after the BM25 lines were printed and stdout was flushed; prints exactly one more
-/// stdout line (the last one) and returns the verb's exit code.
+/// The Jev arm proper. Runs after the BM25 lines were printed and stdout was flushed; prints one more stdout
+/// line (the last one), or none when the second record append fails, and returns the verb's exit code.
 pub(crate) fn jev_arm(run: &JevRun) -> i32 {
     // (1) code in the query, as given.
     if code_in(run.text) || code_in(run.why) {
