@@ -481,7 +481,7 @@ out an in-flight `start` of the same ticket and sees either the finished lines o
 | launched worker, entry has a session equal to `--session` | `counted <id> <uuid>` (nothing written) | 0 |
 | launched worker, entry's session differs from `--session` | — (stderr: `session id mismatch: launched <id> holds a different session id`; nothing written, the launched id is not echoed) | 2 |
 | no ancestor is a live entry, or the matching entry has no session (not a worker): `unmanaged_session {reason: not_supervisor_launched}` is appended | `unmanaged: not counted` | 7 |
-| a parent or start-time read the walk needs BEFORE the launched entry is found cannot be read (the walk is lazy: a parent read above the deciding entry is not made), damaged manifest, bad ticket or non-uuid `--session`, or the `unmanaged_session` append failed | — (stderr names it; "unknown" is never read as "not launched") | 2 |
+| a parent read the walk needs before the launched entry is found, or the start-time read of a matching pid, cannot be read (the walk is lazy: a parent read above the deciding entry is not made), damaged manifest, bad ticket or non-uuid `--session`, or the `unmanaged_session` append failed | — (stderr names it; "unknown" is never read as "not launched") | 2 |
 
 `process sessions <ticket>` is read-only: one `<id> <uuid> live|closed` line per `session` line ever written
 (closed = a later `remove` of that entry, e.g. after `stop`), then `counted <n>` = the live sessions.

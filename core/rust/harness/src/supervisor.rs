@@ -2416,12 +2416,12 @@ fn parse_claim(a: &[String]) -> Result<ClaimArgs, String> {
     })
 }
 
-/// The decision of the claim walk: what the first matching pid of the chain decided.
+/// The decision of the claim walk: what the first pid of the chain that is a live entry and passes the identity probe decided.
 #[derive(Debug, PartialEq, Eq)]
 enum ClaimWalk {
-    /// The first matching entry holds this session: counted (entry id, session id).
+    /// The first deciding entry holds this session: counted (entry id, session id).
     Counted(String, String),
-    /// The first matching entry holds a different session: refusal 2, this text.
+    /// The first deciding entry holds a different session: refusal 2, this text.
     Mismatch(String),
     /// No pid of the chain is a live worker entry of the ticket: exit 7, logged.
     Unmanaged,
@@ -2434,7 +2434,7 @@ enum ClaimWalk {
 /// decision is made. The entry a claim needs sits at the claimant or its first parent (the exec case,
 /// the sh -c case), so a /proc read of a pid ABOVE the deciding entry (an exiting start process the
 /// kernel already reaped) is not made and cannot refuse the claim. The pids, their order, the bound
-/// and the pid <= 1 stop are the walk claim always made; what changes is only WHEN each parent is
+/// and the pid <= 1 stop are the walk claim made before; what changes is WHEN each parent is
 /// read. `parent` and `probe` are the readers of the release build (`parent_of`, `probe_identity`);
 /// a fake exists only as an argument a unit test passes.
 fn walk_claim<PR, PB>(claimant: u64, live: &[manifest::Entry], session: &str, parent: PR, probe: PB) -> ClaimWalk
@@ -3162,12 +3162,12 @@ mod prestage_tests {
 
 // ---------------------------------------------------------------- claim walk (tests)
 
-/// The claim walk of #claim-walk-vanished-ancestor: each test drives `walk_claim` (the release build
+/// The claim walk tests: each test drives `walk_claim` (the release build
 /// calls it with `parent_of` and `probe_identity`; the fakes here are arguments, so nothing in a
 /// release build reads one) through a table of parent answers and a table of identity answers. The
 /// two RED cases pin the lazy walk itself: with the whole chain built before the first match (the
 /// walk this ticket replaces), a vanished ancestor ABOVE the deciding entry refuses a launched
-/// worker's claim. Every other case pins a rule that stays as it was, red only if that rule moves.
+/// worker's claim. The other cases pin rules that stay as they were.
 #[cfg(test)]
 mod claim_walk_tests {
     use super::*;
@@ -3189,7 +3189,7 @@ mod claim_walk_tests {
     }
 
     /// A fake parent reader from a pid -> answer table. A pid NOT in the table answers a fresh,
-    /// far-away parent, so an Err a test lists is the only vanished ancestor of the case.
+    /// far-away parent, so the Err entries a test lists are the only vanished ancestors of the case.
     fn reader(table: &[(u64, Result<u64, String>)]) -> impl Fn(u64) -> Result<u64, String> + '_ {
         move |pid| {
             table
@@ -3200,7 +3200,7 @@ mod claim_walk_tests {
         }
     }
 
-    /// A fake identity probe: the pids answered Reused and Unknown, every other pid Same.
+    /// A fake identity probe: the pids listed as Reused or Unknown answer so; the other pids answer Same.
     fn probe<'a>(reused: &'a [u64], unknown: &'a [u64]) -> impl Fn(u64, u64) -> Identity + 'a {
         move |pid, _| {
             if unknown.contains(&pid) {
@@ -3213,8 +3213,8 @@ mod claim_walk_tests {
         }
     }
 
-    /// The exec case: the claimant IS the launched pid, and the pid above the claimant is already
-    /// reaped (the reader errs on it). RED: a walk that builds the whole chain before the first
+    /// The exec case: the claimant IS the launched pid, and the read of the claimant's own parent
+    /// fails (the reader errs on the claimant's pid). RED: a walk that builds the whole chain before the first
     /// match reads the claimant's parent, meets the Err, and refuses a counted claim.
     #[test]
     fn supervisor_claim_walk_exec_case_decides_before_any_parent_read() {
@@ -3229,8 +3229,8 @@ mod claim_walk_tests {
         );
     }
 
-    /// The sh -c case: the launched pid is the claimant's parent, and every pid above THAT entry is
-    /// reaped. RED: a walk that builds the whole chain first reads past the parent, meets an Err,
+    /// The sh -c case: the launched pid is the claimant's parent, and the read of that entry's own parent
+    /// fails. RED: a walk that builds the whole chain first reads past the parent, meets an Err,
     /// and refuses a counted claim.
     #[test]
     fn supervisor_claim_walk_shell_case_decides_before_reading_above_the_entry() {
@@ -3250,7 +3250,7 @@ mod claim_walk_tests {
 
     /// The deciding entry sits at the claimant's parent, and THAT read fails: the read the decision
     /// needs refuses with Unknown, so claim answers 2 ("claim is unknown, nothing written: ..." plus
-    /// this text) — the fail-closed rule below the entry, unchanged by this ticket.
+    /// this text); the fail-closed rule below the entry, unchanged by this ticket.
     #[test]
     fn supervisor_claim_walk_unreadable_parent_below_the_entry_is_unknown() {
         let live = vec![process_entry("w", PARENT, Some(SID))];
@@ -3278,7 +3278,7 @@ mod claim_walk_tests {
         );
     }
 
-    /// The FIRST matching entry decides: a mismatch at the claimant wins over a matching session one
+    /// The FIRST deciding entry decides: a mismatch at the claimant wins over a matching session one
     /// parent up.
     #[test]
     fn supervisor_claim_walk_the_first_matching_entry_decides() {
@@ -3315,7 +3315,7 @@ mod claim_walk_tests {
     }
 
     /// An identity probe that cannot read the start time at the matching pid: Unknown, so claim
-    /// answers 2 with the probe's text — the read the decision needs, unchanged.
+    /// answers 2 with the probe's text; the read the decision needs, unchanged.
     #[test]
     fn supervisor_claim_walk_an_unreadable_start_time_is_unknown() {
         let live = vec![process_entry("w", ME, Some(SID))];
