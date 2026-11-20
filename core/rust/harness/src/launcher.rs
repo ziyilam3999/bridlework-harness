@@ -242,6 +242,10 @@ impl P<'_> {
                         b'f' => '\u{c}',
                         b'u' => {
                             let hex = self.b.get(self.i..self.i + 4).ok_or("short \\u escape")?;
+                            // from_str_radix takes a leading sign; JSON takes hex digits only.
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return Err("bad \\u".into());
+                            }
                             let n = u32::from_str_radix(std::str::from_utf8(hex).map_err(|_| "bad \\u")?, 16)
                                 .map_err(|_| "bad \\u")?;
                             self.i += 4;
@@ -1154,6 +1158,15 @@ mod tests {
     #[test]
     fn sha256_empty_vector() {
         assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn parse_json_refuses_a_plus_escape_and_reads_hex_escapes() {
+        assert!(super::parse_json(br#"["\u+043"]"#).is_err());
+        assert!(super::parse_json(br#"["\u-043"]"#).is_err());
+        assert!(super::parse_json(br#"["\u 043"]"#).is_err());
+        let ok = format!("[\"{b}u0043{b}u00e9{b}u00E9\"]", b = '\\');
+        assert!(super::parse_json(ok.as_bytes()).is_ok());
     }
 
     #[test]
