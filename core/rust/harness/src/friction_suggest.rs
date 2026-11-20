@@ -3,6 +3,9 @@
 //! The caller has a lesson text (and maybe a cause) it is about to file; this verb says which existing groups it
 //! looks most like, so the new row can be filed with `--breaks <row id>` (or left alone). It is read-only on the
 //! inbox, pure given the inbox and the query, and prints ids and numbers only: no row text ever reaches stdout.
+//! With no `--jev` flag the verb is free: no model, no network. With `--jev-send <program>` the Jev arm (all of
+//! it in `friction_suggest_jev`) sends the cleaned query and cleaned candidate rows to that program only; the
+//! engine itself opens no socket and reads no key file.
 //!
 //! The score, exactly (the contract is `docs/friction-inbox.md`):
 //! * a token is a run of `[a-z0-9]` in the lowercased text after `f-YYYYMMDD-NN`, `issue-N` and `#N` are removed,
@@ -165,15 +168,18 @@ struct Suggestion {
     first: usize,
 }
 
-/// `harness friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>]`.
+/// `harness friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>]`
+/// plus the Jev flags `[--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]]`.
 pub fn suggest_cmd(rest: &[String], testmode: bool) -> i32 {
-    const ALLOWED: [&str; 6] = ["--text", "--why", "--top", "--before", "--record", "--config"];
+    const ALLOWED: [&str; 10] = [
+        "--text", "--why", "--top", "--before", "--record", "--config", "--jev-send", "--jev-key-file", "--jev-ledger-dir", "--jev-deadline-ms",
+    ];
     let mut flags: Vec<(&str, &str)> = Vec::new();
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         // A constant message: the argument bytes have passed no privacy scan, so they are never echoed.
         let Some(name) = ALLOWED.iter().find(|a| **a == arg.as_str()) else {
-            return fail("an unknown option (suggest takes only --text, --why, --top, --before, --record and --config)");
+            return fail("an unknown option (the friction usage line lists the suggest flags)");
         };
         let Some(v) = it.next() else {
             return fail(&format!("{name} is missing its value"));
@@ -200,6 +206,38 @@ pub fn suggest_cmd(rest: &[String], testmode: bool) -> i32 {
             v.parse().unwrap_or(DEFAULT_TOP)
         }
     };
+    // The --jev checks, in this order, right after the --top check and before the config is loaded.
+    let (jev_send, jev_key, jev_ledger, jev_deadline) =
+        (flag("--jev-send"), flag("--jev-key-file"), flag("--jev-ledger-dir"), flag("--jev-deadline-ms"));
+    if jev_send.is_none() && (jev_key.is_some() || jev_ledger.is_some() || jev_deadline.is_some()) {
+        return fail("a --jev flag needs --jev-send");
+    }
+    let mut jev: Option<crate::friction_suggest_jev::JevFlags> = None;
+    if let Some(send) = jev_send {
+        let (Some(key_file), Some(ledger_dir)) = (jev_key, jev_ledger) else {
+            return fail("--jev-send needs --jev-key-file and --jev-ledger-dir");
+        };
+        for (name, v) in [("--jev-send", send), ("--jev-key-file", key_file), ("--jev-ledger-dir", ledger_dir)] {
+            if !v.starts_with('/') {
+                return fail(&format!("{name} must be an absolute path"));
+            }
+        }
+        let deadline_ms = match jev_deadline {
+            None => crate::friction_suggest_jev::DEFAULT_DEADLINE_MS,
+            Some(v) => {
+                if v.is_empty()
+                    || v.len() > 6
+                    || !v.bytes().all(|c| c.is_ascii_digit())
+                    || v.starts_with('0')
+                    || v.parse::<u64>().unwrap_or(0) > 600000
+                {
+                    return fail("--jev-deadline-ms must be a whole number from 1 to 600000");
+                }
+                v.parse().unwrap_or(crate::friction_suggest_jev::DEFAULT_DEADLINE_MS)
+            }
+        };
+        jev = Some(crate::friction_suggest_jev::JevFlags { send, key_file, ledger_dir, deadline_ms });
+    }
     let cfg = match friction::config_path(flag("--config")).and_then(|p| Config::load(&p)) {
         Ok(c) => c,
         Err(e) => return fail(&e),
@@ -263,12 +301,27 @@ pub fn suggest_cmd(rest: &[String], testmode: bool) -> i32 {
         }
     }
     found.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.first.cmp(&b.first)));
+    // The Jev candidates are the BM25 order BEFORE the --top cut, the first 20 of them (--top changes the
+    // printed lines only); each candidate stands for one group and is shown by its best row.
+    let candidates: Vec<crate::friction_suggest_jev::JevCandidate> = found
+        .iter()
+        .take(20)
+        .map(|s| crate::friction_suggest_jev::JevCandidate {
+            group: s.group.clone(),
+            row: rows[s.row].id.clone(),
+            text: rows[s.row].text.clone(),
+            why: rows[s.row].why.clone(),
+        })
+        .collect();
     found.truncate(top);
     // The record is appended BEFORE anything is printed (a failed append is a clean exit 2, empty stdout).
+    // The clock is read once: the Jev arm's second line reuses the same ts.
+    let mut ts: Option<String> = None;
     if let Some(path) = record {
+        let now = now_ts();
         let ids: Vec<String> = found.iter().map(|s| friction::jstr(&s.group)).collect();
         let sha = crate::launcher::sha256_hex(format!("{text}\n{why}").as_bytes());
-        let line = format!("{{\"ts\":{},\"query_sha256\":{},\"top\":[{}],\"via\":\"bm25\"}}\n", friction::jstr(&now_ts()), friction::jstr(&sha), ids.join(","));
+        let line = format!("{{\"ts\":{},\"query_sha256\":{},\"top\":[{}],\"via\":\"bm25\"}}\n", friction::jstr(&now), friction::jstr(&sha), ids.join(","));
         let mut f = match fs::OpenOptions::new().append(true).create(true).open(Path::new(path)) {
             Ok(f) => f,
             Err(_) => return fail("the suggest record cannot be written"),
@@ -276,13 +329,29 @@ pub fn suggest_cmd(rest: &[String], testmode: bool) -> i32 {
         if f.write_all(line.as_bytes()).and_then(|()| f.sync_all()).is_err() {
             return fail("the suggest record cannot be written");
         }
+        ts = Some(now);
     }
     if found.is_empty() {
         println!("suggest: none");
-        return 0;
+    } else {
+        for (i, s) in found.iter().enumerate() {
+            println!("suggest: rank={} group={} row={} score={:.2} via=bm25", i + 1, s.group, rows[s.row].id, s.score);
+        }
     }
-    for (i, s) in found.iter().enumerate() {
-        println!("suggest: rank={} group={} row={} score={:.2} via=bm25", i + 1, s.group, rows[s.row].id, s.score);
+    if let Some(flags) = jev {
+        let _ = std::io::stdout().flush();
+        let qsha = crate::launcher::sha256_hex(format!("{text}\n{why}").as_bytes());
+        let run = crate::friction_suggest_jev::JevRun {
+            text,
+            why,
+            flags,
+            list: &list,
+            query_sha256: &qsha,
+            candidates: &candidates,
+            record,
+            ts: ts.as_deref().unwrap_or(""),
+        };
+        return crate::friction_suggest_jev::jev_arm(&run);
     }
     0
 }
