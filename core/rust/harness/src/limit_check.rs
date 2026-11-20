@@ -2,6 +2,7 @@
 //! reads one seat transcript, one line at a time, and says whether the last error row is a usage limit. Read-only: one file is
 //! read, nothing is written, no provider is called. std only, so it carries its own small JSON reader.
 use std::io::BufRead;
+pub mod rotation_check;
 
 const MAX_DEPTH: usize = 128;
 /// Eight days in milliseconds: a reset further ahead than this is unknown.
