@@ -505,7 +505,7 @@ The arm is on exactly when `--jev-send` is given; there is no config key and no 
 must be absolute, `--jev-send` needs both `--jev-key-file` and `--jev-ledger-dir`, a `--jev` flag without
 `--jev-send` is exit 2, and `--jev-deadline-ms` is a whole number from 1 to 600000 (default 12000). With no
 `--jev` flag the outcomes documented above are unchanged (stdout, exit codes and record line, byte for byte);
-only the usage line and the unknown-option line name the new flags.
+only the usage line and the unknown-option line change.
 
 With the arm on, each step of today runs first and unchanged (the checks and refusals, the BM25 record line,
 then the BM25 lines or `suggest: none`), stdout is flushed, and then one more line is printed, the last one (none
@@ -571,6 +571,13 @@ one exception: the three digits in `http-<code>`.
   {"model":"typesafe/jev-1.13","state":{"query":"<shown query>"},"questions":{"group":{"type":"choice","instructions":"<the fixed 324-byte prompt>","criteria":{"A":"<shown text of the candidate with letter A>","B":"..."}}}}
   ```
 
+  A small real one, for the query `cache warm zeta` with the why `reruns are slow` and two candidates (written on
+  one line; each `\n` is the two characters backslash and n):
+
+  ```json
+  {"model":"typesafe/jev-1.13","state":{"query":"cache warm zeta\nWhy: reruns are slow"},"questions":{"group":{"type":"choice","instructions":"The query above is a new friction report: a problem someone hit while working, with why it matters. Each option is an earlier friction report that stands for one group of reports about the same underlying problem. Which option describes the same underlying problem that the new report repeats? Choose the single best option.","criteria":{"A":"cold cache on every rerun\nWhy: the build is slow","B":"stale lock file\nWhy: a second run hangs"}}}}
+  ```
+
 - **The checks before the run**, in this order; the first that holds prints its skip line with nothing run;
   nothing is made at (1) to (5), and at (7) a missing ledger folder was already made by (6): (1) code in the
   query; (2) candidates with code in their row are left out, and fewer than 2 left is `no-candidates`; (3) the
@@ -590,8 +597,8 @@ one exception: the three digits in `http-<code>`.
   spend. The program's exit codes and stderr texts the engine reads: 0 the answer counts; 5 no key; 7 scan refused;
   8 `cap` when the kept stderr holds `SPEND-CAP reached`, else `ledger`; 9 transport; 10 the LAST stderr line
   ending in `HTTP ` plus exactly 3 digits (402 is `no-credit`, another code is `http-<code>`, no such line is
-  `http-unknown`); 11 and 12 ledger; any other code n is `send-n`; a signal is `send-signal`. The answer file counts
-  only on exit 0: at most 1048576 bytes, a regular file (a link does not count), one JSON object (nesting of at
+  `http-unknown`); 11 and 12 ledger; any other code n is `send-n`; a signal is `send-signal`. The answer file is opened
+  on exit 0 only (no other end touches it) and counts only then: at most 1048576 bytes, a regular file (a link does not count), one JSON object (nesting of at
   most 16 levels, no surrogate-pair escape) whose
   `answers.group.probabilities` holds exactly the asked letters (upper case, byte-equal) as JSON numbers from 0
   to 1; the highest value picks the letter, ties go to the earlier letter, and all-equal is `flat`. The `choice`
@@ -608,7 +615,15 @@ one exception: the three digits in `http-<code>`.
   - the same ts and query sha256 as the first line (the clock is read once), no row text, no query text and no
   path. `cost_usd` is an UPPER ESTIMATE, not a booked spend: 0.000000 when the program did not run; the answer's
   `usage.cost` (a number from 0 to 1) when the program ended 0 and the answer holds it; 0.001400 in each other
-  case. The ledger of the send program is the truth. A failed append of the second line is exit 2 with
+  case. `latency_ms` is the wall time from the start of the program to its end or its kill (the wait for stderr
+  after a normal end is not in it; 0 when the program did not run). The ledger of the send program is the
+  truth. An example of a pick (the sha256 is a sample value):
+
+  ```json
+  {"ts":"2026-11-20T09:15:00Z","query_sha256":"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0","via":"jev","status":"pick","reason":"","letter":"B","group":"les-001","p":0.62,"cost_usd":0.000145,"latency_ms":1830}
+  ```
+
+  A failed append of the second line is exit 2 with
   `harness: error: the suggest record cannot be written` on stderr, and the Jev line is not printed.
 - **What leaves the machine**, through the send program only: the model name, the fixed prompt, the cleaned
   query (text and why) and the cleaned text and why of at most 20 stored rows, one per candidate group. What
@@ -626,7 +641,9 @@ answer file); an exit seen at the very edge of the deadline may be read as `time
 pick of the model is right is not checked; the send script books its worst-case cost on a non-200 answer, so a
 day with no credit reaches its spend cap early, and this verb does not change that; a program that writes
 outside its `--out` path is not detected; a background child of the program that leaves its process group is not
-ended by the deadline.
+ended by the deadline; the answer file is checked as a regular file and then opened, so a program that exited 0 and
+left a background child that swaps that file for a pipe in between can make the open wait with no deadline (the
+other ends never open it).
 
 ## 5. Not in slice 1 (where each piece went)
 

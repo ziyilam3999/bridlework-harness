@@ -347,6 +347,10 @@ impl P<'_> {
                         b't' => out.push(b'\t'),
                         b'u' => {
                             let hex = self.b.get(self.i..self.i + 4).ok_or(())?;
+                            // from_str_radix takes a leading sign; JSON takes hex digits only.
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return Err(());
+                            }
                             let n = u32::from_str_radix(std::str::from_utf8(hex).map_err(|_| ())?, 16).map_err(|_| ())?;
                             let ch = char::from_u32(n).ok_or(())?;
                             let mut buf = [0u8; 4];
@@ -491,7 +495,6 @@ fn run_send(run: &JevRun, temp: &Path) -> (End, u64) {
         }
     }
     c.env("TMPDIR", temp).env("OPENROUTER_KEY_FILE", run.flags.key_file);
-    let start = Instant::now();
     // A file written just before the run can be briefly busy while another thread forks; retry a few times.
     let mut tries = 0;
     let child = loop {
@@ -505,6 +508,8 @@ fn run_send(run: &JevRun, temp: &Path) -> (End, u64) {
         }
     };
     let Some(mut child) = child else { return (End::SpawnFailed, 0) };
+    // The wall time counts from the start that worked to the end or the kill.
+    let start = Instant::now();
     let mut pipe = child.stderr.take().expect("stderr was piped");
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
@@ -527,13 +532,14 @@ fn run_send(run: &JevRun, temp: &Path) -> (End, u64) {
     loop {
         match child.try_wait() {
             Ok(Some(st)) => {
+                let ms = start.elapsed().as_millis() as u64;
                 // After a normal end the engine waits at most 1000 ms for stderr to close; past that the kept stderr is empty.
                 let tail = rx.recv_timeout(Duration::from_millis(1000)).unwrap_or_default();
                 let end = match st.code() {
                     Some(code) => End::Code(code, tail),
                     None => End::Signal,
                 };
-                return (end, start.elapsed().as_millis() as u64);
+                return (end, ms);
             }
             Ok(None) => {}
             Err(_) => return (End::WaitErr, start.elapsed().as_millis() as u64),
@@ -702,15 +708,15 @@ pub(crate) fn jev_arm(run: &JevRun) -> i32 {
     }
     // The run.
     let (end, latency_ms) = run_send(run, &temp);
-    let answer = temp.join("answer.json");
-    let read = read_answer(&answer, &letters);
-    let usage_cost = read.usage_cost.filter(|c| (0.0..=1.0).contains(c));
     let v = match end {
         End::SpawnFailed => v_skip("spawn-failed", 0.0, 0),
         End::WaitErr => v_skip("spawn-failed", ESTIMATE_COST, latency_ms),
         End::Timeout => v_skip("timeout", ESTIMATE_COST, latency_ms),
         End::Signal => v_skip("send-signal", ESTIMATE_COST, latency_ms),
         End::Code(0, _) => {
+            // The answer file is opened on exit 0 only.
+            let read = read_answer(&temp.join("answer.json"), &letters);
+            let usage_cost = read.usage_cost.filter(|c| (0.0..=1.0).contains(c));
             let cost = usage_cost.unwrap_or(ESTIMATE_COST);
             match decide(&read.values, &letters) {
                 Some((letter, p)) => {

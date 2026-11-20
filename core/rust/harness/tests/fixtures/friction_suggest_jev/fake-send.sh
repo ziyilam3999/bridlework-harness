@@ -89,6 +89,12 @@ case "$case_word" in
     kill -TERM "$$"
     sleep 5
     ;;
+  fifo10)
+    # A pipe in the place of the answer file, then exit 10 with the given stderr text: the engine must not open it.
+    mkfifo "$out"
+    cat "$here/stderr.txt" >&2
+    exit 10
+    ;;
   exit*)
     cat "$here/stderr.txt" >&2
     cat "$here/stderr.txt"

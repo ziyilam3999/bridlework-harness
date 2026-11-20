@@ -234,10 +234,15 @@ fn letter_holding(req: &str, marker: &str) -> String {
     panic!("marker {marker} is in no criterion");
 }
 
-/// One discovery run (case no-file), then the letter of the group whose best row holds `marker`.
-fn discover_letter(j: &J, rows: &[String], q: &[&str], extra: &[&str], marker: &str) -> String {
-    let _ = jev_run(j, rows, q, extra);
+/// One discovery run: no answer file is there yet, so the whole stdout is the BM25 lines and the bad-answer line.
+fn discover(j: &J, rows: &[String], q: &[&str], extra: &[&str]) {
+    assert_whole(j, rows, q, extra, "jev: skipped reason=bad-answer\n");
     assert!(j.ran(), "the discovery run reached the program");
+}
+
+/// One discovery run, then the letter of the group whose best row holds `marker`.
+fn discover_letter(j: &J, rows: &[String], q: &[&str], extra: &[&str], marker: &str) -> String {
+    discover(j, rows, q, extra);
     letter_holding(&j.request(), marker)
 }
 
@@ -562,7 +567,7 @@ fn the_request_holds_six_criteria_and_the_pick_names_the_fifth_ranked_group_best
 fn twenty_two_groups_give_the_letters_a_to_t_and_drop_the_two_last_ranked() {
     let j = J::new("no-file");
     let order = plain_order(&j.t, &rows22(), &Q22);
-    let _ = jev_run(&j, &rows22(), &Q22, &[]);
+    discover(&j, &rows22(), &Q22, &[]);
     let req = j.request();
     let pairs = criteria_pairs(&req);
     let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
@@ -581,7 +586,7 @@ fn the_letter_map_is_hash_order_and_survives_a_reversed_inbox() {
     //   printf %s "$(printf 'paddle rower\n' | shasum -a 256 | cut -d' ' -f1):m-5" | shasum -a 256
     // is the smallest of the six, so m-5 carries the letter A.
     let j = J::new("no-file");
-    let _ = jev_run(&j, &rows_l(), &QL, &[]);
+    discover(&j, &rows_l(), &QL, &[]);
     let req = j.request();
     let want: Vec<(String, String)> = vec![
         ("m-1".to_string(), "B".to_string()),
@@ -610,7 +615,7 @@ fn the_letter_map_is_hash_order_and_survives_a_reversed_inbox() {
     // The same fixture with the inbox rows in reverse order gives the same letter for each group.
     let mut rev = rows_l();
     rev.reverse();
-    let _ = jev_run(&j, &rev, &QL, &[]);
+    discover(&j, &rev, &QL, &[]);
     let req2 = j.request();
     for (group, letter) in &want {
         assert_eq!(&letter_holding(&req2, &format!("mk{}", group.split('-').nth(1).unwrap())), letter, "group {group}");
@@ -620,9 +625,9 @@ fn the_letter_map_is_hash_order_and_survives_a_reversed_inbox() {
 #[test]
 fn the_same_input_twice_gives_a_byte_identical_request() {
     let j = J::new("no-file");
-    let _ = jev_run(&j, &rows_l(), &QL, &[]);
+    discover(&j, &rows_l(), &QL, &[]);
     let first = j.request();
-    let _ = jev_run(&j, &rows_l(), &QL, &[]);
+    discover(&j, &rows_l(), &QL, &[]);
     assert_eq!(j.request(), first);
 }
 
@@ -635,7 +640,7 @@ fn planted_ids_of_all_three_shapes_and_cases_are_not_in_the_request() {
         row("k-3", "2026-11-03", "", "row three Issue-44 #9 mkthree", &[]),
     ];
     let q = ["--text", "row words f-20991231-03 ISSUE-45 #1", "--why", "cause #2 Issue-46"];
-    let _ = jev_run(&j, &rows, &q, &[]);
+    discover(&j, &rows, &q, &[]);
     let req = j.request();
     for shape in ["20991231", "issue-42", "ISSUE-43", "Issue-44", "ISSUE-45", "Issue-46"] {
         assert!(!req.contains(shape), "the id shape {shape} left the machine");
@@ -649,7 +654,7 @@ fn planted_ids_of_all_three_shapes_and_cases_are_not_in_the_request() {
 #[test]
 fn before_limits_the_candidates_as_it_limits_the_ranking() {
     let j = J::new("no-file");
-    let _ = jev_run(&j, &rows3(), &Q3, &["--before", "gc-1"]);
+    discover(&j, &rows3(), &Q3, &["--before", "gc-1"]);
     let req = j.request();
     assert!(req.contains("mkga") && req.contains("mkgb"), "the two earlier groups are candidates");
     assert!(!req.contains("mkgc"), "the later group is left out of the request");
@@ -665,7 +670,7 @@ fn the_request_bytes_are_exactly_the_fixed_shape() {
         row("q-3", "2026-11-03", "", "third row MKQC also has Q and q", &[]),
     ];
     let q = ["--text", "find MKQA MKQB MKQC needle", "--why", "the why W and w"];
-    let _ = jev_run(&j, &rows, &q, &[]);
+    discover(&j, &rows, &q, &[]);
     // The literal below is assembled from parts so the JSON escapes stay byte-exact.
     let nl = "\\n";
     let tab = "\\t";
@@ -724,7 +729,7 @@ fn a_candidate_with_an_indented_line_is_left_out_of_the_request() {
     let indented = "indented row\\n    four blanks MKCD";
     let mut rows = rows5();
     rows[3] = row("p-4", "2026-11-04", "", indented, &[]);
-    let _ = jev_run(&j, &rows, &Q5, &[]);
+    discover(&j, &rows, &Q5, &[]);
     let req = j.request();
     assert!(!req.contains("MKCD"), "the code-carrying candidate is not sent");
     for m in ["mkp1", "mkp2", "mkp3", "mkp5"] {
@@ -1249,7 +1254,7 @@ fn run5(j: &J, probs: &[(&str, &str)], usage: Option<&str>) -> Output {
 
 /// One discovery run, then the group of the 5-candidate fixture that carries the letter `letter`.
 fn discover_group5(j: &J, letter: &str) -> String {
-    let _ = jev_run(j, &rows5(), &Q5, &[]);
+    discover(j, &rows5(), &Q5, &[]);
     group_of5(&j.request(), letter)
 }
 
@@ -1298,7 +1303,7 @@ fn an_exponent_form_prints_two_decimals() {
 
 /// The five asked letters of the 5-candidate fixture, as a probabilities map with one letter changed.
 fn five(j: &J, changed: &[(&str, &str)]) -> Vec<(String, String)> {
-    let _ = jev_run(j, &rows5(), &Q5, &[]);
+    discover(j, &rows5(), &Q5, &[]);
     let keys = criteria_pairs(&j.request()).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
     keys.into_iter()
         .map(|k| {
@@ -1472,6 +1477,40 @@ fn a_key_given_twice_is_bad_answer() {
     assert_raw_answer(&j, &body, "jev: skipped reason=bad-answer\n");
 }
 
+/// A probabilities object whose third key is the given raw escape text; read as a letter it would be a pick.
+fn assert_bad_unicode_key(escape: &str) {
+    let j = J::new("answer");
+    let body = format!("{{\"answers\":{{\"group\":{{\"probabilities\":{{\"A\":0.1,\"B\":0.2,\"{escape}\":0.3}}}}}}}}");
+    let _ = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
+    j.answer(&body);
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=bad-answer\n");
+}
+
+#[test]
+fn a_unicode_escape_with_a_plus_sign_is_bad_answer() {
+    assert_bad_unicode_key("\\u+043");
+}
+
+#[test]
+fn a_unicode_escape_with_a_minus_sign_is_bad_answer() {
+    assert_bad_unicode_key("\\u-043");
+}
+
+#[test]
+fn a_unicode_escape_with_a_blank_is_bad_answer() {
+    assert_bad_unicode_key("\\u 043");
+}
+
+#[test]
+fn an_answer_path_that_is_a_pipe_is_not_opened_after_exit_10() {
+    let j = J::new("fifo10");
+    j.stderr_text("send.sh: HTTP 402\n");
+    let started = Instant::now();
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=no-credit\n");
+    assert!(started.elapsed() < Duration::from_secs(10), "no hang on the pipe");
+    assert!(j.tmproot_empty());
+}
+
 #[test]
 fn an_answer_path_that_is_a_link_is_bad_answer() {
     let j = J::new("answer-link");
@@ -1499,7 +1538,7 @@ fn an_answer_of_exactly_one_mib_is_read_and_one_byte_over_is_not() {
 #[test]
 fn a_changed_answer_file_changes_the_pick() {
     let j = J::new("answer");
-    let _ = jev_run(&j, &rows5(), &Q5, &[]);
+    discover(&j, &rows5(), &Q5, &[]);
     let req = j.request();
     let group_of = |letter: &str| group_of5(&req, letter);
     let keys = criteria_pairs(&req).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
@@ -1523,8 +1562,8 @@ fn a_changed_answer_file_changes_the_pick() {
 fn the_deadline_kills_the_whole_group() {
     let j = J::new("hang-bg");
     let started = Instant::now();
-    // 3000, not the 300 of the ticket: the first start of a fresh script copy took over 300 ms here, before the fake wrote its note.
-    let extra = ["--jev-deadline-ms", "3000"];
+    // 5000, not the 300 of the ticket: the first start of a fresh script copy can take seconds under load, before the fake wrote its note.
+    let extra = ["--jev-deadline-ms", "5000"];
     let o = jev_run(&j, &rows3(), &Q3, &extra);
     assert!(started.elapsed() < Duration::from_secs(10), "the verb ended within 10 s");
     assert_jev(&j.t, &rows3(), &Q3, &extra, &o, "jev: skipped reason=timeout\n");
@@ -1553,6 +1592,26 @@ fn a_grandchild_holding_stderr_does_not_hold_the_pick() {
     // The test ends the background sleep itself before it asserts.
     let _ = Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
     assert_jev(&j.t, &rows3(), &Q3, &[], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
+}
+
+#[test]
+fn the_latency_stops_at_the_end_of_the_program_not_at_the_end_of_the_stderr_wait() {
+    // The background sleep holds stderr for 30 s, so the engine waits its 1000 ms after the program ended.
+    let j = J::new("bg-answer");
+    let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
+    let old: u32 = j.note("bg-pid").trim().parse().unwrap();
+    let _ = Command::new("/bin/kill").args(["-KILL", &old.to_string()]).status();
+    j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], None));
+    let rec = j.t.0.join("suggest.jsonl");
+    let extra = ["--record", p(&rec)];
+    let o = jev_run(&j, &rows3(), &Q3, &extra);
+    let pid: u32 = j.note("bg-pid").trim().parse().unwrap();
+    let _ = Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
+    assert_jev(&j.t, &rows3(), &Q3, &extra, &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
+    let body = fs::read_to_string(&rec).unwrap();
+    let second = body.lines().nth(1).unwrap();
+    let ms: u64 = second.rsplit(':').next().unwrap().trim_end_matches('}').parse().unwrap();
+    assert!(ms < 900, "the latency of {ms} ms holds the stderr wait: {second}");
 }
 
 #[test]
