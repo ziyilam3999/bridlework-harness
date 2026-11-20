@@ -353,3 +353,120 @@ The three flags are usage errors (exit 2, the usage text): `--config` without `-
 
 Known limit (the answer key): a row is tied to the ticket it was written on, which may not be the change that
 caused it.
+
+## `harness lesson brief`
+
+```
+harness lesson brief <lessons-dir> --ticket <ticket-file> --scope-file <file> --out <absolute-dir>
+```
+
+Writes the lessons block of a builder brief on stdout and makes a copy of each matched page inside the `--out`
+folder. Ticket mode only (the diff mode flags are unknown options here). The pages, the page rules, the
+retired skip, the cap and the matching are the ticket-mode lookup's own: the verb runs the same page loop and
+prints the lookup's own stderr lines and exit code when the lookup refuses. The verb reads the lessons folder,
+the ticket file, the scope file and the privacy list, and writes inside the `--out` folder only.
+
+Output (exit 0, stderr empty), each line ended by one line feed, in this order:
+
+- line 1: `Lessons for this ticket (harness lesson brief): always=<A> matched=<M>` (`A` the number of
+  `always:` lines below, `M` the number of `lesson:` lines below; with no such page this one line is the whole
+  stdout).
+- when `A` is 1 or more: `Rules from earlier mistakes, kept for this change:` and then the `A` lines
+  `always: <id> <rule>`.
+- when `M` is 1 or more: `Pages on earlier mistakes that match this ticket. Read each file before you write
+  code.`, then `folder: <out>` (the `--out` value as given), then the `M` lines `lesson: <id> <heading> <file
+  name>`.
+
+The `always:` and `lesson:` lines are the lines `harness lesson lookup` prints for the same lessons folder,
+ticket and scope file, byte for byte and in the same order; the receipt line of the lookup is not printed. A
+worked example (two always pages, two matched pages, the out folder `/tmp/brief-out`):
+
+```
+Lessons for this ticket (harness lesson brief): always=2 matched=2
+Rules from earlier mistakes, kept for this change:
+always: ISSUE-102 Restart the counter after a bump.
+always: ISSUE-104 Check the queue depth before a restart.
+Pages on earlier mistakes that match this ticket. Read each file before you write code.
+folder: /tmp/brief-out
+lesson: ISSUE-101 Widget lesson ISSUE-101-a.md
+lesson: ISSUE-103 Widget lesson ISSUE-103-c.md
+```
+
+Copies: on exit 0 the verb has made the `--out` folder (also when `M` is 0; it is then empty) and holds in it
+one regular file per `lesson:` line, named as the page file, holding the text of the page as the lookup read
+it (the page is read once; the copy keeps the bytes, line ends included). Each copy is made with a create
+call that fails when the name exists. Nothing else is in the folder: no copy of an `always:` page, of a
+retired page or of a page that did not match. Two matched pages with one id give two lines and two copies.
+
+The out folder: the verb makes it with a create call that fails when a thing is at the path; it does not make
+the parent. A thing found at the `--out` path (an empty folder, a folder with files, a file, a symbolic link
+to a folder, a dangling symbolic link) refuses with exit 1, stdout empty and the one line `harness: lesson
+brief refused: the out folder exists already`; the thing is left as it was (the check looks at the link itself; a value that ends in a slash is a usage error and does
+not get this far). A parent
+that is missing or is a file exits 2 with `harness: error: the out folder cannot be made`. A second run with
+the same arguments is refused the same way. A copy that cannot be written after the folder was made exits 2
+with `harness: error: the out folder cannot be written`, before any stdout byte; the run then removes each
+file it created (a file whose create call worked counts, also when its write failed), then the folder with a
+call that fails on a folder that is not empty. A stdout write that reports an error after the copies exits 2
+with the same line and the same clean-up. A thing that appears at the `--out` path after the check of stage (3) makes the
+create call fail with the name existing: the run ends as for a thing found at stage (3), exit 1.
+
+Refusals of the verb itself:
+
+- argument faults (exit 2): an unknown option (the three diff mode flags are unknown here), a flag with no
+  value, a flag given twice or more than one lessons folder prints the lookup's one `harness: error:` line;
+  no lessons folder prints the lesson usage text; then a missing `--ticket`, `--scope-file` or `--out` prints
+  one `harness: error:` line each, in that order; then an `--out` value that is not absolute, has a `..` part
+  or ends in a slash (so the value `/` too), or holds a character the escape of the lint would rewrite (a
+  control character, a blank other than a plain space) prints the lesson usage text. A value that ends in a
+  slash is refused because the system would follow a link at such a path, and nothing is made.
+- the privacy list (exit 2, one line): `harness: error: no privacy list configured: a lesson brief is not
+  written unscanned` — no list name set, a list file that cannot be read, a list with no entry, list drift.
+  The list is loaded before a page, the ticket or the scope file is read.
+- stdout empty, no out folder: a thing at the `--out` path (exit 1, the `the out folder exists already` line above); the lookup's own
+  refusals (exit 1: a page or the ticket refused, the cap line) and its read errors (exit 2: a page-shaped
+  symbolic link, a scope file that cannot be read, a page that cannot be read), each with the lookup's
+  stderr lines and the lookup's exit code; then, exit 1, a matched page whose file name the escape would
+  rewrite: `harness: lesson brief refused: <page id>: NAME the file name cannot be printed as it is`; a
+  privacy hit (below). Two pages with one id cannot be told apart in a `NAME` line or a privacy line: both
+  print the `ISSUE-<3 digits>` id only.
+
+Order of the stages; the first that fails prints its lines and ends the run: (1) the arguments (exit 2);
+(2) the privacy list (exit 2); (3) a thing at the `--out` path (exit 1); (4) the lookup with its own order of
+errors (exit 2) and refusals (exit 1); (5) the `NAME` lines, then the privacy hits (exit 1); (6) the out
+folder is made and the copies are written (exit 2 on a failure); (7) the block is printed, exit 0. At stage
+(3) only a path that is found refuses; each other answer of that check goes on, and stage (6) gives the exit
+2 line (so a parent that is missing or a file is reported by stage (6), after the lookup). If a thing appears
+at the path between (3) and (6), the create call fails and the run ends as in (3). All reads, checks and
+scans end before the first write, so a refusal writes nothing: no out folder, no copy, no stdout byte.
+
+The privacy scan: the engine scanner (the loaded deny list, the test mode off) runs over each `always:` line,
+each `lesson:` line and the whole text of each page that gets a copy. Line 1, the `Rules` line, the `Pages`
+line and the `folder` line are not scanned; a page that is not offered (not matched, or retired) is not
+scanned; the body of an `always` page is not scanned (it is not written). A hit refuses with exit 1, stdout
+empty and no out folder made, one line per page, place and class:
+
+- a hit in the `always:` or `lesson:` line of a page: `harness: lesson brief refused: <page id>: PRIVACY brief
+  line <class>`
+- a hit in line `<n>` of the page file (lines counted from 1, the front matter counted):
+  `harness: lesson brief refused: <page id>: PRIVACY page line <n> <class>`
+
+Two classes on one line print in the scanner's order. The order of the lines: the always pages, then the
+matched pages, each group in byte order of the file names; for one page the brief line hits first, then the
+page lines by line number; hits of all offered pages are printed, not the first only. No page text and no
+file name is printed.
+
+Known limits of this change:
+
+- the wrapper does not call the verb yet (a later ticket wires the call); whether a builder reads the block
+  or a copy is not known
+- diff mode has no brief
+- a file name in a refusal line of the lookup is printed before any scan, as the lookup does today; a front
+  matter value in a lookup refusal line is printed unscanned
+- a symbolic link in a parent part of the `--out` path is not checked
+- the `folder:` line is caller text written unscanned
+- a page swapped between the walk and its read is not caught
+- a failed copy and a failed stdout write after the folder was made have no test
+- with stdout closed (`>&-`) the run exits 0 and keeps the folder and the copies: the standard library treats
+  that write as done, so the clean-up for a failed stdout write does not run then
+- the wording of the fixed lines is a first form that the trial of the plan may change

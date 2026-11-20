@@ -38,6 +38,7 @@ pub mod lane;
 #[cfg(unix)]
 pub mod launcher;
 pub mod lesson;
+pub mod lesson_brief;
 pub mod lesson_replay;
 pub mod limit_check;
 pub mod manifest;
