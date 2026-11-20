@@ -1154,3 +1154,50 @@ fn a_symlinked_plan_is_read_and_the_same_file_is_refused() {
     fs::write(e.root.join("base.jsonl"), "x\n").unwrap();
     refusal_of(&e.run("check", &["--plan", &l, "--base-plan", &h, "--base-index", &i]), "base plan index: line 1: does not parse as one JSON object");
 }
+
+#[test]
+fn the_first_refusal_in_the_read_order_is_the_one_printed() {
+    let same = join(&f_lines());
+    // A bad --plan and a bad --base-plan: the head plan file is read first.
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    fs::write(e.root.join("head.md"), "").unwrap();
+    fs::write(e.root.join("base.md"), vec![0xffu8, b'\n']).unwrap();
+    refusal_of(&run3(&e), "plan file: is empty");
+    // A bad base index and a missing --plan: the base index is read before the plan files.
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    fs::write(e.root.join("base.jsonl"), "x\n").unwrap();
+    fs::remove_file(e.root.join("head.md")).unwrap();
+    refusal_of(&run3(&e), "base plan index: line 1: does not parse as one JSON object");
+    // A bad --index and a bad base index: the three old inputs are read first.
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    fs::write(e.root.join("base.jsonl"), "x\n").unwrap();
+    fs::write(e.root.join("index.jsonl"), "y\n").unwrap();
+    refusal_of(&run3(&e), "plan index: line 1: does not parse as one JSON object");
+}
+
+#[test]
+fn a_base_index_that_cannot_be_read_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let same = join(&f_lines());
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    let path = e.root.join("base.jsonl");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let o = run3(&e);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    refusal_of(&o, "base plan index: the file is missing or cannot be read");
+}
+
+#[test]
+fn stale_notes_refuses_the_three_options_with_its_own_usage() {
+    let same = join(&f_lines());
+    let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
+    let p = |n: &str| e.root.join(n).to_str().unwrap().to_string();
+    let (h, i) = (p("head.md"), p("base.jsonl"));
+    let want = "usage: harness plan stale-notes --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> <absolute-file> [<absolute-file> ...]";
+    for opt in ["--plan", "--base-plan", "--base-index"] {
+        let o = e.run("stale-notes", &[&h, opt, &i]);
+        assert_eq!(o.out, "", "{opt}");
+        assert_eq!(o.err, format!("{want}\n"), "{opt}");
+        assert_eq!(o.code, 2, "{opt}");
+    }
+}

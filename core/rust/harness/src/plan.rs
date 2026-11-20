@@ -1,8 +1,8 @@
 //! `harness plan check|status` (std only, no cfg(unix); it does not use launcher.rs or ticket_gate.rs). It reads three private
 //! inputs passed by path: the plan index (`plan_index.rs`), the folder of ticket files (`<id>.json`) and the folder of done records
-//! (`<id>.done`, first line `ticket=<id>`). `check` is red when the index and the finished tickets disagree (a built row with no
+//! (`<id>.done`, first line `ticket=<id>`); `check` with `--plan`, `--base-plan` and `--base-index` also reads two plan files and a base index. `check` is red when the index and the finished tickets disagree (a built row with no
 //! done ticket, a done ticket with no row and no reason, an incomplete deviation or dropped row, a repeated id, an unknown
-//! state); a dropped row (a recorded decision not to build it) is not open and needs no estimate; `status`
+//! state, or, in the three-input form, a row's line that changed at an unchanged plan_line); a dropped row (a recorded decision not to build it) is not open and needs no estimate; `status`
 //! reports rows per state and progress weighted by size (S=1, M=3, L=9); progress counts linked tickets. In whole-index
 //! status the last line `progress-estimated` adds the optional `left_estimate` of open rows; in whole-index check an open row
 //! with no estimate is red. Both read only. They read links and states, not code.

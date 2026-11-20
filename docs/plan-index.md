@@ -109,7 +109,7 @@ Refusals of the three-input form (exit 2, stdout empty, one stderr line, no path
 
 - `harness: error: base plan index: <reason>`: the reasons of the index reader above; also `harness: error: base plan index: an id is on more than one row`.
 - `harness: error: plan file: <what>` for `--plan` and `harness: error: base plan file: <what>` for `--base-plan`, with `<what>` one of `is missing or cannot be read`, `is not a regular file`, `cannot be read`, `is over 16777216 bytes` (16777216 bytes is read), `is not valid UTF-8`, `is empty`. A symlink to a regular file is read.
-- `harness: error: plan file: is the same file as the base plan file`: both paths name one file after links are resolved (equal bytes in two files is not the same file).
+- `harness: error: plan file: is the same file as the base plan file`: both paths are the same path after symbolic links are resolved. A hard link to the base plan file, or two files with equal bytes, is not refused.
 
 ### Ticket mode
 
@@ -184,4 +184,4 @@ Known gaps:
 - The `progress` line still counts a ticket linked to a dropped row.
 - An engine binary older than this change refuses an index with a dropped row (exit 2), so a row is set to `dropped` only after the bw engine binary is rebuilt.
 - An `off_plan` reason is not judged.
-- Plan-line check: a row added, removed or moved (a changed `plan_line`) is not compared; an edit after character 40 of a line is not seen; no program calls the three new inputs yet, so a person runs the verb by hand on the two revisions; whole-index check can be red for other classes, so a caller reads the `plan-line-stale` lines, not the exit code.
+- Plan-line check: a row added, removed or moved (a changed `plan_line`) is not compared; an edit after character 40 of a line is not seen; a base index that shares no id with the head index gives `compared=0` and exit 0; no program calls the three new inputs yet, so a person runs the verb by hand on the two revisions; whole-index check can be red for other classes, so a caller reads the `plan-line-stale` lines, not the exit code.
