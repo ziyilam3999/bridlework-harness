@@ -183,27 +183,32 @@ fn argument_faults_exit_2_and_the_test_flag_needs_the_test_mode() {
     let (_t, dir, shas) = repo_n(1);
     let d = dir.to_str().unwrap();
     let sha = &shas[0];
-    let cases: Vec<Vec<&str>> = vec![
-        vec!["build"],
-        vec!["build", "stamp"],
-        vec!["build", "check"],
-        vec!["build", "check", "--ref", "HEAD"],
-        vec!["build", "check", "--repo-dir", d],
-        vec!["build", "check", "--repo-dir", "repo", "--ref", "HEAD"],
-        vec!["build", "check", "--repo-dir", d, "--ref", "-x"],
-        vec!["build", "check", "--repo-dir", d, "--ref", ""],
-        vec!["build", "check", "--repo-dir", d, "--ref", "HEAD", "--ref", "HEAD"],
-        vec!["build", "check", "--repo-dir", d, "--ref"],
-        vec!["build", "check", "--repo-dir", d, "--ref", "HEAD", "--other", "x"],
-        vec!["build", "check", "--repo-dir", d, "--ref", "HEAD", "--stamp-for-test", sha],
+    // an absolute path that exists and holds `..`, and a path that is a file
+    let dotdot = format!("{d}/../repo");
+    let file = format!("{d}/f0.txt");
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["build"], "build check is the only build verb"),
+        (vec!["build", "stamp"], "build check is the only build verb"),
+        (vec!["build", "check"], "--repo-dir and --ref are required"),
+        (vec!["build", "check", "--ref", "HEAD"], "--repo-dir and --ref are required"),
+        (vec!["build", "check", "--repo-dir", d], "--repo-dir and --ref are required"),
+        (vec!["build", "check", "--repo-dir", "repo", "--ref", "HEAD"], "--repo-dir must be an absolute path"),
+        (vec!["build", "check", "--repo-dir", d, "--ref", "-x"], "--ref must not start with a dash"),
+        (vec!["build", "check", "--repo-dir", d, "--ref", ""], "--ref is empty"),
+        (vec!["build", "check", "--repo-dir", d, "--ref", "HEAD", "--ref", "HEAD"], "--ref was given twice"),
+        (vec!["build", "check", "--repo-dir", d, "--ref"], "--ref is missing its value"),
+        (vec!["build", "check", "--repo-dir", d, "--ref", "HEAD", "--other", "x"], "unknown option --other"),
+        (vec!["build", "check", "--repo-dir", d, "--ref", "HEAD", "--stamp-for-test", sha], "--stamp-for-test is read only with --testmode synthetic-test"),
+        (vec!["build", "check", "--repo-dir", dotdot.as_str(), "--ref", "HEAD"], "--repo-dir must be an absolute path"),
+        (vec!["build", "check", "--repo-dir", file.as_str(), "--ref", "HEAD"], "--repo-dir is not a folder"),
     ];
-    for a in &cases {
+    for (a, msg) in &cases {
         let o = bin(a);
         assert_eq!(code(&o), 2, "case {a:?}: stdout {:?} stderr {:?}", out(&o), err(&o));
         assert_eq!(out(&o), "", "case {a:?}");
         let e = err(&o);
         let mut lines = e.lines();
-        assert!(lines.next().unwrap().starts_with("harness: error: "), "case {a:?}: {e}");
+        assert_eq!(lines.next(), Some(format!("harness: error: {msg}").as_str()), "case {a:?}: {e}");
         assert_eq!(lines.next(), Some(USAGE), "case {a:?}: {e}");
         assert_eq!(lines.next(), None, "case {a:?}: {e}");
     }

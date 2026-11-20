@@ -20,7 +20,8 @@ harness build check
 
 Both flags are required, each once. A missing or repeated option, an unknown option, a flag with no
 value, a relative or missing repo dir, an absolute repo dir that holds `..` (`--repo-dir must be an
-absolute path`), or an empty ref / a ref starting with a dash is exit 2 with a
+absolute path`), a repo dir that is not a folder (`--repo-dir is not a folder`), or an empty ref / a
+ref starting with a dash is exit 2 with a
 `harness: error:` line and the usage line on stderr, stdout empty.
 
 ## The stamp
@@ -42,7 +43,11 @@ environment; if it is exported there, that build picks it up.
 variable set to the commit of `HEAD` of the checkout it lives in, prints
 `stamped-build: built commit=<sha>` and exits 0. It exits 1 with nothing on stdout, and runs no
 build, when `HEAD` has no commit, when the work tree has a tracked change or when it has an untracked
-file (`git status --porcelain` is not empty). It also exits 1 when the cargo build itself fails. The
+file (`git status --porcelain --untracked-files=all` is not empty, whatever `status.showUntrackedFiles`
+says), or when that `git status` call itself fails (an unreadable or corrupt index). It also exits 1
+when the cargo build itself fails. `GIT_DIR`, `GIT_WORK_TREE` and the other repo-location variables
+are cleared before the git calls, so the stamp is the commit of `HEAD` of the checkout the script
+lives in. The
 work tree check does not list git-ignored files, so an ignored file can still change the build; the
 stamp names the commit of `HEAD`, which matches the built code when the tree is otherwise clean. A
 stamp set by hand to a commit that was not built is not seen by the verb; the script is the guard.

@@ -85,13 +85,26 @@ impl Fix {
     /// Run the script with the fake cargo first on the PATH (a fixed string: the bin folder, then the
     /// system folders that hold git).
     fn run(&self) -> Output {
+        self.cmd().stdin(Stdio::null()).output().unwrap()
+    }
+
+    /// The script command with the git location variables cleared; a test may set them after this.
+    fn cmd(&self) -> Command {
         let mut c = Command::new("sh");
         c.arg(self.dir.join("ci/stamped-build.sh"));
         c.env("PATH", format!("{}:/usr/bin:/bin", self.bin.to_str().unwrap()));
         for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
             c.env_remove(k);
         }
-        c.stdin(Stdio::null()).output().unwrap()
+        c
+    }
+
+    /// The run was refused: exit 1, empty stdout, and the fake cargo did not run.
+    fn assert_refused(&self, what: &str) {
+        let o = self.run();
+        assert_eq!(o.status.code(), Some(1), "{what}: stdout {:?} stderr {:?}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_eq!(String::from_utf8_lossy(&o.stdout), "", "{what}");
+        assert!(!self.rec.exists(), "{what}: a refused tree ran the build");
     }
 }
 
@@ -146,4 +159,57 @@ fn a_tracked_change_an_untracked_file_and_no_commit_are_refused_and_cargo_is_not
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&o.stdout), "");
     assert!(!rec.exists(), "a refused tree ran the build");
+}
+
+#[test]
+fn a_git_status_that_fails_is_refused_and_cargo_is_not_run() {
+    let f = fix();
+    // a corrupt index: git status fails while rev-parse HEAD still works
+    fs::write(f.dir.join(".git/index"), b"not an index file\n").unwrap();
+    assert!(!gitcmd(&f.dir, &["status", "--porcelain"]).output().unwrap().status.success(), "the scratch index is not broken");
+    f.assert_refused("a failing git status");
+}
+
+#[test]
+fn an_untracked_file_is_refused_whatever_the_git_config_says() {
+    let f = fix();
+    g(&f.dir, &["config", "status.showUntrackedFiles", "no"]);
+    fs::write(f.dir.join("new.txt"), b"n\n").unwrap();
+    assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the config hides the file from a plain status");
+    f.assert_refused("an untracked file with showUntrackedFiles=no");
+}
+
+#[test]
+fn the_stamp_is_head_of_the_checkout_even_when_git_dir_names_another_repo() {
+    let f = fix();
+    let head = g(&f.dir, &["rev-parse", "HEAD"]);
+    // a second valid repo with its own commit, named by GIT_DIR and GIT_WORK_TREE
+    let other = f._t.0.join("other");
+    fs::create_dir_all(&other).unwrap();
+    g(&other, &["init", "-q"]);
+    for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+        g(&other, &["config", k, v]);
+    }
+    fs::write(other.join("o.txt"), b"o\n").unwrap();
+    g(&other, &["add", "-A"]);
+    g(&other, &["commit", "-q", "-m", "o"]);
+    let other_head = g(&other, &["rev-parse", "HEAD"]);
+    assert_ne!(head, other_head);
+    let mut c = f.cmd();
+    c.env("GIT_DIR", other.join(".git")).env("GIT_WORK_TREE", &other);
+    let o = c.stdin(Stdio::null()).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "stdout {:?} stderr {:?}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), format!("stamped-build: built commit={head}\n"));
+    assert_eq!(fs::read_to_string(&f.rec).unwrap(), format!("{head}\n"), "the stamp names HEAD of the script's own checkout");
+}
+
+#[test]
+fn a_failing_cargo_build_exits_1_with_empty_stdout() {
+    let f = fix();
+    let fake = format!("#!/bin/sh\nprintf '%s\\n' \"$HARNESS_BUILD_COMMIT\" > {}\nexit 1\n", f.rec.to_str().unwrap());
+    fs::write(f.bin.join("cargo"), fake).unwrap();
+    let o = f.run();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+    assert!(f.rec.exists(), "the build was started");
 }
