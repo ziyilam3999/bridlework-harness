@@ -36,7 +36,7 @@ The first failing step gives one stderr line and stops.
    folder above it holds an entry named `.git` (exit 2). The verb creates no folder.
 7. The body file, opened as the ticket file is; at most 4097 bytes are read (exit 2).
 8. The subject checks (exit 1).
-9. The body checks (exit 1).
+9. The body checks (exit 1); they end with the subject-line rule on line 1 of the body.
 10. The privacy scan (exit 1).
 11. The writes (exit 2 on an error).
 
@@ -56,7 +56,9 @@ After `harness: merge-text refused: `:
 - Body, in this order: `body is over 4096 bytes`; `body is empty (0 bytes)`; `body is not UTF-8`;
   `body does not end with a newline`; `body has more than 20 lines`; then per line, in order:
   `body line <n> has a control character`; `body line <n> is blank at the start or the end` (first or last
-  line only; a blank line in the middle is kept); `body line <n> looks like a trailer`.
+  line only; a blank line in the middle is kept); `body line <n> looks like a trailer`; then the
+  subject-line rule of line 1: `body line 1 is the ticket title`; `body line 1 is the squash subject`;
+  `body line 1 has the form of a commit subject`.
 - Privacy: `subject has a privacy hit (<classes>)` or `body line <n> has a privacy hit (<classes>)`. The
   subject is scanned as `merge.subject`, the body line by line as `merge.body`, with the privacy list and
   testmode off. No byte of the hit is printed.
@@ -71,6 +73,19 @@ joined by single `-`, then zero or more blanks, then a colon. The squash body be
 on the public default branch, and a co-author or sign-off line there names a person. The rule is wide on
 purpose: a matching line is refused anywhere in the body, though git reads trailers only in the last
 paragraph. Single-word tokens such as `Note: x` pass; git may read them as trailers when they end the body.
+
+## The subject-line rule
+
+Line 1 of the body is refused when, with leading and trailing blanks removed, it equals the ticket title
+with its blanks removed, or equals the squash subject with its blanks removed; or when, after its leading
+blanks, it has the form of a commit subject: either `type(scope): text`, where `type` is an ASCII
+lowercase letter, then zero or more ASCII lowercase letters, digits or `-`, and `scope` is one or more
+characters with no `(` and no `)`, with an optional `!` before a colon and a space; or one of the words
+`build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`, then an
+optional `!`, then a colon and a space. Only line 1 is read by this rule. The verb writes the squash
+subject from the ticket title, so a subject line in the body ends up twice, or reworded, in the commit on
+the default branch. The rule is narrow on purpose, so a reworded type-only subject with a type outside the
+word list (`data: ...`, `probe: ...`) and a capitalized subject (`Fix: ...`) still pass.
 
 ## Files and cleanup
 
