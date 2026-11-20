@@ -59,7 +59,9 @@ or no usage, or with a usage field that is not a whole number, gives exit 3 on e
 in the transcript.
 
 The last part of the transcript path must be exactly `<session-id>.jsonl` (the id as given, lowercase). The name is checked before the
-file is touched, so the event log, or the transcript of another session, passed by mistake is refused and not counted as 0.
+file is touched, so the event log, or the transcript of another session, passed by mistake is refused and not counted as 0. A path
+that ends in `/` is refused as written, whether the name is a link or a file, because the answer of the operating system for a link
+with an end slash differs between runs.
 
 ## Output and exit codes
 
@@ -108,7 +110,10 @@ the transcript name, the transcript file.
 | start record | `the start time is out of range` (start over 253401609599000) |
 | start record | `the start time is after now` (a start equal to now passes) |
 | transcript | `the file name does not match the session id` |
+| transcript | `the path ends with a slash` (the path text ends in `/`; refused as written, before the file is touched) |
 | transcript | `the transcript cannot be opened: <reason>` |
+| transcript | `the transcript changed between check and open` (the opened file is not the file the kind check saw) |
+| transcript | `the transcript cannot be read: <reason>` |
 | transcript | `the transcript is a symbolic link` |
 | transcript | `the transcript is not a regular file` |
 | transcript | `the transcript is empty` |

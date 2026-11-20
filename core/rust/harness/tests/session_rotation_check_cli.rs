@@ -410,7 +410,14 @@ fn transcript_live_symlink_with_trailing_slash_creates_nothing() {
     symlink(s.p("real.jsonl"), s.tr()).unwrap();
     let mut args = full(&s, &M.to_string(), "+08:00");
     args[5] = format!("{}/", s.tr());
-    check(&s, &args, "", &tr_rf("the transcript cannot be opened: not a directory"), 3);
+    check(&s, &args, "", &tr_rf("the path ends with a slash"), 3);
+}
+#[test]
+fn transcript_regular_file_with_trailing_slash_is_refused() {
+    let s = with_log(&hook(M, SID));
+    let mut args = full(&s, &M.to_string(), "+08:00");
+    args[5] = format!("{}/", s.tr());
+    check(&s, &args, "", &tr_rf("the path ends with a slash"), 3);
 }
 #[test]
 fn transcript_dangling_symlink_with_trailing_slash_creates_nothing() {
@@ -419,7 +426,7 @@ fn transcript_dangling_symlink_with_trailing_slash_creates_nothing() {
     symlink(s.p("nowhere.jsonl"), s.tr()).unwrap();
     let mut args = full(&s, &M.to_string(), "+08:00");
     args[5] = format!("{}/", s.tr());
-    check(&s, &args, "", &tr_rf("the transcript cannot be opened: entity not found"), 3);
+    check(&s, &args, "", &tr_rf("the path ends with a slash"), 3);
     assert!(fs::symlink_metadata(s.p("nowhere.jsonl")).is_err());
 }
 #[test]
@@ -732,7 +739,7 @@ fn hit(text: &str, needle: &str) -> bool {
 
 #[test]
 fn source_holds_no_write_or_child_process_call() {
-    let needles: Vec<String> = [("File", "::create"), ("Open", "Options"), ("fs::", "write"), ("fs::", "remove"), ("fs::", "rename"), ("fs::", "create_dir"), ("fs::", "copy"), ("set_", "permissions"), ("Com", "mand")]
+    let needles: Vec<String> = [("File", "::create"), ("Open", "Options"), ("fs::", "write"), ("fs::", "remove"), ("fs::", "rename"), ("fs::", "create_dir"), ("fs::", "copy"), ("set_", "permissions"), ("Com", "mand"), ("File::", "options"), ("hard_", "link"), ("unix::fs::", "symlink"), (" sym", "link(")]
         .iter()
         .map(|(x, y)| format!("{x}{y}"))
         .collect();

@@ -140,6 +140,10 @@ pub fn rotation_check_cmd(a: &[String]) -> i32 {
     if Path::new(transcript).file_name().and_then(|n| n.to_str()) != Some(name.as_str()) {
         return refuse("transcript", "the file name does not match the session id");
     }
+    // An end slash makes the operating system's answer for a link differ between runs, so the path is refused as written.
+    if transcript.ends_with('/') {
+        return refuse("transcript", "the path ends with a slash");
+    }
     let compactions = match read_compactions(Path::new(transcript)) {
         Ok(n) => n,
         Err(e) => return refuse("transcript", &e),
