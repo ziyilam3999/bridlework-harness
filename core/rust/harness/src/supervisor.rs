@@ -2423,7 +2423,7 @@ enum ClaimWalk {
     Counted(String, String),
     /// The first deciding entry holds a different session: refusal 2, this text.
     Mismatch(String),
-    /// No pid of the chain decided, or the first deciding entry has no session: exit 7, logged.
+    /// The walk ended (the bound, or a parent at or below 1) with no deciding entry, or the first deciding entry has no session: claim logs unmanaged_session and exits 7 (2 if that append fails).
     Unmanaged,
     /// A read the decision needed could not be made: refusal 2, nothing written.
     Unknown(String),
@@ -3172,7 +3172,7 @@ mod claim_walk_tests {
 
     const SID: &str = "11111111-2222-4333-8444-555555555555";
     const OTHER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-    /// The claimant of every case; its parent (when the chain goes on) is 4200.
+    /// The claimant of each case; PARENT is its parent in the cases that list it.
     const ME: u64 = 4100;
     const PARENT: u64 = 4200;
 
