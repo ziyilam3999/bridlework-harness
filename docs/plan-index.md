@@ -105,7 +105,7 @@ One stdout line per finding, `red <class> <id>`, then the last line `plan check 
 | `done-ticket-no-row <ticket id>` | a done ticket with no `off_plan` and no linked row |
 | `done-record-no-ticket <name>` | a `.done` file with no ticket file |
 
-Refusals of the three-input form (exit 2, stdout empty, one stderr line, no path and no file content). Read order: the three inputs above, the base index, the head plan file, the base plan file, then the same-file check; the first refusal is printed.
+Refusals of the three-input form (exit 2, stdout empty, one stderr line, no path and no file content). Read order: the `--index`, `--tickets` and `--done` inputs above, then the base index, the head plan file, the base plan file, then the same-file check; the first refusal is printed.
 
 - `harness: error: base plan index: <reason>`: the reasons of the index reader above; also `harness: error: base plan index: an id is on more than one row`.
 - `harness: error: plan file: <what>` for `--plan` and `harness: error: base plan file: <what>` for `--base-plan`, with `<what>` one of `is missing or cannot be read`, `is not a regular file`, `cannot be read`, `is over 16777216 bytes` (16777216 bytes is read), `is not valid UTF-8`, `is empty`. A symlink to a regular file is read.
