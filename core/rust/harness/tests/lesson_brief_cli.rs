@@ -1,6 +1,8 @@
-//! `harness lesson brief`: real binary, synthetic fixtures only (no real ids, names, paths or text). Every
+//! `harness lesson brief`: real binary, synthetic fixtures only (no real ids, names, paths or text). Each
 //! check runs the real binary as a child process. The privacy list is injected on the child only; the deny
-//! word and the test-mode marker are built at run time so this file never spells them out.
+//! word and the test-mode marker are built at run time so this file does not spell them out. A test that
+//! ends well removes its scratch folders with `done()`; a failed test leaves them for a look.
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -8,6 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
 static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The scratch paths this test made (a path may be absent when the test ends).
+    static SCRATCH: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
 
 /// The usage text of `harness lesson`: the four lines of today plus the new brief line.
 const USAGE: &str = concat!(
@@ -18,13 +25,15 @@ const USAGE: &str = concat!(
     "       harness lesson brief <lessons-dir> --ticket <ticket-file> --scope-file <file> --out <absolute-dir>\n",
 );
 
-/// The scratch name: the tag, the process id and a sequence number.
+/// The scratch name: the tag, the process id and a sequence number; it is noted for `done()`.
 fn scratch_name(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("lbrief-{}-{}-{}", tag, std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)))
+    let p = std::env::temp_dir().join(format!("lbrief-{}-{}-{}", tag, std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+    SCRATCH.with(|s| s.borrow_mut().push(p.clone()));
+    p
 }
 
-/// Remove what is at `d` (a link is removed, not followed) and make an empty folder there.
-fn make_scratch(d: &Path) {
+/// Remove what is at `d` (a link is removed, not followed); nothing happens when nothing is there.
+fn remove_any(d: &Path) {
     if let Ok(md) = fs::symlink_metadata(d) {
         if md.is_dir() {
             fs::remove_dir_all(d).unwrap_or_else(|e| panic!("scratch folder {} was not removed: {}", d.display(), e));
@@ -32,6 +41,19 @@ fn make_scratch(d: &Path) {
             fs::remove_file(d).unwrap_or_else(|e| panic!("scratch entry {} was not removed: {}", d.display(), e));
         }
     }
+}
+
+/// Remove the scratch paths of this test (called as the last step of a test that ended well).
+fn done() {
+    let all: Vec<PathBuf> = SCRATCH.with(|s| s.borrow_mut().drain(..).collect());
+    for p in all {
+        remove_any(&p);
+    }
+}
+
+/// Remove what is at `d` and make an empty folder there.
+fn make_scratch(d: &Path) {
+    remove_any(d);
     fs::create_dir(d).unwrap_or_else(|e| panic!("scratch folder {} was not made: {}", d.display(), e));
 }
 
@@ -44,13 +66,7 @@ fn tmp(tag: &str) -> PathBuf {
 /// A path that is absent now (the out folder of a run is made by the run, not by the test).
 fn fresh(tag: &str) -> PathBuf {
     let d = scratch_name(tag);
-    if let Ok(md) = fs::symlink_metadata(&d) {
-        if md.is_dir() {
-            fs::remove_dir_all(&d).unwrap();
-        } else {
-            fs::remove_file(&d).unwrap();
-        }
-    }
+    remove_any(&d);
     d
 }
 
@@ -73,7 +89,7 @@ fn marker() -> String {
     ["Synthetic", "-Test", "-Marker"].concat()
 }
 
-/// The child with no config or list variable inherited: every input arrives as a flag or an explicit `.env`.
+/// The child with no config or list variable inherited: each input arrives as a flag or an explicit `.env`.
 fn base() -> Command {
     let mut c = Command::new(BIN);
     c.env_remove("HARNESS_CONFIG")
@@ -214,6 +230,7 @@ fn an_unknown_option_exits_2() {
         assert!(stdout(&o).is_empty(), "{}", flag);
         assert_eq!(stderr(&o), format!("harness: error: unknown option {}\n", flag), "{}", flag);
     }
+    done();
 }
 
 #[test]
@@ -228,6 +245,7 @@ fn a_flag_with_no_value_exits_2() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: --out needs a value\n");
+    done();
 }
 
 #[test]
@@ -241,6 +259,7 @@ fn a_flag_given_twice_exits_2() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: --ticket given twice\n");
+    done();
 }
 
 #[test]
@@ -253,6 +272,7 @@ fn two_lessons_folders_exit_2() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: more than one lessons folder given\n");
+    done();
 }
 
 #[test]
@@ -265,6 +285,7 @@ fn no_lessons_folder_prints_the_usage() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), USAGE);
+    done();
 }
 
 #[test]
@@ -272,6 +293,7 @@ fn the_usage_text_keeps_its_four_lines_and_gains_the_brief_line() {
     let o = run_with(&[s("lesson"), s("brief")], &clean());
     assert_eq!(stderr(&o), USAGE);
     assert_eq!(code(&o), 2);
+    done();
 }
 
 #[test]
@@ -285,6 +307,7 @@ fn no_ticket_flag_exits_2() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: --ticket is required\n");
+    done();
 }
 
 #[test]
@@ -298,6 +321,7 @@ fn no_scope_file_flag_exits_2() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: --scope-file is required\n");
+    done();
 }
 
 #[test]
@@ -311,6 +335,7 @@ fn no_out_flag_exits_2() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: --out is required\n");
+    done();
 }
 
 #[test]
@@ -329,6 +354,7 @@ fn no_ticket_and_no_out_prints_the_ticket_line() {
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: --ticket is required\n");
     assert!(absent(&out));
+    done();
 }
 
 #[test]
@@ -339,6 +365,7 @@ fn a_relative_out_value_prints_the_usage() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), USAGE);
+    done();
 }
 
 #[test]
@@ -351,6 +378,7 @@ fn an_out_value_with_a_dot_dot_part_prints_the_usage() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), USAGE);
+    done();
 }
 
 #[test]
@@ -363,6 +391,7 @@ fn an_out_value_with_a_control_character_prints_the_usage() {
     assert_eq!(code(&o), 2);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), USAGE);
+    done();
 }
 
 #[test]
@@ -377,6 +406,64 @@ fn an_out_value_with_a_blank_other_than_a_space_prints_the_usage() {
         assert!(stdout(&o).is_empty(), "{}", name);
         assert_eq!(stderr(&o), USAGE, "{}", name);
     }
+    done();
+}
+
+/// The out value with a slash added at its end.
+fn with_slash(p: &Path) -> PathBuf {
+    PathBuf::from(format!("{}/", p.to_str().unwrap()))
+}
+
+#[test]
+fn an_out_value_ending_in_a_slash_over_a_dangling_link_prints_the_usage_and_makes_nothing() {
+    let d = setup("slash-dangling", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    let gone = fresh("slash-dangling-gone");
+    let out = fresh("slash-dangling-path");
+    link(&gone, &out);
+    let o = brief(&d, &with_slash(&out));
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), USAGE);
+    assert!(absent(&gone), "the link target was made");
+    assert!(fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+    done();
+}
+
+#[test]
+fn an_out_value_ending_in_a_slash_over_a_free_path_prints_the_usage_and_makes_nothing() {
+    let d = setup("slash-free", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    let out = fresh("slash-free-path");
+    let o = brief(&d, &with_slash(&out));
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), USAGE);
+    assert!(absent(&out));
+    done();
+}
+
+#[test]
+fn an_out_value_ending_in_a_slash_over_a_link_to_a_folder_prints_the_usage_and_leaves_the_target() {
+    let d = setup("slash-link", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    let target = tmp("slash-link-target");
+    let out = fresh("slash-link-path");
+    link(&target, &out);
+    let o = brief(&d, &with_slash(&out));
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), USAGE);
+    assert_eq!(listing(&target), Vec::<String>::new());
+    assert!(fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+    done();
+}
+
+#[test]
+fn a_root_only_out_value_prints_the_usage() {
+    let d = setup("slash-root", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    let o = brief(&d, Path::new("/"));
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert_eq!(stderr(&o), USAGE);
+    done();
 }
 
 // ---------------------------------------------------------------- the block
@@ -410,6 +497,7 @@ fn the_block_prints_the_always_lines_before_the_lesson_lines() {
         out.to_str().unwrap()
     );
     assert_eq!(stdout(&o), want);
+    done();
 }
 
 #[test]
@@ -436,6 +524,7 @@ fn two_always_pages_and_no_matched_page() {
     );
     assert!(out.is_dir());
     assert_eq!(listing(&out), Vec::<String>::new());
+    done();
 }
 
 #[test]
@@ -459,6 +548,7 @@ fn two_matched_pages_and_no_always_page() {
         out.to_str().unwrap()
     );
     assert_eq!(stdout(&o), want);
+    done();
 }
 
 #[test]
@@ -476,6 +566,7 @@ fn pages_but_none_offered_prints_one_line() {
     assert_eq!(stdout(&o), "Lessons for this ticket (harness lesson brief): always=0 matched=0\n");
     assert!(out.is_dir());
     assert_eq!(listing(&out), Vec::<String>::new());
+    done();
 }
 
 #[test]
@@ -499,6 +590,7 @@ fn the_always_and_lesson_lines_match_the_lookup_stdout() {
         t.lines().filter(|l| l.starts_with("always: ") || l.starts_with("lesson: ")).map(s).collect()
     };
     assert_eq!(pick(stdout(&b)), pick(stdout(&l)));
+    done();
 }
 
 // ---------------------------------------------------------------- copies
@@ -521,6 +613,7 @@ fn the_out_folder_holds_exactly_the_matched_page_copies() {
     let o = brief(&d, &out);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(listing(&out), vec![s("ISSUE-101-a.md"), s("ISSUE-103-c.md")]);
+    done();
 }
 
 #[test]
@@ -540,6 +633,7 @@ fn each_copy_is_byte_equal_to_its_page() {
     for n in ["ISSUE-101-a.md", "ISSUE-102-b.md"] {
         assert_eq!(fs::read(out.join(n)).unwrap(), fs::read(d.join("lessons").join(n)).unwrap(), "{}", n);
     }
+    done();
 }
 
 #[test]
@@ -559,6 +653,7 @@ fn two_matched_pages_with_one_id_give_two_lines_and_two_copies() {
     assert_eq!(lines[0], "Lessons for this ticket (harness lesson brief): always=0 matched=2");
     assert_eq!(lines[3], "lesson: ISSUE-101 Widget lesson ISSUE-101-a.md");
     assert_eq!(lines[4], "lesson: ISSUE-101 Widget lesson ISSUE-101-b.md");
+    done();
 }
 
 #[test]
@@ -576,6 +671,7 @@ fn a_page_whose_file_name_the_escape_rewrites_refuses() {
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: lesson brief refused: ISSUE-102: NAME the file name cannot be printed as it is\n");
     assert!(absent(&out));
+    done();
 }
 
 // ---------------------------------------------------------------- the out folder
@@ -590,6 +686,7 @@ fn an_empty_folder_at_the_out_path_refuses() {
     assert_eq!(stderr(&o), "harness: lesson brief refused: the out folder exists already\n");
     assert!(out.is_dir());
     assert_eq!(listing(&out), Vec::<String>::new());
+    done();
 }
 
 #[test]
@@ -603,6 +700,7 @@ fn a_folder_with_files_at_the_out_path_refuses() {
     assert_eq!(stderr(&o), "harness: lesson brief refused: the out folder exists already\n");
     assert_eq!(listing(&out), vec![s("keep.txt")]);
     assert_eq!(fs::read(out.join("keep.txt")).unwrap(), b"kept");
+    done();
 }
 
 #[test]
@@ -616,6 +714,7 @@ fn a_file_at_the_out_path_refuses() {
     assert_eq!(stderr(&o), "harness: lesson brief refused: the out folder exists already\n");
     assert!(fs::symlink_metadata(&out).unwrap().is_file());
     assert_eq!(fs::read(&out).unwrap(), b"a file");
+    done();
 }
 
 #[test]
@@ -631,6 +730,7 @@ fn a_link_to_a_folder_at_the_out_path_refuses_and_is_not_followed() {
     assert_eq!(stderr(&o), "harness: lesson brief refused: the out folder exists already\n");
     assert!(fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
     assert_eq!(listing(&target), vec![s("keep.txt")]);
+    done();
 }
 
 #[test]
@@ -644,6 +744,8 @@ fn a_dangling_link_at_the_out_path_refuses() {
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: lesson brief refused: the out folder exists already\n");
     assert!(fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+    assert!(absent(&gone), "the link target was made");
+    done();
 }
 
 #[test]
@@ -659,6 +761,7 @@ fn a_second_run_with_the_same_arguments_is_refused() {
     assert_eq!(stderr(&second), "harness: lesson brief refused: the out folder exists already\n");
     let again = listing(&out).into_iter().map(|n| (n.clone(), fs::read(out.join(&n)).unwrap())).collect::<Vec<_>>();
     assert_eq!(snap, again);
+    done();
 }
 
 #[test]
@@ -671,6 +774,7 @@ fn a_missing_parent_of_the_out_path_exits_2() {
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: the out folder cannot be made\n");
     assert!(absent(&base.join("nosuch")));
+    done();
 }
 
 #[test]
@@ -685,6 +789,7 @@ fn a_parent_that_is_a_file_exits_2() {
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: error: the out folder cannot be made\n");
     assert!(fs::symlink_metadata(&file_p).unwrap().is_file());
+    done();
 }
 
 // ---------------------------------------------------------------- lookup reuse
@@ -714,6 +819,7 @@ fn a_page_with_no_closing_front_matter_refuses_as_the_lookup() {
     let (b, _) = reuses_lookup("reuse-front", &[("ISSUE-101-a.md", good_match()), ("ISSUE-102-b.md", bad)], &default_ticket("t"), None);
     assert_eq!(code(&b), 1);
     assert!(stderr(&b).contains("FRONT-MATTER"), "{}", stderr(&b));
+    done();
 }
 
 #[test]
@@ -722,6 +828,7 @@ fn an_unknown_status_refuses_as_the_lookup() {
     let (b, _) = reuses_lookup("reuse-status", &[("ISSUE-101-a.md", good_match()), ("ISSUE-102-b.md", bad)], &default_ticket("t"), None);
     assert_eq!(code(&b), 1);
     assert!(stderr(&b).contains("STATUS"), "{}", stderr(&b));
+    done();
 }
 
 #[test]
@@ -730,6 +837,7 @@ fn a_page_with_always_and_match_refuses_as_the_lookup() {
     let (b, _) = reuses_lookup("reuse-always", &[("ISSUE-101-a.md", good_match()), ("ISSUE-102-b.md", bad)], &default_ticket("t"), None);
     assert_eq!(code(&b), 1);
     assert!(stderr(&b).contains("ALWAYS always and match"), "{}", stderr(&b));
+    done();
 }
 
 #[test]
@@ -746,6 +854,7 @@ fn six_always_pages_refuse_as_the_lookup() {
         "{}",
         stderr(&b)
     );
+    done();
 }
 
 #[test]
@@ -753,6 +862,7 @@ fn a_refused_ticket_file_refuses_as_the_lookup() {
     let (b, _) = reuses_lookup("reuse-ticket", &[("ISSUE-101-a.md", good_match())], b"\xff\xfe{}", None);
     assert_eq!(code(&b), 1);
     assert!(stderr(&b).contains("harness: ticket refused:"), "{}", stderr(&b));
+    done();
 }
 
 #[test]
@@ -768,6 +878,7 @@ fn a_page_shaped_symbolic_link_refuses_as_the_lookup() {
     assert!(absent(&out));
     assert_eq!(stderr(&b), stderr(&l));
     assert!(stderr(&b).ends_with("is a symbolic link\n"), "{}", stderr(&b));
+    done();
 }
 
 #[test]
@@ -796,6 +907,7 @@ fn a_missing_scope_file_refuses_as_the_lookup() {
     assert!(absent(&out));
     assert_eq!(stderr(&b), stderr(&l));
     assert!(stderr(&b).contains("the scope file cannot be read"), "{}", stderr(&b));
+    done();
 }
 
 // ---------------------------------------------------------------- retired pages
@@ -814,6 +926,7 @@ fn a_retired_page_that_would_match_gives_no_line_and_no_copy() {
     assert_eq!(stdout(&o), "Lessons for this ticket (harness lesson brief): always=0 matched=0\n");
     assert!(out.is_dir());
     assert_eq!(listing(&out), Vec::<String>::new());
+    done();
 }
 
 #[test]
@@ -828,6 +941,7 @@ fn a_retired_always_page_gives_no_line() {
     let o = brief(&d, &out);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(stdout(&o), "Lessons for this ticket (harness lesson brief): always=0 matched=0\n");
+    done();
 }
 
 #[test]
@@ -847,6 +961,7 @@ fn five_always_pages_and_one_retired_always_page_pass() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).starts_with("Lessons for this ticket (harness lesson brief): always=5 matched=0\n"), "{}", stdout(&o));
     assert_eq!(listing(&out), Vec::<String>::new());
+    done();
 }
 
 // ---------------------------------------------------------------- the privacy list
@@ -863,6 +978,7 @@ fn no_list_configured_exits_2() {
         stderr(&o),
         "harness: error: no privacy list configured: a lesson brief is not written unscanned\n"
     );
+    done();
 }
 
 #[test]
@@ -881,6 +997,7 @@ fn a_list_file_that_cannot_be_read_exits_2() {
         stderr(&o),
         "harness: error: no privacy list configured: a lesson brief is not written unscanned\n"
     );
+    done();
 }
 
 #[test]
@@ -908,6 +1025,7 @@ fn no_list_with_a_broken_ticket_and_a_missing_lessons_folder_prints_the_list_lin
         stderr(&o),
         "harness: error: no privacy list configured: a lesson brief is not written unscanned\n"
     );
+    done();
 }
 
 // ---------------------------------------------------------------- the privacy scan
@@ -954,6 +1072,7 @@ fn privacy_hits_are_printed_in_the_named_order() {
          harness: lesson brief refused: ISSUE-103: PRIVACY page line 9 deny-token\n\
          harness: lesson brief refused: ISSUE-103: PRIVACY page line 12 deny-token\n"
     );
+    done();
 }
 
 #[test]
@@ -972,6 +1091,7 @@ fn the_deny_word_in_a_file_name_gives_one_brief_line() {
     assert!(absent(&out));
     assert_eq!(stderr(&o), "harness: lesson brief refused: ISSUE-102: PRIVACY brief line deny-token\n");
     assert!(!stdout(&o).contains(&w) && !stderr(&o).contains(&w));
+    done();
 }
 
 #[test]
@@ -999,6 +1119,7 @@ fn the_deny_word_in_pages_that_are_not_scanned_passes() {
          Rules from earlier mistakes, kept for this change:\n\
          always: ISSUE-103 Check the depth.\n"
     );
+    done();
 }
 
 #[test]
@@ -1017,6 +1138,7 @@ fn the_deny_word_in_the_out_folder_name_passes() {
         out.to_str().unwrap()
     );
     assert_eq!(stdout(&o), want);
+    done();
 }
 
 #[test]
@@ -1038,6 +1160,7 @@ fn the_same_pages_pass_with_one_list_and_refuse_with_the_other() {
     assert!(stdout(&o).is_empty());
     assert!(absent(&out_refused));
     assert_eq!(stderr(&o), "harness: lesson brief refused: ISSUE-101: PRIVACY page line 5 deny-token\n");
+    done();
 }
 
 #[test]
@@ -1068,6 +1191,7 @@ fn the_test_mode_marker_is_refused_also_with_the_flag() {
             with_flag
         );
     }
+    done();
 }
 
 #[test]
@@ -1090,6 +1214,7 @@ fn two_classes_on_one_page_line_print_in_the_scanner_order() {
         "harness: lesson brief refused: ISSUE-101: PRIVACY page line 5 deny-token\n\
          harness: lesson brief refused: ISSUE-101: PRIVACY page line 5 synthetic-test\n"
     );
+    done();
 }
 
 #[test]
@@ -1111,6 +1236,7 @@ fn the_deny_word_in_a_heading_gives_two_lines() {
         "harness: lesson brief refused: ISSUE-101: PRIVACY brief line deny-token\n\
          harness: lesson brief refused: ISSUE-101: PRIVACY page line 4 deny-token\n"
     );
+    done();
 }
 
 // ---------------------------------------------------------------- order of the stages
@@ -1124,6 +1250,7 @@ fn no_list_and_no_out_prints_the_out_line() {
     let o = run_no_list(&a);
     assert_eq!(code(&o), 2);
     assert_eq!(stderr(&o), "harness: error: --out is required\n");
+    done();
 }
 
 #[test]
@@ -1136,6 +1263,7 @@ fn no_list_and_a_thing_at_the_out_path_prints_the_list_line() {
         stderr(&o),
         "harness: error: no privacy list configured: a lesson brief is not written unscanned\n"
     );
+    done();
 }
 
 #[test]
@@ -1151,6 +1279,7 @@ fn a_thing_at_the_out_path_and_a_refused_page_print_the_out_folder_line_only() {
     assert_eq!(code(&o), 1);
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), "harness: lesson brief refused: the out folder exists already\n");
+    done();
 }
 
 #[test]
@@ -1169,6 +1298,7 @@ fn a_missing_parent_and_a_refused_page_print_the_lookup_lines_only() {
     assert!(stdout(&o).is_empty());
     assert_eq!(stderr(&o), stderr(&l));
     assert!(absent(&base.join("nosuch")));
+    done();
 }
 
 #[test]
@@ -1190,6 +1320,7 @@ fn a_refused_page_and_a_privacy_hit_in_another_page_print_the_lookup_lines_only(
     assert!(stdout(&o).is_empty());
     assert!(absent(&out));
     assert_eq!(stderr(&o), stderr(&l));
+    done();
 }
 
 #[test]
@@ -1215,6 +1346,7 @@ fn a_name_page_and_a_privacy_hit_in_another_page_print_the_name_line_first() {
         "harness: lesson brief refused: ISSUE-101: NAME the file name cannot be printed as it is\n\
          harness: lesson brief refused: ISSUE-102: PRIVACY page line 5 deny-token\n"
     );
+    done();
 }
 
 #[test]
@@ -1234,13 +1366,15 @@ fn a_privacy_refusal_after_one_clean_matched_page_leaves_the_out_path_absent() {
     assert_eq!(code(&o), 1);
     assert!(stdout(&o).is_empty());
     assert!(absent(&out));
+    done();
 }
 
 // ---------------------------------------------------------------- reads and repeat runs
 
-/// The bytes of every input file and the entry names of the root, the lessons folder and the current folder.
-#[allow(clippy::type_complexity)]
-fn snapshot(root: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>, Vec<String>) {
+type Snap = (Vec<(String, Vec<u8>)>, Vec<String>, Vec<String>);
+
+/// The bytes of each input file and the entry names of the root, the lessons folder and the current folder.
+fn snapshot(root: &Path) -> Snap {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for n in ["ticket.json", "scope.txt"] {
         files.push((n.to_string(), fs::read(root.join(n)).unwrap()));
@@ -1290,6 +1424,67 @@ fn the_inputs_stay_byte_identical_and_nothing_is_written_beside_them() {
     assert_eq!(code(&o), 1);
     assert!(absent(&out_name));
     assert_eq!(snapshot(&d2), before2);
+    done();
+}
+
+#[test]
+fn the_inputs_stay_byte_identical_after_the_other_kinds_of_refusal() {
+    // an argument refusal (no --out), then one with an out value that ends in a slash
+    let d = setup("reads-arg", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    let before = snapshot(&d);
+    let out = fresh("reads-arg");
+    let mut a = brief_args(&d, &out);
+    a.pop();
+    a.pop();
+    let o = run_with(&a, &clean());
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert_eq!(snapshot(&d), before);
+    let o = brief(&d, &with_slash(&out));
+    assert_eq!(code(&o), 2);
+    assert_eq!(stderr(&o), USAGE);
+    assert!(absent(&out));
+    assert_eq!(snapshot(&d), before);
+    // a privacy list refusal
+    let o = run_no_list(&brief_args(&d, &out));
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert!(absent(&out));
+    assert_eq!(snapshot(&d), before);
+    // a lookup refusal (a page with no closing front matter line)
+    let d_front = setup(
+        "reads-front",
+        &default_ticket("t"),
+        b"src/\n",
+        &[("ISSUE-101-a.md", good_match()), ("ISSUE-102-b.md", "---\nmatch: [example]\n".to_string())],
+    );
+    let before_front = snapshot(&d_front);
+    let out_front = fresh("reads-front");
+    let o = brief(&d_front, &out_front);
+    assert_eq!(code(&o), 1);
+    assert!(stdout(&o).is_empty());
+    assert!(absent(&out_front));
+    assert_eq!(snapshot(&d_front), before_front);
+    // a lookup read error (a page-shaped symbolic link)
+    let d_link = setup("reads-link", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    link(&d_link.join("lessons").join("ISSUE-101-a.md"), &d_link.join("lessons").join("ISSUE-102-b.md"));
+    let before_link = snapshot(&d_link);
+    let out_link = fresh("reads-link");
+    let o = brief(&d_link, &out_link);
+    assert_eq!(code(&o), 2);
+    assert!(stdout(&o).is_empty());
+    assert!(absent(&out_link));
+    assert_eq!(snapshot(&d_link), before_link);
+    // the out folder cannot be made (a missing parent)
+    let d_par = setup("reads-parent", &default_ticket("t"), b"src/\n", &[("ISSUE-101-a.md", good_match())]);
+    let before_par = snapshot(&d_par);
+    let base = tmp("reads-parent-base");
+    let o = brief(&d_par, &base.join("nosuch").join("out"));
+    assert_eq!(code(&o), 2);
+    assert_eq!(stderr(&o), "harness: error: the out folder cannot be made\n");
+    assert!(absent(&base.join("nosuch")));
+    assert_eq!(snapshot(&d_par), before_par);
+    done();
 }
 
 #[test]
@@ -1314,6 +1509,7 @@ fn two_runs_with_fresh_out_folders_differ_in_the_folder_line_only() {
     assert!(stdout(&o1).contains(&format!("folder: {}\n", out1.to_str().unwrap())));
     assert!(stdout(&o2).contains(&format!("folder: {}\n", out2.to_str().unwrap())));
     assert_eq!(fs::read(out1.join("ISSUE-101-a.md")).unwrap(), fs::read(out2.join("ISSUE-101-a.md")).unwrap());
+    done();
 }
 
 #[test]
@@ -1331,6 +1527,7 @@ fn a_page_matched_only_through_the_scope_file_changes_the_answer() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(stdout(&o), "Lessons for this ticket (harness lesson brief): always=0 matched=0\n");
     assert_eq!(listing(&out2), Vec::<String>::new());
+    done();
 }
 
 #[test]
@@ -1346,4 +1543,5 @@ fn a_page_matched_only_through_the_ticket_title_changes_the_answer() {
     let o = brief(&d2, &out2);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(stdout(&o), "Lessons for this ticket (harness lesson brief): always=0 matched=0\n");
+    done();
 }

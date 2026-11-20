@@ -71,7 +71,8 @@ pub(crate) fn brief_cmd(a: &[String]) -> i32 {
         None => return fail("--out is required"),
     };
     let q = Path::new(out.as_str());
-    if !q.is_absolute() || q.components().any(|c| matches!(c, Component::ParentDir)) || esc(out) != *out {
+    // A value that ends in a slash is a usage error: the system would follow a link at the path then.
+    if !q.is_absolute() || out.ends_with('/') || q.components().any(|c| matches!(c, Component::ParentDir)) || esc(out) != *out {
         return usage();
     }
     // (2) The privacy list, before a page, the ticket or the scope file is read.
@@ -79,7 +80,8 @@ pub(crate) fn brief_cmd(a: &[String]) -> i32 {
         Ok(l) => l,
         Err(c) => return c,
     };
-    // (3) A thing found at the --out path refuses (a link is not followed); a path not found goes on.
+    // (3) A thing found at the --out path refuses (the check looks at a link itself, as the value has no
+    // trailing slash); a path not found goes on.
     if std::fs::symlink_metadata(q).is_ok() {
         eprintln!("harness: lesson brief refused: the out folder exists already");
         return 1;
