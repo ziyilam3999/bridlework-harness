@@ -23,7 +23,7 @@ seven OPTIONAL keys — `kind` and `repeats` (ticket 192), `source` (ticket 193)
 {"id":"pat-001","date":"2026-11-01","ticket":"192","where-it-lives":"memory","breaks":"","text":"the procedure that worked","kind":"pattern"}
 {"id":"pat-001-r1","date":"2026-11-02","ticket":"192","where-it-lives":"memory","breaks":"","text":"it worked again","kind":"pattern","repeats":"pat-001"}
 {"id":"les-002","date":"2026-11-03","ticket":"3601","where-it-lives":"gate","breaks":"les-001","text":"the lesson, again","at":"2026-11-03T09:30:00Z","impact":"high","why":"suspected: the gate reads a stale head","proof":"bridlework-harness@1a24234:core/rust/harness/src/friction.rs:75; session:s-0042; pr:owner/repo#93; cmd:cargo test; ~/notes/x.md"}
-{"id":"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45","date":"2026-11-02","ticket":"t-9.3","where-it-lives":"memory","breaks":"","text":"event replan_required repo=ai-brain ticket=193 reason=replan-threshold","source":"event"}
+{"id":"evt.replan_required.12_example-repo.3_193.16_replan-threshold.2026-w45","date":"2026-11-02","ticket":"t-9.3","where-it-lives":"memory","breaks":"","text":"event replan_required repo=example-repo ticket=193 reason=replan-threshold","source":"event","at":"2026-11-02T00:00:00Z","impact":"medium"}
 ```
 
 | field | rule |

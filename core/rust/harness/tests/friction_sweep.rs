@@ -122,7 +122,7 @@ fn gate_fail_line(t: u64, repo: &str, ticket: &str, gate_id: &str, failure_class
 /// boundary-twin logs, and line 5 of the fixture).
 fn escalation_line(t: u64, reason: &str) -> String {
     format!(
-        "{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":{t},\"run_id\":\"run-1\",\"ticket\":\"9\",\"repo\":\"ai-brain\",\"reason\":\"{reason}\",\"role\":\"executor\",\"model\":\"worker\"}}"
+        "{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":{t},\"run_id\":\"run-1\",\"ticket\":\"9\",\"repo\":\"example-repo\",\"reason\":\"{reason}\",\"role\":\"executor\",\"model\":\"worker\"}}"
     )
 }
 
@@ -130,12 +130,12 @@ fn escalation_line(t: u64, reason: &str) -> String {
 /// escalation (off the closed list) and the same replan cause in W46.
 fn fixture_lines() -> Vec<String> {
     vec![
-        replan_line(1793577600000, "ai-brain", "193", "replan-threshold"),
-        replan_line(1793750400000, "ai-brain", "193", "replan-threshold"),
+        replan_line(1793577600000, "example-repo", "193", "replan-threshold"),
+        replan_line(1793750400000, "example-repo", "193", "replan-threshold"),
         launch_line(1793664000000, "worker", "aa11bb22cc33dd44ee55ff6600112233445566aa11bb22cc33dd44ee55ff6600", "builder-state-deny"),
         gate_fail_line(1793577600000, "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A),
         escalation_line(1793577600000, "manual"),
-        replan_line(1794182400000, "ai-brain", "193", "replan-threshold"),
+        replan_line(1794182400000, "example-repo", "193", "replan-threshold"),
     ]
 }
 
@@ -147,8 +147,8 @@ fn fixture_log(t: &Tmp) -> PathBuf {
 /// The three W45 rows the plan pins, byte for byte, in id order (each line + newline).
 const R45_GATE: &str = "{\"id\":\"evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event gate_fail repo=bridlework-harness ticket=199 gate_id=rust-test failure_class=suite-fail\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"high\"}";
 const R45_LAUNCH: &str = "{\"id\":\"evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\",\"date\":\"2026-11-03\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event launch_refused launch_role=worker matched_entry=builder-state-deny\",\"source\":\"event\",\"at\":\"2026-11-03T00:00:00Z\",\"impact\":\"medium\"}";
-const R45_REPLAN: &str = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"medium\"}";
-const R46_REPLAN: &str = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w46\",\"date\":\"2026-11-09\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-09T00:00:00Z\",\"impact\":\"medium\"}";
+const R45_REPLAN: &str = "{\"id\":\"evt.replan_required.12_example-repo.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=example-repo ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"medium\"}";
+const R46_REPLAN: &str = "{\"id\":\"evt.replan_required.12_example-repo.3_193.16_replan-threshold.2026-w46\",\"date\":\"2026-11-09\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=example-repo ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-09T00:00:00Z\",\"impact\":\"medium\"}";
 
 /// `harness friction sweep` over the given log and week, with this scratch config.
 fn sweep(t: &Tmp, log: &Path, week: &str) -> Output {
@@ -205,7 +205,7 @@ fn ac1_files_the_expected_week_rows() {
     let log = fixture_log(&t);
     let o = sweep(&t, &log, "2026-w45");
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
-    let want_out = "stored id=evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\nstored id=evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\nstored id=evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\nsweep week=2026-w45 filed=3 already=0\n";
+    let want_out = "stored id=evt.gate_fail.18_bridlework-harness.3_199.9_rust-test.10_suite-fail.2026-w45\nstored id=evt.launch_refused.6_worker.18_builder-state-deny.2026-w45\nstored id=evt.replan_required.12_example-repo.3_193.16_replan-threshold.2026-w45\nsweep week=2026-w45 filed=3 already=0\n";
     assert_eq!(out(&o), want_out);
     assert_eq!(err(&o), "");
     let want_inbox = format!("{R45_GATE}\n{R45_LAUNCH}\n{R45_REPLAN}\n");
@@ -236,7 +236,7 @@ fn ac3_next_week_adds_only_the_new_rows() {
     assert_eq!(code(&sweep(&t, &log, "2026-w45")), 0);
     let o = sweep(&t, &log, "2026-w46");
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
-    assert_eq!(out(&o), "stored id=evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w46\nsweep week=2026-w46 filed=1 already=0\n");
+    assert_eq!(out(&o), "stored id=evt.replan_required.12_example-repo.3_193.16_replan-threshold.2026-w46\nsweep week=2026-w46 filed=1 already=0\n");
     assert_eq!(err(&o), "");
     let want = format!("{R45_GATE}\n{R45_LAUNCH}\n{R45_REPLAN}\n{R46_REPLAN}\n");
     assert_eq!(String::from_utf8(inbox_bytes(&t).unwrap()).unwrap(), want);

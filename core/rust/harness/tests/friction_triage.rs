@@ -268,7 +268,7 @@ fn a_corrupt_state_or_feed_refuses_and_changes_nothing() {
     let t = Tmp::new();
     five(&t);
     assert_eq!(code(&triage(&t, W45, &["--top", "1"])), 0);
-    let log = t.file("events.jsonl", format!("{}\n", "{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":1793577600000,\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"ai-brain\",\"reason\":\"replan-threshold\",\"role\":\"executor\",\"model\":\"worker\"}"));
+    let log = t.file("events.jsonl", format!("{}\n", "{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":1793577600000,\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"example-repo\",\"reason\":\"replan-threshold\",\"role\":\"executor\",\"model\":\"worker\"}"));
     let good = fs::read_to_string(t.state()).unwrap();
     for bad in [format!("{good}not json\n"), format!("{good}{{\"group\":\"g-1\"}}\n"), good.trim_end().to_string(), good.replace("proposed", "weird"), good.replace("\"task_id\":\"\"", "\"task_id\":\"-x\"")] {
         fs::write(t.state(), &bad).unwrap();

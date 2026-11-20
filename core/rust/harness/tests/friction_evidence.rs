@@ -126,7 +126,7 @@ fn mapper_fills_at_and_a_fixed_impact_and_leaves_why_proof_empty() {
     assert_eq!(r.at, "2026-11-02T01:02:03Z");
     assert_eq!(&r.at[0..10], r.date);
     assert!(r.why.is_empty() && r.proof.is_empty());
-    let replan = format!("{{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":{TS},\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"ai-brain\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"worker\"}}");
+    let replan = format!("{{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":{TS},\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"example-repo\",\"reason\":\"x\",\"role\":\"executor\",\"model\":\"worker\"}}");
     assert_eq!(map_line(&replan).unwrap().unwrap().impact, "medium");
     let launch = format!("{{\"v\":2,\"kind\":\"launch_refused\",\"ts_ms\":{TS},\"launch_role\":\"worker\",\"brief_sha256\":\"{}\",\"matched_entry\":\"e\"}}", "a".repeat(64));
     assert_eq!(map_line(&launch).unwrap().unwrap().impact, "medium");
