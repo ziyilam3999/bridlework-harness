@@ -19,7 +19,8 @@ harness build check
   starting with a dash. A tag is peeled to its commit.
 
 Both flags are required, each once. A missing or repeated option, an unknown option, a flag with no
-value, a relative or missing repo dir, or an empty ref / a ref starting with a dash is exit 2 with a
+value, a relative or missing repo dir, an absolute repo dir that holds `..` (`--repo-dir must be an
+absolute path`), or an empty ref / a ref starting with a dash is exit 2 with a
 `harness: error:` line and the usage line on stderr, stdout empty.
 
 ## The stamp
@@ -33,18 +34,23 @@ call that binary older for good).
 
 The stamp must be 40 lower-case hex characters. A build with the variable not set has no stamp: the
 check refuses it as cannot tell, so an unstamped binary is not taken as current. A variable set but
-empty, upper case, 39 or 41 characters or a word is refused with the same cannot-tell line.
+empty, upper case, 39 or 41 characters or a word is refused with the same cannot-tell line. A plain
+cargo build or cargo test sets no stamp while `HARNESS_BUILD_COMMIT` is not set in the caller's
+environment; if it is exported there, that build picks it up.
 
 `ci/stamped-build.sh` is the one place that sets the stamp. It builds `core/rust` release with the
 variable set to the commit of `HEAD` of the checkout it lives in, prints
 `stamped-build: built commit=<sha>` and exits 0. It exits 1 with nothing on stdout, and runs no
 build, when `HEAD` has no commit, when the work tree has a tracked change or when it has an untracked
-file (`git status --porcelain` is not empty), so the stamp names the code that was built. A stamp set
-by hand to a commit that was not built is not seen by the verb; the script is the guard.
+file (`git status --porcelain` is not empty). It also exits 1 when the cargo build itself fails. The
+work tree check does not list git-ignored files, so an ignored file can still change the build; the
+stamp names the commit of `HEAD`, which matches the built code when the tree is otherwise clean. A
+stamp set by hand to a commit that was not built is not seen by the verb; the script is the guard.
 
 The release build, the release smoke and the clean-install scripts set no stamp, so a released
-tarball holds none and its check says cannot tell. Nothing in the public repo refuses an unstamped
-build, and the install page (docs/install.md) builds unstamped: this is by design.
+tarball holds none (while `HARNESS_BUILD_COMMIT` is not set in the build environment) and its check
+says cannot tell. Nothing in the public repo refuses an unstamped build, and the install page
+(docs/install.md) builds unstamped: this is by design.
 
 ## The compare
 
@@ -68,9 +74,11 @@ missing from the object store fails the call, it is not fetched).
 - `the commits between the stamp and the head cannot be counted`
 - `git is not runnable`
 
-A stamp on a side branch, a stamp ahead of the head, and a commit the repo dir has not fetched are
-all `not an ancestor`: the verb cannot show that this binary holds the head, so it is not called
-current. A folder that is no repo gives `the head ref cannot be resolved in the repo dir`.
+A stamp on a side branch or a stamp ahead of the head gives `not an ancestor`, and a stamp naming a
+commit the repo dir has not fetched gives `not a commit of the repo dir`: the verb cannot show that
+this binary holds the head, so it is not called current. A folder that is no repo, and is not inside
+another repo, gives `the head ref cannot be resolved in the repo dir`; a folder inside another repo
+is read against that parent repo.
 
 A caller that must not go on with an older engine refuses on each non-zero exit: the only exit 0 is
 an equal stamp.
@@ -85,7 +93,8 @@ an equal stamp.
 - It does not check that the stamp was really built from that commit (the script is the guard).
 - The head is the head as last fetched: a head not yet fetched makes the verb say current for a
   binary that holds it.
-- No other verb changes behaviour, and `harness --version` prints the same line as before.
+- No other verb changes behaviour, and `harness --version` prints the same line as before. The
+  top level usage text does change: it names the new `build check` entry.
 
 ## The test flag
 

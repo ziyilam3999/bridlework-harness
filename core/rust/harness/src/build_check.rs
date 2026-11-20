@@ -2,8 +2,9 @@
 //! built from the head of the engine source as last fetched. The binary carries the commit it was built
 //! from as a build-time stamp: the HARNESS_BUILD_COMMIT variable read with option_env! at compile time
 //! (no build script, no git call at build time), set by ci/stamped-build.sh, which reads HEAD of the
-//! checkout it lives in and refuses a tree that is not that commit. A plain cargo build sets nothing, so
-//! such a binary has no stamp and is refused as cannot tell: an unstamped binary is not taken as current.
+//! checkout it lives in and refuses a tree that is not that commit. A plain cargo build sets nothing while
+//! the variable is not exported in the caller's environment, so such a binary has no stamp and is
+//! refused as cannot tell: an unstamped binary is not taken as current.
 //! The verb compares commits, not changes: a merge that changes no file a caller uses still makes an
 //! older binary older. It reads one binary constant, the arguments and read-only git answers; it writes
 //! nothing and fetches nothing, so the head is the head as last fetched and the caller fetches first.

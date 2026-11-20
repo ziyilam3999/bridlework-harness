@@ -1,7 +1,8 @@
 //! Process-level tests for `harness build check` (docs/build-check.md is the contract). The real
 //! binary runs as a child against a temp git repo built with local git only (no network). The stamp
 //! under test is given with `--stamp-for-test`, which the verb reads only after the test mode flag;
-//! the compiled test binary itself sets no build stamp, and one test proves that arm. Each refusal
+//! the compiled test binary sets no build stamp while HARNESS_BUILD_COMMIT is not exported in the
+//! environment of cargo test, and one test proves that arm. Each refusal
 //! test checks the exact stderr line and an empty stdout.
 #![cfg(unix)]
 use std::fs;
