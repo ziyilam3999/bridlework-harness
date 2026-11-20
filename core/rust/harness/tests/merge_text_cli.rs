@@ -685,6 +685,125 @@ fn a_plain_url_passes() {
     body_ok(b"see https://example.invalid/path for more\n");
 }
 
+// ---------------------------------------------------------------- the subject-line rule
+
+fn subject_rule_ok(title_json: &str, body: &[u8]) {
+    let c = case(title_json, body);
+    let o = c.go();
+    let lines = body.iter().filter(|b| **b == b'\n').count();
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    assert_eq!(out(&o), format!("merge-text ok ticket=mt-1 pr=7 body_lines={lines}\n"));
+    assert!(err(&o).is_empty());
+    assert_eq!(fs::read(c.out.join("mt-1.body")).unwrap(), body);
+}
+
+fn subject_rule_refused(title_json: &str, body: &[u8], line: &str) {
+    let c = case(title_json, body);
+    let o = c.go();
+    c.refused1(&o, line);
+}
+
+#[test]
+fn a_body_line_1_equal_to_the_title_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"Add the thing\nmore\n", "body line 1 is the ticket title");
+}
+
+#[test]
+fn a_body_line_1_equal_to_the_title_with_blanks_around_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"  Add the thing  \nmore\n", "body line 1 is the ticket title");
+}
+
+#[test]
+fn a_body_line_1_equal_to_the_squash_subject_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"Add the thing (#7)\nmore\n", "body line 1 is the squash subject");
+}
+
+#[test]
+fn a_body_line_1_in_type_scope_form_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"feat(ticket): other words\nmore\n", "body line 1 has the form of a commit subject");
+}
+
+#[test]
+fn a_body_line_1_in_type_scope_form_with_a_bang_and_a_dashed_scope_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"fix(a-b)!: x\nmore\n", "body line 1 has the form of a commit subject");
+}
+
+#[test]
+fn a_body_line_1_in_type_only_form_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"fix: x\nmore\n", "body line 1 has the form of a commit subject");
+}
+
+#[test]
+fn a_body_line_1_in_type_only_form_with_a_bang_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"docs!: x\nmore\n", "body line 1 has the form of a commit subject");
+}
+
+#[test]
+fn a_body_line_1_in_type_scope_form_after_two_blanks_is_refused() {
+    subject_rule_refused("\"Add the thing\"", b"  feat(x): y\nmore\n", "body line 1 has the form of a commit subject");
+}
+
+#[test]
+fn a_type_scope_title_equal_to_body_line_1_is_the_title_refusal() {
+    subject_rule_refused("\"feat(x): add the thing\"", b"feat(x): add the thing\nmore\n", "body line 1 is the ticket title");
+}
+
+#[test]
+fn a_type_scope_squash_subject_as_body_line_1_is_refused() {
+    subject_rule_refused("\"feat(x): add the thing\"", b"feat(x): add the thing (#7)\nmore\n", "body line 1 is the squash subject");
+}
+
+#[test]
+fn the_body_checks_come_before_the_subject_line_rule() {
+    subject_rule_refused("\"Add the thing\"", b"Add the thing\ntwo\nCo-authored-by: x\n", "body line 3 looks like a trailer");
+}
+
+#[test]
+fn the_subject_line_rule_comes_before_the_privacy_scan() {
+    subject_rule_refused("\"Add the thing\"", format!("Add the thing\n{DENY}\n").as_bytes(), "body line 1 is the ticket title");
+}
+
+#[test]
+fn a_capitalized_type_only_line_1_passes() {
+    subject_rule_ok("\"Add the thing\"", b"Fix: a typo\nmore\n");
+}
+
+#[test]
+fn a_type_only_word_outside_the_list_as_line_1_passes() {
+    subject_rule_ok("\"Add the thing\"", b"data: rows 1 to 5\nmore\n");
+    subject_rule_ok("\"Add the thing\"", b"probe: x\nmore\n");
+}
+
+#[test]
+fn a_line_1_with_no_space_after_the_colon_passes() {
+    subject_rule_ok("\"Add the thing\"", b"feat:x\nmore\n");
+}
+
+#[test]
+fn a_line_1_with_a_space_before_the_parenthesis_passes() {
+    subject_rule_ok("\"Add the thing\"", b"fix (x): y\nmore\n");
+}
+
+#[test]
+fn a_see_line_1_passes() {
+    subject_rule_ok("\"Add the thing\"", b"see core/rust: x\n");
+}
+
+#[test]
+fn the_title_as_line_2_passes() {
+    subject_rule_ok("\"Add the thing\"", b"First line\nAdd the thing\n");
+}
+
+#[test]
+fn a_line_1_holding_the_title_inside_a_sentence_passes() {
+    subject_rule_ok("\"Add the thing\"", b"the plan adds Add the thing today\nmore\n");
+}
+
+#[test]
+fn a_line_1_with_the_title_and_a_full_stop_passes() {
+    subject_rule_ok("\"Add the thing\"", b"Add the thing.\nmore\n");
+}
+
 // ---------------------------------------------------------------- privacy scan
 
 fn hit_prefix(what: &str) -> String {

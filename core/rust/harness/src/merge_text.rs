@@ -143,6 +143,54 @@ fn looks_like_trailer(line: &str) -> bool {
     b.get(i) == Some(&b':')
 }
 
+/// One of the type-only words of the subject-line rule (C2).
+const SUBJECT_WORDS: [&str; 11] =
+    ["build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test"];
+
+/// The form of a commit subject (C): `type(scope)!: ` or one of `SUBJECT_WORDS` with `!: ` / `: `.
+fn commit_subject_form(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    if !b.first().is_some_and(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    i += 1;
+    while i < b.len() && (b[i].is_ascii_lowercase() || b[i].is_ascii_digit() || b[i] == b'-') {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'(') {
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && b[j] != b'(' && b[j] != b')' {
+            j += 1;
+        }
+        if j == start || b.get(j) != Some(&b')') {
+            return false;
+        }
+        i = j + 1;
+    } else if !SUBJECT_WORDS.contains(&&s[..i]) {
+        return false;
+    }
+    if b.get(i) == Some(&b'!') {
+        i += 1;
+    }
+    b.get(i) == Some(&b':') && b.get(i + 1) == Some(&b' ')
+}
+
+/// The first-line rule: (A) the title, (B) the squash subject, (C) a commit subject form.
+fn first_line_problem(line1: &str, title: &str, subject: &str) -> Option<&'static str> {
+    if line1.trim() == title.trim() {
+        return Some("body line 1 is the ticket title");
+    }
+    if line1.trim() == subject.trim() {
+        return Some("body line 1 is the squash subject");
+    }
+    if commit_subject_form(line1.trim_start()) {
+        return Some("body line 1 has the form of a commit subject");
+    }
+    None
+}
+
 /// The output folder: a real folder (not a link), canonicalized once, with no `.git` entry in it or above it.
 fn resolve_out(arg: &Path) -> Result<PathBuf, &'static str> {
     // Rebuilt from components: drops a trailing "/" or "/.", so the last name is not followed.
@@ -263,6 +311,10 @@ pub fn merge_text_cmd(a: &[String]) -> i32 {
         Ok(v) => v,
         Err(m) => return refuse(&m),
     };
+    // (9b) the first-line rule, after the body checks and before the privacy scan
+    if let Some(m) = first_line_problem(text.split('\n').next().unwrap_or(""), title, &subject) {
+        return refuse(m);
+    }
     // (10) the privacy scan, testmode off
     let ctx = crate::scan::Ctx { list: &list, testmode: false };
     let hits = crate::scan::scan_text(&ctx, "merge.subject", &subject);
