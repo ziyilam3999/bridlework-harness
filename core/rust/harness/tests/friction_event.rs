@@ -7,7 +7,7 @@
 //! pass as mapped or unmapped.
 #![cfg(unix)]
 use harness::events::{Field, Kind, Record};
-use harness::friction::{encode_row, parse_row};
+use harness::friction::{encode_row, lint_text, parse_row};
 use harness::friction_event::{map_line, map_lines, map_record};
 use std::fs;
 use std::path::PathBuf;
@@ -105,13 +105,13 @@ fn mapped(line: &str) -> harness::friction::Row {
 
 #[test]
 fn mapped_replan_required_row() {
-    let line = replan_line(ts(2026, 11, 2), "ai-brain", "193", "replan-threshold");
+    let line = replan_line(ts(2026, 11, 2), "example-repo", "193", "replan-threshold");
     let row = mapped(&line);
     assert_eq!(row.tag, "memory", "an event row lives in memory (the catcher is the capturer)");
     assert_eq!(row.ticket, "t-9.3", "an event row never carries the event's own ticket");
     assert_eq!(row.breaks, "");
     assert_eq!(row.kind, "", "an event row is a friction row, the kind default");
-    let want = "{\"id\":\"evt.replan_required.8_ai-brain.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=ai-brain ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"medium\"}";
+    let want = "{\"id\":\"evt.replan_required.12_example-repo.3_193.16_replan-threshold.2026-w45\",\"date\":\"2026-11-02\",\"ticket\":\"t-9.3\",\"where-it-lives\":\"memory\",\"breaks\":\"\",\"text\":\"event replan_required repo=example-repo ticket=193 reason=replan-threshold\",\"source\":\"event\",\"at\":\"2026-11-02T00:00:00Z\",\"impact\":\"medium\"}";
     assert_eq!(encode_row(&row).unwrap(), want);
 }
 
@@ -203,7 +203,7 @@ fn s(v: &str) -> String {
 fn mapped_rows_pass_friction_lint() {
     let t = Tmp::new();
     let rows = map_lines(&[
-        &replan_line(ts(2026, 11, 2), "ai-brain", "193", "replan-threshold"),
+        &replan_line(ts(2026, 11, 2), "example-repo", "193", "replan-threshold"),
         &launch_line(ts(2026, 11, 3), "worker", BRIEF_A, "builder-state-deny"),
         &gate_fail_line(ts(2026, 11, 4), "bridlework-harness", "199", "rust-test", "suite-fail", HEAD_A),
     ])
@@ -307,8 +307,8 @@ fn unmapped_kinds_yield_none() {
 #[test]
 fn same_cause_same_week_one_row() {
     // Monday 2026-11-02 and Sunday 2026-11-08: one ISO week, one cause.
-    let mon = replan_line(ts(2026, 11, 2), "ai-brain", "193", "replan-threshold");
-    let sun = replan_line(ts(2026, 11, 8), "ai-brain", "193", "replan-threshold");
+    let mon = replan_line(ts(2026, 11, 2), "example-repo", "193", "replan-threshold");
+    let sun = replan_line(ts(2026, 11, 8), "example-repo", "193", "replan-threshold");
     let rows = map_lines(&[&mon, &sun]).unwrap();
     assert_eq!(rows.len(), 1, "the same cause twice in one week files ONE row");
     assert_eq!(rows[0].date, "2026-11-02", "the row is dated the earliest event of the week");
@@ -337,8 +337,8 @@ fn gate_fail_same_cause_same_week_one_row() {
 #[test]
 fn week_boundary_two_rows() {
     // Sunday 23:59:59.999 UTC of one ISO week and Monday 00:00:00.000 UTC of the next: two rows.
-    let sun_last = replan_line(ts_ms(2026, 11, 8, 86399, 999), "ai-brain", "193", "replan-threshold");
-    let mon_first = replan_line(ts_ms(2026, 11, 9, 0, 0), "ai-brain", "193", "replan-threshold");
+    let sun_last = replan_line(ts_ms(2026, 11, 8, 86399, 999), "example-repo", "193", "replan-threshold");
+    let mon_first = replan_line(ts_ms(2026, 11, 9, 0, 0), "example-repo", "193", "replan-threshold");
     let rows = map_lines(&[&sun_last, &mon_first]).unwrap();
     assert_eq!(rows.len(), 2, "the same cause in two different weeks files two rows");
     assert_ne!(rows[0].id, rows[1].id, "the week is part of the key: the ids differ");
@@ -352,7 +352,7 @@ fn week_boundary_two_rows() {
 fn iso_year_boundaries() {
     // The week part of the id, straight from a mapped record (rsplit: tokens may contain dots, week suffixes never).
     let suffix = |t: u64| {
-        let rec = replan_record(t, "ai-brain", "193", "replan-threshold");
+        let rec = replan_record(t, "example-repo", "193", "replan-threshold");
         let row = map_record(&rec).unwrap().expect("the fixture must map");
         row.id.rsplit('.').next().unwrap().to_string()
     };
@@ -368,8 +368,8 @@ fn iso_year_boundaries() {
 #[test]
 fn different_cause_same_week_two_rows() {
     // Two replan events in one week, differing only in ticket: two rows.
-    let a = replan_line(ts(2026, 11, 2), "ai-brain", "193", "replan-threshold");
-    let b = replan_line(ts(2026, 11, 3), "ai-brain", "194", "replan-threshold");
+    let a = replan_line(ts(2026, 11, 2), "example-repo", "193", "replan-threshold");
+    let b = replan_line(ts(2026, 11, 3), "example-repo", "194", "replan-threshold");
     let rows = map_lines(&[&a, &b]).unwrap();
     assert_eq!(rows.len(), 2, "a different cause in the same week files its own row");
     assert_ne!(rows[0].id, rows[1].id);
@@ -389,14 +389,14 @@ fn different_cause_same_week_two_rows() {
 
 #[test]
 fn malformed_event_refused() {
-    let good = replan_line(ts(2026, 11, 2), "ai-brain", "193", "replan-threshold");
+    let good = replan_line(ts(2026, 11, 2), "example-repo", "193", "replan-threshold");
     // Each fixture carries its own bad condition, derived from the good line.
     let torn = "{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":1730".to_string();
     let not_json = "this line is not a json object at all".to_string();
     let unknown_kind = good.replace("replan_required", "nope");
     let missing_key = good.replace(",\"reason\":\"replan-threshold\"", "");
     let wrong_version = good.replace("\"v\":2", "\"v\":1");
-    let past_year_9999 = replan_line(ts(10000, 1, 1), "ai-brain", "193", "replan-threshold");
+    let past_year_9999 = replan_line(ts(10000, 1, 1), "example-repo", "193", "replan-threshold");
     for (name, line) in [
         ("a torn line", &torn),
         ("a non-JSON line", &not_json),
@@ -515,4 +515,53 @@ fn source_flag_on_add_stores_and_refuses() {
     let o = run(&[s("friction"), s("lint"), s("--config"), cfg]);
     assert_eq!(code(&o), 0, "stderr: {}", err(&o));
     assert_eq!(out(&o), "inbox ok rows=1\n");
+}
+
+// ---------------------------------------------------------------- the docs example block (docs/friction-inbox.md)
+
+/// The repo-relative path of the docs page this test reads: the only spelling of the path any message names
+/// (never a home path).
+const DOCS_PAGE: &str = "docs/friction-inbox.md";
+
+/// The lines of the first fenced code block after the heading of section 1 of the docs page, read from the
+/// repo at run time (no network, no file outside the repo). Fail closed: a page that cannot be read, a page
+/// with no such heading, or no fenced block after it, fails naming the repo-relative path only.
+fn docs_example_block() -> Vec<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docs/friction-inbox.md");
+    let text = fs::read_to_string(&path).unwrap_or_else(|_| panic!("{DOCS_PAGE} cannot be read"));
+    let mut in_section = false;
+    let mut in_block = false;
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !in_section {
+            in_section = line.starts_with("## 1.");
+            continue;
+        }
+        if !in_block {
+            in_block = line.starts_with("```");
+            continue;
+        }
+        if line.starts_with("```") {
+            return lines;
+        }
+        lines.push(line.to_string());
+    }
+    panic!("{DOCS_PAGE} holds no fenced code block in section 1");
+}
+
+/// The docs page's five example rows are real rows, and its event row is byte for byte the mapper's row.
+#[test]
+fn docs_example_rows_lint_and_the_event_row_is_the_mappers() {
+    let block = docs_example_block();
+    // (a) exactly five example rows.
+    assert_eq!(block.len(), 5, "the first block of section 1 holds five example rows: {block:?}");
+    // (b) the five rows pass the whole lint: five rows, no problem, no torn tail.
+    let body: String = block.iter().map(|l| format!("{l}\n")).collect();
+    let inbox = lint_text(&body);
+    assert!(inbox.problems.is_empty(), "the example rows must lint clean: {:?}", inbox.problems);
+    assert!(inbox.torn_tail.is_none(), "the example block must have no torn tail");
+    assert_eq!(inbox.rows.len(), 5, "the five example rows parse as five rows");
+    // (c) the fifth line is byte for byte the mapper's row for the example event.
+    let row = mapped(&replan_line(ts(2026, 11, 2), "example-repo", "193", "replan-threshold"));
+    assert_eq!(block[4], encode_row(&row).unwrap(), "the docs event row must equal the mapped row");
 }
