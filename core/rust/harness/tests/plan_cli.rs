@@ -1168,7 +1168,7 @@ fn the_first_refusal_in_the_read_order_is_the_one_printed() {
     fs::write(e.root.join("base.jsonl"), "x\n").unwrap();
     fs::remove_file(e.root.join("head.md")).unwrap();
     refusal_of(&run3(&e), "base plan index: line 1: does not parse as one JSON object");
-    // A bad --index and a bad base index: the three old inputs are read first.
+    // A bad --index and a bad base index: the --index file is read first.
     let e = f_env(&same, &same, &F_ROWS, &F_ROWS);
     fs::write(e.root.join("base.jsonl"), "x\n").unwrap();
     fs::write(e.root.join("index.jsonl"), "y\n").unwrap();
