@@ -1115,8 +1115,8 @@ pub(crate) fn pattern_roots(rows: &[Row], threshold: u64) -> Vec<(String, usize)
 /// listed=<k>`. Ids and counts only: a row's text is never printed. Nothing is written except, when `--record`
 /// is given, ONE appended JSONL trial line (`schemas/friction-trial.schema.json`). Being listed creates zero
 /// files under any skill or ticket path. Exit codes as the family: 0 ok; 1 a refusal (the lint leg); 2 a usage
-/// or setup error (a failed record append, so a half-written trial never reads as a clean run; and `--record`
-/// naming the inbox itself, because a trial line is not a row).
+/// or setup error (a failed record append, so a half-written trial never reads as a clean run; and a `--record`
+/// that the record guard refuses, for example one naming the inbox, because a trial line is not a row).
 pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", m);
@@ -1157,9 +1157,9 @@ pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    // A trial line is not a row: `--record` naming the inbox itself (or a symlink to it) is refused
-    // before anything is read or written, or the appended record would corrupt the inbox the listing
-    // is about to validate. Exit 2, one line, nothing written.
+    // A trial line is not a row: the record guard refuses a `--record` that is relative, unresolvable,
+    // the inbox, a config or privacy list file, or not a JSON-lines record, before anything is read or
+    // written. Exit 2, one line, nothing written.
     if let Some(path) = record {
         if let Err(m) = record_guard(path, file, cfg.friction_inbox()) {
             return fail(m);

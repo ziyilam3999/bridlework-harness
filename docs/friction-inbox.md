@@ -206,7 +206,8 @@ messages are constant and no path bytes are echoed:
 
 1. a path that does not start with `/`: `--record must be an absolute path`;
 2. a path that cannot be resolved (a symbolic link whose target does not resolve, a missing file in a folder that
-   cannot be canonicalised, a path that ends in `..` or has no file name): `--record cannot be resolved`;
+   cannot be canonicalised, a missing path that ends in `..` or has no file name): `--record cannot be resolved`
+   (an existing path that ends in `..`, such as `<existing folder>/..`, is a folder and falls under (5));
 3. the friction inbox: `--record must not name the friction inbox`;
 4. the `--config` value and the `HARNESS_CONFIG` value (both, when both are set), and the `HARNESS_PRIVACY_LIST`
    and `HARNESS_PRIVACY_OLD_LIST` values when set and not empty, also when the verb does not read the list file
@@ -214,7 +215,8 @@ messages are constant and no path bytes are echoed:
 5. the file type is read with `symlink_metadata` before any open or read: an existing path that is not a regular
    file (a folder, a FIFO, a device such as `/dev/null`) is refused without being opened, so a FIFO cannot block
    the verb; then an existing non-empty regular file whose first byte is not `{` is refused, and so is a regular
-   file that cannot be opened or read: `--record names a file that is not a JSON-lines record`.
+   file that cannot be opened or read: `--record names a file that is not a JSON-lines record`. The guard checks
+   only the first byte, and the same text is used for a folder, a FIFO, a device and an unreadable file.
 
 **How a path is compared.** A relative protected value is taken against the working folder. When the path is
 found (a link counts, also a dangling one) it must canonicalise, else it is refused as (2); when it is not
@@ -231,7 +233,7 @@ a key=value config, a YAML config or a deny list does not and is refused by rule
 non-empty file that starts with `{` and is none of the files of (3) and (4), for example the `friction triage
 --state` file (JSON lines), another JSON-lines record or log, the inbox of another config, or a JSON settings
 file; the files of (3) and (4) are caught by path whatever they hold. Other limits: the check and the open are
-two steps, so a file swapped in between is not seen. A record file that holds a non-JSON first line must be
+two steps, so a file swapped in between is not seen. A record file whose first byte is not `{` must be
 moved aside.
 
 ### `harness friction close-check`

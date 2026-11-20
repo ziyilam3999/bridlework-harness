@@ -18,7 +18,7 @@
 //! * group score = its best row's score; ties go to the group seen first in inbox order.
 //!
 //! Exit codes as the family: 0 ok; 1 a refusal (a privacy hit in the query, a damaged inbox, an unknown
-//! `--before` row); 2 a usage or setup error (bad flags, no config, no privacy list, `--record` naming the inbox).
+//! `--before` row); 2 a usage or setup error (bad flags, no config, no privacy list, a `--record` the record guard refuses).
 
 use crate::config::Config;
 use crate::friction::{self, Row};
