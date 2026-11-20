@@ -73,7 +73,7 @@ fn unfolded_home_path_in_proof_is_refused_with_class_home_path() {
     let t = Tmp::new();
     let home = planted_home();
     for proof in [format!("{home}/a.md"), format!("cmd:cat {home}/a.md")] {
-        let o = add(&t, &[("--id", "a-1"), ("--date", "2026-11-01"), ("--ticket", "t-1"), ("--where-it-lives", "memory"), ("--proof", &proof), ("--text", "x")]);
+        let o = add(&t, &[("--id", "a-1"), ("--date", "2026-11-01"), ("--ticket", "t-1"), ("--where-it-lives", "memory"), ("--why", "cause: system"), ("--proof", &proof), ("--text", "x")]);
         assert_eq!(code(&o), 1, "{proof}: {}", err(&o));
         assert!(out(&o).is_empty());
         let e = err(&o);
@@ -98,7 +98,7 @@ fn folded_path_and_session_id_proofs_are_stored() {
             ("--where-it-lives", "memory"),
             ("--at", "2026-11-01T08:09:10Z"),
             ("--impact", "high"),
-            ("--why", "suspected: a stale lock"),
+            ("--why", "suspected: a stale lock; cause: system"),
             ("--proof", "~/notes/a.md; session:3f2c9a10-1111-2222-3333-444455556666"),
             ("--text", "x"),
         ],

@@ -117,6 +117,8 @@ fn add(t: &Tmp, id: &str, date: &str, ticket: &str, tag: &str, breaks: &str, tex
     a.push(s(tag));
     a.push(s("--text"));
     a.push(s(text));
+    a.push(s("--why"));
+    a.push(s("cause: system"));
     run(&a)
 }
 
@@ -287,6 +289,7 @@ fn refuses_a_privacy_hit_in_every_field_even_a_valid_token() {
             s("friction"), s("add"), s("--config"), cfg.clone(),
             s("--id"), s("l-2"), s("--date"), s("2026-11-01"), s("--ticket"), s("154"),
             s("--where-it-lives"), s("memory"), s("--text"), s("clean text, poisoned field"),
+            s("--why"), s("cause: system"),
         ];
         if i == 0 {
             a[5] = s(DENY); // swap the poisoned value in; --id twice would be a usage error
@@ -514,6 +517,8 @@ fn no_privacy_list_refuses_without_storing() {
         "memory",
         "--text",
         "unscanned text",
+        "--why",
+        "cause: system",
     ])
     .stdin(Stdio::null());
     let o = c.output().unwrap();
@@ -678,6 +683,7 @@ fn add_args(cfg: &str, id: &str, text: &str) -> Vec<String> {
         s("friction"), s("add"), s("--config"), s(cfg), s("--id"), s(id),
         s("--date"), s("2026-11-01"), s("--ticket"), s("154"),
         s("--where-it-lives"), s("memory"), s("--text"), s(text),
+        s("--why"), s("cause: system"),
     ]
 }
 

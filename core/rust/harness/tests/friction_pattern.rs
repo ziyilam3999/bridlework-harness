@@ -149,6 +149,8 @@ fn add(_t: &Tmp, cfg: &Path, id: &str, kind: &str, repeats: &str, text: &str) ->
         a.push(s("--repeats"));
         a.push(s(repeats));
     }
+    a.push(s("--why"));
+    a.push(s("cause: system"));
     run(&a)
 }
 
@@ -172,6 +174,8 @@ fn add_breaks(_t: &Tmp, cfg: &Path, id: &str, breaks: &str, text: &str) -> Outpu
         s(breaks),
         s("--text"),
         s(text),
+        s("--why"),
+        s("cause: system"),
     ])
 }
 

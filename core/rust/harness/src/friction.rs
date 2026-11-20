@@ -223,6 +223,28 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- the cause tag (a rule of `add` only)
+
+/// The three cause tags a hand-written friction row's `why` must hold at `add`: `Orchestrator`, `builder`,
+/// `system`, byte for byte (letter case included).
+const CAUSE_TAGS: [&str; 3] = ["Orchestrator", "builder", "system"];
+
+/// A word byte: an ASCII letter, digit, underscore or hyphen (the bytes that may not follow a tag).
+fn word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+/// True when `why` holds a cause tag: the FIRST `cause:` of the why (the byte before it is not checked), then
+/// one space, then one of `CAUSE_TAGS`, then the end of the why or one byte that is not a word byte. An empty
+/// why holds no tag. A rule of `friction add` only: no other verb and no stored row is checked against it.
+fn why_holds_cause_tag(why: &str) -> bool {
+    let Some(rest) = why.split("cause:").nth(1) else { return false };
+    CAUSE_TAGS.iter().any(|t| match rest.strip_prefix(' ').and_then(|r| r.strip_prefix(*t)) {
+        Some(after) => after.is_empty() || !word_byte(after.as_bytes()[0]),
+        None => false,
+    })
+}
+
 // ---------------------------------------------------------------- strict JSON (the row grammar only)
 
 /// A tiny strict reader for the one shape a row has: `{ "key": "value", ... }`, every value a string.
@@ -711,7 +733,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] [--why <cause>] [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] --why <cause> [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -733,7 +755,8 @@ pub(crate) fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, Stri
 /// contract is `docs/friction-inbox.md`).
 /// Exit 0 ok; 1 a refusal (a refused write leaves the inbox byte-identical, stdout empty, stderr naming the field
 /// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error. Nothing is written
-/// before every check has passed: flags, then row rules, then the privacy engine over the new row, then — under
+/// before every check has passed: flags, then row rules, then the cause tag of a hand-written friction row's
+/// `why` (below), then the privacy engine over the new row, then — under
 /// the exclusive writer lock — the same privacy engine over every stored row and the inbox cross rules, and only
 /// then one append.
 pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
@@ -838,6 +861,12 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     if let Err(e) = validate_row(&row) {
         return refuse(&e);
+    }
+    // The cause tag: a hand-written friction row (kind empty or `friction`, source empty) carries its cause in
+    // `why`. Pattern rows and event rows are exempt. The check sits after the row rules and before the privacy
+    // list is loaded, and reads only the why of the new row (a tag in the text or the proof does not count).
+    if (row.kind.is_empty() || row.kind == "friction") && row.source.is_empty() && !why_holds_cause_tag(&row.why) {
+        return refuse("why must hold a cause tag: cause: Orchestrator, cause: builder or cause: system");
     }
     // The privacy list loads before anything else is read: with no list configured the verb fails closed (2),
     // and the new row is scanned before any cross rule runs, so no unscanned byte of it is ever echoed.
