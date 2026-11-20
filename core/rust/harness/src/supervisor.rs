@@ -2416,14 +2416,14 @@ fn parse_claim(a: &[String]) -> Result<ClaimArgs, String> {
     })
 }
 
-/// The decision of the claim walk: what the first pid of the chain that is a live entry and passes the identity probe decided.
+/// The outcome of the claim walk.
 #[derive(Debug, PartialEq, Eq)]
 enum ClaimWalk {
     /// The first deciding entry holds this session: counted (entry id, session id).
     Counted(String, String),
     /// The first deciding entry holds a different session: refusal 2, this text.
     Mismatch(String),
-    /// No pid of the chain is a live worker entry of the ticket: exit 7, logged.
+    /// No pid of the chain decided, or the first deciding entry has no session: exit 7, logged.
     Unmanaged,
     /// A read the decision needed could not be made: refusal 2, nothing written.
     Unknown(String),
@@ -2431,8 +2431,8 @@ enum ClaimWalk {
 
 /// The claim walk, lazy: each pid of the chain (the claimant itself first, then at most
 /// ANCESTOR_BOUND parents) is matched when it is reached, and the next parent is read only while no
-/// decision is made. The entry a claim needs sits at the claimant or its first parent (the exec case,
-/// the sh -c case), so a /proc read of a pid ABOVE the deciding entry (an exiting start process the
+/// decision is made. In the two launch shapes the tests drive (exec, sh -c) the entry sits at the
+/// claimant or its first parent, so a /proc read of a pid ABOVE the deciding entry (an exiting start process the
 /// kernel already reaped) is not made and cannot refuse the claim. The pids, their order, the bound
 /// and the pid <= 1 stop are the walk claim made before; what changes is WHEN each parent is
 /// read. `parent` and `probe` are the readers of the release build (`parent_of`, `probe_identity`);
@@ -2445,14 +2445,12 @@ where
     let mut pid = claimant;
     let mut reads = 0;
     loop {
-        if let Some(e) = live
-            .iter()
-            .find(|e| matches!(&e.target, Target::Process { pid: p, .. } if *p == pid))
-        {
-            let Target::Process { pid_start_ms, .. } = &e.target else {
-                continue;
-            };
-            match probe(pid, *pid_start_ms) {
+        let found = live.iter().find_map(|e| match &e.target {
+            Target::Process { pid: p, pid_start_ms } if *p == pid => Some((e, *pid_start_ms)),
+            _ => None,
+        });
+        if let Some((e, pid_start_ms)) = found {
+            match probe(pid, pid_start_ms) {
                 Identity::Same => {
                     return match &e.session {
                         Some(sid) if sid == session => ClaimWalk::Counted(e.id.clone(), sid.clone()),
@@ -3332,7 +3330,7 @@ mod claim_walk_tests {
     #[test]
     fn supervisor_claim_walk_the_bound_reaches_the_33rd_pid() {
         let ladder: Vec<(u64, Result<u64, String>)> =
-            (0..32).map(|i| (ME + i, Ok(ME + i + 1))).collect();
+            (0..33).map(|i| (ME + i, Ok(ME + i + 1))).collect();
         let at_bound = walk_claim(
             ME,
             &[process_entry("w", ME + 32, Some(SID))],
