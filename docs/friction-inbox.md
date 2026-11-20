@@ -475,12 +475,12 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 
 ### `friction suggest` (ask A32)
 
-`harness friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>]`
+`harness friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]]`
 ranks the existing groups against a row that is not stored yet, so the new row can be filed with `--breaks`.
 One line per group, best first: `suggest: rank=<n> group=<group id> row=<best row id> score=<2 decimals> via=bm25`
 (default `--top 3`; an empty inbox, or no row before `--before`, prints `suggest: none`; exit 0). The group ids are
 the ones `friction rank` prints (a hand or pattern root's row id, an event group's signature); `row=` is always a
-stored row id. Free: no model, no network.
+stored row id. Free with no `--jev` flag: no model, no network.
 
 - Token: a run of `[a-z0-9]` in the lowercased text after `f-YYYYMMDD-NN`, `issue-N` and `#N` are removed, kept
   when longer than 2 and not all digits. The query is the DISTINCT tokens of `text + ' ' + why`; each ranked row
@@ -491,9 +491,159 @@ stored row id. Free: no model, no network.
   order. `--before <row id>` ranks only the rows before that row (an unknown id refuses, exit 1).
 - The query is scanned by the privacy engine before ranking (a hit refuses, exit 1, naming the field and class,
   never the bytes); a damaged inbox refuses like `rank` (exit 1); no privacy list configured is exit 2.
-- Read-only on the inbox. `--record <file>` appends one line `{ts, query_sha256, top, via}` (sha256 of
+- Read-only on the inbox. `--record <file>` appends one line `{ts, query_sha256, top, via}` (a second one with the Jev arm, below) (sha256 of
   `text + newline + why`, the top group ids, `bm25`) and never any text; a `--record` naming the inbox, by path, by a symbolic link, or by a hard link (the same
   device and inode), is exit 2. The same check guards `friction rank --record`. The verb exists on unix only.
+
+**The Jev arm** (ticket friction-suggest-jev). Four more flags turn a second ranking on:
+
+```
+[--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]]
+```
+
+The arm is on exactly when `--jev-send` is given; there is no config key and no mode flag. The three path flags
+must be absolute, `--jev-send` needs both `--jev-key-file` and `--jev-ledger-dir`, a `--jev` flag without
+`--jev-send` is exit 2, and `--jev-deadline-ms` is a whole number from 1 to 600000 (default 12000). With no
+`--jev` flag the outcomes documented above are unchanged (stdout, exit codes and record line, byte for byte);
+only the usage line and the unknown-option line change.
+
+With the arm on, each step of today runs first and unchanged (the checks and refusals, the BM25 record line,
+then the BM25 lines or `suggest: none`), stdout is flushed, and then one more line is printed, the last one (none
+when the second record line cannot be written, below; a refusal prints no Jev line). A worked example, three BM25 lines then a pick:
+
+```
+suggest: rank=1 group=les-001 row=les-001 score=2.10 via=bm25
+suggest: rank=2 group=evt.gate_fail.3_abc row=evt.gate_fail.3_abc.2026-w44 score=2.02 via=bm25
+suggest: rank=3 group=les-009 row=les-012 score=0.72 via=bm25
+suggest: jev pick=les-001 row=les-001 p=0.62
+```
+
+The same run with no credit left ends:
+
+```
+(the same three BM25 lines)
+jev: skipped reason=no-credit
+```
+
+The pick line names the picked group, the best row of that group (the row whose text was sent) and the model's
+probability with 2 decimals. The skip line names one token of this closed list:
+
+| token | cause |
+|---|---|
+| `no-candidates` | fewer than 2 candidate groups are left (an empty inbox, one group only, or the code rule left fewer than 2) |
+| `code-skipped` | the `--text` or `--why` value, as given, holds a code fence or an indented line |
+| `payload` | the request is over 199999 bytes |
+| `scan-refused` | the privacy engine refuses the request as a whole, or the program exited 7 |
+| `no-key` | the `--jev-key-file` path names no regular file, or the program exited 5 |
+| `ledger` | the ledger path is not a folder or cannot be made, or the program exited 8 without the cap text, 11 or 12 |
+| `spawn-failed` | the temp folder or request file cannot be made, the program cannot be started, or a wait error |
+| `timeout` | the program did not end within `--jev-deadline-ms` |
+| `no-credit` | the program exited 10 and its last `HTTP <3 digits>` line says 402 |
+| `http-<3 digits>` | another HTTP status on that line |
+| `http-unknown` | exit 10 with no `HTTP <3 digits>` line |
+| `transport` | the program exited 9 |
+| `cap` | the program exited 8 and its stderr holds `SPEND-CAP reached` |
+| `send-<exit code>` | any other exit code (for example `send-6`) |
+| `send-signal` | the program was ended by a signal |
+| `bad-answer` | the answer file is missing or not the fixed shape |
+| `flat` | all probabilities are equal, so the model names no best option |
+
+The verb exits 0 for each Jev outcome, pick or skip; the one exception is a failed write of the second record
+line (below), which is exit 2 after the BM25 lines. No byte the program prints reaches the verb's streams, with
+one exception: the three digits in `http-<code>`.
+
+- **Candidates.** The groups in the BM25 order (score, then first seen), taken BEFORE the `--top` cut, the first
+  20 of them; `--top` changes the printed lines only, and `--before` limits the candidates as it limits the
+  ranking. Each candidate stands for one group and is shown by its best row.
+- **The clean rule.** The shown text of a row and of the query is `clean(text)`, one line feed, `Why: `,
+  `clean(why)` (the Why part is there also when why is empty). `clean` replaces the three id shapes `f-YYYYMMDD-NN`,
+  `issue-N` and `#N` (matched in upper or lower case) by one blank, folds each run of 2 or more blanks or tabs
+  into one blank, and cuts blanks, tabs and line ends from both ends. The text is not lower-cased: each other
+  byte is kept as stored.
+- **The letter rule.** With n candidates the letters are the first n of A to T. A candidate's letter is its rank
+  in the order of the lower-case hex sha256 of `<query sha256 hex>:<group id>`, smallest first (the query sha256
+  is the value the record line holds: sha256 of `text`, a line feed, `why`). For the same query and the same set
+  of candidates, each group gets the same letter whatever the inbox order.
+- **The request.** One JSON object, no blanks between tokens, no final line feed, keys in this order (strings
+  escaped as the row lines are):
+
+  ```json
+  {"model":"typesafe/jev-1.13","state":{"query":"<shown query>"},"questions":{"group":{"type":"choice","instructions":"<the fixed 324-byte prompt>","criteria":{"A":"<shown text of the candidate with letter A>","B":"..."}}}}
+  ```
+
+  A small real one, for the query `cache warm zeta` with the why `reruns are slow` and two candidates (written on
+  one line; each `\n` is the two characters backslash and n):
+
+  ```json
+  {"model":"typesafe/jev-1.13","state":{"query":"cache warm zeta\nWhy: reruns are slow"},"questions":{"group":{"type":"choice","instructions":"The query above is a new friction report: a problem someone hit while working, with why it matters. Each option is an earlier friction report that stands for one group of reports about the same underlying problem. Which option describes the same underlying problem that the new report repeats? Choose the single best option.","criteria":{"A":"cold cache on every rerun\nWhy: the build is slow","B":"stale lock file\nWhy: a second run hangs"}}}}
+  ```
+
+- **The checks before the run**, in this order; the first that holds prints its skip line with nothing run;
+  nothing is made at (1) to (5), and at (7) a missing ledger folder was already made by (6): (1) code in the
+  query; (2) candidates with code in their row are left out, and fewer than 2 left is `no-candidates`; (3) the
+  byte cap; (4) the whole request through the privacy engine with test mode OFF whatever the run was given (the
+  stored rows and the query already passed it field by field before the ranking); (5) the key file must name a
+  regular file (a link to a file counts); the engine does not open it; (6) the ledger folder must be there, or
+  missing and makable (only the last path part, mode 0700); the engine does not make the ledger file; (7) the
+  temp folder and request file must be makable.
+- **The send program contract.** The engine writes the request to a fresh folder under the system temp folder
+  (mode 0700; `request.json` inside it, mode 0600) and runs exactly:
+  `<program> --payload <temp>/request.json --surface prose --spend-ledger <ledger dir>/spend-friction-suggest-<UTC date>.jsonl --out <temp>/answer.json`
+  - these 8 arguments and no other. The child runs in the temp folder, in its own process group, with stdin and
+  stdout closed to the null device and its stderr read by the engine (the last 4096 bytes are kept). Its
+  environment is cleared, then `PATH`, `HOME`, `LANG` and `LC_ALL` pass through when the caller has them,
+  `TMPDIR` is the temp folder of the run, and `OPENROUTER_KEY_FILE` holds the `--jev-key-file` value; no other
+  name is passed. The engine opens no socket and reads no key file: the program makes the call and only it can
+  spend. The program's exit codes and stderr texts the engine reads: 0 the answer counts; 5 no key; 7 scan refused;
+  8 `cap` when the kept stderr holds `SPEND-CAP reached`, else `ledger`; 9 transport; 10 the LAST stderr line
+  ending in `HTTP ` plus exactly 3 digits (402 is `no-credit`, another code is `http-<code>`, no such line is
+  `http-unknown`); 11 and 12 ledger; any other code n is `send-n`; a signal is `send-signal`. The answer file is opened
+  on exit 0 only (no other end touches it) and counts only then: at most 1048576 bytes, a regular file (a link does not count), one JSON object (nesting of at
+  most 16 levels, no surrogate-pair escape) whose
+  `answers.group.probabilities` holds exactly the asked letters (upper case, byte-equal) as JSON numbers from 0
+  to 1; the highest value picks the letter, ties go to the earlier letter, and all-equal is `flat`. The `choice`
+  field is not read.
+- **The deadline.** When the program has not ended `--jev-deadline-ms` after its start, the engine kills the
+  whole process group with the KILL signal, reaps the child and prints `timeout`; after a normal end it waits at
+  most 1000 ms for stderr to close; when stderr is still open then, the kept stderr counts as empty (exit 10
+  gives `http-unknown`, exit 8 gives `ledger`). The engine removes the temp folder and all in it on each path
+  after it was made (pick, each skip, timeout, a failed record write); a removal that fails is not reported. Not removed when a signal ends the engine
+  itself during the run (the engine has no signal handler): a folder with mode 0700 and a child that runs on.
+- **The record.** With `--record`, the line of today is written as today, and with the Jev arm on a second line
+  is appended after the Jev outcome is known and before the Jev line is printed:
+  `{"ts":...,"query_sha256":...,"via":"jev","status":"pick|skipped","reason":"<token>","letter":"<pick or empty>","group":"<pick or empty>","p":<number or null>,"cost_usd":...,"latency_ms":...}`
+  - the same ts and query sha256 as the first line (the clock is read once), no row text, no query text and no
+  path. `cost_usd` is an UPPER ESTIMATE, not a booked spend: 0.000000 when the program did not run; the answer's
+  `usage.cost` (a number from 0 to 1) when the program ended 0 and the answer holds it; 0.001400 in each other
+  case. `latency_ms` is the wall time from the start of the program to its end or its kill (the wait for stderr
+  after a normal end is not in it; 0 when the program did not run). The ledger of the send program is the
+  truth. An example of a pick (the sha256 is a sample value):
+
+  ```json
+  {"ts":"2026-11-20T09:15:00Z","query_sha256":"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0","via":"jev","status":"pick","reason":"","letter":"B","group":"les-001","p":0.62,"cost_usd":0.000145,"latency_ms":1830}
+  ```
+
+  A failed append of the second line is exit 2 with
+  `harness: error: the suggest record cannot be written` on stderr, and the Jev line is not printed.
+- **What leaves the machine**, through the send program only: the model name, the fixed prompt, the cleaned
+  query (text and why) and the cleaned text and why of at most 20 stored rows, one per candidate group. What
+  does not: row ids, group ids, scores, the paths of the run (temp, ledger, key file, inbox), the privacy list;
+  the key is not read by the engine. A source test fails when one of the two engine files holds `std::net`, a TCP
+  or UDP socket type name, or an http or https URL scheme.
+
+Limits worth knowing: the code check is two byte rules (three grave accents, or a line that starts with 4 blanks
+or a tab), so code with no fence and no indent still leaves; a query with no word in common with a stored row
+(BM25 score 0) still sends its candidates; a run killed at the deadline is not booked in the ledger of the send
+program, so the spend cap can be passed by one call per timeout; the letter order rule and the id strip are a
+new form of what the trial used (the trial seeded its shuffle by the row id); the wrapper does not pass the flags yet;
+a program that ignores its arguments is not detected (the engine reads only its exit code, its stderr and the
+answer file); an exit seen at the very edge of the deadline may be read as `timeout` or as the exit; whether the
+pick of the model is right is not checked; the send script books its worst-case cost on a non-200 answer, so a
+day with no credit reaches its spend cap early, and this verb does not change that; a program that writes
+outside its `--out` path is not detected; a background child of the program that leaves its process group is not
+ended by the deadline; the answer file is checked as a regular file and then opened, so a program that exited 0 and
+left a background child that swaps that file for a pipe in between can make the open wait with no deadline (the
+other ends never open it).
 
 ## 5. Not in slice 1 (where each piece went)
 
