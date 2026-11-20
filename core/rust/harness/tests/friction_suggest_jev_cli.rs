@@ -115,9 +115,9 @@ fn jev_run(j: &J, rows: &[String], q: &[&str], extra: &[&str]) -> Output {
     c.args(&refs).output().unwrap()
 }
 
-/// The whole-stdout assertion: the run with the Jev arm prints exactly what today's verb printed, plus the one
-/// Jev line, with an empty stderr and exit 0. The `--jev` flags go to the Jev run only.
-fn assert_whole(j: &J, rows: &[String], q: &[&str], extra: &[&str], jev_line: &str) {
+/// The BM25 lines a run with no --jev flag prints for the same input. The `--jev` flags and `--record` go to the
+/// Jev run only.
+fn bm25_of(t: &Tmp, rows: &[String], q: &[&str], extra: &[&str]) -> String {
     let mut plain_extra: Vec<&str> = Vec::new();
     let mut skip = false;
     for a in extra {
@@ -125,18 +125,62 @@ fn assert_whole(j: &J, rows: &[String], q: &[&str], extra: &[&str], jev_line: &s
             skip = false;
             continue;
         }
-        if a.starts_with("--jev") {
+        if a.starts_with("--jev") || *a == "--record" {
             skip = true;
             continue;
         }
         plain_extra.push(a);
     }
-    let plain = plain_run(&j.t, rows, q, &plain_extra);
+    let plain = plain_run(t, rows, q, &plain_extra);
     assert_eq!(code(&plain), 0, "{}", err(&plain));
+    assert_eq!(err(&plain), "");
+    out(&plain)
+}
+
+/// The three asserts of each Jev run: the exit code as a number, an empty stderr, and the whole stdout, which is
+/// the given BM25 lines and then the one Jev line.
+fn check_out(o: &Output, bm25: &str, jev_line: &str) {
+    assert_eq!(code(o), 0, "{}", err(o));
+    assert_eq!(err(o), "");
+    assert_eq!(out(o), format!("{bm25}{jev_line}"));
+}
+
+/// `check_out` with the BM25 lines of the plain run on the same input.
+fn assert_jev(t: &Tmp, rows: &[String], q: &[&str], extra: &[&str], o: &Output, jev_line: &str) {
+    check_out(o, &bm25_of(t, rows, q, extra), jev_line);
+}
+
+/// The whole-stdout assertion: the run with the Jev arm prints exactly what today's verb printed, plus the one
+/// Jev line, with an empty stderr and exit 0.
+fn assert_whole(j: &J, rows: &[String], q: &[&str], extra: &[&str], jev_line: &str) {
     let o = jev_run(j, rows, q, extra);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert_eq!(err(&o), "");
-    assert_eq!(out(&o), format!("{}{}", out(&plain), jev_line));
+    assert_jev(&j.t, rows, q, extra, &o, jev_line);
+}
+
+/// A run that must stop on a flag check: exit 2, stdout empty, the given stderr line, nothing run.
+fn refuse(args: &[&str], line: &str) {
+    let mut owned = vec!["friction", "suggest", "--text", "cache"];
+    owned.extend_from_slice(args);
+    let o = base().args(&owned).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(code(&o), 2, "{args:?}: {}", err(&o));
+    assert_eq!(out(&o), "", "{args:?}");
+    assert_eq!(err(&o), format!("{line}\n"), "{args:?}");
+}
+
+const NEEDS_SEND: &str = "harness: error: a --jev flag needs --jev-send";
+const NEEDS_PARTNERS: &str = "harness: error: --jev-send needs --jev-key-file and --jev-ledger-dir";
+const BAD_DEADLINE: &str = "harness: error: --jev-deadline-ms must be a whole number from 1 to 600000";
+
+/// The deadline check with all three partner flags in place.
+fn refuse_deadline(v: &str) {
+    refuse(&["--jev-send", "/send", "--jev-key-file", "/k", "--jev-ledger-dir", "/l", "--jev-deadline-ms", v], BAD_DEADLINE);
+}
+
+/// The group id `p-N` of the 5-candidate fixture whose criterion holds the letter `letter` in `req`.
+fn group_of5(req: &str, letter: &str) -> String {
+    let marker = criteria_pairs(req).into_iter().find(|(k, _)| k == letter).map(|(_, v)| v).unwrap();
+    let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
+    format!("p-{n}")
 }
 
 /// The (letter, raw value) pairs of the criteria object, in file order.
@@ -197,7 +241,7 @@ fn discover_letter(j: &J, rows: &[String], q: &[&str], extra: &[&str], marker: &
     letter_holding(&j.request(), marker)
 }
 
-/// The group ids of the plain run's suggest lines, best first (--top wide open, so every group is listed).
+/// The group ids of the plain run's suggest lines, best first (--top is 99; the fixtures have fewer groups than that cut).
 fn plain_order(t: &Tmp, rows: &[String], q: &[&str]) -> Vec<String> {
     let o = plain_run(t, rows, q, &["--top", "99"]);
     assert_eq!(code(&o), 0, "{}", err(&o));
@@ -299,116 +343,102 @@ fn answer_json(probs: &[(&str, &str)], usage: Option<&str>) -> String {
 // ---------------------------------------------------------------- flags
 
 #[test]
-fn a_jev_flag_without_jev_send_is_exit_2_per_flag() {
-    for extra in [
-        vec!["--jev-key-file", "/k"],
-        vec!["--jev-ledger-dir", "/l"],
-        vec!["--jev-deadline-ms", "10"],
-    ] {
-        let mut c = base();
-        let mut owned = vec!["friction".to_string(), "suggest".to_string(), "--text".to_string(), "cache".to_string()];
-        owned.extend(extra.iter().map(|s| s.to_string()));
-        let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-        let o = c.args(&refs).stdin(Stdio::null()).output().unwrap();
-        assert_eq!(code(&o), 2, "{extra:?}: {}", err(&o));
-        assert_eq!(out(&o), "");
-        assert_eq!(err(&o), "harness: error: a --jev flag needs --jev-send\n", "{extra:?}");
-    }
+fn a_key_file_flag_without_jev_send_is_exit_2() {
+    refuse(&["--jev-key-file", "/k"], NEEDS_SEND);
 }
 
 #[test]
-fn jev_send_with_a_missing_partner_flag_is_exit_2() {
-    for extra in [vec!["--jev-send", "/s", "--jev-key-file", "/k"], vec!["--jev-send", "/s", "--jev-ledger-dir", "/l"]] {
-        let mut c = base();
-        let mut owned = vec!["friction".to_string(), "suggest".to_string(), "--text".to_string(), "cache".to_string()];
-        owned.extend(extra.iter().map(|s| s.to_string()));
-        let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-        let o = c.args(&refs).stdin(Stdio::null()).output().unwrap();
-        assert_eq!(code(&o), 2, "{extra:?}: {}", err(&o));
-        assert_eq!(out(&o), "");
-        assert_eq!(err(&o), "harness: error: --jev-send needs --jev-key-file and --jev-ledger-dir\n", "{extra:?}");
-    }
+fn a_ledger_dir_flag_without_jev_send_is_exit_2() {
+    refuse(&["--jev-ledger-dir", "/l"], NEEDS_SEND);
 }
 
 #[test]
-fn a_relative_jev_path_value_is_exit_2_per_flag() {
-    for (flag, note) in [("--jev-send", "prog"), ("--jev-key-file", "k"), ("--jev-ledger-dir", "l")] {
-        let mut owned = vec!["friction".to_string(), "suggest".to_string(), "--text".to_string(), "cache".to_string()];
-        let values = [("/send", "--jev-send"), ("/k", "--jev-key-file"), ("/l", "--jev-ledger-dir")];
-        for (v, f) in values {
-            owned.push(f.to_string());
-            owned.push(if f == flag { note.to_string() } else { v.to_string() });
-        }
-        let mut c = base();
-        let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-        let o = c.args(&refs).stdin(Stdio::null()).output().unwrap();
-        assert_eq!(code(&o), 2, "{flag}: {}", err(&o));
-        assert_eq!(out(&o), "");
-        assert_eq!(err(&o), format!("harness: error: {flag} must be an absolute path\n"), "{flag}");
-    }
+fn a_deadline_flag_without_jev_send_is_exit_2() {
+    refuse(&["--jev-deadline-ms", "10"], NEEDS_SEND);
 }
 
 #[test]
-fn a_bad_deadline_value_is_exit_2() {
-    for v in ["0", "600001", "012", "12x", "", "12345678901234567890"] {
-        let mut owned = vec!["friction".to_string(), "suggest".to_string(), "--text".to_string(), "cache".to_string()];
-        owned.extend(["--jev-send".to_string(), "/send".to_string(), "--jev-key-file".to_string(), "/k".to_string(), "--jev-ledger-dir".to_string(), "/l".to_string(), "--jev-deadline-ms".to_string(), v.to_string()]);
-        let mut c = base();
-        let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-        let o = c.args(&refs).stdin(Stdio::null()).output().unwrap();
-        assert_eq!(code(&o), 2, "{v:?}: {}", err(&o));
-        assert_eq!(out(&o), "");
-        assert_eq!(err(&o), "harness: error: --jev-deadline-ms must be a whole number from 1 to 600000\n", "{v:?}");
-    }
+fn jev_send_without_the_ledger_dir_is_exit_2() {
+    refuse(&["--jev-send", "/s", "--jev-key-file", "/k"], NEEDS_PARTNERS);
 }
 
 #[test]
-fn the_flag_checks_run_in_order() {
-    // checks 1 and 4: the missing --jev-send wins.
-    let mut c = base();
-    let o = c
-        .args(["friction", "suggest", "--text", "cache", "--jev-key-file", "/k", "--jev-deadline-ms", "0x"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!((code(&o), out(&o), err(&o)), (2, String::new(), "harness: error: a --jev flag needs --jev-send\n".to_string()));
-    // checks 2 and 3: the missing partner wins over the relative path.
-    let mut c = base();
-    let o = c
-        .args(["friction", "suggest", "--text", "cache", "--jev-send", "prog", "--jev-key-file", "rel"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!((code(&o), out(&o), err(&o)), (2, String::new(), "harness: error: --jev-send needs --jev-key-file and --jev-ledger-dir\n".to_string()));
-    // checks 3 and 4: the relative path wins over the bad deadline.
-    let mut c = base();
-    let o = c
-        .args(["friction", "suggest", "--text", "cache", "--jev-send", "/s", "--jev-key-file", "/k", "--jev-ledger-dir", "rel", "--jev-deadline-ms", "0"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!((code(&o), out(&o), err(&o)), (2, String::new(), "harness: error: --jev-ledger-dir must be an absolute path\n".to_string()));
-    // --jev-ledger-dir given before --jev-send, both relative: the line names --jev-send (flag order, not argv order).
-    let mut c = base();
-    let o = c
-        .args(["friction", "suggest", "--text", "cache", "--jev-key-file", "/k", "--jev-ledger-dir", "rel", "--jev-send", "prog"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!((code(&o), out(&o), err(&o)), (2, String::new(), "harness: error: --jev-send must be an absolute path\n".to_string()));
+fn jev_send_without_the_key_file_is_exit_2() {
+    refuse(&["--jev-send", "/s", "--jev-ledger-dir", "/l"], NEEDS_PARTNERS);
+}
+
+#[test]
+fn a_relative_jev_send_is_exit_2() {
+    refuse(&["--jev-send", "prog", "--jev-key-file", "/k", "--jev-ledger-dir", "/l"], "harness: error: --jev-send must be an absolute path");
+}
+
+#[test]
+fn a_relative_jev_key_file_is_exit_2() {
+    refuse(&["--jev-send", "/send", "--jev-key-file", "k", "--jev-ledger-dir", "/l"], "harness: error: --jev-key-file must be an absolute path");
+}
+
+#[test]
+fn a_relative_jev_ledger_dir_is_exit_2() {
+    refuse(&["--jev-send", "/send", "--jev-key-file", "/k", "--jev-ledger-dir", "l"], "harness: error: --jev-ledger-dir must be an absolute path");
+}
+
+#[test]
+fn a_deadline_of_0_is_exit_2() {
+    refuse_deadline("0");
+}
+
+#[test]
+fn a_deadline_of_600001_is_exit_2() {
+    refuse_deadline("600001");
+}
+
+#[test]
+fn a_deadline_with_a_leading_zero_is_exit_2() {
+    refuse_deadline("012");
+}
+
+#[test]
+fn a_deadline_with_a_trailing_letter_is_exit_2() {
+    refuse_deadline("12x");
+}
+
+#[test]
+fn an_empty_deadline_is_exit_2() {
+    refuse_deadline("");
+}
+
+#[test]
+fn a_deadline_of_twenty_digits_is_exit_2() {
+    refuse_deadline("12345678901234567890");
+}
+
+#[test]
+fn checks_1_and_4_print_line_1() {
+    refuse(&["--jev-key-file", "/k", "--jev-deadline-ms", "0x"], NEEDS_SEND);
+}
+
+#[test]
+fn checks_2_and_3_print_line_2() {
+    refuse(&["--jev-send", "prog", "--jev-key-file", "rel"], NEEDS_PARTNERS);
+}
+
+#[test]
+fn checks_3_and_4_print_line_3() {
+    refuse(
+        &["--jev-send", "/s", "--jev-key-file", "/k", "--jev-ledger-dir", "rel", "--jev-deadline-ms", "0"],
+        "harness: error: --jev-ledger-dir must be an absolute path",
+    );
+}
+
+#[test]
+fn a_relative_ledger_dir_given_before_a_relative_send_names_jev_send() {
+    // The flag order of the checks, not the order on the command line.
+    refuse(&["--jev-key-file", "/k", "--jev-ledger-dir", "rel", "--jev-send", "prog"], "harness: error: --jev-send must be an absolute path");
 }
 
 #[test]
 fn a_jev_flag_given_twice_is_exit_2() {
-    let mut c = base();
-    let o = c
-        .args(["friction", "suggest", "--text", "cache", "--jev-send", "/a", "--jev-send", "/b", "--jev-key-file", "/k", "--jev-ledger-dir", "/l"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(code(&o), 2);
-    assert_eq!(out(&o), "");
-    assert_eq!(err(&o), "harness: error: --jev-send was given twice\n");
+    refuse(&["--jev-send", "/a", "--jev-send", "/b", "--jev-key-file", "/k", "--jev-ledger-dir", "/l"], "harness: error: --jev-send was given twice");
 }
 
 #[test]
@@ -416,9 +446,9 @@ fn deadline_600000_is_accepted() {
     let j = J::new("answer");
     let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
     j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], None));
-    let o = jev_run(&j, &rows3(), &Q3, &["--jev-deadline-ms", "600000"]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("suggest: jev pick=ga-1 row=ga-1 p=0.90\n"), "{}", out(&o));
+    let extra = ["--jev-deadline-ms", "600000"];
+    let o = jev_run(&j, &rows3(), &Q3, &extra);
+    assert_jev(&j.t, &rows3(), &Q3, &extra, &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
 }
 
 #[test]
@@ -451,18 +481,20 @@ fn the_fake_sees_only_the_bm25_lines_in_the_engine_stdout_file() {
     let j = J::new("answer");
     let stdout_path = j.t.0.join("engine-stdout.txt");
     let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
-    let _ = letter;
-    j.answer(&answer_json(&[("A", "0.9"), ("B", "0.1"), ("C", "0.1")], None));
+    j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], None));
     fs::write(j.dir.join("engine-stdout"), p(&stdout_path)).unwrap();
-    let plain = plain_run(&j.t, &rows3(), &Q3, &[]);
+    let bm25 = bm25_of(&j.t, &rows3(), &Q3, &[]);
     let mut c = jev_cmd(&j);
     let extra = ["--text", "cache warm zeta"];
     let f = fs::File::create(&stdout_path).unwrap();
     c.stdout(Stdio::from(f)).args(extra);
     let o = c.output().unwrap();
     assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(err(&o), "");
     let copy = fs::read_to_string(j.dir.join("notes").join("engine-stdout-copy")).unwrap();
-    assert_eq!(copy, out(&plain), "the copy holds exactly the BM25 lines");
+    assert_eq!(copy, bm25, "the copy holds exactly the BM25 lines");
+    let whole = fs::read_to_string(&stdout_path).unwrap();
+    assert_eq!(whole, format!("{bm25}suggest: jev pick=ga-1 row=ga-1 p=0.90\n"));
 }
 
 #[test]
@@ -517,14 +549,13 @@ fn the_request_holds_six_criteria_and_the_pick_names_the_fifth_ranked_group_best
     j.answer(&answer_json(&owned, None));
     // The asserted run: 6 criteria, only the best row of the fifth group, only 3 BM25 lines.
     let o = jev_run(&j, &rows6(), &Q6, &[]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_jev(&j.t, &rows6(), &Q6, &[], &o, "suggest: jev pick=s-5 row=s-5c p=0.80\n");
     let req = j.request();
     assert_eq!(criteria_pairs(&req).len(), 6);
     let values: String = criteria_pairs(&req).into_iter().map(|(_, v)| v).collect();
     assert!(values.contains("mk5c"), "the best row's text is sent");
     assert!(!values.contains("mk5a") && !values.contains("mk5b"), "the other two rows are not");
     assert_eq!(out(&o).lines().count(), 4, "3 BM25 lines plus the Jev line");
-    assert!(out(&o).ends_with("suggest: jev pick=s-5 row=s-5c p=0.80\n"), "{}", out(&o));
 }
 
 #[test]
@@ -569,8 +600,13 @@ fn the_letter_map_is_hash_order_and_survives_a_reversed_inbox() {
     let inbox: Vec<String> = rows_l().iter().map(|r| r.split('"').nth(3).unwrap().to_string()).collect();
     assert_ne!(order, inbox);
     assert_ne!(order, ids);
-    let letters: Vec<String> = want.iter().map(|(_, l)| l.clone()).collect();
-    assert_ne!(letters, ids);
+    let mut by_letter = want.clone();
+    by_letter.sort_by(|a, b| a.1.cmp(&b.1));
+    let letter_order: Vec<String> = by_letter.into_iter().map(|(g, _)| g).collect();
+    assert_eq!(letter_order, vec!["m-5", "m-1", "m-2", "m-3", "m-4", "m-6"]);
+    assert_ne!(order, letter_order, "the BM25 order differs from the letter order");
+    assert_ne!(inbox, letter_order);
+    assert_ne!(ids, letter_order);
     // The same fixture with the inbox rows in reverse order gives the same letter for each group.
     let mut rev = rows_l();
     rev.reverse();
@@ -720,24 +756,19 @@ fn the_byte_cap_is_199999() {
     let j = J::new("no-file");
     // Pad --text and --why, each under the 131072-byte argv bound, so the request lands at an exact size.
     let why = format!("cause {}", "y".repeat(98000));
-    let mut pads: Vec<usize> = Vec::new();
-    let measure = |pads: &mut Vec<usize>, pad: usize| -> (String, Output) {
-        pads.push(pad);
+    let measure = |pad: usize, line: &str| -> String {
         let text = format!("cache padstart{}", "x".repeat(pad));
         let q = ["--text", &text, "--why", &why];
         let o = jev_run(&j, &rows3(), &q, &[]);
-        (j.request(), o)
+        assert_jev(&j.t, &rows3(), &q, &[], &o, line);
+        j.request()
     };
-    let (req, _) = measure(&mut pads, 100000);
-    let size = req.len();
+    let size = measure(100000, "jev: skipped reason=bad-answer\n").len();
     assert!(size < 199999, "the padding starts under the cap ({size})");
-    let (req, o) = measure(&mut pads, 100000 + 199999 - size);
+    // The fake answers nothing, so a request at the cap reaches the program and ends as bad-answer.
+    let req = measure(100000 + 199999 - size, "jev: skipped reason=bad-answer\n");
     assert_eq!(req.len(), 199999, "the request is exactly at the cap");
-    assert_eq!(code(&o), 0);
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
-    let (_, o) = measure(&mut pads, 100000 + 199999 - size + 1);
-    assert_eq!(code(&o), 0);
-    assert!(out(&o).ends_with("jev: skipped reason=payload\n"), "{}", out(&o));
+    let _ = measure(100000 + 199999 - size + 1, "jev: skipped reason=payload\n");
     assert!(j.tmproot_empty());
 }
 
@@ -763,8 +794,7 @@ fn the_request_scan_refuses_only_when_the_whole_body_hits() {
         .args(["friction", "suggest", "--text", q[1], "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=scan-refused\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows, &q, &[], &o, "jev: skipped reason=scan-refused\n");
     assert!(!j.ran());
     assert!(j.tmproot_empty());
     assert!(!j.ledger.exists());
@@ -780,8 +810,7 @@ fn the_request_scan_refuses_only_when_the_whole_body_hits() {
         .args(["friction", "suggest", "--text", q[1], "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("suggest: jev pick=w-1 row=w-1 p=0.90\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows, &q, &[], &o, "suggest: jev pick=w-1 row=w-1 p=0.90\n");
 }
 
 #[test]
@@ -801,10 +830,17 @@ fn the_body_scan_runs_with_the_test_mode_off() {
         .args(["--testmode", "synthetic-test", "friction", "suggest", "--text", "cache", "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).starts_with("suggest: rank=1 group=t-1"), "{}", out(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=scan-refused\n"), "{}", out(&o));
+    // The BM25 lines of the same run with the Jev flags left off.
+    let mut pc = base();
+    pc.env("HARNESS_PRIVACY_LIST_SECRET", DENY)
+        .args(["--testmode", "synthetic-test", "friction", "suggest", "--text", "cache", "--config", p(&cfg)])
+        .stdin(Stdio::null());
+    let plain = pc.output().unwrap();
+    assert_eq!(code(&plain), 0, "{}", err(&plain));
+    assert!(out(&plain).starts_with("suggest: rank=1 group=t-1"), "{}", out(&plain));
+    check_out(&o, &out(&plain), "jev: skipped reason=scan-refused\n");
     assert!(!j.ran());
+    assert!(j.tmproot_empty());
 }
 
 #[test]
@@ -838,8 +874,7 @@ fn a_key_link_runs_and_a_dangling_key_link_skips() {
         .args(["friction", "suggest", "--text", "cache warm zeta", "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&link), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("suggest: jev pick=ga-1 row=ga-1 p=0.90\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
     // A link to nothing names no regular file, and nothing runs.
     let j2 = J::new("answer");
     let dangling = j2.t.0.join("key-nothing");
@@ -852,9 +887,10 @@ fn a_key_link_runs_and_a_dangling_key_link_skips() {
         .args(["friction", "suggest", "--text", "cache warm zeta", "--config", p(&cfg2), "--jev-send", p(&j2.send()), "--jev-key-file", p(&dangling), "--jev-ledger-dir", p(&j2.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=no-key\n"), "{}", out(&o));
+    assert_jev(&j2.t, &rows3(), &Q3, &[], &o, "jev: skipped reason=no-key\n");
     assert!(!j2.ran());
+    assert!(j2.tmproot_empty());
+    assert!(!j2.ledger.exists());
 }
 
 #[test]
@@ -875,11 +911,11 @@ fn a_ledger_path_whose_parent_is_missing_skips_ledger_and_makes_nothing() {
         .env("TMPDIR", p(&j.tmproot))
         .args(["friction", "suggest", "--text", "cache warm zeta", "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&deep)])
         .stdin(Stdio::null());
-    let plain = plain_run(&j.t, &rows3(), &Q3, &[]);
+    let bm25 = bm25_of(&j.t, &rows3(), &Q3, &[]);
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert_eq!(out(&o), format!("{}jev: skipped reason=ledger\n", out(&plain)));
+    check_out(&o, &bm25, "jev: skipped reason=ledger\n");
     assert!(!j.ran());
+    assert!(j.tmproot_empty());
     assert!(!deep.exists() && !deep.parent().unwrap().exists(), "nothing was made");
 }
 
@@ -921,8 +957,8 @@ fn the_checks_before_the_run_run_in_order() {
         .args(["friction", "suggest", "--text", &text, "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=payload\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows, &["--text", &text], &[], &o, "jev: skipped reason=payload\n");
+    assert!(!j.ran());
     // the scan hit beats a missing key file.
     let j = J::new("answer");
     fs::remove_file(&j.key).unwrap();
@@ -935,7 +971,8 @@ fn the_checks_before_the_run_run_in_order() {
         .args(["friction", "suggest", "--text", "cache plover", "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert!(out(&o).ends_with("jev: skipped reason=scan-refused\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows, &["--text", "cache plover"], &[], &o, "jev: skipped reason=scan-refused\n");
+    assert!(!j.ran());
     // code in --text beats an inbox of one group.
     let j = J::new("answer");
     assert_skip_before_run(&j, &[row("solo-1", "2026-11-01", "", "cache solo", &[])], &["--text", &format!("cache {fence}")], &[], "code-skipped", false);
@@ -970,8 +1007,10 @@ fn a_temp_root_that_is_a_regular_file_gives_spawn_failed() {
 
 #[test]
 fn the_program_gets_exactly_the_eight_arguments() {
-    let j = J::new("answer");
-    let _ = jev_run(&j, &rows3(), &Q3, &[]);
+    // The fake writes no answer file, so the run ends as bad-answer after the program has been started.
+    let j = J::new("no-file");
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=bad-answer\n");
+    assert!(j.tmproot_empty(), "the temp folder is removed after the run");
     let a = j.args();
     assert_eq!(a.len(), 8, "{a:?}");
     assert_eq!(a[0], "--payload");
@@ -997,15 +1036,16 @@ fn the_program_gets_exactly_the_eight_arguments() {
 
 #[test]
 fn the_temp_folder_and_request_file_have_private_modes() {
-    let j = J::new("answer");
-    let _ = jev_run(&j, &rows3(), &Q3, &[]);
+    let j = J::new("no-file");
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=bad-answer\n");
+    assert!(j.tmproot_empty());
     assert!(j.note("dir-mode").starts_with("drwx------"), "{}", j.note("dir-mode"));
     assert!(j.note("request-mode").starts_with("-rw-------"), "{}", j.note("request-mode"));
 }
 
 #[test]
 fn the_child_environment_is_cleared_but_for_the_named_values() {
-    let j = J::new("answer");
+    let j = J::new("no-file");
     let list = j.t.file("list.txt", format!("{DENY}\n"));
     let cfg = j.t.config();
     j.t.write_inbox(&rows3());
@@ -1017,8 +1057,9 @@ fn the_child_environment_is_cleared_but_for_the_named_values() {
         .args(["friction", "suggest", "--text", "cache warm zeta", "--config", p(&cfg), "--jev-send", p(&j.send()), "--jev-key-file", p(&j.key), "--jev-ledger-dir", p(&j.ledger)])
         .stdin(Stdio::null());
     let o = c.output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    let allowed = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "OPENROUTER_KEY_FILE", "PWD", "OLDPWD", "SHLVL", "_"];
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "jev: skipped reason=bad-answer\n");
+    assert!(j.tmproot_empty());
+    let allowed =["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "OPENROUTER_KEY_FILE", "PWD", "OLDPWD", "SHLVL", "_"];
     for name in j.env_names() {
         assert!(allowed.contains(&name.as_str()), "the name {name} reached the program");
     }
@@ -1027,13 +1068,13 @@ fn the_child_environment_is_cleared_but_for_the_named_values() {
 
 #[test]
 fn path_home_and_lang_pass_through_and_an_unset_lc_all_is_not_made() {
-    let j = J::new("answer");
+    let j = J::new("no-file");
     j.t.write_inbox(&rows3());
     let mut c = jev_cmd(&j);
     c.env("PATH", "/synthetic/path:/usr/bin:/bin").env("HOME", "/synthetic/home").env("LANG", "xx_XX").env_remove("LC_ALL");
-    let refs = ["--text", "cache warm zeta"];
-    let o = c.args(refs).output().unwrap();
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    let o = c.args(Q3).output().unwrap();
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "jev: skipped reason=bad-answer\n");
+    assert!(j.tmproot_empty());
     let env = j.env_text();
     assert!(env.contains("PATH=/synthetic/path:/usr/bin:/bin\n"), "{env}");
     assert!(env.contains("HOME=/synthetic/home\n"), "{env}");
@@ -1045,10 +1086,13 @@ fn path_home_and_lang_pass_through_and_an_unset_lc_all_is_not_made() {
 fn a_hang_leaves_nothing_in_the_temp_root_after_the_deadline() {
     let j = J::new("hang");
     let started = Instant::now();
-    let o = jev_run(&j, &rows3(), &Q3, &["--jev-deadline-ms", "300"]);
+    // The deadline leaves the fake time to write its file first; the fake lists its TMPDIR to a note, so the
+    // test sees that the file it checks was there before the kill.
+    let extra = ["--jev-deadline-ms", "5000"];
+    let o = jev_run(&j, &rows3(), &Q3, &extra);
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=timeout\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &extra, &o, "jev: skipped reason=timeout\n");
+    assert!(j.note("tmpdir-listing").contains("left-by-fake"), "the fake wrote its file before it hung");
     assert!(j.tmproot_empty(), "the file the fake wrote into its TMPDIR is gone with the folder");
 }
 
@@ -1056,15 +1100,18 @@ fn a_hang_leaves_nothing_in_the_temp_root_after_the_deadline() {
 fn a_big_stderr_with_exit_10_and_http_402_gives_no_credit_fast() {
     let j = J::new("exit10");
     let mut big = String::new();
-    for _ in 0..16384 {
+    // 41 bytes a line: 25600 lines are over 1 MiB before the last line.
+    for _ in 0..25600 {
         big.push_str("filler line of stderr text zz padding zz\n");
     }
+    assert!(big.len() >= 1048576);
     big.push_str("send.sh: HTTP 402\n");
     j.stderr_text(&big);
     let started = Instant::now();
-    let _ = jev_run(&j, &rows3(), &Q3, &[]);
+    let o = jev_run(&j, &rows3(), &Q3, &[]);
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=no-credit\n");
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "jev: skipped reason=no-credit\n");
+    assert!(j.tmproot_empty());
 }
 
 #[test]
@@ -1176,8 +1223,8 @@ fn a_marker_in_the_program_output_reaches_neither_verb_stream() {
     let j = J::new("exit10");
     j.stderr_text(&format!("{marker}\nsend.sh: HTTP 500\n"));
     let o = jev_run(&j, &rows3(), &Q3, &[]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
     assert!(!out(&o).contains(marker) && !err(&o).contains(marker));
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "jev: skipped reason=http-500\n");
 }
 
 // ---------------------------------------------------------------- the answer
@@ -1190,85 +1237,53 @@ fn run5(j: &J, probs: &[(&str, &str)], usage: Option<&str>) -> Output {
     jev_run(j, &rows5(), &Q5, &[])
 }
 
+/// One discovery run, then the group of the 5-candidate fixture that carries the letter `letter`.
+fn discover_group5(j: &J, letter: &str) -> String {
+    let _ = jev_run(j, &rows5(), &Q5, &[]);
+    group_of5(&j.request(), letter)
+}
+
 #[test]
 fn a_pick_in_the_middle_prints_its_group_and_row() {
     let j = J::new("answer");
     // C highest, A and E lower: the pick names the group whose letter is C.
-    let req_letter = discover_letter(&j, &rows5(), &Q5, &[], "mkp1");
-    let _ = req_letter;
-    let letter_c = {
-        let _ = jev_run(&j, &rows5(), &Q5, &[]);
-        let req = j.request();
-        let marker = criteria_pairs(&req).into_iter().find(|(k, _)| k == "C").map(|(_, v)| v).unwrap();
-        let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
-        format!("p-{n}")
-    };
+    let group_c = discover_group5(&j, "C");
     let o = run5(&j, &[("A", "0.10"), ("B", "0.20"), ("C", "0.90"), ("D", "0.30"), ("E", "0.10")], None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with(&format!("suggest: jev pick={letter_c} row={letter_c} p=0.90\n")), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, &format!("suggest: jev pick={group_c} row={group_c} p=0.90\n"));
 }
 
 #[test]
 fn the_highest_value_shared_by_two_letters_goes_to_the_earlier_letter() {
     let j = J::new("answer");
     // D is written first in the file, B shares the highest value: B wins.
-    let _ = discover_letter(&j, &rows5(), &Q5, &[], "mkp1");
-    let letter_b_group = {
-        let _ = jev_run(&j, &rows5(), &Q5, &[]);
-        let req = j.request();
-        let marker = criteria_pairs(&req).into_iter().find(|(k, _)| k == "B").map(|(_, v)| v).unwrap();
-        let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
-        format!("p-{n}")
-    };
+    let group_b = discover_group5(&j, "B");
     let o = run5(&j, &[("D", "0.80"), ("B", "0.80"), ("A", "0.10"), ("C", "0.10"), ("E", "0.10")], None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with(&format!("suggest: jev pick={letter_b_group} row={letter_b_group} p=0.80\n")), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, &format!("suggest: jev pick={group_b} row={group_b} p=0.80\n"));
 }
 
 #[test]
 fn the_choice_field_is_not_read_for_the_pick() {
     let j = J::new("answer");
-    let letter_b_group = {
-        let _ = jev_run(&j, &rows5(), &Q5, &[]);
-        let req = j.request();
-        let marker = criteria_pairs(&req).into_iter().find(|(k, _)| k == "B").map(|(_, v)| v).unwrap();
-        let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
-        format!("p-{n}")
-    };
+    let group_b = discover_group5(&j, "B");
     j.answer(&answer_json(&[("A", "0.10"), ("B", "0.90"), ("C", "0.10"), ("D", "0.10"), ("E", "0.10")], None).replace("\"choice\":\"A\"", "\"choice\":\"E\""));
     let o = jev_run(&j, &rows5(), &Q5, &[]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with(&format!("suggest: jev pick={letter_b_group} row={letter_b_group} p=0.90\n")), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, &format!("suggest: jev pick={group_b} row={group_b} p=0.90\n"));
 }
 
 #[test]
 fn whole_number_values_one_and_zero_are_numbers() {
     let j = J::new("answer");
-    let letter_a_group = {
-        let _ = jev_run(&j, &rows5(), &Q5, &[]);
-        let req = j.request();
-        let marker = criteria_pairs(&req).into_iter().find(|(k, _)| k == "A").map(|(_, v)| v).unwrap();
-        let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
-        format!("p-{n}")
-    };
+    let group_a = discover_group5(&j, "A");
     let o = run5(&j, &[("A", "1"), ("B", "0"), ("C", "0"), ("D", "0"), ("E", "0")], None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with(&format!("suggest: jev pick={letter_a_group} row={letter_a_group} p=1.00\n")), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, &format!("suggest: jev pick={group_a} row={group_a} p=1.00\n"));
 }
 
 #[test]
 fn an_exponent_form_prints_two_decimals() {
     let j = J::new("answer");
-    let letter_e_group = {
-        let _ = jev_run(&j, &rows5(), &Q5, &[]);
-        let req = j.request();
-        let marker = criteria_pairs(&req).into_iter().find(|(k, _)| k == "E").map(|(_, v)| v).unwrap();
-        let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
-        format!("p-{n}")
-    };
+    let group_e = discover_group5(&j, "E");
     let o = run5(&j, &[("A", "0.1"), ("B", "0.1"), ("C", "0.1"), ("D", "0.1"), ("E", "2.5e-1")], None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with(&format!("suggest: jev pick={letter_e_group} row={letter_e_group} p=0.25\n")), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, &format!("suggest: jev pick={group_e} row={group_e} p=0.25\n"));
 }
 
 /// The five asked letters of the 5-candidate fixture, as a probabilities map with one letter changed.
@@ -1289,8 +1304,16 @@ fn five(j: &J, changed: &[(&str, &str)]) -> Vec<(String, String)> {
 fn assert_bad_answer(j: &J, probs: Vec<(String, String)>) {
     let owned: Vec<(&str, &str)> = probs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let o = run5(j, &owned, None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, "jev: skipped reason=bad-answer\n");
+}
+
+/// A run on the 5-candidate fixture with the given raw answer file body: the whole stdout is the BM25 lines and
+/// then the given Jev line.
+fn assert_raw_answer(j: &J, body: &str, jev_line: &str) {
+    let _ = discover_letter(j, &rows5(), &Q5, &[], "mkp1");
+    j.answer(body);
+    let o = jev_run(j, &rows5(), &Q5, &[]);
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, jev_line);
 }
 
 #[test]
@@ -1363,52 +1386,39 @@ fn a_text_value_is_bad_answer() {
 #[test]
 fn an_empty_probabilities_object_is_bad_answer() {
     let j = J::new("answer");
-    let _ = discover_letter(&j, &rows5(), &Q5, &[], "mkp1");
-    j.answer("{\"answers\":{\"group\":{\"type\":\"choice\",\"probabilities\":{}}}}");
-    let o = jev_run(&j, &rows5(), &Q5, &[]);
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_raw_answer(&j, "{\"answers\":{\"group\":{\"type\":\"choice\",\"probabilities\":{}}}}", "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
 fn an_empty_answer_file_is_bad_answer() {
     let j = J::new("answer");
-    let _ = discover_letter(&j, &rows5(), &Q5, &[], "mkp1");
-    j.answer("");
-    let o = jev_run(&j, &rows5(), &Q5, &[]);
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_raw_answer(&j, "", "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
 fn no_answer_file_is_bad_answer() {
     let j = J::new("no-file");
-    let o = jev_run(&j, &rows3(), &Q3, &[]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
 fn the_text_of_a_letter_alone_is_bad_answer() {
     let j = J::new("answer");
-    let _ = discover_letter(&j, &rows5(), &Q5, &[], "mkp1");
-    j.answer("A");
-    let o = jev_run(&j, &rows5(), &Q5, &[]);
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_raw_answer(&j, "A", "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
 fn all_values_equal_is_flat() {
     let j = J::new("answer");
     let o = run5(&j, &[("A", "0.2"), ("B", "0.2"), ("C", "0.2"), ("D", "0.2"), ("E", "0.2")], None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=flat\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, "jev: skipped reason=flat\n");
 }
 
 #[test]
 fn all_values_zero_is_flat() {
     let j = J::new("answer");
     let o = run5(&j, &[("A", "0"), ("B", "0"), ("C", "0"), ("D", "0"), ("E", "0")], None);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=flat\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &o, "jev: skipped reason=flat\n");
 }
 
 #[test]
@@ -1449,9 +1459,7 @@ fn a_key_given_twice_is_bad_answer() {
     }
     body.push_str(&format!(",\"{}\":0.9", keys[0]));
     body.push_str("}}}}");
-    j.answer(&body);
-    let o = jev_run(&j, &rows5(), &Q5, &[]);
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_raw_answer(&j, &body, "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
@@ -1460,9 +1468,7 @@ fn an_answer_path_that_is_a_link_is_bad_answer() {
     let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
     let real = j.dir.join("real-answer.json");
     fs::write(&real, answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], None)).unwrap();
-    let o = jev_run(&j, &rows3(), &Q3, &[]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
@@ -1474,12 +1480,10 @@ fn an_answer_of_exactly_one_mib_is_read_and_one_byte_over_is_not() {
     base.push_str(&" ".repeat(pad));
     assert_eq!(base.len(), 1048576);
     j.answer(&base);
-    let o = jev_run(&j, &rows3(), &Q3, &[]);
-    assert!(out(&o).ends_with("suggest: jev pick=ga-1 row=ga-1 p=0.70\n"), "{}", out(&o));
+    assert_whole(&j, &rows3(), &Q3, &[], "suggest: jev pick=ga-1 row=ga-1 p=0.70\n");
     base.push(' ');
     j.answer(&base);
-    let o = jev_run(&j, &rows3(), &Q3, &[]);
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_whole(&j, &rows3(), &Q3, &[], "jev: skipped reason=bad-answer\n");
 }
 
 #[test]
@@ -1487,11 +1491,7 @@ fn a_changed_answer_file_changes_the_pick() {
     let j = J::new("answer");
     let _ = jev_run(&j, &rows5(), &Q5, &[]);
     let req = j.request();
-    let group_of = |letter: &str| -> String {
-        let marker = criteria_pairs(&req).into_iter().find(|(k, _)| k == letter).map(|(_, v)| v).unwrap();
-        let n: usize = marker.split("mkp").nth(1).unwrap().split(&['\\', ' '][..]).next().unwrap().parse().unwrap();
-        format!("p-{n}")
-    };
+    let group_of = |letter: &str| group_of5(&req, letter);
     let keys = criteria_pairs(&req).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
     let hi = keys[0].clone();
     let lo = keys[4].clone();
@@ -1499,13 +1499,12 @@ fn a_changed_answer_file_changes_the_pick() {
     let first = jev_run(&j, &rows5(), &Q5, &[]);
     j.answer(&answer_json(&[(hi.as_str(), "0.1"), (lo.as_str(), "0.9"), (keys[1].as_str(), "0.1"), (keys[2].as_str(), "0.1"), (keys[3].as_str(), "0.1")], None));
     let second = jev_run(&j, &rows5(), &Q5, &[]);
-    let l1 = out(&first).lines().last().unwrap().to_string();
-    let l2 = out(&second).lines().last().unwrap().to_string();
-    assert_ne!(l1, l2);
     let g_hi = group_of(&hi);
     let g_lo = group_of(&lo);
-    assert_eq!(l1, format!("suggest: jev pick={g_hi} row={g_hi} p=0.90"));
-    assert_eq!(l2, format!("suggest: jev pick={g_lo} row={g_lo} p=0.90"));
+    assert_ne!(g_hi, g_lo);
+    assert_jev(&j.t, &rows5(), &Q5, &[], &first, &format!("suggest: jev pick={g_hi} row={g_hi} p=0.90\n"));
+    assert_jev(&j.t, &rows5(), &Q5, &[], &second, &format!("suggest: jev pick={g_lo} row={g_lo} p=0.90\n"));
+    assert_ne!(out(&first), out(&second));
 }
 
 // ---------------------------------------------------------------- the deadline
@@ -1514,11 +1513,11 @@ fn a_changed_answer_file_changes_the_pick() {
 fn the_deadline_kills_the_whole_group() {
     let j = J::new("hang-bg");
     let started = Instant::now();
-    let o = jev_run(&j, &rows3(), &Q3, &["--jev-deadline-ms", "3000"]);
+    // 3000, not the 300 of the ticket: the first start of a fresh script copy took over 300 ms here, before the fake wrote its note.
+    let extra = ["--jev-deadline-ms", "3000"];
+    let o = jev_run(&j, &rows3(), &Q3, &extra);
     assert!(started.elapsed() < Duration::from_secs(10), "the verb ended within 10 s");
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert_eq!(err(&o), "");
-    assert!(out(&o).ends_with("jev: skipped reason=timeout\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &extra, &o, "jev: skipped reason=timeout\n");
     let pid: u32 = j.note("bg-pid").trim().parse().expect("the file with the id of the background sleep");
     assert!(dead_within(pid, 2), "the background sleep is not alive within 2 s");
     assert!(j.tmproot_empty());
@@ -1540,9 +1539,10 @@ fn a_grandchild_holding_stderr_does_not_hold_the_pick() {
     let started = Instant::now();
     let o = jev_run(&j, &rows3(), &Q3, &[]);
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert!(out(&o).ends_with("suggest: jev pick=ga-1 row=ga-1 p=0.90\n"), "{}", out(&o));
     let pid: u32 = j.note("bg-pid").trim().parse().unwrap();
+    // The test ends the background sleep itself before it asserts.
     let _ = Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
 }
 
 #[test]
@@ -1554,7 +1554,7 @@ fn with_no_deadline_flag_a_two_second_program_still_picks() {
     let started = Instant::now();
     let o = jev_run(&j, &rows3(), &Q3, &[]);
     assert!(started.elapsed() >= Duration::from_secs(2));
-    assert!(out(&o).ends_with("suggest: jev pick=ga-1 row=ga-1 p=0.90\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
 }
 
 // ---------------------------------------------------------------- the record
@@ -1566,7 +1566,7 @@ fn a_pick_appends_the_second_record_line() {
     j.answer(&answer_json(&[(letter.as_str(), "0.7"), ("B", "0.1"), ("C", "0.1")], Some("\"cost\":0.000145194")));
     let rec = j.t.0.join("suggest.jsonl");
     let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.70\n");
     let body = fs::read_to_string(&rec).unwrap();
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 2, "{body}");
@@ -1584,7 +1584,8 @@ fn a_pick_appends_the_second_record_line() {
     let cut = |l: &str| l.split("\"query_sha256\"").nth(1).unwrap().to_string();
     assert_eq!(cut(lines[0]), cut(&plain_line));
     // A second run gives four lines in total.
-    let _ = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
+    let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.70\n");
     assert_eq!(fs::read_to_string(&rec).unwrap().lines().count(), 4);
 }
 
@@ -1595,7 +1596,7 @@ fn assert_bad_usage_cost_books_the_estimate(cost: &str) {
     j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], Some(&format!("\"cost\":{cost}"))));
     let rec = j.t.0.join("suggest.jsonl");
     let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
     let body = fs::read_to_string(&rec).unwrap();
     assert!(body.contains("\"cost_usd\":0.001400"), "{cost}: {body}");
     assert!(body.contains(&format!("\"letter\":\"{letter}\"")), "{cost}: {body}");
@@ -1623,8 +1624,7 @@ fn a_bad_answer_with_a_good_usage_cost_books_that_cost() {
     j.answer(&answer_json(&[("A", "0.9"), ("B", "0.1")], Some("\"cost\":0.000145194")));
     let rec = j.t.0.join("suggest.jsonl");
     let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
-    assert!(out(&o).ends_with("jev: skipped reason=bad-answer\n"), "{}", out(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "jev: skipped reason=bad-answer\n");
     let body = fs::read_to_string(&rec).unwrap();
     let second = body.lines().nth(1).unwrap();
     assert!(second.contains("\"status\":\"skipped\",\"reason\":\"bad-answer\""), "{second}");
@@ -1637,10 +1637,10 @@ fn a_no_credit_skip_books_the_estimate_and_a_null_p() {
     j.stderr_text("send.sh: HTTP 402\n");
     let rec = j.t.0.join("suggest.jsonl");
     let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "jev: skipped reason=no-credit\n");
     let body = fs::read_to_string(&rec).unwrap();
     let second = body.lines().nth(1).unwrap();
-    let ts = body.lines().next().unwrap().split("\"ts\":\"").nth(1).unwrap().split('"').next().unwrap();
+    let ts =body.lines().next().unwrap().split("\"ts\":\"").nth(1).unwrap().split('"').next().unwrap();
     let sha = body.lines().next().unwrap().split("\"query_sha256\":\"").nth(1).unwrap().split('"').next().unwrap();
     assert_eq!(
         second.split(",\"latency_ms\"").next().unwrap(),
@@ -1654,7 +1654,7 @@ fn a_skip_before_the_run_books_zero_cost_and_zero_latency() {
     fs::remove_file(&j.key).unwrap();
     let rec = j.t.0.join("suggest.jsonl");
     let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "jev: skipped reason=no-key\n");
     let body = fs::read_to_string(&rec).unwrap();
     let second = body.lines().nth(1).unwrap();
     assert!(second.contains("\"reason\":\"no-key\""), "{second}");
@@ -1666,8 +1666,9 @@ fn a_skip_before_the_run_books_zero_cost_and_zero_latency() {
 fn a_timeout_books_the_estimate() {
     let j = J::new("hang");
     let rec = j.t.0.join("suggest.jsonl");
-    let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec), "--jev-deadline-ms", "300"]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    let extra = ["--record", p(&rec), "--jev-deadline-ms", "300"];
+    let o = jev_run(&j, &rows3(), &Q3, &extra);
+    assert_jev(&j.t, &rows3(), &Q3, &extra, &o, "jev: skipped reason=timeout\n");
     let second = fs::read_to_string(&rec).unwrap().lines().nth(1).unwrap().to_string();
     assert!(second.contains("\"reason\":\"timeout\""), "{second}");
     assert!(second.contains("\"cost_usd\":0.001400"), "{second}");
@@ -1679,7 +1680,8 @@ fn no_record_line_holds_row_text_or_query_text() {
     let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
     j.answer(&answer_json(&[(letter.as_str(), "0.7"), ("B", "0.1"), ("C", "0.1")], None));
     let rec = j.t.0.join("suggest.jsonl");
-    let _ = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
+    let o = jev_run(&j, &rows3(), &Q3, &["--record", p(&rec)]);
+    assert_jev(&j.t, &rows3(), &Q3, &["--record", p(&rec)], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.70\n");
     let body = fs::read_to_string(&rec).unwrap();
     assert!(!body.contains("cache") && !body.contains("warm") && !body.contains("mkga"), "{body}");
 }
@@ -1705,10 +1707,9 @@ fn a_failed_second_record_write_is_exit_2_after_the_bm25_lines() {
 fn with_no_record_flag_no_record_file_is_made() {
     let j = J::new("answer");
     let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
-    let _ = letter;
-    j.answer(&answer_json(&[("A", "0.9"), ("B", "0.1"), ("C", "0.1")], None));
+    j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], None));
     let o = jev_run(&j, &rows3(), &Q3, &[]);
-    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
     assert!(!j.t.0.join("suggest.jsonl").exists());
 }
 
@@ -1746,14 +1747,19 @@ fn the_inbox_is_byte_identical_after_pick_skip_and_timeout() {
     let before = fs::read(j.t.inbox()).unwrap();
     let letter = discover_letter(&j, &rows3(), &Q3, &[], "mkga");
     j.answer(&answer_json(&[(letter.as_str(), "0.9"), ("B", "0.1"), ("C", "0.1")], None));
-    let _ = jev_run(&j, &rows3(), &Q3, &[]);
+    let o = jev_run(&j, &rows3(), &Q3, &[]);
+    // The inbox is read right after the run, before the plain run of the assert writes the same rows again.
     assert_eq!(fs::read(j.t.inbox()).unwrap(), before, "after a pick");
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "suggest: jev pick=ga-1 row=ga-1 p=0.90\n");
     fs::remove_file(&j.key).unwrap();
-    let _ = jev_run(&j, &rows3(), &Q3, &[]);
+    let o = jev_run(&j, &rows3(), &Q3, &[]);
     assert_eq!(fs::read(j.t.inbox()).unwrap(), before, "after a skip before the run");
+    assert_jev(&j.t, &rows3(), &Q3, &[], &o, "jev: skipped reason=no-key\n");
     let j2 = J::new("hang");
     j2.t.write_inbox(&rows3());
     let before2 = fs::read(j2.t.inbox()).unwrap();
-    let _ = jev_run(&j2, &rows3(), &Q3, &["--jev-deadline-ms", "300"]);
+    let extra = ["--jev-deadline-ms", "300"];
+    let o = jev_run(&j2, &rows3(), &Q3, &extra);
     assert_eq!(fs::read(j2.t.inbox()).unwrap(), before2, "after a timeout");
+    assert_jev(&j2.t, &rows3(), &Q3, &extra, &o, "jev: skipped reason=timeout\n");
 }

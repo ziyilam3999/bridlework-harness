@@ -2,10 +2,11 @@
 //!
 //! With no `--jev` flag the verb is free: no model, no network. With `--jev-send <program>` the arm builds one
 //! request from the cleaned query and the cleaned best row of at most 20 candidate groups, writes it to a fresh
-//! private temp folder, runs the named send program with the path of that file (and the ledger path, the answer
-//! path and the key file path), and prints one more line: the pick of the model or a skip line with a closed
-//! reason token. The engine itself opens no socket and reads no key file: the send program makes the call and
-//! only it can spend; the key file path is passed to it and is not opened here.
+//! private temp folder, runs the named send program with the path of that file (and the surface, the ledger
+//! path and the answer path, as arguments), and prints one more line: the pick of the model or a skip line
+//! with a closed reason token. The key file path goes to the program in the environment variable
+//! OPENROUTER_KEY_FILE. The engine itself opens no socket and reads no key file: the send program makes the
+//! call and only it can spend; the key file path is passed to it and is not opened here.
 
 use crate::friction::jstr;
 use std::fs;

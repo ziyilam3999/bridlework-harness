@@ -504,7 +504,8 @@ stored row id. Free with no `--jev` flag: no model, no network.
 The arm is on exactly when `--jev-send` is given; there is no config key and no mode flag. The three path flags
 must be absolute, `--jev-send` needs both `--jev-key-file` and `--jev-ledger-dir`, a `--jev` flag without
 `--jev-send` is exit 2, and `--jev-deadline-ms` is a whole number from 1 to 600000 (default 12000). With no
-`--jev` flag the verb is exactly the free verb above, byte for byte.
+`--jev` flag the outcomes documented above are unchanged (stdout, exit codes and record line, byte for byte);
+only the usage line and the unknown-option line name the new flags.
 
 With the arm on, each step of today runs first and unchanged (the checks and refusals, the BM25 record line,
 then the BM25 lines or `suggest: none`), stdout is flushed, and then one more line is printed, the last one (none
@@ -619,7 +620,13 @@ Limits worth knowing: the code check is two byte rules (three grave accents, or 
 or a tab), so code with no fence and no indent still leaves; a query with no word in common with a stored row
 (BM25 score 0) still sends its candidates; a run killed at the deadline is not booked in the ledger of the send
 program, so the spend cap can be passed by one call per timeout; the letter order rule and the id strip are a
-new form of what the trial used (the trial seeded its shuffle by the row id); the wrapper does not pass the flags yet.
+new form of what the trial used (the trial seeded its shuffle by the row id); the wrapper does not pass the flags yet;
+a program that ignores its arguments is not detected (the engine reads only its exit code, its stderr and the
+answer file); an exit seen at the very edge of the deadline may be read as `timeout` or as the exit; whether the
+pick of the model is right is not checked; the send script books its worst-case cost on a non-200 answer, so a
+day with no credit reaches its spend cap early, and this verb does not change that; a program that writes
+outside its `--out` path is not detected; a background child of the program that leaves its process group is not
+ended by the deadline.
 
 ## 5. Not in slice 1 (where each piece went)
 

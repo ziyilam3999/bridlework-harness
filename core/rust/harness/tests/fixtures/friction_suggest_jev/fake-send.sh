@@ -10,6 +10,11 @@ set -u
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 notes="$here/notes"
 mkdir -p "$notes"
+# The group-kill case starts its background sleep and writes its id first: a short deadline may fire early.
+if [ "$(cat "$here/case")" = "hang-bg" ]; then
+  sleep 30 &
+  printf '%s\n' "$!" > "$notes/bg-pid"
+fi
 : > "$notes/ran"
 printf '%s\n' "$@" > "$notes/args"
 env | sort > "$notes/env"
@@ -63,11 +68,10 @@ case "$case_word" in
   hang)
     # Leaves a file behind in its TMPDIR, then hangs until the deadline kills the group.
     : > "${TMPDIR:-/tmp}/left-by-fake"
+    ls -A "${TMPDIR:-/tmp}" > "$notes/tmpdir-listing"
     sleep 30
     ;;
   hang-bg)
-    sleep 30 &
-    printf '%s\n' "$!" > "$notes/bg-pid"
     sleep 30
     ;;
   record-dir)
