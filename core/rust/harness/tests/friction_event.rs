@@ -520,7 +520,7 @@ fn source_flag_on_add_stores_and_refuses() {
 // ---------------------------------------------------------------- the docs example block (docs/friction-inbox.md)
 
 /// The repo-relative path of the docs page this test reads: the only spelling of the path any message names
-/// (never a home path).
+/// (no home path).
 const DOCS_PAGE: &str = "docs/friction-inbox.md";
 
 /// The lines of the first fenced code block after the heading of section 1 of the docs page, read from the

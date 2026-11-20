@@ -122,7 +122,7 @@ fn gate_fail_line(t: u64, repo: &str, ticket: &str, gate_id: &str, failure_class
 /// boundary-twin logs, and line 5 of the fixture).
 fn escalation_line(t: u64, reason: &str) -> String {
     format!(
-        "{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":{t},\"run_id\":\"run-1\",\"ticket\":\"9\",\"repo\":\"ai-brain\",\"reason\":\"{reason}\",\"role\":\"executor\",\"model\":\"worker\"}}"
+        "{{\"v\":2,\"kind\":\"escalation\",\"ts_ms\":{t},\"run_id\":\"run-1\",\"ticket\":\"9\",\"repo\":\"example-repo\",\"reason\":\"{reason}\",\"role\":\"executor\",\"model\":\"worker\"}}"
     )
 }
 
