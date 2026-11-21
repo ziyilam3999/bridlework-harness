@@ -34,13 +34,17 @@ Decided in this order on each check.
 | v2 | no joined entry | `gone` | 15 |
 | v3 | state `working`, tree age below `--idle-s` | `working` | 0 |
 | v3 | state `working`, transcript age below `--silence-s` | `slow-alive` | 10 |
-| v3 | state `working`, entry pid is a live process | `stalled` | 11 |
+| v3 | state `working`, past both limits, entry pid a live process, a commit in base..HEAD at or after the launch second, `last_gate=pass`, `gate_current=yes` | `finished` | 13 |
+| v3 | state `working`, entry pid is a live process, otherwise | `stalled` | 11 |
 | v4 | state `blocked` | `stopped-early why=blocked` | 12 |
 | v5 | state `done` or `idle`, a commit in base..HEAD at or after the launch second, and `gate_current=yes` | `finished gate=<pass\|fail>` | 13 |
 | v5 | otherwise | `stopped-early why=no-commit` (wins) or `why=no-gate` | 12 |
 
 Follow mode ends with 16 (`verdict=watch-limit last=<verdict>`) at the time limit. Refusals (cannot judge) are exit 3 with empty stdout
 and one stderr line. Exit 1 is not used.
+
+The v3 `finished` row is a seat the host still lists as working. The seat may still be running. It needs `last_gate=pass`, which the v5
+row does not. Its line carries `state=working/<status>`, which tells it from a v5 finish.
 
 Tree age is now minus the newest of: the mtime of every file and folder of the work tree outside `.git` (no link followed, over 200000
 entries is a refusal), the mtime of the git index, and the committer time of HEAD. Transcript age is now minus the transcript mtime.
@@ -50,7 +54,8 @@ entries is a refusal), the mtime of the git index, and the committer time of HEA
 `verdict= state=<host state>/<host status or -> tree_age= transcript_age= commits_since_launch= gate=<pass|fail|none>/<yes|no> session=<short id> skipped_entries=<n>`
 then `why=` or `by=` where named. `skipped_entries` counts the listing entries left out of the join (0 when none). A value the verdict
 did not need is `-` (tree age and the commit and gate facts are read only
-where the verdict uses them; `blocked` shows them when they can be read). No path, transcript text or file name is printed.
+where the verdict uses them; `blocked` shows them when they can be read; `stalled` shows the commits and gate it read). No path,
+transcript text or file name is printed.
 
 ## Refusals
 
@@ -59,7 +64,8 @@ a listing entry with no string id or name, or an id that is not a plain token, t
 record session_id, its id equals the record short_id, its name equals the record name, or its cwd equals the tree); an entry of that
 kind that cannot be the watched one is left out and counted in `skipped_entries`;
 no launch record for the name, or the newest is not bound; two or more joined entries; cwd not the tree; the transcript check fails; a
-working seat past both limits with a pid that is missing, not a whole number or not a live process (one `ps -p` run); the tree walk is
+working seat past both limits with a pid that is missing, not a whole number or not a live process (one `ps -p` run); a working seat past
+both limits also reads git base..HEAD and `harness status`, and their failures refuse it; the tree walk is
 over its cap; git cannot report HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
 working, done, blocked, idle, stopped. A refusal is never printed as working or slow-alive.
 
