@@ -1001,8 +1001,8 @@ pub(crate) fn today_utc() -> String {
 /// True when two path strings name one file: the same text, or both exist and are the same file by device and
 /// inode (so a hard link counts), or both canonicalize (symlinks resolved) to the same path. A record file that
 /// does not exist yet only matches its own text, so a fresh `--record` path is never mistaken for the inbox.
-pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
-    let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
+pub(crate) fn paths_name_one_file<A: AsRef<std::path::Path>, B: AsRef<std::path::Path>>(a: A, b: B) -> bool {
+    let (pa, pb) = (a.as_ref(), b.as_ref());
     if pa == pb {
         return true;
     }
@@ -1018,6 +1018,77 @@ pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
     match (std::fs::canonicalize(pa), std::fs::canonicalize(pb)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => false,
+    }
+}
+
+/// The resolved form of a path (a relative one is taken against the working folder): a found path (a link counts,
+/// also a dangling one) must canonicalize; a missing path needs a folder that canonicalizes and a file name.
+fn resolved_form(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut path = p.to_path_buf();
+    if path.is_relative() {
+        path = std::env::current_dir().ok()?.join(path);
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => fs::canonicalize(&path).ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.file_name()?.to_os_string();
+            let dir = fs::canonicalize(path.parent()?).ok()?;
+            Some(dir.join(name))
+        }
+        Err(_) => None,
+    }
+}
+
+/// The one guard of `--record` for patterns, rank and suggest: an absolute path that resolves, names neither the
+/// inbox nor a config or privacy list file, and is a new file, an empty regular file or a regular file that starts
+/// with `{`. The file type is read before any open, so a FIFO cannot block the verb. Messages are constant.
+pub(crate) fn record_guard(record: &str, config_flag: Option<&str>, inbox: &str) -> Result<(), &'static str> {
+    if !record.starts_with('/') {
+        return Err("--record must be an absolute path");
+    }
+    let Some(rec) = resolved_form(std::path::Path::new(record)) else {
+        return Err("--record cannot be resolved");
+    };
+    let names = |other: &std::path::Path| paths_name_one_file(record, other) || resolved_form(other).is_some_and(|o| o == rec);
+    if names(std::path::Path::new(inbox)) {
+        return Err("--record must not name the friction inbox");
+    }
+    let mut protected: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(c) = config_flag {
+        protected.push(c.into());
+    }
+    for var in ["HARNESS_CONFIG", "HARNESS_PRIVACY_LIST", "HARNESS_PRIVACY_OLD_LIST"] {
+        if let Some(v) = std::env::var_os(var) {
+            protected.push(v);
+        }
+    }
+    for v in protected.iter().filter(|v| !v.is_empty()) {
+        let v = std::path::Path::new(v);
+        if names(v) {
+            return Err("--record must not name a config file");
+        }
+        // A protected value that cannot be resolved (a dangling link) cannot be compared: refuse.
+        if resolved_form(v).is_none() {
+            return Err("--record cannot be resolved");
+        }
+    }
+    const NOT_RECORD: &str = "--record names a file that is not a JSON-lines record";
+    match fs::symlink_metadata(&rec) {
+        Ok(md) => {
+            if !md.file_type().is_file() {
+                return Err(NOT_RECORD);
+            }
+            if md.len() > 0 {
+                let mut first = [0u8; 1];
+                let ok = fs::File::open(&rec).and_then(|mut f| f.read_exact(&mut first)).is_ok();
+                if !ok || first[0] != b'{' {
+                    return Err(NOT_RECORD);
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("--record cannot be resolved"),
     }
 }
 
@@ -1047,8 +1118,8 @@ pub(crate) fn pattern_roots(rows: &[Row], threshold: u64) -> Vec<(String, usize)
 /// listed=<k>`. Ids and counts only: a row's text is never printed. Nothing is written except, when `--record`
 /// is given, ONE appended JSONL trial line (`schemas/friction-trial.schema.json`). Being listed creates zero
 /// files under any skill or ticket path. Exit codes as the family: 0 ok; 1 a refusal (the lint leg); 2 a usage
-/// or setup error (a failed record append, so a half-written trial never reads as a clean run; and `--record`
-/// naming the inbox itself, because a trial line is not a row).
+/// or setup error (a failed record append, so a half-written trial never reads as a clean run; and a `--record`
+/// that the record guard refuses, for example one naming the inbox, because a trial line is not a row).
 pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
     let fail = |m: &str| {
         eprintln!("harness: error: {}", m);
@@ -1089,12 +1160,12 @@ pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    // A trial line is not a row: `--record` naming the inbox itself (or a symlink to it) is refused
-    // before anything is read or written, or the appended record would corrupt the inbox the listing
-    // is about to validate. Exit 2, one line, nothing written.
+    // A trial line is not a row: the record guard refuses a `--record` that is relative, unresolvable,
+    // the inbox, a config or privacy list file, or not a JSON-lines record, before anything is read or
+    // written. Exit 2, one line, nothing written.
     if let Some(path) = record {
-        if paths_name_one_file(path, cfg.friction_inbox()) {
-            return fail("--record must not name the friction inbox");
+        if let Err(m) = record_guard(path, file, cfg.friction_inbox()) {
+            return fail(m);
         }
     }
     // The listing reads the inbox, so it runs the same privacy engine and fails closed without a list,

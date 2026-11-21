@@ -18,7 +18,7 @@
 //! * group score = its best row's score; ties go to the group seen first in inbox order.
 //!
 //! Exit codes as the family: 0 ok; 1 a refusal (a privacy hit in the query, a damaged inbox, an unknown
-//! `--before` row); 2 a usage or setup error (bad flags, no config, no privacy list, `--record` naming the inbox).
+//! `--before` row); 2 a usage or setup error (bad flags, no config, no privacy list, a `--record` the record guard refuses).
 
 use crate::config::Config;
 use crate::friction::{self, Row};
@@ -245,8 +245,8 @@ pub fn suggest_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     let record = flag("--record");
     if let Some(path) = record {
-        if friction::paths_name_one_file(path, cfg.friction_inbox()) {
-            return fail("--record must not name the friction inbox");
+        if let Err(m) = friction::record_guard(path, flag("--config"), cfg.friction_inbox()) {
+            return fail(m);
         }
     }
     let list = match crate::overlay::load() {

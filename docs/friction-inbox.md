@@ -197,7 +197,46 @@ is the shape; the date is the run's UTC day, written by the harness). The trial 
 evidence for this feature: if four weekly records show nothing ever reaching N, Governance removes `kind` and
 `repeats` (the 4-run ablation decision is Governance's, not a verb's). Exit codes as the family: 0 ok; 1 the lint
 leg refused; 2 a usage or setup error — including a failed record append, so a half-written trial never reads as
-a clean run.
+a clean run. The record path is checked by the guard below, and `--record` may not name the inbox.
+
+**The `--record` guard** (one function, used by `patterns`, `rank` and `suggest`). It runs after the config is
+loaded and before the privacy list is loaded and before anything is read, ranked, printed or written. Refused in
+this order, exit 2, stdout empty, one stderr line `harness: error: <message>`, nothing created or appended; the
+messages are constant and no path bytes are echoed:
+
+1. a path that does not start with `/`: `--record must be an absolute path`;
+2. a path that cannot be resolved (a symbolic link whose target does not resolve, a missing file in a folder that
+   cannot be canonicalised, a missing path that ends in `..` or has no file name): `--record cannot be resolved`
+   (an existing path that ends in `..`, such as `<existing folder>/..`, is a folder and falls under (5));
+3. the friction inbox: `--record must not name the friction inbox`;
+4. the `--config` value and the `HARNESS_CONFIG` value (both, when both are set), and the `HARNESS_PRIVACY_LIST`
+   and `HARNESS_PRIVACY_OLD_LIST` values when set and not empty, also when the verb does not read the list file
+   (with `HARNESS_PRIVACY_LIST_SECRET` set): `--record must not name a config file`; a protected value that is
+   set, not empty and cannot be resolved (for example a dangling symbolic link) is refused with `--record cannot
+   be resolved`, because it cannot be compared; a value that is not UTF-8 is compared as it is;
+5. the file type is read with `symlink_metadata` before any open or read: an existing path that is not a regular
+   file (a folder, a FIFO, a device such as `/dev/null`) is refused without being opened, so a FIFO cannot block
+   the verb; then an existing non-empty regular file whose first byte is not `{` is refused, and so is a regular
+   file that cannot be opened or read: `--record names a file that is not a JSON-lines record`. The guard checks
+   only the first byte, and the same text is used for a folder, a FIFO, a device and an unreadable file.
+
+**How a path is compared.** A relative protected value is taken against the working folder. When the path is
+found (a link counts, also a dangling one) it must canonicalise, else it is refused as (2); when it is not
+found, its folder must canonicalise and it needs a file name, and the resolved form is that folder plus the
+name. A protected value that does not resolve is refused as (2) after the match test. A protected value matches the record when the inbox check says so (same text, same device and inode, or
+both canonicalise to one path) or when the two resolved forms are equal, so a symbolic link, a hard link, a
+`<folder>/sub/../config.yaml` form, a relative list value and a protected path that does not exist yet are
+matched too (the missing file is not made). On a case-insensitive file system a case variant of a name is the
+same file and is caught by the inode test.
+
+**The shape rule.** The engine is not handed the config file of a wrapper. The record lines of `patterns`,
+`rank` and `suggest` are each one JSON object, so a record file that exists and is not empty starts with `{`;
+a key=value config, a YAML config or a deny list does not and is refused by rule (5). What it misses: any
+non-empty file that starts with `{` and is none of the files of (3) and (4), for example the `friction triage
+--state` file (JSON lines), another JSON-lines record or log, the inbox of another config, or a JSON settings
+file; the files of (3) and (4) are caught by path whatever they hold. Other limits: the check and the open are
+two steps, so a file swapped in between is not seen. A record file whose first byte is not `{` must be
+moved aside.
 
 ### `harness friction close-check`
 
@@ -273,7 +312,7 @@ rank ok groups=<n> listed=<k>
 
 `--top` defaults to `friction.triage_top` (config contract, the second optional key; absent = 3). `--record <file>`
 appends one JSONL trial line `{"date","groups","listed":[ids]}` BEFORE anything is printed, with the same failure
-rule as `patterns --record` (exit 2; the record may not name the inbox).
+rule as `patterns --record` (exit 2; the record may not name the inbox, and the `--record` guard under `patterns` applies).
 
 `--min-occurrences <n>` (a positive whole number, parsed like `--top`; `0`, `abc` or an empty value is exit 2 with
 nothing on stdout) lists only groups whose `occurrences` is `n` or more. The filter runs first and `--top` then caps
@@ -508,7 +547,9 @@ stored row id. Free with no `--jev` flag: no model, no network.
   never the bytes); a damaged inbox refuses like `rank` (exit 1); no privacy list configured is exit 2.
 - Read-only on the inbox. `--record <file>` appends one line `{ts, query_sha256, top, via}` (a second one with the Jev arm, below) (sha256 of
   `text + newline + why`, the top group ids, `bm25`) and never any text; a `--record` naming the inbox, by path, by a symbolic link, or by a hard link (the same
-  device and inode), is exit 2. The same check guards `friction rank --record`. The verb exists on unix only.
+  device and inode), is exit 2. The same check guards `friction rank --record`, and the whole `--record` guard under `patterns` (an
+  absolute path, a path that resolves, no config or privacy list file, a new, empty or `{`-led regular file)
+  applies to this verb too; the Jev arm's second line goes to the same checked path. The verb exists on unix only.
 
 **The Jev arm** (ticket friction-suggest-jev). Four more flags turn a second ranking on:
 
