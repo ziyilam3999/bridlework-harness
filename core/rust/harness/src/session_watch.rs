@@ -285,16 +285,18 @@ fn pid_live(pid: Option<&str>) -> R<bool> {
 }
 
 /// The listing for the join. An entry with no string id or no string name, or whose id is not a plain token, is left out when it cannot
-/// be the watched entry: its sessionId is not the record session_id, its id is not the record short_id and its cwd, canonicalized, is
-/// not the tree. Such an entry that could be the watched one (its sessionId equals the record session_id, its id equals the record
-/// short_id, or its cwd equals the tree) refuses. Returns the entries to join on and how many were left out.
-fn watch_listing(o: &Opts, short: &str, sid: &str) -> R<(Vec<Entry>, usize)> {
+/// be the watched entry: its sessionId is not the record session_id, its id is not the record short_id, its name is not the record
+/// name and its cwd, canonicalized, is not the tree. Such an entry that could be the watched one (its sessionId equals the record
+/// session_id, its id equals the record short_id, its name equals the record name, or its cwd equals the tree) refuses. Returns the
+/// entries to join on and how many were left out.
+fn watch_listing(o: &Opts, short: &str, sid: &str, name: &str) -> R<(Vec<Entry>, usize)> {
     let tree = canonicalize(&o.tree).ok();
     let mut entries = Vec::new();
     let mut skipped = 0usize;
     for r in raw_listing(&o.host)? {
         let could_be_watched = r.session_id.as_deref() == Some(sid)
             || r.id.as_deref() == Some(short)
+            || r.name.as_deref() == Some(name)
             || r.cwd
                 .as_deref()
                 .and_then(|c| canonicalize(c).ok())
@@ -367,7 +369,7 @@ fn check(o: &Opts) -> R<Out> {
         return Ok(out("stopped", &s, &format!(" by=bw stop={kind}"), None));
     }
     // v2: join on the short id and the session id; entries that cannot be the watched one are left out (skipped_entries)
-    let (entries, skipped) = watch_listing(o, &short, &sid)?;
+    let (entries, skipped) = watch_listing(o, &short, &sid, &l.name)?;
     s.skipped = skipped;
     let hits: Vec<&Entry> = entries.iter().filter(|e| e.id == short && e.session_id.as_deref() == Some(sid.as_str())).collect();
     let e = match hits.as_slice() {

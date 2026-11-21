@@ -315,6 +315,12 @@ fn refused(r: &R, what: &str) {
     assert!(!r.err.trim().is_empty(), "{what}: one stderr line expected");
 }
 
+/// A refusal whose stderr line holds the given message.
+fn refused_msg(r: &R, what: &str, msg: &str) {
+    refused(r, what);
+    assert!(r.err.contains(msg), "{what}: {msg:?} missing in {:?}", r.err);
+}
+
 /// A working seat with a fresh tree and a transcript 30 s old.
 fn working() -> Fx {
     let fx = Fx::new();
@@ -504,19 +510,25 @@ fn t11_an_entry_that_could_be_the_watched_one_still_refuses_without_an_id_or_nam
         fx.ent("working", Some("busy")),
         format!("{{\"name\":\"probe\",\"cwd\":\"{}\",\"sessionId\":\"{SID}\",\"state\":\"working\"}}", other_dir(&fx)),
     ]);
-    refused(&fx.run(), "no id, the record session id");
+    refused_msg(&fx.run(), "no id, the record session id", "a listing entry has no string id and name");
     // no id, another session id, but the cwd is the tree
     fx.list(&[
         fx.ent("working", Some("busy")),
         format!("{{\"name\":\"probe\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", fx.cwd()),
     ]);
-    refused(&fx.run(), "no id, the tree as cwd");
+    refused_msg(&fx.run(), "no id, the tree as cwd", "a listing entry has no string id and name");
     // the id equals the short id, but no name
     fx.list(&[
         fx.ent("working", Some("busy")),
         format!("{{\"id\":\"{SHORT}\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
     ]);
-    refused(&fx.run(), "the short id, no name");
+    refused_msg(&fx.run(), "the short id, no name", "a listing entry has no string id and name");
+    // no id, another session id, another cwd, but the name is the watched seat's name
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"name\":\"{NAME}\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    refused_msg(&fx.run(), "no id, the seat name", "a listing entry has no string id and name");
 }
 
 // ------------------------------------------------------------------------------------------------ refusals
