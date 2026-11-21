@@ -39,6 +39,24 @@ impl J {
         J { t, dir, key, ledger, tmproot }
     }
 
+    /// One start of the fresh copy outside the engine, with the no-file case: the first start of a newly
+    /// written copy can take seconds under load while a later start of the same file is fast, so the
+    /// deadline tests warm the copy before their clock starts.
+    fn warm(&self, case: &str) {
+        fs::write(self.dir.join("case"), "no-file").unwrap();
+        let o = Command::new(self.send())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", p(&self.dir))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 0, "{}", err(&o));
+        assert!(self.ran(), "the warm start wrote its ran note");
+        fs::remove_dir_all(self.dir.join("notes")).unwrap();
+        fs::write(self.dir.join("case"), case).unwrap();
+    }
+
     fn send(&self) -> PathBuf {
         self.dir.join("fake-send.sh")
     }
@@ -1100,6 +1118,7 @@ fn path_home_and_lang_pass_through_and_an_unset_lc_all_is_not_made() {
 #[test]
 fn a_hang_leaves_nothing_in_the_temp_root_after_the_deadline() {
     let j = J::new("hang");
+    j.warm("hang");
     let started = Instant::now();
     // The deadline leaves the fake time to write its file first; the fake lists its TMPDIR to a note, so the
     // test sees that the file it checks was there before the kill.
@@ -1561,6 +1580,7 @@ fn a_changed_answer_file_changes_the_pick() {
 #[test]
 fn the_deadline_kills_the_whole_group() {
     let j = J::new("hang-bg");
+    j.warm("hang-bg");
     let started = Instant::now();
     // 5000, not the 300 of the ticket: the first start of a fresh script copy can take seconds under load, before the fake wrote its note.
     let extra = ["--jev-deadline-ms", "5000"];
