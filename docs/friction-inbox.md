@@ -10,7 +10,7 @@ operational text, so it is private data. This repo holds the contract, the reade
 
 Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
 `repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
-`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, and the read-only `suggest` verb (ask A32, unix only). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, the read-only `suggest` verb (ask A32, unix only), and the two status keys `status` and `status_ref` with the read-only `open` verb (ticket friction-row-status-fields). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
@@ -545,8 +545,8 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
   the row naming the field and the class, never the bytes. These verbs scan the stored rows: `add`, `lint`,
-  `open`, `patterns`, `close-check`, `rank`, `controls-check`, `triage`, `page`, `suggest`, `bind` (for a group
-  with no state row) and `lesson replay` (with its answer key). `close-check` scans its `lesson:` lines too.
+  `open`, `patterns`, `close-check`, `rank`, `controls-check`, `triage`, `page`, `suggest`, `sweep` (when the
+  week maps at least one row), `bind` (for a group with no state row) and `lesson replay` (with its answer key). `close-check` scans its `lesson:` lines too.
   The scan covers `status` and `status_ref` as it covers `proof`.
 - One writer at a time: `add` takes ONE exclusive kernel advisory lock (`flock(2)`, the std file lock) on the inbox
   file itself, and does the read, scan, cross check and append through that same open descriptor, so two

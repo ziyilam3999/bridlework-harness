@@ -342,7 +342,9 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
 }
 
 /// The status rules: no status means no `status_ref`; a status is one of `STATUSES` and carries a `status_ref`
-/// with the pointer that status needs. An explicit `open` or empty status is refused (a canonical row omits it).
+/// with the pointer that status needs. An empty status reads as open (so it takes no `status_ref`); an explicit
+/// `open` is not in `STATUSES` and is refused here (a canonical row omits it). `parse_row_status` refuses an
+/// explicit empty `status` key before this runs.
 pub fn validate_status(s: &Status) -> Result<(), String> {
     if s.status.is_empty() {
         if !s.status_ref.is_empty() {
@@ -622,8 +624,10 @@ pub struct Inbox {
 /// derefs to; the two status keys of each row (same order) ride beside it, so the one privacy pass sees them.
 #[derive(Debug, Default, Clone)]
 pub struct Rows {
-    pub list: Vec<(usize, Row)>,
-    pub statuses: Vec<Status>,
+    // Private on purpose: a `Rows` is built only through `push_with_status`, so the two lists keep the same
+    // length and the privacy pass cannot skip the status keys of a row.
+    list: Vec<(usize, Row)>,
+    statuses: Vec<Status>,
 }
 
 impl Rows {
@@ -959,7 +963,7 @@ pub(crate) fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, Stri
     Ok(std::path::PathBuf::from(path))
 }
 
-/// `harness friction add | lint | patterns | close-check | sweep` (K-1 slice 1 plus tickets 192, 200; the
+/// `harness friction add | lint | patterns | close-check | sweep | open` (K-1 slice 1 plus tickets 192, 200; the
 /// contract is `docs/friction-inbox.md`).
 /// Exit 0 ok; 1 a refusal (a refused write leaves the inbox byte-identical, stdout empty, stderr naming the field
 /// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error. Nothing is written
