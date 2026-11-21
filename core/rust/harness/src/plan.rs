@@ -9,14 +9,22 @@
 //! One unparsable ticket or bad done record makes check, status and ticket mode exit 2. Details: `docs/plan-index.md`.
 //! `harness plan stale-notes` (read only) lists lines in named files that hold a pending phrase and a done or built id, and
 //! in-build rows that list tickets, all done, with no estimated work left.
+//! `harness plan fresh --index <file>` says whether the checkout holding a plan index is behind its remote default branch
+//! (`refs/remotes/origin/HEAD` resolved to its target), from local refs only: no fetch, no network. One stdout line;
+//! exit 0 current, 1 behind or diverged, 2 usage or the checkout cannot be judged (one fixed stderr line, git's own
+//! stderr is not passed through).
 
 use crate::plan_index::{self, Row, State};
 use crate::ticket::Ticket;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 pub const USAGE: &str = "usage: harness plan check|status --index <absolute-file> --tickets <absolute-dir> --done <absolute-dir> [--ticket <id>] [--plan <absolute-file> --base-plan <absolute-file> --base-index <absolute-file>]";
+
+/// The `plan fresh` usage line (its own line: the check/status usage above is pinned by tests).
+pub const FRESH_USAGE: &str = "usage: harness plan fresh --index <absolute-file>";
 
 const MAX_TICKET_BYTES: u64 = 1024 * 1024 + 1;
 const DONE_READ_CAP: u64 = 256;
@@ -653,9 +661,126 @@ fn stale_notes(a: &[String]) -> i32 {
     i32::from(notes > 0 || rows > 0)
 }
 
+/// One git call of `plan fresh`, pinned the way `ticket_gate::git_pinned` pins its calls: no inherited `GIT_*` name,
+/// hooks off, no stdin, and git's own stderr is dropped, never passed through. Git finds the work tree itself from
+/// `dir`, so a linked worktree (a `.git` file) works the same as a main checkout.
+fn git_local(dir: &Path, args: &[&str]) -> Option<String> {
+    let mut c = Command::new("git");
+    c.current_dir(dir).arg("--no-optional-locks").args(["-c", "core.hooksPath=/dev/null"]).args(args);
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            c.env_remove(k);
+        }
+    }
+    let out = c.stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// The first 12 characters of a full sha (the caller has checked the shape).
+fn short_sha(sha: &str) -> &str {
+    &sha[..12]
+}
+
+/// A full 40-character lowercase-or-uppercase hex sha.
+fn sha_ok(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `harness plan fresh --index <absolute-file>`: is the checkout holding the plan index behind its remote default
+/// branch? Local refs only: no fetch, no network. Exit 0 `plan-index current head=<12> base=<12>` (HEAD equals the
+/// ref or is ahead with nothing behind); 1 `plan-index behind=<n> ...` (behind, not ahead) or `plan-index diverged
+/// ahead=<a> behind=<b> ...`; 2 usage (the usage line on stderr), or one fixed engine stderr line when the plan index
+/// file is missing, is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the
+/// current branch is not the branch origin/HEAD names, or a git call fails. A dirty work tree does not change the
+/// answer: the check is about commits.
+fn fresh_cmd(a: &[String]) -> i32 {
+    let fail = |m: &str| -> i32 {
+        eprintln!("harness: error: {m}");
+        2
+    };
+    let mut it = a.iter();
+    let idx = match (it.next(), it.next(), it.next()) {
+        (Some(f), Some(v), None) if f == "--index" && abs_ok(v) => v.as_str(),
+        _ => {
+            eprintln!("{FRESH_USAGE}");
+            return 2;
+        }
+    };
+    // The file is canonicalized first (a symlink is followed), so the work tree found is the one holding the real file.
+    let canon = match std::fs::canonicalize(idx) {
+        Ok(p) => p,
+        Err(_) => return fail("the plan index file is missing or cannot be read"),
+    };
+    let dir = match canon.parent() {
+        Some(d) => d,
+        None => return fail("the plan index is not inside a git work tree"),
+    };
+    let top = match git_local(dir, &["rev-parse", "--show-toplevel"]) {
+        Some(o) => PathBuf::from(o.trim_end_matches(['\n', '\r'])),
+        None => return fail("the plan index is not inside a git work tree"),
+    };
+    let base_ref = match git_local(&top, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        Some(o) => o.trim().to_string(),
+        None => return fail("the remote default branch ref refs/remotes/origin/HEAD is not set"),
+    };
+    let unset = "the remote default branch ref refs/remotes/origin/HEAD is not set";
+    let Some(branch) = base_ref.strip_prefix("refs/remotes/origin/") else {
+        return fail(unset);
+    };
+    if branch.is_empty() || branch.ends_with('/') {
+        return fail(unset);
+    }
+    let head_ref = match git_local(&top, &["symbolic-ref", "HEAD"]) {
+        Some(o) => o.trim().to_string(),
+        None => return fail("HEAD is detached"),
+    };
+    if head_ref != format!("refs/heads/{branch}") {
+        return fail("the current branch is not the branch origin/HEAD names");
+    }
+    let one = |args: &[&str]| git_local(&top, args);
+    let head = match one(&["rev-parse", "HEAD"]).as_deref().map(str::trim) {
+        Some(h) if sha_ok(h) => h.to_string(),
+        _ => return fail("a git call failed"),
+    };
+    let base = match one(&["rev-parse", base_ref.as_str()]).as_deref().map(str::trim) {
+        Some(b) if sha_ok(b) => b.to_string(),
+        _ => return fail("a git call failed"),
+    };
+    let spec = format!("{head}...{base}");
+    let counts = match one(&["rev-list", "--left-right", "--count", spec.as_str()]) {
+        Some(c) => c,
+        None => return fail("a git call failed"),
+    };
+    let mut it = counts.split_whitespace();
+    let (ahead, behind) = match (it.next(), it.next(), it.next()) {
+        (Some(a), Some(b), None) => (a, b),
+        _ => return fail("a git call failed"),
+    };
+    let (Ok(ahead), Ok(behind)) = (ahead.parse::<u64>(), behind.parse::<u64>()) else {
+        return fail("a git call failed");
+    };
+    let (h, b) = (short_sha(&head), short_sha(&base));
+    if behind == 0 {
+        println!("plan-index current head={h} base={b}");
+        0
+    } else if ahead == 0 {
+        println!("plan-index behind={behind} head={h} base={b}");
+        1
+    } else {
+        println!("plan-index diverged ahead={ahead} behind={behind} head={h} base={b}");
+        1
+    }
+}
+
 pub fn plan_cmd(a: &[String]) -> i32 {
     if a.first().map(String::as_str) == Some("stale-notes") {
         return stale_notes(&a[1..]);
+    }
+    if a.first().map(String::as_str) == Some("fresh") {
+        return fresh_cmd(&a[1..]);
     }
     let Some(args) = parse_args(a) else {
         eprintln!("{USAGE}");

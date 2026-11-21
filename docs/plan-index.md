@@ -169,6 +169,30 @@ Known gaps:
 - A note split over two lines is not found.
 - Neither `plan::USAGE` nor the top-level usage line names the sub-verb.
 
+## plan fresh
+
+```
+harness plan fresh --index <absolute-file>
+```
+
+The checkout holding a plan index can sit behind its remote after another session merges a plan ref and nothing fast-forwards the local clone. This verb reports that. It reads local refs only: it runs no fetch and contacts no remote, so the caller fetches first when a fresh answer is wanted.
+
+`--index` is required and given at most once, and its value goes through the absolute-path rule of the other plan verbs: a relative path or a path with a `..` part, an unknown flag, a flag with no value, or any other word prints the usage line on stderr and exits 2.
+
+The file is canonicalized first, so a symlink to the index answers about the work tree of the file it points at. Then the git work tree holding the canonical file is found; a linked worktree (a `.git` file) works like a main checkout. The remote default branch is `refs/remotes/origin/HEAD` resolved to its target, and the work tree's `HEAD` is compared with that ref. A dirty work tree does not change the answer: the check is about commits. Git runs the way the engine pins it: no inherited `GIT_*` name, hooks off, no stdin.
+
+One stdout line:
+
+| Line | When | Exit |
+|---|---|---|
+| `plan-index current head=<12 hex> base=<12 hex>` | HEAD equals the ref, or is ahead of it with nothing behind | 0 |
+| `plan-index behind=<n> head=<12 hex> base=<12 hex>` | HEAD is behind and not ahead | 1 |
+| `plan-index diverged ahead=<a> behind=<b> head=<12 hex> base=<12 hex>` | HEAD is both ahead and behind | 1 |
+
+`head` is the first 12 hex characters of the work tree's HEAD commit, `base` of the ref's commit; `n`, `a` and `b` are commit counts.
+
+Exit 2, stdout empty, one fixed stderr line `harness: error: <what>`, when the plan index file is missing or cannot be read, the file is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the current branch is not the branch `origin/HEAD` names, or a git call fails. Git's own stderr is not printed.
+
 ## What it does not do
 
 - `plan stale-notes` reports and changes no file.
@@ -185,3 +209,6 @@ Known gaps:
 - An engine binary older than this change refuses an index with a dropped row (exit 2), so a row is set to `dropped` only after the bw engine binary is rebuilt.
 - An `off_plan` reason is not judged.
 - Plan-line check: a row added, removed or moved (a changed `plan_line`) is not compared; an edit after character 40 of a line is not seen; a base index with no row of the same id and `plan_line` as a head row gives `compared=0`, and the exit is 0 when no other finding is red; no program calls the three new inputs yet, so a person runs the verb by hand on the two revisions; whole-index check can be red for other classes, so a caller reads the `plan-line-stale` lines, not the exit code.
+- `plan fresh` reads local refs only: a `current` answer says nothing about the remote itself until the caller fetches.
+- `plan fresh` reads the index file's place, not its content; any readable file in the checkout gives the same answer.
+- `plan fresh` compares with `refs/remotes/origin/HEAD` only: a checkout on another branch is exit 2, not a compared answer.
