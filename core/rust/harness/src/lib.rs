@@ -2,6 +2,7 @@
 
 #[cfg(unix)]
 pub mod both_ends;
+pub mod build_check;
 #[cfg(unix)]
 pub mod caps;
 pub mod classes;

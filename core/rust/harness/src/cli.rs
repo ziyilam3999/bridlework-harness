@@ -722,8 +722,11 @@ pub fn run(mut args: Vec<String>) -> i32 {
     if !args.is_empty() && args[0] == "plan" {
         return crate::plan::plan_cmd(&args[1..]);
     }
+    if !args.is_empty() && args[0] == "build" {
+        return crate::build_check::build_check_cmd(&args[1..], testmode);
+    }
     if args.len() < 3 || args[0] != "privacy" || (args[1] != "scan" && args[1] != "explain") {
-        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ... | lesson lint <path> ... | lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file> | lane claim|release|list|admission-check ... | owed add|list|close ... | plan check|status ...");
+        eprintln!("usage: harness --version | privacy classes | privacy scan|explain <mode> | friction add|lint|patterns|close-check | status <ticket-file> ... | process start|stop|check|step <ticket> ... | evidence show|check|quote <ticket> ... | workspace create <ticket-file> ... | workspace check <ticket> ... | controls approval-message|write ... | permission approval-message|write ... | session check-name|record-start ... | lesson lint <path> ... | lesson lookup <lessons-dir> --ticket <ticket-file> --scope-file <file> | lane claim|release|list|admission-check ... | owed add|list|close ... | build check --repo-dir <dir> --ref <ref> | plan check|status ...");
         return 2;
     }
     let explain_mode = args[1] == "explain";
