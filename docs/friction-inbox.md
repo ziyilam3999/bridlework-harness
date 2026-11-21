@@ -544,9 +544,10 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 ## 4. Privacy, caps, torn tails
 
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
-  the row naming the field and the class, never the bytes. Every reader of the inbox runs the same scan over
-  the stored rows (`add`, `lint`, `close-check`, `open`, `rank`, `suggest`), and `close-check` scans its `lesson:`
-  lines too. The scan covers `status` and `status_ref` as it covers `proof`.
+  the row naming the field and the class, never the bytes. These verbs scan the stored rows: `add`, `lint`,
+  `open`, `patterns`, `close-check`, `rank`, `controls-check`, `triage`, `page`, `suggest`, `bind` (for a group
+  with no state row) and `lesson replay` (with its answer key). `close-check` scans its `lesson:` lines too.
+  The scan covers `status` and `status_ref` as it covers `proof`.
 - One writer at a time: `add` takes ONE exclusive kernel advisory lock (`flock(2)`, the std file lock) on the inbox
   file itself, and does the read, scan, cross check and append through that same open descriptor, so two
   concurrent adds can never both store the same id (the check and the append are one critical section) — however

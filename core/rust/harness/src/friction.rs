@@ -18,11 +18,12 @@ use std::path::Path;
 pub const TAGS: [&str; 4] = ["skill", "gate", "memory", "wiki"];
 /// The row fields in canonical order (the JSON key order this module writes).
 pub const FIELDS: [&str; 6] = ["id", "date", "ticket", "where-it-lives", "breaks", "text"];
-/// The three optional fields: `kind` and `repeats` (ticket 192) and `source` (ticket 193). `kind` is the
-/// row's class (default `friction`) and `repeats` the id of the pattern row this row repeats; `source` is the
-/// row's origin (default empty = hand-written; the only other value is `event`, the T-9.3 event rows the
-/// `friction_event` mapper produces). All three are omitted from the canonical line at their defaults, so
-/// every six-key row written before this contract re-encodes byte-identical.
+/// The nine optional fields: `kind` and `repeats` (ticket 192) and `source` (ticket 193), then six added
+/// after ticket 193 (`at`, `impact`, `why`, `proof`, `status`, `status_ref`). `kind` is the row's class
+/// (default `friction`) and `repeats` the id of the pattern row this row repeats; `source` is the row's origin
+/// (default empty = hand-written; the only other value is `event`, the T-9.3 event rows the `friction_event`
+/// mapper produces). Each is omitted from the canonical line at its default, so every six-key row written
+/// before this contract re-encodes byte-identical.
 pub const OPTIONAL_FIELDS: [&str; 9] = ["kind", "repeats", "source", "at", "impact", "why", "proof", "status", "status_ref"];
 /// The five non-default `status` words (the default, `open`, is an absent key). Each needs a `status_ref` pointer
 /// of one kind (see `status_ref_problem`).
@@ -554,7 +555,7 @@ pub fn parse_row_status(line: &str) -> Result<(Row, Status), String> {
     for (k, slot) in [("id", &mut row.id), ("date", &mut row.date), ("ticket", &mut row.ticket), ("where-it-lives", &mut row.tag), ("breaks", &mut row.breaks), ("text", &mut row.text)] {
         *slot = get(k).ok_or_else(|| format!("missing field {k:?}"))?;
     }
-    // The three optional fields default to their defaults when absent; an explicit empty value reads the same.
+    // `kind`, `repeats` and `source` default to their defaults when absent; an explicit empty value reads the same.
     row.kind = get("kind").unwrap_or_default();
     row.repeats = get("repeats").unwrap_or_default();
     row.source = get("source").unwrap_or_default();
@@ -637,12 +638,6 @@ impl std::ops::Deref for Rows {
     type Target = Vec<(usize, Row)>;
     fn deref(&self) -> &Self::Target {
         &self.list
-    }
-}
-
-impl std::ops::DerefMut for Rows {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.list
     }
 }
 
@@ -742,9 +737,9 @@ fn status_fields(st: &Status) -> [(&'static str, &str); 2] {
     [("status", st.status.as_str()), ("status_ref", st.status_ref.as_str())]
 }
 
-/// The privacy engine over every field of every stored row — the same rules `add` applies to a new row. Every
-/// reader of the inbox runs this pass (add, lint, close-check); a reason names the line, the field and the
-/// pattern class, never the bytes.
+/// The privacy engine over the fields of the stored rows — the same rules `add` applies to a new row. The
+/// verbs that run this pass are listed in docs/friction-inbox.md section 4; a reason names the line, the field
+/// and the pattern class, never the bytes.
 /// The two status keys of each row are scanned with its other fields (they travel in `Rows`).
 pub fn privacy_problems(ctx: &crate::scan::Ctx, rows: &Rows) -> Vec<(usize, String)> {
     let mut out = Vec::new();
