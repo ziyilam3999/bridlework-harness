@@ -161,13 +161,61 @@ fn a_tracked_change_an_untracked_file_and_no_commit_are_refused_and_cargo_is_not
     assert!(!rec.exists(), "a refused tree ran the build");
 }
 
+impl Fix {
+    /// A `git` first on the script's PATH that exits 128 on the given subcommand and passes every other
+    /// call to the real git, so only that one call fails.
+    fn git_fails_on(&self, sub: &str) {
+        let fake = format!("#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = {sub} ] && exit 128\ndone\nPATH=/usr/bin:/bin exec git \"$@\"\n");
+        fs::write(self.bin.join("git"), fake).unwrap();
+        fs::set_permissions(self.bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 #[test]
 fn a_git_status_that_fails_is_refused_and_cargo_is_not_run() {
     let f = fix();
-    // a corrupt index: git status fails while rev-parse HEAD still works
-    fs::write(f.dir.join(".git/index"), b"not an index file\n").unwrap();
-    assert!(!gitcmd(&f.dir, &["status", "--porcelain"]).output().unwrap().status.success(), "the scratch index is not broken");
+    f.git_fails_on("status");
     f.assert_refused("a failing git status");
+}
+
+#[test]
+fn a_git_ls_files_that_fails_is_refused_and_cargo_is_not_run() {
+    let f = fix();
+    f.git_fails_on("ls-files");
+    f.assert_refused("a failing git ls-files");
+}
+
+#[test]
+fn an_edit_hidden_by_a_fsmonitor_hook_is_refused_and_cargo_is_not_run() {
+    let f = fix();
+    // a hook that reports no change; one status call lets the index take its token
+    let hook = f._t.0.join("hook.sh");
+    fs::write(&hook, "#!/bin/sh\nprintf 'tok\\0'\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    g(&f.dir, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    g(&f.dir, &["status", "--porcelain"]);
+    g(&f.dir, &["update-index", "--refresh"]);
+    fs::write(f.dir.join("a.txt"), b"changed\n").unwrap();
+    assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the hook hides the edit from status");
+    f.assert_refused("a tracked edit hidden by core.fsmonitor");
+}
+
+#[test]
+fn a_same_size_edit_hidden_by_loose_stat_config_is_refused_and_cargo_is_not_run() {
+    let f = fix();
+    g(&f.dir, &["config", "core.trustctime", "false"]);
+    g(&f.dir, &["config", "core.checkStat", "minimal"]);
+    // an old mtime in the index, so the entry is not racily clean
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let set_mtime = |p: &Path| fs::OpenOptions::new().write(true).open(p).unwrap().set_modified(old).unwrap();
+    set_mtime(&f.dir.join("a.txt"));
+    g(&f.dir, &["update-index", "--refresh"]);
+    // git compares ctime in whole seconds: the edit must land in a later second than the refresh
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(f.dir.join("a.txt"), b"b\n").unwrap();
+    set_mtime(&f.dir.join("a.txt"));
+    assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the config hides the edit from status");
+    f.assert_refused("a same-size edit with the mtime set back");
 }
 
 #[test]
@@ -195,6 +243,18 @@ fn an_edit_hidden_by_skip_worktree_is_refused_and_cargo_is_not_run() {
     fs::write(f.dir.join("a.txt"), b"changed\n").unwrap();
     assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the flag hides the edit from status");
     f.assert_refused("a skip-worktree entry");
+}
+
+#[test]
+fn a_flagged_entry_after_the_first_line_of_ls_files_is_refused() {
+    let f = fix();
+    fs::write(f.dir.join("z.txt"), b"z\n").unwrap();
+    g(&f.dir, &["add", "-A"]);
+    g(&f.dir, &["commit", "-q", "-m", "z"]);
+    g(&f.dir, &["update-index", "--assume-unchanged", "z.txt"]);
+    fs::write(f.dir.join("z.txt"), b"changed\n").unwrap();
+    assert_eq!(g(&f.dir, &["status", "--porcelain"]), "", "the flag hides the edit from status");
+    f.assert_refused("an assume-unchanged entry on a later line");
 }
 
 #[test]

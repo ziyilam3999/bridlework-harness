@@ -8,7 +8,8 @@
 # tree holds a tracked change or an untracked file: git status --porcelain --untracked-files=all is not
 # empty, or git status fails, or an index entry is flagged assume-unchanged or skip-worktree, or
 # git ls-files fails) and then no build runs, or the cargo build failed; nothing is printed
-# on stdout. GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_COMMON_DIR and GIT_OBJECT_DIRECTORY are
+# on stdout. Both git calls run with core.fsmonitor=false, core.trustctime=true and core.checkStat=default,
+# so those repo config keys cannot hide a tracked edit. GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_COMMON_DIR and GIT_OBJECT_DIRECTORY are
 # cleared before the git calls. The release build, the release smoke and the clean-install scripts
 # set no stamp, so their binaries hold none unless the variable is set in their environment.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
@@ -16,13 +17,15 @@ root="$here/.."
 # The git calls read this checkout, not a repo named by the caller's environment.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 commit=$(git -C "$root" rev-parse --verify HEAD 2>/dev/null) || exit 1
-# A git status that fails is a refusal; untracked files are listed whatever status.showUntrackedFiles
+# Repo config cannot switch off the change detection: both git calls override core.fsmonitor,
+# core.trustctime and core.checkStat. Untracked files are listed whatever status.showUntrackedFiles
 # says (files ignored by .gitignore, .git/info/exclude or core.excludesFile are not checked).
-st=$(git -C "$root" status --porcelain --untracked-files=all) || exit 1
+# A git status that fails is a refusal.
+st=$(git -C "$root" -c core.fsmonitor=false -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all) || exit 1
 [ -z "$st" ] || exit 1
 # An index entry flagged assume-unchanged or skip-worktree hides an edit from git status: ls-files -v
 # tags such an entry with a letter other than H. A failing ls-files is a refusal.
-tags=$(git -C "$root" ls-files -v) || exit 1
+tags=$(git -C "$root" -c core.fsmonitor=false -c core.trustctime=true -c core.checkStat=default ls-files -v) || exit 1
 case "$tags" in
   *'
 '[!H]' '*|[!H]' '*) exit 1 ;;

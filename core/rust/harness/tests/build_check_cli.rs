@@ -179,6 +179,16 @@ fn a_tag_ref_is_resolved_to_its_commit_and_a_folder_that_is_no_repo_cannot_tell(
 }
 
 #[test]
+fn the_git_location_variables_of_the_caller_do_not_move_the_check() {
+    let (_t, dir, shas) = repo_n(2);
+    let (_t2, other, _o) = repo_n(1);
+    let mut c = Command::new(BIN);
+    c.args(["--testmode", "synthetic-test", "build", "check", "--repo-dir", dir.to_str().unwrap(), "--ref", "HEAD", "--stamp-for-test", &shas[1]]);
+    c.env("GIT_DIR", other.join(".git")).env("GIT_WORK_TREE", &other).stdin(Stdio::null());
+    check_current(&c.output().unwrap(), &shas[1]);
+}
+
+#[test]
 fn argument_faults_exit_2_and_the_test_flag_needs_the_test_mode() {
     let (_t, dir, shas) = repo_n(1);
     let d = dir.to_str().unwrap();

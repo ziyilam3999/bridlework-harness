@@ -47,7 +47,10 @@ file (`git status --porcelain --untracked-files=all` is not empty, whatever `sta
 says), or when that `git status` call itself fails (an unreadable or corrupt index). It also exits 1
 when an index entry is flagged assume-unchanged or skip-worktree (`git ls-files -v` prints a tag other
 than `H`; such a flag hides an edit from `git status`) or when `git ls-files` fails. It also exits 1
-when the cargo build itself fails. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` and
+when the cargo build itself fails. Both git calls run with `core.fsmonitor=false`,
+`core.trustctime=true` and `core.checkStat=default`, so a repo config that sets those keys otherwise
+(a hook that reports no change, a loose stat compare) cannot hide a tracked edit; other config keys
+are not overridden. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` and
 `GIT_OBJECT_DIRECTORY` are cleared before the git calls, so the stamp is the commit of `HEAD` of the
 checkout the script lives in. The
 work tree check does not list files ignored by `.gitignore`, `.git/info/exclude` or
