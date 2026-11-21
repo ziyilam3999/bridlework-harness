@@ -162,8 +162,8 @@ fn a_tracked_change_an_untracked_file_and_no_commit_are_refused_and_cargo_is_not
 }
 
 impl Fix {
-    /// A `git` first on the script's PATH that exits 128 on the given subcommand and passes every other
-    /// call to the real git, so only that one call fails.
+    /// A `git` first on the script's PATH that exits 128 when any argument equals the given word and
+    /// passes every other call to the real git, so only the calls with that word fail.
     fn git_fails_on(&self, sub: &str) {
         let fake = format!("#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = {sub} ] && exit 128\ndone\nPATH=/usr/bin:/bin exec git \"$@\"\n");
         fs::write(self.bin.join("git"), fake).unwrap();

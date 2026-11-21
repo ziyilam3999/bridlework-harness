@@ -42,15 +42,17 @@ environment; if it is exported there, that build picks it up.
 `ci/stamped-build.sh` is the one place that sets the stamp. It builds `core/rust` release with the
 variable set to the commit of `HEAD` of the checkout it lives in, prints
 `stamped-build: built commit=<sha>` and exits 0. It exits 1 with nothing on stdout, and runs no
-build, when `HEAD` has no commit, when the work tree has a tracked change or when it has an untracked
-file (`git status --porcelain --untracked-files=all` is not empty, whatever `status.showUntrackedFiles`
-says), or when that `git status` call itself fails (an unreadable or corrupt index). It also exits 1
+build, when `HEAD` has no commit, when `git status --porcelain --untracked-files=all` lists a change
+(a tracked edit or an untracked file, whatever `status.showUntrackedFiles` says), or when that `git status`
+call itself fails (an unreadable or corrupt index). It also exits 1
 when an index entry is flagged assume-unchanged or skip-worktree (`git ls-files -v` prints a tag other
 than `H`; such a flag hides an edit from `git status`) or when `git ls-files` fails. It also exits 1
 when the cargo build itself fails. Both git calls run with `core.fsmonitor=false`,
 `core.trustctime=true` and `core.checkStat=default`, so a repo config that sets those keys otherwise
-(a hook that reports no change, a loose stat compare) cannot hide a tracked edit; other config keys
-are not overridden. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` and
+(a hook that reports no change, a loose stat compare) cannot hide an edit; other config keys
+are not overridden. Other repo config, for example a clean filter named in `.git/info/attributes`, can
+still hide an edit from `git status`, as ignored files can; a fresh clone (the rebuild hand step)
+carries no such config. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` and
 `GIT_OBJECT_DIRECTORY` are cleared before the git calls, so the stamp is the commit of `HEAD` of the
 checkout the script lives in. The
 work tree check does not list files ignored by `.gitignore`, `.git/info/exclude` or
