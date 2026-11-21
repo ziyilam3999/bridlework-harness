@@ -211,7 +211,9 @@ messages are constant and no path bytes are echoed:
 3. the friction inbox: `--record must not name the friction inbox`;
 4. the `--config` value and the `HARNESS_CONFIG` value (both, when both are set), and the `HARNESS_PRIVACY_LIST`
    and `HARNESS_PRIVACY_OLD_LIST` values when set and not empty, also when the verb does not read the list file
-   (with `HARNESS_PRIVACY_LIST_SECRET` set): `--record must not name a config file`;
+   (with `HARNESS_PRIVACY_LIST_SECRET` set): `--record must not name a config file`; a protected value that is
+   set, not empty and cannot be resolved (for example a dangling symbolic link) is refused with `--record cannot
+   be resolved`, because it cannot be compared; a value that is not UTF-8 is compared as it is;
 5. the file type is read with `symlink_metadata` before any open or read: an existing path that is not a regular
    file (a folder, a FIFO, a device such as `/dev/null`) is refused without being opened, so a FIFO cannot block
    the verb; then an existing non-empty regular file whose first byte is not `{` is refused, and so is a regular
@@ -221,7 +223,7 @@ messages are constant and no path bytes are echoed:
 **How a path is compared.** A relative protected value is taken against the working folder. When the path is
 found (a link counts, also a dangling one) it must canonicalise, else it is refused as (2); when it is not
 found, its folder must canonicalise and it needs a file name, and the resolved form is that folder plus the
-name. A protected value matches the record when the inbox check says so (same text, same device and inode, or
+name. A protected value that does not resolve is refused as (2) after the match test. A protected value matches the record when the inbox check says so (same text, same device and inode, or
 both canonicalise to one path) or when the two resolved forms are equal, so a symbolic link, a hard link, a
 `<folder>/sub/../config.yaml` form, a relative list value and a protected path that does not exist yet are
 matched too (the missing file is not made). On a case-insensitive file system a case variant of a name is the

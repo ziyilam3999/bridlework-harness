@@ -1001,8 +1001,8 @@ pub(crate) fn today_utc() -> String {
 /// True when two path strings name one file: the same text, or both exist and are the same file by device and
 /// inode (so a hard link counts), or both canonicalize (symlinks resolved) to the same path. A record file that
 /// does not exist yet only matches its own text, so a fresh `--record` path is never mistaken for the inbox.
-pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
-    let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
+pub(crate) fn paths_name_one_file<A: AsRef<std::path::Path>, B: AsRef<std::path::Path>>(a: A, b: B) -> bool {
+    let (pa, pb) = (a.as_ref(), b.as_ref());
     if pa == pb {
         return true;
     }
@@ -1023,8 +1023,8 @@ pub(crate) fn paths_name_one_file(a: &str, b: &str) -> bool {
 
 /// The resolved form of a path (a relative one is taken against the working folder): a found path (a link counts,
 /// also a dangling one) must canonicalize; a missing path needs a folder that canonicalizes and a file name.
-fn resolved_form(p: &str) -> Option<std::path::PathBuf> {
-    let mut path = std::path::PathBuf::from(p);
+fn resolved_form(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut path = p.to_path_buf();
     if path.is_relative() {
         path = std::env::current_dir().ok()?.join(path);
     }
@@ -1046,11 +1046,11 @@ pub(crate) fn record_guard(record: &str, config_flag: Option<&str>, inbox: &str)
     if !record.starts_with('/') {
         return Err("--record must be an absolute path");
     }
-    let Some(rec) = resolved_form(record) else {
+    let Some(rec) = resolved_form(std::path::Path::new(record)) else {
         return Err("--record cannot be resolved");
     };
-    let names = |other: &str| paths_name_one_file(record, other) || resolved_form(other).is_some_and(|o| o == rec);
-    if names(inbox) {
+    let names = |other: &std::path::Path| paths_name_one_file(record, other) || resolved_form(other).is_some_and(|o| o == rec);
+    if names(std::path::Path::new(inbox)) {
         return Err("--record must not name the friction inbox");
     }
     let mut protected: Vec<std::ffi::OsString> = Vec::new();
@@ -1062,11 +1062,14 @@ pub(crate) fn record_guard(record: &str, config_flag: Option<&str>, inbox: &str)
             protected.push(v);
         }
     }
-    for v in &protected {
-        if let Some(s) = v.to_str().filter(|s| !s.is_empty()) {
-            if names(s) {
-                return Err("--record must not name a config file");
-            }
+    for v in protected.iter().filter(|v| !v.is_empty()) {
+        let v = std::path::Path::new(v);
+        if names(v) {
+            return Err("--record must not name a config file");
+        }
+        // A protected value that cannot be resolved (a dangling link) cannot be compared: refuse.
+        if resolved_form(v).is_none() {
+            return Err("--record cannot be resolved");
         }
     }
     const NOT_RECORD: &str = "--record names a file that is not a JSON-lines record";

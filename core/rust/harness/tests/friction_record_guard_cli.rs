@@ -1,5 +1,5 @@
 //! The `--record` guard of `friction patterns`, `rank` and `suggest`: one function, three verbs. The real binary
-//! runs as a child on a scratch inbox; each test runs over the three verbs. Every value is synthetic.
+//! runs as a child on a scratch inbox; each test runs over the three verbs. The values are synthetic.
 #![cfg(unix)]
 mod friction_common;
 use friction_common::*;
@@ -183,6 +183,26 @@ fn a_privacy_list_path_that_is_relative_or_missing_is_protected() {
 }
 
 #[test]
+fn a_protected_path_that_cannot_be_resolved_is_refused() {
+    let t = scratch();
+    let cfg = t.config();
+    let target = t.0.join("list-target.txt");
+    let link = t.0.join("list-link.txt");
+    symlink(&target, &link).unwrap();
+    for verb in VERBS {
+        // The record names the missing target of a dangling list link: refused, not made.
+        let o = go(verb, p(&target), Some(&cfg), &[("HARNESS_PRIVACY_LIST", p(&link))], &t.0, true);
+        refused(&o, UNRESOLVED);
+        let o = go(verb, p(&target), Some(&cfg), &[("HARNESS_PRIVACY_OLD_LIST", p(&link))], &t.0, true);
+        refused(&o, UNRESOLVED);
+        // The same for a dangling config variable (the config flag is read, so it is a valid file).
+        let o = go(verb, p(&target), Some(&cfg), &[("HARNESS_CONFIG", p(&link))], &t.0, true);
+        refused(&o, UNRESOLVED);
+        assert!(!target.exists(), "{verb}");
+    }
+}
+
+#[test]
 fn a_record_naming_the_inbox_keeps_its_own_refusal() {
     let t = scratch();
     let cfg = t.config();
@@ -203,6 +223,9 @@ fn a_file_that_is_not_a_record_is_refused_and_a_record_file_is_appended() {
         let kv = t.file("wrapper.conf", "record=x\n");
         refused(&go(verb, p(&kv), Some(&cfg), &[], &t.0, true), SHAPE);
         assert_eq!(fs::read_to_string(&kv).unwrap(), "record=x\n");
+        let one = t.file("one-byte.txt", "x");
+        refused(&go(verb, p(&one), Some(&cfg), &[], &t.0, true), SHAPE);
+        assert_eq!(fs::read_to_string(&one).unwrap(), "x");
         let dir = t.0.join("adir");
         fs::create_dir_all(&dir).unwrap();
         refused(&go(verb, p(&dir), Some(&cfg), &[], &t.0, true), SHAPE);
