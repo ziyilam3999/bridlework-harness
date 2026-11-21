@@ -408,6 +408,13 @@ fn check(o: &Opts) -> R<Out> {
             if !pid_live(e.pid.as_deref())? {
                 return Err("the entry pid is not a live process".into());
             }
+            // A quiet seat the host still lists as working can be done: a commit since the launch with a passed gate on the current head.
+            let f = facts(o, floor)?;
+            s.commits = Some(f.commits);
+            s.gate = format!("{}/{}", f.last, if f.current { "yes" } else { "no" });
+            if f.commits > 0 && f.last == "pass" && f.current {
+                return Ok(out("finished", &s, "", w));
+            }
             Ok(out("stalled", &s, "", w))
         }
         "blocked" => {

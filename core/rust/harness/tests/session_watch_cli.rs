@@ -363,6 +363,145 @@ fn t4_stalled_when_both_are_old_and_the_pid_is_live() {
     is(&fx.run(), 11, &["verdict=stalled"]);
 }
 
+// ------------------------------------------------------------------------------------------------ a quiet working seat
+
+/// A quiet working seat: a live pid, a commit 900 s ago, a tree 800 s old and a transcript 700 s old.
+fn quiet(p: &Live, note: bool) -> Fx {
+    let fx = Fx::new();
+    fx.commit_at(900);
+    if note {
+        fx.note(true);
+    }
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
+    fx.transcript(700);
+    fx.age_tree(800);
+    fx
+}
+
+#[test]
+fn t4b_a_quiet_working_seat_with_a_passed_gate_on_the_head_is_finished() {
+    let p = live();
+    let fx = quiet(&p, true);
+    let r = fx.run();
+    is(&r, 13, &["verdict=finished", "state=working/busy", "gate=pass/yes", "session=ab12cd34", "skipped_entries=0"]);
+    num(&r, "tree_age=", 800, 900);
+    num(&r, "transcript_age=", 700, 800);
+    // the line holds exactly the eight fields of a finish, in order, with no why= or by=
+    let t: Vec<&str> = r.out.trim_end().split(' ').collect();
+    let want = [
+        "verdict=finished",
+        "state=working/busy",
+        "",
+        "",
+        "commits_since_launch=1",
+        "gate=pass/yes",
+        "session=ab12cd34",
+        "skipped_entries=0",
+    ];
+    assert_eq!(t.len(), want.len(), "one line of eight fields: {:?}", r.out);
+    for (got, w) in t.iter().zip(want) {
+        if !w.is_empty() {
+            assert_eq!(*got, w, "{:?}", r.out);
+        }
+    }
+}
+
+#[test]
+fn t4c_a_quiet_working_seat_with_the_gate_off_the_head_stays_stalled() {
+    let p = live();
+    let fx = Fx::new();
+    fx.commit_at(900);
+    fx.note(true);
+    fx.commit_at(850);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
+    fx.transcript(700);
+    fx.age_tree(800);
+    is(&fx.run(), 11, &["verdict=stalled", "gate=pass/no", "commits_since_launch=2"]);
+}
+
+#[test]
+fn t4d_a_quiet_working_seat_with_a_failed_gate_stays_stalled() {
+    let p = live();
+    let fx = Fx::new();
+    fx.commit_at(900);
+    fx.note(false);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
+    fx.transcript(700);
+    fx.age_tree(800);
+    is(&fx.run(), 11, &["verdict=stalled", "gate=fail/yes", "commits_since_launch=1"]);
+}
+
+#[test]
+fn t4e_a_quiet_working_seat_with_no_commit_since_the_launch_stays_stalled() {
+    let p = live();
+    let fx = Fx::new();
+    fx.commit_at(2000);
+    fx.note(true);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
+    fx.transcript(700);
+    fx.age_tree(800);
+    is(&fx.run(), 11, &["verdict=stalled", "commits_since_launch=0", "gate=pass/yes"]);
+}
+
+#[test]
+fn t4f_a_quiet_working_seat_with_no_gate_note_stays_stalled() {
+    let p = live();
+    let fx = quiet(&p, false);
+    is(&fx.run(), 11, &["verdict=stalled", "commits_since_launch=1", "gate=none/no"]);
+}
+
+#[test]
+fn t4g_a_quiet_passed_seat_with_an_ended_pid_is_a_refusal() {
+    let fx = Fx::new();
+    fx.commit_at(900);
+    fx.note(true);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(ended_pid().to_string()))]);
+    fx.transcript(700);
+    fx.age_tree(800);
+    refused(&fx.run(), "quiet passed seat, pid ended");
+}
+
+#[test]
+fn t4h_a_quiet_working_seat_with_an_unreadable_ticket_is_a_refusal() {
+    let p = live();
+    let fx = Fx::new();
+    fx.commit_at(900);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
+    fs::write(fx.root.join("tickets/t.json"), "not a ticket").unwrap();
+    fx.transcript(700);
+    fx.age_tree(800);
+    refused_msg(&fx.run(), "quiet working seat, status refuses", "status refused (exit 1)");
+}
+
+#[test]
+fn t4i_the_commits_and_gate_are_not_read_before_the_idle_or_the_silence_test() {
+    // the ticket is unreadable, so a seat that reaches the facts read refuses; a seat inside a window does not reach it
+    let fx = Fx::new();
+    fs::write(fx.root.join("tickets/t.json"), "not a ticket").unwrap();
+    fx.list(&[fx.ent("working", Some("busy"))]);
+    fx.transcript(30);
+    fx.age_tree(5);
+    is(&fx.run(), 0, &["verdict=working"]);
+    let fx = Fx::new();
+    fs::write(fx.root.join("tickets/t.json"), "not a ticket").unwrap();
+    fx.list(&[fx.ent("working", Some("busy"))]);
+    fx.transcript(30);
+    fx.age_tree(800);
+    is(&fx.run(), 10, &["verdict=slow-alive"]);
+}
+
+#[test]
+fn t4j_follow_ends_at_once_on_a_quiet_finished_seat() {
+    let p = live();
+    let fx = quiet(&p, true);
+    let r = fx.run_extra(&["--follow", "--poll-s", "1", "--max-s", "3"]);
+    assert_eq!(r.code, 13, "{} {}", r.out, r.err);
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 1, "{:?}", r.out);
+    assert!(lines[0].contains("verdict=finished"), "{}", lines[0]);
+    num(&r, "max_transcript_age=", 700, 800);
+}
+
 #[test]
 fn t5_stopped_early_no_commit_for_done_and_idle() {
     for state in ["done", "idle"] {
