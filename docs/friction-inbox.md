@@ -194,7 +194,7 @@ every field of every row — a hand-written row holding private text is refused 
 privacy hit or a torn tail, each named with its line on stderr. With no privacy list configured lint fails
 closed (exit 2): an inbox is never linted clean unscanned. Hand-written rows from before this contract and the
 154b weekly script share this one checker. A missing inbox is a setup error (2): `lint` is how a real inbox is
-audited, so it must exist.
+audited, so it must exist. A recovery copy next to the missing inbox gives the recovery refusal (1) instead.
 
 ### `harness friction open`
 
@@ -229,7 +229,8 @@ values writes nothing and exits 0. On success stdout is one line: `status set id
 
 Exit 1 is a refusal. The inbox is byte-identical, stdout is empty and stderr is one line that says the status was not
 set. The line names at most a line number, a field and a privacy class, never a row, the `--id`, the `--ref` or a path.
-The refusals are: no row with that id (a missing inbox included, and the file is not created); an `--id` that is not
+The refusals are: no row with that id (a missing inbox included, and the file is not created; a recovery copy next to a
+missing inbox gives the recovery refusal below instead); an `--id` that is not
 a plain token; a problem the full read finds (a torn tail, a bad or CRLF line, a duplicate id, a privacy hit in a
 stored row, the same read as `add`); a privacy hit in the new `--ref` (scanned first, under the scope
 `friction.set-status`); a status and pointer pair the status rules refuse; a new line over the 16 KiB line cap; a new
@@ -238,18 +239,26 @@ setup error: a missing or repeated flag, an unknown flag, an extra word, no conf
 cannot be read or written, an inbox over the cap or not UTF-8, a lock busy past the wait, a folder that cannot take the
 recovery copy. A setup error leaves the inbox unchanged and no recovery copy.
 
-**How the write goes.** One exclusive lock on the inbox file covers the read, every check and the write. Every check
-passes before the recovery copy is made. Then the verb creates `<inbox>.status-write` (exclusive create, with the
-inbox's permission bits) in the real file's folder, writes the whole old inbox to it and syncs the copy and the
-folder. Then it truncates the locked file, writes the new content and syncs. Then it removes the copy and syncs the
-folder. The file keeps its inode: no temp file is renamed onto the path, so every spelling of the path and every
-symlink to it sees the new content. A hard link would keep the old bytes under the other name, so a hard-linked
-inbox is refused. The recovery path is the canonical inbox path plus `.status-write`, so a symlinked file or folder
-spelling of the inbox path finds the same copy.
+**How the write goes.** The flag checks, the scan of the new `--ref` and the status rules run first, before the lock.
+Then one exclusive lock on the inbox file covers the read, the stored-row checks, the id lookup, the hard-link check,
+the line cap check, the inbox cap check and the write. Those checks have passed before the recovery copy is made. Then
+the verb creates `<inbox>.status-write` (exclusive create, with the inbox's permission bits) in the real file's
+folder, writes the whole old inbox to it and syncs the copy and the folder. If the copy cannot be made, or its
+permission bits cannot be set, no copy is left: a partly made copy is removed, and when that removal fails the exit 2
+line names the path of the copy. Then the verb truncates the locked file, writes the new content and syncs. Then it
+removes the copy and syncs the folder. If the removal succeeds and only the folder sync fails, the exit 2 line says the
+status was written and the copy was removed. The file keeps its inode: no temp file is renamed onto the path, so a
+symlink to the inbox sees the new content. A hard link would keep the old bytes under the other name, so a
+hard-linked inbox is refused. The recovery path is the canonical inbox path plus `.status-write`, so a symlinked file
+or folder spelling of the inbox path finds the same copy.
 
-**Crash windows.** A failure after the copy exists leaves the copy in place and exits 2. A kill has the same effect.
-Every verb that reads the inbox checks for the copy after it holds its lock and refuses while it exists (exit 1; exit 2
-for `close-check`), with one fixed stderr line that names the recovery copy and no path. The windows are:
+**Crash windows.** A failure after the copy exists leaves the copy in place and exits 2, except the folder sync failure
+after the copy was removed (above). A kill has the same effect as a failure. The verbs that read the inbox check for the
+copy after they hold their lock, and refuse while it exists (exit 1; exit 2 for `close-check`), with one fixed stderr
+line that names the recovery copy and no path. When the inbox file is missing, there is no lock to take, and the
+copy is still reported the same way: `lint`, `open`, `patterns`, `close-check`, `add`, `sweep`, `set-status` and the
+verbs that read through the same reader give the recovery line, and none of them creates the inbox. A `sweep` week that
+maps no row reads no inbox and does not check for the copy. The windows are:
 
 | window | state on disk | how it shows |
 |---|---|---|
@@ -602,8 +611,8 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   section) — however many writers arrive at once and however the inbox path is spelled. The readers take the SHARED
   lock on the file they read, for the length of the read only, and let it go before they return (`suggest` does not
   hold it across its Jev call). A reader waits for a writer, and a writer waits for the readers. Readers do not wait
-  for each other. The lock lives on the inbox's inode, so every
-  spelling of the path shares it: a symlinked folder, a symlinked file, a `./` or doubled-slash detour, a hard
+  for each other. The lock lives on the inbox's inode, so the spellings named here share it: a symlinked
+  folder, a symlinked file, a `./` or doubled-slash detour, a hard
   link, and a not-yet-created file behind a symlink (the first append creates the target and locks it). `set-status`
   refuses a hard-linked inbox, because it rewrites the file in place. There is
   no side lock file and no path built for locking. The recovery copy path (above) is the one place a path is
@@ -612,7 +621,8 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   NO steal rule and no stale-lock age at all. A file or folder named `<inbox>.lock` is not a lock and is simply
   ignored (never read, locked, renamed or deleted: the friction verbs delete nothing they did not create). A
   lock held longer than 10 seconds by a live writer fails the verb closed (exit 2, `the inbox is busy`, no
-  path); a reader waits the same 10 seconds and then exits 2 the same way. The lock calls (`File::try_lock` and
+  path); a reader waits the same 10 seconds and then exits 2, with `the inbox is busy (it is locked)` because the
+  holder may be a reader or a writer. The lock calls (`File::try_lock` and
   `File::try_lock_shared`) need Rust 1.89 or newer; the workspace pins 1.99.1. The lock is advisory, so it protects
   against other harness verbs, not against an editor that ignores it. Readers outside the engine (the private
   `bw` script that lists rows) read without the lock. They fail closed: a row they miss is a refusal, and a duplicate
@@ -627,8 +637,9 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
   append): reported by `lint` with its line number, never read as a row; `add` refuses to append onto it.
 - A recovery copy next to the inbox (`<inbox>.status-write`, left by a `set-status` write that did not finish) is the
-  other crash sign. Each verb that reads the inbox checks for it after it holds its lock, and refuses (1; `close-check`
-  2) with one line that names the copy and no path, until the copy is moved aside by hand (see `set-status`).
+  other crash sign. The verbs that read the inbox check for it after they hold their lock (a missing inbox has no
+  lock; the check runs there without one), and refuse (1; `close-check` 2) with one line that names the copy and no
+  path, until the copy is moved aside by hand (see `set-status`).
 
 ### `friction suggest` (ask A32)
 

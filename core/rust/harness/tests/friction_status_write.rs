@@ -680,6 +680,57 @@ fn a_recovery_copy_beside_a_missing_inbox_stops_close_check() {
     assert!(err(&o).contains("status-write recovery copy") && out(&o).is_empty(), "{}", err(&o));
 }
 
+/// A recovery copy planted beside an inbox that does not exist: the verb gives the one recovery line and the exit
+/// code it gives with the inbox present, the copy is left as it was and no inbox file is made.
+fn recovery_beside_missing_inbox(name: &str, want: i32, build: impl Fn(&Tmp, &str) -> Vec<String>) {
+    let t = Tmp::new();
+    fs::write(copy_path(&t), b"a partial copy").unwrap();
+    let cfg = t.config();
+    let args = build(&t, p(&cfg));
+    let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let o = run(&a);
+    assert_eq!(code(&o), want, "{name}: {}", err(&o));
+    assert!(out(&o).is_empty(), "{name}: stdout {}", out(&o));
+    let e = err(&o);
+    assert_eq!(e.lines().count(), 1, "{name}: {e}");
+    assert!(e.contains("status-write recovery copy"), "{name}: {e}");
+    assert!(!e.contains(p(&t.0)), "{name}: a path leaked: {e}");
+    assert!(!t.inbox().exists(), "{name}: the inbox was created");
+    assert_eq!(fs::read(copy_path(&t)).unwrap(), b"a partial copy", "{name}: the copy changed");
+}
+
+fn strings(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn a_read_verb_with_a_recovery_copy_and_no_inbox_gives_the_recovery_line() {
+    recovery_beside_missing_inbox("lint", 1, |_, c| strings(&["friction", "lint", "--config", c]));
+    recovery_beside_missing_inbox("open", 1, |_, c| strings(&["friction", "open", "--config", c]));
+    recovery_beside_missing_inbox("patterns", 1, |_, c| strings(&["friction", "patterns", "--config", c]));
+    recovery_beside_missing_inbox("rank", 1, |_, c| strings(&["friction", "rank", "--config", c]));
+    recovery_beside_missing_inbox("set-status", 1, |_, c| strings(&["friction", "set-status", "--id", "a-1", "--set", "open", "--config", c]));
+    recovery_beside_missing_inbox("close-check", 2, |t, c| {
+        let note = p(&t.file("note.md", "lesson: none\n")).to_string();
+        strings(&["friction", "close-check", &note, "--ticket", "t-1", "--config", c])
+    });
+}
+
+#[test]
+fn add_with_a_recovery_copy_and_no_inbox_gives_the_recovery_line_and_creates_no_inbox() {
+    recovery_beside_missing_inbox("add", 1, |_, c| {
+        strings(&["friction", "add", "--id", "new-1", "--date", "2026-11-05", "--ticket", "t-1", "--where-it-lives", "memory", "--why", "cause: system", "--text", "x", "--config", c])
+    });
+}
+
+#[test]
+fn sweep_with_a_recovery_copy_and_no_inbox_gives_the_recovery_line_and_creates_no_inbox() {
+    recovery_beside_missing_inbox("sweep", 1, |t, c| {
+        let log = t.file("events.jsonl", "{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":1794182400000,\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"example-repo\",\"reason\":\"replan-threshold\",\"role\":\"executor\",\"model\":\"worker\"}\n");
+        strings(&["friction", "sweep", "--log", p(&log), "--week", "2026-w46", "--config", c])
+    });
+}
+
 #[test]
 fn the_recovery_copy_is_found_through_every_spelling_of_the_inbox_path() {
     let t = fixture();
@@ -763,6 +814,41 @@ fn the_recovery_copy_has_the_inbox_permission_bits_and_is_gone_after_a_good_writ
     assert_eq!(code(&o), 0, "{}", err(&o));
     assert!(!copy_path(&t).exists());
     assert_eq!(fs::metadata(t.inbox()).unwrap().permissions().mode() & 0o7777, 0o640);
+}
+
+/// The copy a killed write leaves has the inbox's permission bits. The binary runs under a file size limit
+/// (`ulimit -f`, 512-byte blocks) smaller than the inbox, so the write of the old inbox into the copy is stopped
+/// by the kernel (SIGXFSZ) after the copy was created: the copy exists, partial, and is read here. This is also the
+/// first crash window (while the copy is written: the inbox whole, the copy partial).
+#[test]
+fn a_copy_left_by_a_killed_write_has_the_inbox_permission_bits_and_the_inbox_is_whole() {
+    let t = fixture();
+    // 0o664 is not what a 022 umask gives a new file, so only the explicit bits pass this.
+    fs::set_permissions(t.inbox(), fs::Permissions::from_mode(0o664)).unwrap();
+    let before = inbox_bytes(&t);
+    assert!(before.len() > 1024);
+    let cfg = t.config();
+    let mut c = std::process::Command::new("sh");
+    c.arg("-c")
+        .arg("ulimit -c 0; ulimit -f 1; exec \"$0\" \"$@\"")
+        .arg(BIN)
+        .args(set_args(&cfg, "a-1", "fixed", Some(FIXED)))
+        .env_remove("HARNESS_CONFIG")
+        .env_remove("HARNESS_PRIVACY_LIST")
+        .env_remove("HARNESS_PRIVACY_OLD_LIST")
+        .env("HARNESS_PRIVACY_LIST_SECRET", DENY)
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_ne!(code(&o), 0, "the write finished under the size limit: {}", out(&o));
+    assert!(out(&o).is_empty(), "{}", out(&o));
+    let copy = copy_path(&t);
+    let m = fs::metadata(&copy).expect("the killed write left no copy");
+    assert!(m.len() < before.len() as u64, "the copy is not partial");
+    assert_eq!(m.permissions().mode() & 0o7777, 0o664, "the copy does not carry the inbox bits");
+    assert_eq!(inbox_bytes(&t), before, "the inbox changed before the copy was whole");
+    let o = run(&["friction", "lint", "--config", p(&cfg)]);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(err(&o).contains("status-write recovery copy"), "{}", err(&o));
 }
 
 // ---------------------------------------------------------------- races (f)

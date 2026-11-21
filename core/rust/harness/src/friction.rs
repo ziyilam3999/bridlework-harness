@@ -627,6 +627,12 @@ pub struct Inbox {
 /// The one stderr line of every verb that meets a recovery copy (no path, no row).
 pub(crate) const RECOVERY_MSG: &str = "the inbox has a status-write recovery copy next to it (a set-status write did not finish); compare the two files by hand and move the copy aside";
 
+/// True when the inbox path names no file and a recovery copy sits beside it. `add` and `sweep` open the inbox
+/// with create, so they check this first and refuse without creating the file.
+fn missing_inbox_with_recovery_copy(inbox: &Path) -> bool {
+    matches!(fs::metadata(inbox), Err(e) if e.kind() == std::io::ErrorKind::NotFound) && recovery_copy_present(inbox)
+}
+
 /// The recovery copy path: the canonical inbox path plus `.status-write`, so every spelling of the inbox path
 /// names the same copy, in the real file's folder. A missing inbox resolves through its folder.
 fn recovery_path(inbox: &Path) -> Option<std::path::PathBuf> {
@@ -695,8 +701,17 @@ impl<'a> IntoIterator for &'a Rows {
 /// The read holds the SHARED lock on the inbox file (waiting up to `LOCK_WAIT`, then `Err`: busy) and releases
 /// it before it returns, so a writer never changes the file under a reader and no caller keeps the lock while
 /// it does other work. The recovery copy check runs after the lock is held, in the same run that reads.
+///
+/// A missing inbox has no file to lock. When a recovery copy sits beside the missing path the read still
+/// reports it, so the verb gives the recovery line and not a read error.
 pub fn read_inbox(path: &Path) -> Result<Inbox, String> {
-    let meta = fs::metadata(path).map_err(|_| "the inbox cannot be read".to_string())?;
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && recovery_copy_present(path) => {
+            return Ok(Inbox { recovery_copy: true, ..Inbox::default() });
+        }
+        Err(_) => return Err("the inbox cannot be read".to_string()),
+    };
     if meta.is_dir() {
         return Err("the inbox path is a folder".to_string());
     }
@@ -901,7 +916,9 @@ fn lock_wait(f: &fs::File, shared: bool) -> Result<(), String> {
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err("the inbox is busy (another writer holds it); try again".to_string());
+            // A reader waits for a writer, and a writer waits for a writer or a reader: the reader text does not
+            // name a writer.
+            return Err(if shared { "the inbox is busy (it is locked); try again" } else { "the inbox is busy (another writer holds it); try again" }.to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1155,6 +1172,11 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
             return refuse(&m);
         }
     }
+    // A recovery copy beside a missing inbox: the copy is reported and the inbox is not created.
+    if missing_inbox_with_recovery_copy(&inbox_path) {
+        eprintln!("harness: friction refused: {RECOVERY_MSG}");
+        return 1;
+    }
     // One writer at a time: the exclusive lock is on the inbox file itself, held across read, check and append,
     // and released on every exit path, so the duplicate-id check can never race a concurrent add of the same id.
     let mut file = match open_locked(&inbox_path) {
@@ -1339,8 +1361,10 @@ fn sync_folder(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Create the recovery copy: exclusive (an existing file, folder or planted symlink at the path refuses), with
-/// the inbox's own permission bits.
-fn create_recovery(path: &Path, perms: &fs::Permissions) -> std::io::Result<fs::File> {
+/// the inbox's own permission bits. A setup failure leaves no copy: when the bits cannot be set, the partly made
+/// copy is removed, and when that removal fails too the message names the path so the copy can be moved aside.
+fn create_recovery(path: &Path, perms: &fs::Permissions) -> Result<fs::File, String> {
+    const CANNOT: &str = "the recovery copy cannot be created; the status was not set";
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1348,16 +1372,23 @@ fn create_recovery(path: &Path, perms: &fs::Permissions) -> std::io::Result<fs::
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         opts.mode(perms.mode() & 0o7777);
     }
-    let f = opts.open(path)?;
-    f.set_permissions(perms.clone())?;
+    let f = opts.open(path).map_err(|_| CANNOT.to_string())?;
+    if f.set_permissions(perms.clone()).is_err() {
+        drop(f);
+        return Err(match fs::remove_file(path) {
+            Ok(()) => CANNOT.to_string(),
+            Err(_) => format!("{CANNOT}; a partly made recovery copy could not be removed: {}", path.display()),
+        });
+    }
     Ok(f)
 }
 
 /// `harness friction set-status --id <row id> --set <fixed|guarded|ticket|lesson|no-action|open> [--ref <pointers>]
 /// [--config <file>]`: change the `status` and `status_ref` keys of the ONE row with that id, in place, and
-/// nothing else. Every check runs inside one exclusive critical section on the inbox file (read through
-/// `read_inbox_locked` on the locked descriptor), and all of them pass before the recovery copy is made.
-/// Lines the verb does not change are written back from their original bytes. The write keeps the inode: the
+/// nothing else. The flag checks, the scan of the new `--ref` and the status rules run before the lock is taken.
+/// The hard-link check, the read, the stored-row checks, the id lookup and the cap checks run inside one
+/// exclusive critical section on the inbox file (read through `read_inbox_locked` on the locked descriptor), and
+/// they have passed before the recovery copy is made. Lines the verb does not change are written back from their original bytes. The write keeps the inode: the
 /// whole old inbox goes to `<inbox>.status-write` (exclusive create, synced), then the locked file is truncated
 /// and the new content written and synced, then the copy is removed. A failure after the copy exists leaves
 /// it (exit 2) and every verb refuses until it is moved aside by hand. Exit 0 ok (a set equal to the current
@@ -1432,7 +1463,14 @@ fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
     // Opened without create: a missing inbox holds no such row, and the check has no time gap to the open.
     let mut f = match fs::OpenOptions::new().read(true).write(true).open(&inbox_path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return refuse("no row with that id"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A recovery copy beside the missing inbox is reported first (the same line and code as with the inbox).
+            if recovery_copy_present(&inbox_path) {
+                eprintln!("harness: {RECOVERY_MSG}");
+                return 1;
+            }
+            return refuse("no row with that id");
+        }
         Err(_) => return fail("the inbox cannot be written"),
     };
     if let Err(m) = lock_wait(&f, false) {
@@ -1503,7 +1541,7 @@ fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
     // Every check has passed. From the exclusive create on, a failure leaves the copy in place (fail closed).
     let mut copy = match create_recovery(&rp, &perms) {
         Ok(c) => c,
-        Err(_) => return fail("the recovery copy cannot be created; the status was not set"),
+        Err(m) => return fail(&m),
     };
     const LEFT: &str = "the inbox write did not finish; a recovery copy was left next to the inbox";
     if copy.write_all(text.as_bytes()).and_then(|()| copy.sync_all()).and_then(|()| sync_folder(&dir)).is_err() {
@@ -1518,8 +1556,13 @@ fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
         return fail(LEFT);
     }
     drop(copy);
-    if fs::remove_file(&rp).and_then(|()| sync_folder(&dir)).is_err() {
+    // The inbox is whole here. When the removal fails the copy is still there (LEFT is true); when only the
+    // folder sync fails the copy is gone, and the message says so.
+    if fs::remove_file(&rp).is_err() {
         return fail(LEFT);
+    }
+    if sync_folder(&dir).is_err() {
+        return fail("the status was written and the recovery copy was removed, but the folder sync failed");
     }
     println!("status set id={} status={}", row.id, new.word());
     0
@@ -2053,6 +2096,11 @@ pub(crate) fn sweep_cmd(rest: &[String], testmode: bool) -> i32 {
         }
     }
     let inbox_path = std::path::PathBuf::from(cfg.friction_inbox());
+    // A recovery copy beside a missing inbox: the copy is reported and the inbox is not created.
+    if missing_inbox_with_recovery_copy(&inbox_path) {
+        eprintln!("harness: friction refused: {RECOVERY_MSG}");
+        return 1;
+    }
     // One writer at a time, the same lock as `add`: read, skip, check and append through one descriptor.
     let mut file = match open_locked(&inbox_path) {
         Ok(f) => f,
