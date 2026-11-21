@@ -16,7 +16,12 @@ with `--follow` and both are required there. A missing, repeated or bad flag is 
 
 The newest launch record of `--name` (largest `ts_ms`, later row on a tie) must be bound. `bw seat --restart` reuses the round-1 name,
 so the name alone does not pick the entry. The listing entry is the one whose `id` equals the record `short_id` and whose `sessionId`
-equals the record `session_id`. None: `gone`. Two or more: refusal. The entry `cwd`, canonicalized, must equal the canonicalized tree of
+equals the record `session_id`. None: `gone`. Two or more: refusal. An entry with no string `id` or no string `name`, or whose `id` is
+not a plain token, is left out of the join when it cannot be the watched one: its `sessionId` is not the record `session_id`, its `id`
+is not the record `short_id`, its `name` is not the record name and its `cwd`, canonicalized, is not the tree. Such an entry that could
+be the watched one — its `sessionId` equals the record `session_id`, its `id` equals the record `short_id`, its `name` equals the
+record name, or its `cwd` equals the tree — is a refusal. The output line
+counts the entries left out in `skipped_entries`. The entry `cwd`, canonicalized, must equal the canonicalized tree of
 `--repo-map`, else refusal. The records file is opened without following a link and must be a regular file.
 
 ## Verdicts
@@ -42,13 +47,17 @@ entries is a refusal), the mtime of the git index, and the committer time of HEA
 
 ## Output line
 
-`verdict= state=<host state>/<host status or -> tree_age= transcript_age= commits_since_launch= gate=<pass|fail|none>/<yes|no> session=<short id>`
-then `why=` or `by=` where named. A value the verdict did not need is `-` (tree age and the commit and gate facts are read only
+`verdict= state=<host state>/<host status or -> tree_age= transcript_age= commits_since_launch= gate=<pass|fail|none>/<yes|no> session=<short id> skipped_entries=<n>`
+then `why=` or `by=` where named. `skipped_entries` counts the listing entries left out of the join (0 when none). A value the verdict
+did not need is `-` (tree age and the commit and gate facts are read only
 where the verdict uses them; `blocked` shows them when they can be read). No path, transcript text or file name is printed.
 
 ## Refusals
 
 The listing cannot be run, exits non-zero, times out, is not a JSON array, or the joined entry has no string state, cwd or sessionId;
+a listing entry with no string id or name, or an id that is not a plain token, that could be the watched one (its sessionId equals the
+record session_id, its id equals the record short_id, its name equals the record name, or its cwd equals the tree); an entry of that
+kind that cannot be the watched one is left out and counted in `skipped_entries`;
 no launch record for the name, or the newest is not bound; two or more joined entries; cwd not the tree; the transcript check fails; a
 working seat past both limits with a pid that is missing, not a whole number or not a live process (one `ps -p` run); the tree walk is
 over its cap; git cannot report HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside

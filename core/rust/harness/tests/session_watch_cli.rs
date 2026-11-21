@@ -315,6 +315,12 @@ fn refused(r: &R, what: &str) {
     assert!(!r.err.trim().is_empty(), "{what}: one stderr line expected");
 }
 
+/// A refusal whose stderr line holds the given message.
+fn refused_msg(r: &R, what: &str, msg: &str) {
+    refused(r, what);
+    assert!(r.err.contains(msg), "{what}: {msg:?} missing in {:?}", r.err);
+}
+
 /// A working seat with a fresh tree and a transcript 30 s old.
 fn working() -> Fx {
     let fx = Fx::new();
@@ -433,6 +439,96 @@ fn t10_gone_without_an_entry_with_both_ids() {
     is(&fx.run(), 15, &["verdict=gone"]);
     fx.list(&[fx.entry("deadbeef", SID, "working", Some("busy"), &fx.cwd(), None)]);
     is(&fx.run(), 15, &["verdict=gone"]);
+}
+
+// ------------------------------------------------------------------------------------------------ entries left out of the join
+
+const OTHER_SID: &str = "99999999-2222-4333-8444-555555555555";
+
+/// A second folder that exists (its path canonicalizes), so a probe entry cwd is real but is not the tree.
+fn other_dir(fx: &Fx) -> String {
+    let d = fx.root.join("probe-cwd");
+    fs::create_dir_all(&d).unwrap();
+    d.display().to_string()
+}
+
+/// The verdict line with the two age fields taken out: they tick between two runs of one fixture.
+fn norm(l: &str) -> String {
+    l.split(' ')
+        .filter(|t| !t.starts_with("tree_age=") && !t.starts_with("transcript_age="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn t10b_an_entry_with_no_id_that_cannot_be_the_watched_one_is_left_out() {
+    let fx = working();
+    let base = fx.run();
+    is(&base, 0, &["verdict=working", "skipped_entries=0"]);
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"name\":\"probe\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    let with = fx.run();
+    assert_eq!(with.code, 0, "{} {}", with.out, with.err);
+    num(&with, "transcript_age=", 30, 120);
+    assert_eq!(
+        norm(&with.out),
+        norm(&base.out).replace("skipped_entries=0", "skipped_entries=1"),
+        "the run with the probe entry must give the same line with skipped_entries=1"
+    );
+    fx.no_host_writes();
+}
+
+#[test]
+fn t10b_an_entry_with_no_name_or_a_bad_id_is_left_out_too() {
+    let fx = working();
+    let base = fx.run();
+    // an id other than the short id, and no name
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"id\":\"deadbeef\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    let r = fx.run();
+    assert_eq!(r.code, 0, "{} {}", r.out, r.err);
+    assert_eq!(norm(&r.out), norm(&base.out).replace("skipped_entries=0", "skipped_entries=1"), "an id other than the short id, no name");
+    // an id that is not a plain token
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"id\":\"a b\",\"name\":\"probe\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    let r = fx.run();
+    assert_eq!(r.code, 0, "{} {}", r.out, r.err);
+    assert_eq!(norm(&r.out), norm(&base.out).replace("skipped_entries=0", "skipped_entries=1"), "an id that is not a plain token");
+}
+
+#[test]
+fn t11_an_entry_that_could_be_the_watched_one_still_refuses_without_an_id_or_name() {
+    // no id, but the sessionId equals the record session id
+    let fx = working();
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"name\":\"probe\",\"cwd\":\"{}\",\"sessionId\":\"{SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    refused_msg(&fx.run(), "no id, the record session id", "a listing entry has no string id and name");
+    // no id, another session id, but the cwd is the tree
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"name\":\"probe\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", fx.cwd()),
+    ]);
+    refused_msg(&fx.run(), "no id, the tree as cwd", "a listing entry has no string id and name");
+    // the id equals the short id, but no name
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"id\":\"{SHORT}\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    refused_msg(&fx.run(), "the short id, no name", "a listing entry has no string id and name");
+    // no id, another session id, another cwd, but the name is the watched seat's name
+    fx.list(&[
+        fx.ent("working", Some("busy")),
+        format!("{{\"name\":\"{NAME}\",\"cwd\":\"{}\",\"sessionId\":\"{OTHER_SID}\",\"state\":\"working\"}}", other_dir(&fx)),
+    ]);
+    refused_msg(&fx.run(), "no id, the seat name", "a listing entry has no string id and name");
 }
 
 // ------------------------------------------------------------------------------------------------ refusals

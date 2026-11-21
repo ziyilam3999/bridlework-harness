@@ -43,6 +43,46 @@ pub struct Entry {
     pub pid: Option<String>,
 }
 
+/// One raw listing entry before the id and name rules of `listing`: the host may leave the id, the name or any other field out. The
+/// fields are the ones of `Entry`.
+#[derive(Debug)]
+pub struct RawEntry {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub state: Option<String>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub status: Option<String>,
+    pub pid: Option<String>,
+}
+
+impl RawEntry {
+    /// The refusal the id and name rules of `listing` give this entry, when they give one (no string id or name, or an id that is not
+    /// a plain token).
+    pub fn bad(&self) -> Option<&'static str> {
+        if self.id.is_none() || self.name.is_none() {
+            Some("a listing entry has no string id and name")
+        } else if !self.id.as_deref().is_some_and(id_ok) {
+            Some("a listing entry has an id that is not a plain token")
+        } else {
+            None
+        }
+    }
+
+    /// The strict `Entry`; call this only after `bad` returned `None`.
+    pub fn into_entry(self) -> Entry {
+        Entry {
+            id: self.id.unwrap(),
+            name: self.name.unwrap(),
+            state: self.state,
+            session_id: self.session_id,
+            cwd: self.cwd,
+            status: self.status,
+            pid: self.pid,
+        }
+    }
+}
+
 fn id_ok(tok: &str) -> bool {
     !tok.is_empty()
         && !tok.starts_with('-')
@@ -52,8 +92,9 @@ fn id_ok(tok: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// One `agents --json --all` run. Any failure is `Err` (cannot-check).
-pub fn listing(host: &Path) -> Result<Vec<Entry>, String> {
+/// One `agents --json --all` run, parsed with no entry rules (a raw entry for each item, as the host gave it). Run failures are the
+/// `Err` values of `listing`.
+pub fn raw_listing(host: &Path) -> Result<Vec<RawEntry>, String> {
     let o = match run_host(
         host,
         &["agents".as_ref(), "--json".as_ref(), "--all".as_ref()],
@@ -74,15 +115,9 @@ pub fn listing(host: &Path) -> Result<Vec<Entry>, String> {
     }
     let mut v = Vec::new();
     for e in &items {
-        let (Some(id), Some(name)) = (e.str("id"), e.str("name")) else {
-            return Err("a listing entry has no string id and name".into());
-        };
-        if !id_ok(id) {
-            return Err("a listing entry has an id that is not a plain token".into());
-        }
-        v.push(Entry {
-            id: id.to_string(),
-            name: name.to_string(),
+        v.push(RawEntry {
+            id: e.str("id").map(|s| s.to_string()),
+            name: e.str("name").map(|s| s.to_string()),
             state: e.str("state").map(|s| s.to_string()),
             session_id: e.str("sessionId").map(|s| s.to_string()),
             cwd: e.str("cwd").map(|s| s.to_string()),
@@ -93,6 +128,18 @@ pub fn listing(host: &Path) -> Result<Vec<Entry>, String> {
                 _ => None,
             },
         });
+    }
+    Ok(v)
+}
+
+/// One `agents --json --all` run under the id and name rules. Any failure is `Err` (cannot-check).
+pub fn listing(host: &Path) -> Result<Vec<Entry>, String> {
+    let mut v = Vec::new();
+    for e in raw_listing(host)? {
+        if let Some(m) = e.bad() {
+            return Err(m.into());
+        }
+        v.push(e.into_entry());
     }
     Ok(v)
 }

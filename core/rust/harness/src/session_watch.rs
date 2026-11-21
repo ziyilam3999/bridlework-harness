@@ -5,7 +5,7 @@
 
 use crate::lane::stale::open_launch_records;
 use crate::launcher::{read_launches, Launch};
-use crate::session_close::{listing, Entry};
+use crate::session_close::{raw_listing, Entry};
 use crate::status;
 use std::collections::HashMap;
 use std::fs::{canonicalize, read_dir, symlink_metadata};
@@ -284,6 +284,35 @@ fn pid_live(pid: Option<&str>) -> R<bool> {
     Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == p)
 }
 
+/// The listing for the join. An entry with no string id or no string name, or whose id is not a plain token, is left out when it cannot
+/// be the watched entry: its sessionId is not the record session_id, its id is not the record short_id, its name is not the record
+/// name and its cwd, canonicalized, is not the tree. Such an entry that could be the watched one (its sessionId equals the record
+/// session_id, its id equals the record short_id, its name equals the record name, or its cwd equals the tree) refuses. Returns the
+/// entries to join on and how many were left out.
+fn watch_listing(o: &Opts, short: &str, sid: &str, name: &str) -> R<(Vec<Entry>, usize)> {
+    let tree = canonicalize(&o.tree).ok();
+    let mut entries = Vec::new();
+    let mut skipped = 0usize;
+    for r in raw_listing(&o.host)? {
+        let could_be_watched = r.session_id.as_deref() == Some(sid)
+            || r.id.as_deref() == Some(short)
+            || r.name.as_deref() == Some(name)
+            || r.cwd
+                .as_deref()
+                .and_then(|c| canonicalize(c).ok())
+                .is_some_and(|c| tree.as_ref().is_some_and(|t| c == *t));
+        if let Some(m) = r.bad() {
+            if could_be_watched {
+                return Err(m.to_string());
+            }
+            skipped += 1;
+            continue;
+        }
+        entries.push(r.into_entry());
+    }
+    Ok((entries, skipped))
+}
+
 // ---------------------------------------------------------------------------------------------- verdicts
 
 struct Out {
@@ -301,6 +330,8 @@ struct Show<'a> {
     commits: Option<u64>,
     gate: String,
     session: &'a str,
+    /// Listing entries left out of the join because they cannot be the watched one.
+    skipped: usize,
 }
 
 fn out(verdict: &'static str, s: &Show, extra: &str, working_age: Option<u64>) -> Out {
@@ -315,13 +346,14 @@ fn out(verdict: &'static str, s: &Show, extra: &str, working_age: Option<u64>) -
         _ => 15,
     };
     let line = format!(
-        "verdict={verdict} state={} tree_age={} transcript_age={} commits_since_launch={} gate={} session={}{extra}",
+        "verdict={verdict} state={} tree_age={} transcript_age={} commits_since_launch={} gate={} session={} skipped_entries={}{extra}",
         s.state,
         n(s.tree),
         n(s.transcript),
         n(s.commits),
         s.gate,
-        s.session
+        s.session,
+        s.skipped
     );
     Out { verdict, code, line, working_age }
 }
@@ -331,13 +363,14 @@ fn check(o: &Opts) -> R<Out> {
     let now_s = epoch(now);
     let l = load_launch(o)?;
     let (short, sid) = (l.short_id.clone().unwrap_or_default(), l.session_id.clone().unwrap_or_default());
-    let mut s = Show { state: "-/-".into(), tree: None, transcript: None, commits: None, gate: "-".into(), session: &short };
+    let mut s = Show { state: "-/-".into(), tree: None, transcript: None, commits: None, gate: "-".into(), session: &short, skipped: 0 };
     // v1: the bw stop record
     if let Some(kind) = &o.stop {
         return Ok(out("stopped", &s, &format!(" by=bw stop={kind}"), None));
     }
-    // v2: join on the short id and the session id
-    let entries = listing(&o.host)?;
+    // v2: join on the short id and the session id; entries that cannot be the watched one are left out (skipped_entries)
+    let (entries, skipped) = watch_listing(o, &short, &sid, &l.name)?;
+    s.skipped = skipped;
     let hits: Vec<&Entry> = entries.iter().filter(|e| e.id == short && e.session_id.as_deref() == Some(sid.as_str())).collect();
     let e = match hits.as_slice() {
         [] => return Ok(out("gone", &s, "", None)),
