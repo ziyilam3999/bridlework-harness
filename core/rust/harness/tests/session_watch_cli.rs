@@ -386,24 +386,15 @@ fn t4b_a_quiet_working_seat_with_a_passed_gate_on_the_head_is_finished() {
     is(&r, 13, &["verdict=finished", "state=working/busy", "gate=pass/yes", "session=ab12cd34", "skipped_entries=0"]);
     num(&r, "tree_age=", 800, 900);
     num(&r, "transcript_age=", 700, 800);
-    // the line holds exactly the eight fields of a finish, in order, with no why= or by=
+    // the whole line is compared: the two ages come from the line itself (checked above), the rest is exact, field order included
     let t: Vec<&str> = r.out.trim_end().split(' ').collect();
-    let want = [
-        "verdict=finished",
-        "state=working/busy",
-        "",
-        "",
-        "commits_since_launch=1",
-        "gate=pass/yes",
-        "session=ab12cd34",
-        "skipped_entries=0",
-    ];
-    assert_eq!(t.len(), want.len(), "one line of eight fields: {:?}", r.out);
-    for (got, w) in t.iter().zip(want) {
-        if !w.is_empty() {
-            assert_eq!(*got, w, "{:?}", r.out);
-        }
-    }
+    assert!(t.len() > 3, "too few fields: {:?}", r.out);
+    let want = format!(
+        "verdict=finished state=working/busy {} {} commits_since_launch=1 gate=pass/yes session=ab12cd34 skipped_entries=0",
+        t[2], t[3]
+    );
+    assert!(t[2].starts_with("tree_age=") && t[3].starts_with("transcript_age="), "{:?}", r.out);
+    assert_eq!(r.out, format!("{want}\n"), "the whole stdout line");
 }
 
 #[test]
@@ -459,6 +450,17 @@ fn t4g_a_quiet_passed_seat_with_an_ended_pid_is_a_refusal() {
     fx.transcript(700);
     fx.age_tree(800);
     refused(&fx.run(), "quiet passed seat, pid ended");
+    // with the ticket unreadable too, the pid test must come first: the refusal is the pid message, not the status one
+    let fx = Fx::new();
+    fx.commit_at(900);
+    fx.note(true);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(ended_pid().to_string()))]);
+    fs::write(fx.root.join("tickets/t.json"), "not a ticket").unwrap();
+    fx.transcript(700);
+    fx.age_tree(800);
+    let r = fx.run();
+    refused_msg(&r, "quiet seat, pid ended, ticket unreadable", "the entry pid is not a live process");
+    assert!(!r.err.contains("status refused"), "the pid test comes before the facts read: {:?}", r.err);
 }
 
 #[test]
