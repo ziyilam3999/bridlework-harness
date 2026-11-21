@@ -10,13 +10,14 @@ operational text, so it is private data. This repo holds the contract, the reade
 
 Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
 `repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
-`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, and the read-only `suggest` verb (ask A32, unix only). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, the read-only `suggest` verb (ask A32, unix only), and the two status keys `status` and `status_ref` with the read-only `open` verb (ticket friction-row-status-fields). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
 One JSON object per line: exactly these six keys, every one required (a missing, empty or extra key is refused), plus
-seven OPTIONAL keys — `kind` and `repeats` (ticket 192), `source` (ticket 193) and the four evidence keys `at`,
-`impact`, `why` and `proof` (ticket 3601) — each omitted at its default:
+nine OPTIONAL keys — `kind` and `repeats` (ticket 192), `source` (ticket 193), the four evidence keys `at`,
+`impact`, `why` and `proof` (ticket 3601) and the two status keys `status` and `status_ref` (ticket
+friction-row-status-fields) — each omitted at its default:
 
 ```
 {"id":"les-001","date":"2026-11-01","ticket":"154","where-it-lives":"memory","breaks":"","text":"the lesson"}
@@ -41,6 +42,30 @@ seven OPTIONAL keys — `kind` and `repeats` (ticket 192), `source` (ticket 193)
 | `impact` (optional) | empty (= unrated) or exactly one of `low`, `medium`, `high`, `blocker`; anything else (`urgent`) is refused naming `impact`. Rank weights are 1, 3, 9, 27 (unrated counts as 1) |
 | `why` (optional) | one line, at most 1,000 bytes: the cause, stated as suspected or proven. A newline is stored escaped, as in `text`. Over the cap is refused naming `why`. Optional in a stored row; at `add` a hand-written friction row must hold a cause tag (see "The cause tag" under `harness friction add`), while `pattern` rows, `event` rows and rows already stored are not checked |
 | `proof` (optional) | one line, at most 2,000 bytes: pointers separated by `; `. **Proof pointer grammar:** each pointer is exactly one of `<repo>@<7-40 lowercase hex>:<path>[:<line>]` (a commit and a repo-relative path, an optional line number), `session:<id-token>`, `pr:<owner>/<repo>#<n>`, `cmd:<text>` (free text, one line) or `~/<path>`. Anything else is refused naming `proof` (the reason never echoes the pointer) |
+| `status` (optional) | what became of the row. One of `fixed`, `guarded`, `ticket`, `lesson`, `no-action`; an absent key reads as `open`. An explicit `"status":"open"` or `"status":""` is refused, so a hand-written default cannot slip in: an open row omits the key. An unknown word is refused naming `status`. Omitted at its default, so a row with only the older keys re-encodes byte-identical |
+| `status_ref` (optional) | the pointer that backs the status: the proof pointer grammar and the 2,000-byte cap of `proof`, `; `-separated. A status other than open needs it. A `status_ref` with no status (or with an explicit `open`) is refused. The pointer kinds each status needs are in the table below |
+
+**The status words and the pointer each needs.** Each row of the table is checked by the row rules. At least one
+pointer of the named kind must be in `status_ref`. A missing `status_ref`, a pointer of the wrong kind and an unknown
+status word are each refused with a reason that names the field.
+
+| `status` | needs in `status_ref` |
+|---|---|
+| open (key absent) | no `status_ref` |
+| `fixed` | a `pr:<owner>/<repo>#<n>` pointer or a `<repo>@<sha>:<path>` pointer |
+| `guarded` | a `<repo>@<sha>:<path>:<line>` pointer whose path ends in `friction-controls.txt` |
+| `ticket` | a `~/.bridlework/tickets/<path>` pointer or a `pr:` pointer |
+| `lesson` | a `<repo>@<sha>:<path>` pointer whose path is under `.sources/bridlework/lessons/` |
+| `no-action` | a `cmd:<text>` pointer; the text is the reason |
+
+```
+{"id":"les-003","date":"2026-11-04","ticket":"3601","where-it-lives":"gate","breaks":"","text":"the lesson","status":"fixed","status_ref":"pr:owner/repo#101"}
+```
+
+`status_ref` goes through the privacy engine like `proof` (section 4). A `status_ref` that pushes the line
+over the 16 KiB cap is refused. No verb writes a status yet: it is set by hand or by a data change, and `friction add`
+stores a new row with no status (a new row is open). `rank` and `suggest` list rows of any status, on purpose: a
+fixed row can still repeat, and the repeat belongs in its group. Only `friction open` filters by status.
 
 **Privacy behaviour of the evidence keys.** All four pass through the UNCHANGED privacy engine like every other field
 (section 4): an unfolded home path anywhere in `proof` — including inside a `cmd:` pointer, which is free text and
@@ -170,6 +195,24 @@ privacy hit or a torn tail, each named with its line on stderr. With no privacy 
 closed (exit 2): an inbox is never linted clean unscanned. Hand-written rows from before this contract and the
 154b weekly script share this one checker. A missing inbox is a setup error (2): `lint` is how a real inbox is
 audited, so it must exist.
+
+### `harness friction open`
+
+```
+harness friction open [--config <file>]
+```
+
+Lists the rows whose status is open (an absent `status`). It runs the full lint first, as `rank` does: a torn tail,
+any bad row or a privacy hit exits 1 with nothing on stdout. A missing inbox or no privacy list is exit 2. On exit 0
+stdout is one line per open row, in file order, then one count line:
+
+```
+open id=<id> date=<date> impact=<impact or -> ticket=<ticket>
+rows open=<n> fixed=<n> guarded=<n> ticket=<n> lesson=<n> no-action=<n> total=<n>
+```
+
+The word `rows` marks the count line as per row. The `open=<n>` of `triage` counts groups. The open lines hold no
+`text`, `why`, `proof` or `status_ref`. The verb writes nothing.
 
 ### `harness friction patterns`
 
@@ -501,8 +544,10 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 ## 4. Privacy, caps, torn tails
 
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
-  the row naming the field and the class, never the bytes. Every reader of the inbox runs the same scan over
-  every stored row (`add`, `lint`, `close-check`), and `close-check` scans its `lesson:` lines too.
+  the row naming the field and the class, never the bytes. These verbs scan the stored rows: `add`, `lint`,
+  `open`, `patterns`, `close-check`, `rank`, `controls-check`, `triage`, `page`, `suggest`, `sweep` (when the
+  week maps at least one row), `bind` (for a group with no state row) and `lesson replay` (with its answer key). `close-check` scans its `lesson:` lines too.
+  The scan covers `status` and `status_ref` as it covers `proof`.
 - One writer at a time: `add` takes ONE exclusive kernel advisory lock (`flock(2)`, the std file lock) on the inbox
   file itself, and does the read, scan, cross check and append through that same open descriptor, so two
   concurrent adds can never both store the same id (the check and the append are one critical section) — however
