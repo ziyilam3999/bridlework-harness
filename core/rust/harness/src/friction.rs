@@ -24,7 +24,7 @@ pub const FIELDS: [&str; 6] = ["id", "date", "ticket", "where-it-lives", "breaks
 /// `friction_event` mapper produces). All three are omitted from the canonical line at their defaults, so
 /// every six-key row written before this contract re-encodes byte-identical.
 pub const OPTIONAL_FIELDS: [&str; 9] = ["kind", "repeats", "source", "at", "impact", "why", "proof", "status", "status_ref"];
-/// The six non-default `status` words (the default, `open`, is an absent key). Each needs a `status_ref` pointer
+/// The five non-default `status` words (the default, `open`, is an absent key). Each needs a `status_ref` pointer
 /// of one kind (see `status_ref_problem`).
 pub const STATUSES: [&str; 5] = ["fixed", "guarded", "ticket", "lesson", "no-action"];
 /// The four evidence keys (ticket 3601) are the last four of `OPTIONAL_FIELDS`: `at` (an exact UTC timestamp),

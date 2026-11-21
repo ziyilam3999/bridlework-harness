@@ -62,7 +62,7 @@ status word are each refused with a reason that names the field.
 {"id":"les-003","date":"2026-11-04","ticket":"3601","where-it-lives":"gate","breaks":"","text":"the lesson","status":"fixed","status_ref":"pr:owner/repo#101"}
 ```
 
-`status_ref` goes through the privacy engine like every other field (section 4). A `status_ref` that pushes the line
+`status_ref` goes through the privacy engine like `proof` (section 4). A `status_ref` that pushes the line
 over the 16 KiB cap is refused. No verb writes a status yet: it is set by hand or by a data change, and `friction add`
 stores a new row with no status (a new row is open). `rank` and `suggest` list rows of any status, on purpose: a
 fixed row can still repeat, and the repeat belongs in its group. Only `friction open` filters by status.
@@ -545,7 +545,7 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
   the row naming the field and the class, never the bytes. Every reader of the inbox runs the same scan over
-  every stored row (`add`, `lint`, `close-check`, `open`, `rank`, `suggest`), and `close-check` scans its `lesson:`
+  the stored rows (`add`, `lint`, `close-check`, `open`, `rank`, `suggest`), and `close-check` scans its `lesson:`
   lines too. The scan covers `status` and `status_ref` as it covers `proof`.
 - One writer at a time: `add` takes ONE exclusive kernel advisory lock (`flock(2)`, the std file lock) on the inbox
   file itself, and does the read, scan, cross check and append through that same open descriptor, so two
