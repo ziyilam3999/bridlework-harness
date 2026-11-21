@@ -191,7 +191,7 @@ One stdout line:
 
 `head` is the first 12 hex characters of the work tree's HEAD commit, `base` of the ref's commit; `n`, `a` and `b` are commit counts.
 
-Exit 2, stdout empty, one fixed stderr line `harness: error: <what>`, when `--index` does not name a regular file that opens for reading (a missing path, a folder and a file that cannot be opened all give `the plan index is not a readable regular file`), the file is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the current branch is not the branch `origin/HEAD` names, or a git call fails. Git's own stderr is not printed.
+Exit 2, stdout empty, one fixed stderr line `harness: error: <what>`, when `--index` does not name a regular file that opens for reading (a missing path, a folder and a file that cannot be opened give `the plan index is not a readable regular file`; `/`, a path with no parent folder, is the exception and gives `the plan index is not inside a git work tree`), the file is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the current branch is not the branch `origin/HEAD` names, HEAD or the remote default branch is not a 40-hex sha (`HEAD or the remote default branch is not a 40-hex sha (a sha256 repository is not supported)`), or a git call fails. Git's own stderr is not printed.
 
 ## What it does not do
 
@@ -210,6 +210,6 @@ Exit 2, stdout empty, one fixed stderr line `harness: error: <what>`, when `--in
 - An `off_plan` reason is not judged.
 - Plan-line check: a row added, removed or moved (a changed `plan_line`) is not compared; an edit after character 40 of a line is not seen; a base index with no row of the same id and `plan_line` as a head row gives `compared=0`, and the exit is 0 when no other finding is red; no program calls the three new inputs yet, so a person runs the verb by hand on the two revisions; whole-index check can be red for other classes, so a caller reads the `plan-line-stale` lines, not the exit code.
 - `plan fresh` reads local refs only: a `current` answer says nothing about the remote itself until the caller fetches.
-- `plan fresh` reads the index file's place, not its content; any regular file that opens for reading in the checkout gives the same answer.
+- `plan fresh` reads the index file's place, not its content; the answer is about the work tree git finds from the file's folder, so a regular file that opens for reading in the checkout gives the checkout's answer, and a file in a nested repository gives that repository's answer. A file under `.git/` is refused.
 - `plan fresh` tests cover the refusals for an unreadable file (skipped when the tests run as root), a folder, a missing file, an `origin/HEAD` that does not point under `refs/remotes/origin/`, a sha256 repository (skipped with a printed note when the local git cannot make one), inherited `GIT_DIR` and `GIT_WORK_TREE`, and `--index /`. The pins for hooks off, no stdin and `--no-optional-locks` have no test: no call of the verb runs a hook, reads stdin or needs a lock.
 - `plan fresh` compares with `refs/remotes/origin/HEAD` only: a checkout on another branch is exit 2, not a compared answer.

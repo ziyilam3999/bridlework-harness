@@ -694,7 +694,8 @@ fn sha_ok(s: &str) -> bool {
 /// ref or is ahead with nothing behind); 1 `plan-index behind=<n> ...` (behind, not ahead) or `plan-index diverged
 /// ahead=<a> behind=<b> ...`; 2 usage (the usage line on stderr), or one fixed engine stderr line when the plan index
 /// file is not a regular file that opens for reading (missing, a folder, unreadable), is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the
-/// current branch is not the branch origin/HEAD names, or a git call fails. A dirty work tree does not change the
+/// current branch is not the branch origin/HEAD names, HEAD or the remote default branch is not a 40-hex sha (a sha256
+/// repository: its own line), or a git call fails. A dirty work tree does not change the
 /// answer: the check is about commits.
 fn fresh_cmd(a: &[String]) -> i32 {
     let fail = |m: &str| -> i32 {
@@ -746,13 +747,16 @@ fn fresh_cmd(a: &[String]) -> i32 {
         return fail("the current branch is not the branch origin/HEAD names");
     }
     let one = |args: &[&str]| git_local(&top, args);
+    let not_sha = "HEAD or the remote default branch is not a 40-hex sha (a sha256 repository is not supported)";
     let head = match one(&["rev-parse", "HEAD"]).as_deref().map(str::trim) {
         Some(h) if sha_ok(h) => h.to_string(),
-        _ => return fail("a git call failed"),
+        Some(_) => return fail(not_sha),
+        None => return fail("a git call failed"),
     };
     let base = match one(&["rev-parse", base_ref.as_str()]).as_deref().map(str::trim) {
         Some(b) if sha_ok(b) => b.to_string(),
-        _ => return fail("a git call failed"),
+        Some(_) => return fail(not_sha),
+        None => return fail("a git call failed"),
     };
     let spec = format!("{head}...{base}");
     let counts = match one(&["rev-list", "--left-right", "--count", spec.as_str()]) {

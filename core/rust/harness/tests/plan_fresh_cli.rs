@@ -219,7 +219,36 @@ fn sha256_repository_exit_two() {
     let o = fresh(p.to_str().unwrap(), None);
     assert_eq!(code(&o), 2);
     assert_eq!(out(&o), "");
-    assert_eq!(err(&o), "harness: error: a git call failed\n");
+    assert_eq!(err(&o), "harness: error: HEAD or the remote default branch is not a 40-hex sha (a sha256 repository is not supported)\n");
+}
+
+#[test]
+fn upstream_differing_from_origin_head_does_not_change_the_answer() {
+    let f = fix();
+    // origin/dev is one commit ahead of origin/main; local main tracks origin/dev, origin/HEAD names origin/main.
+    git(&f.c2, &["checkout", "-q", "-b", "dev"]);
+    commit(&f.c2, "d.txt", "d");
+    git(&f.c2, &["push", "-q", "origin", "dev"]);
+    git(&f.c1, &["fetch", "-q", "origin"]);
+    git(&f.c1, &["branch", "-q", "--set-upstream-to=origin/dev", "main"]);
+    assert_eq!(git(&f.c1, &["rev-parse", "--abbrev-ref", "main@{upstream}"]), "origin/dev");
+    assert_eq!(git(&f.c1, &["symbolic-ref", "refs/remotes/origin/HEAD"]), "refs/remotes/origin/main");
+    // Against the upstream the clone is behind by one; against origin/HEAD it is current.
+    let o = fresh(f.index1.to_str().unwrap(), None);
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    let line = format!("plan-index current head={} base={}", short(&head(&f.c1)), short(&base(&f.c1)));
+    assert_eq!(lines(&o), vec![line]);
+    assert_eq!(err(&o), "");
+    // origin/main moves ahead: the answer follows origin/HEAD.
+    git(&f.c2, &["checkout", "-q", "main"]);
+    commit(&f.c2, "m.txt", "m");
+    git(&f.c2, &["push", "-q", "origin", "main"]);
+    git(&f.c1, &["fetch", "-q", "origin"]);
+    let o = fresh(f.index1.to_str().unwrap(), None);
+    assert_eq!(code(&o), 1, "stderr: {}", err(&o));
+    let line = format!("plan-index behind=1 head={} base={}", short(&head(&f.c1)), short(&base(&f.c1)));
+    assert_eq!(lines(&o), vec![line]);
+    assert_eq!(err(&o), "");
 }
 
 #[test]
