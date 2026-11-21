@@ -17,7 +17,6 @@ const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frict
 struct J {
     t: Tmp,
     dir: PathBuf,
-    case: String,
     key: PathBuf,
     ledger: PathBuf,
     tmproot: PathBuf,
@@ -31,20 +30,19 @@ impl J {
         let send = dir.join("fake-send.sh");
         fs::copy(FIXTURE, &send).unwrap();
         fs::set_permissions(&send, fs::Permissions::from_mode(0o755)).unwrap();
-        let case = case.to_string();
-        fs::write(dir.join("case"), &case).unwrap();
+        fs::write(dir.join("case"), case).unwrap();
         let key = t.0.join("key");
         fs::write(&key, "synthetic-key-bytes\n").unwrap();
         let ledger = t.0.join("ledger");
         let tmproot = t.0.join("tmproot");
         fs::create_dir_all(&tmproot).unwrap();
-        J { t, dir, case, key, ledger, tmproot }
+        J { t, dir, key, ledger, tmproot }
     }
 
     /// One start of the fresh copy outside the engine, with the no-file case: the first start of a newly
     /// written copy can take seconds under load while a later start of the same file is fast, so the
     /// deadline tests warm the copy before their clock starts.
-    fn warm(&self) {
+    fn warm(&self, case: &str) {
         fs::write(self.dir.join("case"), "no-file").unwrap();
         let o = Command::new(self.send())
             .env_clear()
@@ -56,7 +54,7 @@ impl J {
         assert_eq!(code(&o), 0, "{}", err(&o));
         assert!(self.ran(), "the warm start wrote its ran note");
         fs::remove_dir_all(self.dir.join("notes")).unwrap();
-        fs::write(self.dir.join("case"), &self.case).unwrap();
+        fs::write(self.dir.join("case"), case).unwrap();
     }
 
     fn send(&self) -> PathBuf {
@@ -1120,7 +1118,7 @@ fn path_home_and_lang_pass_through_and_an_unset_lc_all_is_not_made() {
 #[test]
 fn a_hang_leaves_nothing_in_the_temp_root_after_the_deadline() {
     let j = J::new("hang");
-    j.warm();
+    j.warm("hang");
     let started = Instant::now();
     // The deadline leaves the fake time to write its file first; the fake lists its TMPDIR to a note, so the
     // test sees that the file it checks was there before the kill.
@@ -1582,7 +1580,7 @@ fn a_changed_answer_file_changes_the_pick() {
 #[test]
 fn the_deadline_kills_the_whole_group() {
     let j = J::new("hang-bg");
-    j.warm();
+    j.warm("hang-bg");
     let started = Instant::now();
     // 5000, not the 300 of the ticket: the first start of a fresh script copy can take seconds under load, before the fake wrote its note.
     let extra = ["--jev-deadline-ms", "5000"];
