@@ -452,6 +452,7 @@ fn lint_refuses_missing_field_unknown_field_self_break_and_duplicate() {
     let o = lint(&t);
     assert_eq!(code(&o), 1);
     assert!(err(&o).contains("line 1") && err(&o).contains("unknown field"), "{}", err(&o));
+    assert!(err(&o).contains("nine optional") && err(&o).contains("status_ref"), "{}", err(&o));
     // a `breaks` naming its own row
     fs::write(t.inbox(), format!("{good}\n{{\"id\":\"l-2\",\"date\":\"2026-11-01\",\"ticket\":\"154\",\"where-it-lives\":\"memory\",\"breaks\":\"l-2\",\"text\":\"myself\"}}\n")).unwrap();
     let o = lint(&t);
@@ -596,7 +597,7 @@ fn refusals_never_echo_unscanned_bytes() {
         fs::write(t.inbox(), format!("{row}\n")).unwrap();
         let o = lint(&t);
         assert_eq!(code(&o), 1, "{}", err(&o));
-        assert!(err(&o).contains("line 1") && err(&o).contains("unknown field"), "{}", err(&o));
+        assert!(err(&o).contains("line 1") && err(&o).contains("unknown field") && err(&o).contains("nine optional"), "{}", err(&o));
         assert!(!err(&o).contains(&shape), "the key must not be echoed: {}", err(&o));
         // (c) as a duplicate key of a hand-written row, read by lint.
         let row = format!("{{\"{}\":\"a\",\"{}\":\"b\",{}", shape, shape, &hand_written("l-2", "154", "memory", "", "a clean lesson")[1..]);

@@ -18,12 +18,16 @@ use std::path::Path;
 pub const TAGS: [&str; 4] = ["skill", "gate", "memory", "wiki"];
 /// The row fields in canonical order (the JSON key order this module writes).
 pub const FIELDS: [&str; 6] = ["id", "date", "ticket", "where-it-lives", "breaks", "text"];
-/// The three optional fields: `kind` and `repeats` (ticket 192) and `source` (ticket 193). `kind` is the
-/// row's class (default `friction`) and `repeats` the id of the pattern row this row repeats; `source` is the
-/// row's origin (default empty = hand-written; the only other value is `event`, the T-9.3 event rows the
-/// `friction_event` mapper produces). All three are omitted from the canonical line at their defaults, so
-/// every six-key row written before this contract re-encodes byte-identical.
-pub const OPTIONAL_FIELDS: [&str; 7] = ["kind", "repeats", "source", "at", "impact", "why", "proof"];
+/// The nine optional fields: `kind` and `repeats` (ticket 192) and `source` (ticket 193), then six added
+/// after ticket 193 (`at`, `impact`, `why`, `proof`, `status`, `status_ref`). `kind` is the row's class
+/// (default `friction`) and `repeats` the id of the pattern row this row repeats; `source` is the row's origin
+/// (default empty = hand-written; the only other value is `event`, the T-9.3 event rows the `friction_event`
+/// mapper produces). Each is omitted from the canonical line at its default, so every six-key row written
+/// before this contract re-encodes byte-identical.
+pub const OPTIONAL_FIELDS: [&str; 9] = ["kind", "repeats", "source", "at", "impact", "why", "proof", "status", "status_ref"];
+/// The five non-default `status` words (the default, `open`, is an absent key). Each needs a `status_ref` pointer
+/// of one kind (see `status_ref_problem`).
+pub const STATUSES: [&str; 5] = ["fixed", "guarded", "ticket", "lesson", "no-action"];
 /// The four evidence keys (ticket 3601) are the last four of `OPTIONAL_FIELDS`: `at` (an exact UTC timestamp),
 /// `impact` (a rating), `why` (the cause) and `proof` (typed pointers). Each is omitted at its default, so every
 /// row written before them re-encodes byte-identical. The legal `impact` values:
@@ -69,6 +73,26 @@ pub struct Row {
     pub why: String,
     /// Optional: `; `-separated typed pointers, at most `PROOF_CAP` bytes (see `proof_problem`).
     pub proof: String,
+}
+
+/// The two status keys of a row, kept beside the `Row` (a row built without them is open). `status` is empty
+/// (= open; a canonical row omits the key), or one of `STATUSES`; `status_ref` is typed pointers (the proof
+/// grammar and cap), required with a status and refused without one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Status {
+    pub status: String,
+    pub status_ref: String,
+}
+
+impl Status {
+    /// The status word: `open` when the key is absent.
+    pub fn word(&self) -> &str {
+        if self.status.is_empty() {
+            "open"
+        } else {
+            &self.status
+        }
+    }
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` naming a real UTC instant (the date part a real calendar date).
@@ -133,6 +157,100 @@ pub(crate) fn proof_problem(proof: &str) -> Option<&'static str> {
         return Some("proof must be one line");
     }
     proof.split("; ").find_map(pointer_problem)
+}
+
+/// The kind of one pointer that already passed `pointer_problem`.
+#[derive(PartialEq)]
+enum PtrKind {
+    Session,
+    Pr,
+    Cmd,
+    Home,
+    Repo,
+}
+
+fn ptr_kind(p: &str) -> PtrKind {
+    if p.starts_with("session:") {
+        PtrKind::Session
+    } else if p.starts_with("pr:") {
+        PtrKind::Pr
+    } else if p.starts_with("cmd:") {
+        PtrKind::Cmd
+    } else if p.starts_with("~/") {
+        PtrKind::Home
+    } else {
+        PtrKind::Repo
+    }
+}
+
+/// For a repo pointer `<repo>@<sha>:<path>[:<line>]`: its path and whether it carries a line.
+fn repo_path_line(p: &str) -> Option<(&str, bool)> {
+    let (_, rest) = p.split_once('@')?;
+    let (_, path) = rest.split_once(':')?;
+    Some(match path.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|c| c.is_ascii_digit()) => (head, true),
+        _ => (path, false),
+    })
+}
+
+/// True when the path holds a `..` component.
+fn dotdot(path: &str) -> bool {
+    path.split('/').any(|c| c == "..")
+}
+
+/// The pointer a status needs inside its `status_ref` (at least one pointer of the right kind).
+fn status_ref_problem(status: &str, status_ref: &str) -> Option<&'static str> {
+    if status_ref.len() > PROOF_CAP {
+        return Some("status_ref is over its 2000-byte cap");
+    }
+    if status_ref.chars().any(|c| c.is_control()) {
+        return Some("status_ref must be one line");
+    }
+    if proof_problem(status_ref).is_some() {
+        return Some("status_ref has a pointer that is not one of <repo>@<7-40 hex>:<path>[:<line>], session:<id>, pr:<owner>/<repo>#<n>, cmd:<text>, ~/<path>");
+    }
+    let mut ptrs = status_ref.split("; ");
+    match status {
+        "fixed" => {
+            if ptrs.any(|p| matches!(ptr_kind(p), PtrKind::Pr | PtrKind::Repo)) {
+                None
+            } else {
+                Some("status_ref for status fixed needs a pr: or <repo>@<sha> pointer")
+            }
+        }
+        "guarded" => {
+            if ptrs.any(|p| ptr_kind(p) == PtrKind::Repo && matches!(repo_path_line(p), Some((path, true)) if path.ends_with("friction-controls.txt") && !dotdot(path))) {
+                None
+            } else {
+                Some("status_ref for status guarded needs a <repo>@<sha>:<path>:<line> pointer whose path ends in friction-controls.txt")
+            }
+        }
+        "ticket" => {
+            if ptrs.any(|p| match ptr_kind(p) {
+                PtrKind::Pr => true,
+                PtrKind::Home => p.len() > "~/.bridlework/tickets/".len() && p.starts_with("~/.bridlework/tickets/") && !dotdot(p),
+                _ => false,
+            }) {
+                None
+            } else {
+                Some("status_ref for status ticket needs a ~/.bridlework/tickets/<path> pointer or a pr: pointer")
+            }
+        }
+        "lesson" => {
+            if ptrs.any(|p| ptr_kind(p) == PtrKind::Repo && matches!(repo_path_line(p), Some((path, _)) if path.len() > ".sources/bridlework/lessons/".len() && path.starts_with(".sources/bridlework/lessons/") && !dotdot(path))) {
+                None
+            } else {
+                Some("status_ref for status lesson needs a <repo>@<sha>:<path> pointer whose path is under .sources/bridlework/lessons/")
+            }
+        }
+        _ => {
+            if ptrs.any(|p| ptr_kind(p) == PtrKind::Cmd) {
+                None
+            } else {
+                Some("status_ref for status no-action needs a cmd: pointer whose text is the reason")
+            }
+        }
+    }
 }
 
 /// `YYYY-MM-DD` naming a real calendar date (month 1-12, the day inside that month, leap years included).
@@ -219,6 +337,27 @@ pub fn validate_row(row: &Row) -> Result<(), String> {
         if let Some(m) = proof_problem(&row.proof) {
             return Err(m.to_string());
         }
+    }
+    Ok(())
+}
+
+/// The status rules: no status means no `status_ref`; a status is one of `STATUSES` and carries a `status_ref`
+/// with the pointer that status needs. An explicit `open` or empty status is refused (a canonical row omits it).
+pub fn validate_status(s: &Status) -> Result<(), String> {
+    if s.status.is_empty() {
+        if !s.status_ref.is_empty() {
+            return Err("status_ref is allowed only with a status other than open (an absent status reads as open)".to_string());
+        }
+        return Ok(());
+    }
+    if !STATUSES.contains(&s.status.as_str()) {
+        return Err("status must be fixed, guarded, ticket, lesson or no-action (an open row omits status)".to_string());
+    }
+    if s.status_ref.is_empty() {
+        return Err("status_ref is missing: a status other than open needs its pointer".to_string());
+    }
+    if let Some(m) = status_ref_problem(&s.status, &s.status_ref) {
+        return Err(m.to_string());
     }
     Ok(())
 }
@@ -385,6 +524,11 @@ pub(crate) fn jstr(s: &str) -> String {
 /// Strict decode + validate of one row line WITHOUT its newline. Never guesses, never repairs: the exact field set,
 /// then every row rule. The reason names the field.
 pub fn parse_row(line: &str) -> Result<Row, String> {
+    parse_row_status(line).map(|(row, _)| row)
+}
+
+/// `parse_row` that also returns the row's two status keys (default when the row has neither).
+pub fn parse_row_status(line: &str) -> Result<(Row, Status), String> {
     if line.len() + 1 > LINE_CAP {
         return Err(format!("the row is over the {LINE_CAP}-byte cap"));
     }
@@ -400,14 +544,18 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
     let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     for (k, _) in &pairs {
         if !FIELDS.contains(&k.as_str()) && !OPTIONAL_FIELDS.contains(&k.as_str()) {
-            return Err("an unknown field: a row has exactly the six contract fields plus the seven optional ones (kind, repeats, source, at, impact, why, proof)".to_string());
+            return Err("an unknown field: a row has exactly the six contract fields plus the nine optional ones (kind, repeats, source, at, impact, why, proof, status, status_ref)".to_string());
         }
+    }
+    // An explicit empty status reads as a hand-written default: refused, a canonical row omits the key.
+    if get("status").is_some_and(|v| v.is_empty()) {
+        return Err("status must not be empty: an open row omits the status key".to_string());
     }
     let mut row = Row::default();
     for (k, slot) in [("id", &mut row.id), ("date", &mut row.date), ("ticket", &mut row.ticket), ("where-it-lives", &mut row.tag), ("breaks", &mut row.breaks), ("text", &mut row.text)] {
         *slot = get(k).ok_or_else(|| format!("missing field {k:?}"))?;
     }
-    // The three optional fields default to their defaults when absent; an explicit empty value reads the same.
+    // `kind`, `repeats` and `source` default to their defaults when absent; an explicit empty value reads the same.
     row.kind = get("kind").unwrap_or_default();
     row.repeats = get("repeats").unwrap_or_default();
     row.source = get("source").unwrap_or_default();
@@ -415,15 +563,23 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
     row.impact = get("impact").unwrap_or_default();
     row.why = get("why").unwrap_or_default();
     row.proof = get("proof").unwrap_or_default();
+    let st = Status { status: get("status").unwrap_or_default(), status_ref: get("status_ref").unwrap_or_default() };
     validate_row(&row)?;
-    Ok(row)
+    validate_status(&st)?;
+    Ok((row, st))
 }
 
 /// Canonical line WITHOUT its newline: the six fields in `FIELDS` order, then `kind`, `repeats` and `source`
 /// when they are not at their defaults (`kind` empty or `friction`, `repeats` empty, `source` empty). Refuses
 /// an invalid row and a line over the cap.
 pub fn encode_row(row: &Row) -> Result<String, String> {
+    encode_row_status(row, &Status::default())
+}
+
+/// `encode_row` with the two status keys, written last and only when set.
+pub fn encode_row_status(row: &Row, st: &Status) -> Result<String, String> {
     validate_row(row)?;
+    validate_status(st)?;
     let mut line = String::from("{");
     for (k, v) in [("id", &row.id), ("date", &row.date), ("ticket", &row.ticket), ("where-it-lives", &row.tag), ("breaks", &row.breaks), ("text", &row.text)] {
         if !line.ends_with('{') {
@@ -440,7 +596,7 @@ pub fn encode_row(row: &Row) -> Result<String, String> {
     if !row.source.is_empty() {
         line.push_str(&format!(",{}:{}", jstr("source"), jstr(&row.source)));
     }
-    for (k, v) in [("at", &row.at), ("impact", &row.impact), ("why", &row.why), ("proof", &row.proof)] {
+    for (k, v) in [("at", &row.at), ("impact", &row.impact), ("why", &row.why), ("proof", &row.proof), ("status", &st.status), ("status_ref", &st.status_ref)] {
         if !v.is_empty() {
             line.push_str(&format!(",{}:{}", jstr(k), jstr(v)));
         }
@@ -457,9 +613,48 @@ pub fn encode_row(row: &Row) -> Result<String, String> {
 /// One read inbox: the valid rows with their 1-based line numbers, the per-row problems, and a torn tail line if any.
 #[derive(Debug, Default)]
 pub struct Inbox {
-    pub rows: Vec<(usize, Row)>,
+    pub rows: Rows,
     pub problems: Vec<(usize, String)>,
     pub torn_tail: Option<usize>,
+}
+
+/// The valid rows of an inbox with their 1-based line numbers. It reads as the plain `Vec<(usize, Row)>` it
+/// derefs to; the two status keys of each row (same order) ride beside it, so the one privacy pass sees them.
+#[derive(Debug, Default, Clone)]
+pub struct Rows {
+    pub list: Vec<(usize, Row)>,
+    pub statuses: Vec<Status>,
+}
+
+impl Rows {
+    /// Append one row with its status keys.
+    pub fn push_with_status(&mut self, item: (usize, Row), st: Status) {
+        self.list.push(item);
+        self.statuses.push(st);
+    }
+}
+
+impl std::ops::Deref for Rows {
+    type Target = Vec<(usize, Row)>;
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+impl IntoIterator for Rows {
+    type Item = (usize, Row);
+    type IntoIter = std::vec::IntoIter<(usize, Row)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Rows {
+    type Item = &'a (usize, Row);
+    type IntoIter = std::slice::Iter<'a, (usize, Row)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.iter()
+    }
 }
 
 /// Read at most the cap plus one byte, then lint every line. `Err` is a setup failure (unreadable, oversized, not
@@ -502,8 +697,8 @@ pub fn lint_text(text: &str) -> Inbox {
         if b == b'\n' {
             line_no += 1;
             let line = &text[start..i];
-            match parse_row(line) {
-                Ok(row) => out.rows.push((line_no, row)),
+            match parse_row_status(line) {
+                Ok((row, st)) => out.rows.push_with_status((line_no, row), st),
                 Err(e) => out.problems.push((line_no, e)),
             }
             start = i + 1;
@@ -537,21 +732,34 @@ fn row_fields(row: &Row) -> [(&'static str, &str); 13] {
     ]
 }
 
-/// The privacy engine over every field of every stored row — the same rules `add` applies to a new row. Every
-/// reader of the inbox runs this pass (add, lint, close-check); a reason names the line, the field and the
-/// pattern class, never the bytes.
-pub fn privacy_problems(ctx: &crate::scan::Ctx, rows: &[(usize, Row)]) -> Vec<(usize, String)> {
+/// The status keys of a row as (name, value) pairs: scanned with the row fields.
+fn status_fields(st: &Status) -> [(&'static str, &str); 2] {
+    [("status", st.status.as_str()), ("status_ref", st.status_ref.as_str())]
+}
+
+/// The privacy engine over the fields of the stored rows — the same rules `add` applies to a new row. The
+/// verbs that run this pass are listed in docs/friction-inbox.md section 4; a reason names the line, the field
+/// and the pattern class, never the bytes.
+/// The two status keys of each row are scanned with its other fields (they travel in `Rows`).
+pub fn privacy_problems(ctx: &crate::scan::Ctx, rows: &Rows) -> Vec<(usize, String)> {
     let mut out = Vec::new();
-    for (n, row) in rows {
-        for (name, value) in row_fields(row) {
-            let hits = crate::scan::scan_text(ctx, "friction", value);
-            if !hits.is_empty() {
-                let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
-                out.push((*n, format!("field {name} has a privacy hit ({})", classes.join(", "))));
-            }
+    for (i, (n, row)) in rows.iter().enumerate() {
+        scan_fields(ctx, *n, &row_fields(row), &mut out);
+        if let Some(st) = rows.statuses.get(i) {
+            scan_fields(ctx, *n, &status_fields(st), &mut out);
         }
     }
     out
+}
+
+fn scan_fields(ctx: &crate::scan::Ctx, n: usize, fields: &[(&'static str, &str)], out: &mut Vec<(usize, String)>) {
+    for (name, value) in fields {
+        let hits = crate::scan::scan_text(ctx, "friction", value);
+        if !hits.is_empty() {
+            let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
+            out.push((n, format!("field {name} has a privacy hit ({})", classes.join(", "))));
+        }
+    }
 }
 
 /// The cross-row pass a whole-file lint runs after every line parsed: duplicate ids across the file, `breaks`
@@ -733,7 +941,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] --why <cause> [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] --why <cause> [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction open [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -767,6 +975,7 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     match sub.as_str() {
         "add" => add_cmd(rest, testmode),
         "lint" => lint_cmd(rest, testmode),
+        "open" => open_cmd(rest, testmode),
         "patterns" => patterns_cmd(rest, testmode),
         "close-check" => close_check_cmd(rest, testmode),
         "sweep" => sweep_cmd(rest, testmode),
@@ -797,7 +1006,7 @@ fn rows_for_add(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<(usize, Row)
     if let Some((n, m)) = privacy_problems(ctx, &inbox.rows).first() {
         return Err((1, format!("the inbox already has a problem at line {n}: {m}; nothing was appended (run harness friction lint)")));
     }
-    Ok(inbox.rows)
+    Ok(inbox.rows.list)
 }
 
 fn add_cmd(rest: &[String], testmode: bool) -> i32 {
@@ -969,7 +1178,7 @@ fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
         return 1;
     }
-    let mut problems = inbox.problems;
+    let mut problems = inbox.problems.clone();
     problems.extend(privacy_problems(&ctx, &inbox.rows));
     if !problems.is_empty() {
         for (n, m) in &problems {
@@ -978,6 +1187,85 @@ fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
         return 1;
     }
     println!("inbox ok rows={}", inbox.rows.len());
+    0
+}
+
+/// `harness friction open [--config <file>]`: the rows whose status is open, one line each
+/// (`open id=<id> date=<date> impact=<impact or -> ticket=<ticket>`; no text, why, proof or status_ref), then
+/// `rows open=<n> fixed=<n> guarded=<n> ticket=<n> lesson=<n> no-action=<n> total=<n>`. Fail closed like `lint`:
+/// a torn tail, any bad row or a privacy hit exits 1 with nothing on stdout.
+fn open_cmd(rest: &[String], testmode: bool) -> i32 {
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    let mut file: Option<&str> = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => {
+                let Some(v) = it.next() else {
+                    return fail("--config is missing its value");
+                };
+                if file.replace(v.as_str()).is_some() {
+                    return fail("--config was given twice");
+                }
+            }
+            _ => return fail("an unknown option (open takes only --config <file>)"),
+        }
+    }
+    let cfg = match config_path(file) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let cfg = match crate::config::Config::load(&cfg) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => return fail("no privacy list configured: an unscanned inbox is never listed"),
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    let inbox = match read_inbox(std::path::Path::new(cfg.friction_inbox())) {
+        Ok(i) => i,
+        Err(e) => return fail(&e),
+    };
+    if let Some(n) = inbox.torn_tail {
+        eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
+        return 1;
+    }
+    let mut problems = inbox.problems.clone();
+    problems.extend(privacy_problems(&ctx, &inbox.rows));
+    if !problems.is_empty() {
+        for (n, m) in &problems {
+            eprintln!("harness: inbox line {n}: {m}");
+        }
+        return 1;
+    }
+    let mut counts = [0usize; 6];
+    let mut text = String::new();
+    for ((_, r), st) in inbox.rows.iter().zip(inbox.rows.statuses.iter()) {
+        let word = st.word();
+        if word == "open" {
+            counts[0] += 1;
+            let impact = if r.impact.is_empty() { "-" } else { r.impact.as_str() };
+            text.push_str(&format!("open id={} date={} impact={} ticket={}\n", r.id, r.date, impact, r.ticket));
+        } else if let Some(i) = STATUSES.iter().position(|s| *s == word) {
+            counts[i + 1] += 1;
+        }
+    }
+    print!("{text}");
+    println!(
+        "rows open={} fixed={} guarded={} ticket={} lesson={} no-action={} total={}",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        inbox.rows.len()
+    );
     0
 }
 
@@ -1324,7 +1612,7 @@ fn close_check_cmd(rest: &[String], testmode: bool) -> i32 {
                 if let Some((n, m)) = privacy_problems(&ctx, &i.rows).first() {
                     return fail(&format!("the inbox has a problem at line {n}: {m}; the close line cannot be checked"));
                 }
-                i.rows
+                i.rows.list
             }
             Err(e) => return fail(&e),
         }
