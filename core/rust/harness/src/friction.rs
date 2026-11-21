@@ -47,7 +47,8 @@ const INBOX_CAP: u64 = 4 * 1024 * 1024;
 /// A close note is read no further than this; past it the check fails closed (exit 2).
 const NOTE_CAP: u64 = 1024 * 1024;
 /// The event log a sweep reads no further than; past it the sweep fails closed (exit 2). The same bound as
-/// the inbox: both are append-only stores the friction verb family reads whole (ticket 200).
+/// the inbox: the verb family reads both whole (ticket 200). The event log is append-only; the inbox is
+/// appended to, and `set-status` is the one verb that rewrites a line of it in place.
 const EVENT_LOG_CAP: u64 = 4 * 1024 * 1024;
 
 /// One inbox row. `breaks` is empty or the id of the lesson that broke again (K-1 rule 3). `kind` is empty
@@ -618,6 +619,33 @@ pub struct Inbox {
     pub rows: Rows,
     pub problems: Vec<(usize, String)>,
     pub torn_tail: Option<usize>,
+    /// True when a `set-status` recovery copy sits next to the inbox (a write did not finish). The inbox was not
+    /// read then: the rows are empty and every verb refuses, like it does for a torn tail.
+    pub recovery_copy: bool,
+}
+
+/// The one stderr line of every verb that meets a recovery copy (no path, no row).
+pub(crate) const RECOVERY_MSG: &str = "the inbox has a status-write recovery copy next to it (a set-status write did not finish); compare the two files by hand and move the copy aside";
+
+/// The recovery copy path: the canonical inbox path plus `.status-write`, so every spelling of the inbox path
+/// names the same copy, in the real file's folder. A missing inbox resolves through its folder.
+fn recovery_path(inbox: &Path) -> Option<std::path::PathBuf> {
+    let real = match fs::canonicalize(inbox) {
+        Ok(p) => p,
+        Err(_) => resolved_form(inbox)?,
+    };
+    let mut name = real.file_name()?.to_os_string();
+    name.push(".status-write");
+    Some(real.with_file_name(name))
+}
+
+/// True when a recovery copy (a regular file) sits at the recovery path. A symlink or a folder there is not a
+/// copy this module made; `set-status` meets it at its exclusive create and refuses.
+fn recovery_copy_present(inbox: &Path) -> bool {
+    match recovery_path(inbox) {
+        Some(p) => fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()),
+        None => false,
+    }
 }
 
 /// The valid rows of an inbox with their 1-based line numbers. It reads as the plain `Vec<(usize, Row)>` it
@@ -663,29 +691,35 @@ impl<'a> IntoIterator for &'a Rows {
 
 /// Read at most the cap plus one byte, then lint every line. `Err` is a setup failure (unreadable, oversized, not
 /// UTF-8); a bad row is a `problems` entry, not an `Err`, so one checker reports every line.
+///
+/// The read holds the SHARED lock on the inbox file (waiting up to `LOCK_WAIT`, then `Err`: busy) and releases
+/// it before it returns, so a writer never changes the file under a reader and no caller keeps the lock while
+/// it does other work. The recovery copy check runs after the lock is held, in the same run that reads.
 pub fn read_inbox(path: &Path) -> Result<Inbox, String> {
     let meta = fs::metadata(path).map_err(|_| "the inbox cannot be read".to_string())?;
     if meta.is_dir() {
         return Err("the inbox path is a folder".to_string());
     }
-    let bytes = read_capped(path, INBOX_CAP).map_err(|_| "the inbox cannot be read".to_string())?;
-    inbox_from_bytes(bytes)
+    let f = fs::File::open(path).map_err(|_| "the inbox cannot be read".to_string())?;
+    lock_wait(&f, true)?;
+    read_inbox_locked(&f, path).map(|(inbox, _)| inbox)
 }
 
-/// The same read over an already-open (and, for `add`, already-locked) inbox descriptor: the rows the append
-/// will follow are read from the very file the lock is held on.
-fn read_inbox_locked(f: &fs::File) -> Result<Inbox, String> {
+/// The same read over an already-open and already-locked (shared or exclusive) inbox descriptor: the rows a
+/// write will follow are read from the very file the lock is held on. `path` only names the recovery copy.
+/// It also returns the text read (empty when a recovery copy stopped the read), so a writer can keep the
+/// bytes of the lines it does not change.
+fn read_inbox_locked(f: &fs::File, path: &Path) -> Result<(Inbox, String), String> {
+    if recovery_copy_present(path) {
+        return Ok((Inbox { recovery_copy: true, ..Inbox::default() }, String::new()));
+    }
     let mut buf = Vec::new();
     f.take(INBOX_CAP + 1).read_to_end(&mut buf).map_err(|_| "the inbox cannot be read".to_string())?;
-    inbox_from_bytes(buf)
-}
-
-fn inbox_from_bytes(bytes: Vec<u8>) -> Result<Inbox, String> {
-    if bytes.len() as u64 > INBOX_CAP {
+    if buf.len() as u64 > INBOX_CAP {
         return Err(format!("the inbox is over the {}-byte cap", INBOX_CAP));
     }
-    let text = String::from_utf8(bytes).map_err(|_| "the inbox is not utf-8".to_string())?;
-    Ok(lint_text(&text))
+    let text = String::from_utf8(buf).map_err(|_| "the inbox is not utf-8".to_string())?;
+    Ok((lint_text(&text), text))
 }
 
 /// The whole-file lint over already-read inbox text: per-row rules, then the cross-row rules (duplicate `id`,
@@ -839,9 +873,10 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// the path (a symlinked folder or file, a `.`/`..` detour, a hard link, a not-yet-created file behind a
 /// symlink) opens the same inode, so they all take the ONE lock; there is no side lock file and no path is
 /// built or compared. The kernel releases the lock when the descriptor closes (return, panic, kill -9), so
-/// there is no stale-steal rule. The returned file is the locked descriptor: the caller reads and appends through it,
-/// and dropping it releases the lock. `Err` is a setup failure (cannot open) or the lock stayed busy past
-/// LOCK_WAIT. Nothing here prints any path.
+/// there is no stale-steal rule. The returned file is the locked descriptor: the caller reads and appends
+/// through it (a second open of the inbox in the same process would wait for this very lock), and dropping it
+/// releases the lock. `Err` is a setup failure (cannot open) or the lock stayed busy past LOCK_WAIT. Nothing
+/// here prints any path.
 pub(crate) fn open_locked(inbox: &Path) -> Result<fs::File, String> {
     let f = fs::OpenOptions::new()
         .read(true)
@@ -849,12 +884,21 @@ pub(crate) fn open_locked(inbox: &Path) -> Result<fs::File, String> {
         .create(true)
         .open(inbox)
         .map_err(|_| "the inbox cannot be written".to_string())?;
+    lock_wait(&f, false)?;
+    Ok(f)
+}
+
+/// Take the lock on an open inbox descriptor, shared or exclusive, waiting up to `LOCK_WAIT`.
+fn lock_wait(f: &fs::File, shared: bool) -> Result<(), String> {
     let deadline = std::time::Instant::now() + LOCK_WAIT;
     loop {
-        match f.try_lock() {
-            Ok(()) => return Ok(f),
+        let got = if shared { f.try_lock_shared() } else { f.try_lock() };
+        match got {
+            Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(_)) => return Err("the inbox cannot be written".to_string()),
+            Err(std::fs::TryLockError::Error(_)) => {
+                return Err(if shared { "the inbox cannot be read" } else { "the inbox cannot be written" }.to_string());
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err("the inbox is busy (another writer holds it); try again".to_string());
@@ -945,7 +989,7 @@ pub fn read_note(path: &Path) -> Result<String, String> {
 
 // ---------------------------------------------------------------- the verb family
 
-pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] --why <cause> [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction open [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>]";
+pub const FRICTION_USAGE: &str = "usage: harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> --where-it-lives <skill|gate|memory|wiki> [--breaks <row-id>] [--kind <friction|pattern>] [--repeats <row-id>] [--source event] [--at <YYYY-MM-DDTHH:MM:SSZ>] [--impact <low|medium|high|blocker>] --why <cause> [--proof <pointers>] --text <lesson> [--config <file>] | friction lint [--config <file>] | friction open [--config <file>] | friction patterns [--config <file>] [--record <file>] | friction close-check <close-note> --ticket <t> [--config <file>] | friction sweep --log <event-log> --week <iso-year>-w<ww> [--config <file>] | friction rank [--top <k>] [--min-occurrences <n>] [--record <file>] [--config <file>] | friction suggest --text <t> [--why <w>] [--top <k>] [--before <row id>] [--record <file>] [--config <file>] [--jev-send <program> --jev-key-file <file> --jev-ledger-dir <dir> [--jev-deadline-ms <n>]] (suggest is unix only) | friction triage --week <iso-year>-w<ww> --state <file> --handoff-dir <dir> [--log <event-log>] [--closed <file>] [--controls <file> --lessons-dir <dir>] [--as-of <YYYY-MM-DDTHH:MM:SSZ>] [--top <k>] [--config <file>] | friction bind --state <file> --group <id> --task-id <id> --task-session <token> [--config <file>] | friction page --week <iso-year>-w<ww> --state <file> --out <file> [--config <file>] | friction controls-check --controls <file> --lessons-dir <dir> [--config <file>] | friction set-status --id <row id> --set <fixed|guarded|ticket|lesson|no-action|open> [--ref <pointers>] [--config <file>]";
 
 /// The config source, resolved exactly as `harness config check` and `session check-name` resolve it: `--config`,
 /// else `HARNESS_CONFIG`, no third source, an empty value refused and never defaulted.
@@ -963,8 +1007,8 @@ pub(crate) fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, Stri
     Ok(std::path::PathBuf::from(path))
 }
 
-/// `harness friction add | lint | patterns | close-check | sweep | open` (K-1 slice 1 plus tickets 192, 200; the
-/// contract is `docs/friction-inbox.md`).
+/// `harness friction add | lint | patterns | close-check | sweep | open | set-status` (K-1 slice 1 plus tickets
+/// 192, 200; the contract is `docs/friction-inbox.md`). `set-status` is the one verb that rewrites a line in place.
 /// Exit 0 ok; 1 a refusal (a refused write leaves the inbox byte-identical, stdout empty, stderr naming the field
 /// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error. Nothing is written
 /// before every check has passed: flags, then row rules, then the cause tag of a hand-written friction row's
@@ -980,6 +1024,7 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
         "add" => add_cmd(rest, testmode),
         "lint" => lint_cmd(rest, testmode),
         "open" => open_cmd(rest, testmode),
+        "set-status" => set_status_cmd(rest, testmode),
         "patterns" => patterns_cmd(rest, testmode),
         "close-check" => close_check_cmd(rest, testmode),
         "sweep" => sweep_cmd(rest, testmode),
@@ -999,8 +1044,11 @@ pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
 
 /// The inbox rows, refusing a damaged inbox (fail closed): a torn tail, any bad row or any privacy hit in a
 /// stored row blocks the append. Reads the locked descriptor, so the rows are the ones the append will follow.
-fn rows_for_add(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<(usize, Row)>, (i32, String)> {
-    let inbox = read_inbox_locked(f).map_err(|m| (2, m))?;
+fn rows_for_add(f: &fs::File, path: &Path, ctx: &crate::scan::Ctx) -> Result<Vec<(usize, Row)>, (i32, String)> {
+    let (inbox, _) = read_inbox_locked(f, path).map_err(|m| (2, m))?;
+    if inbox.recovery_copy {
+        return Err((1, RECOVERY_MSG.to_string()));
+    }
     if let Some(n) = inbox.torn_tail {
         return Err((1, format!("the inbox has a torn tail at line {n}; nothing was appended (run harness friction lint)")));
     }
@@ -1113,9 +1161,13 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(f) => f,
         Err(m) => return fail(&m),
     };
-    let mut rows = match rows_for_add(&file, &ctx) {
+    let mut rows = match rows_for_add(&file, &inbox_path, &ctx) {
         Ok(r) => r,
         Err((code, m)) => {
+            if m == RECOVERY_MSG {
+                eprintln!("harness: friction refused: {m}");
+                return code;
+            }
             eprintln!("harness: friction refused: {}", m);
             eprintln!("harness: ROW NOT RECORDED");
             return code;
@@ -1178,6 +1230,10 @@ fn lint_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(i) => i,
         Err(e) => return fail(&e),
     };
+    if inbox.recovery_copy {
+        eprintln!("harness: {RECOVERY_MSG}");
+        return 1;
+    }
     if let Some(n) = inbox.torn_tail {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
         return 1;
@@ -1235,6 +1291,10 @@ fn open_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(i) => i,
         Err(e) => return fail(&e),
     };
+    if inbox.recovery_copy {
+        eprintln!("harness: {RECOVERY_MSG}");
+        return 1;
+    }
     if let Some(n) = inbox.torn_tail {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
         return 1;
@@ -1270,6 +1330,198 @@ fn open_cmd(rest: &[String], testmode: bool) -> i32 {
         counts[5],
         inbox.rows.len()
     );
+    0
+}
+
+/// Sync a folder so a file made or removed in it is on disk.
+fn sync_folder(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Create the recovery copy: exclusive (an existing file, folder or planted symlink at the path refuses), with
+/// the inbox's own permission bits.
+fn create_recovery(path: &Path, perms: &fs::Permissions) -> std::io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(perms.mode() & 0o7777);
+    }
+    let f = opts.open(path)?;
+    f.set_permissions(perms.clone())?;
+    Ok(f)
+}
+
+/// `harness friction set-status --id <row id> --set <fixed|guarded|ticket|lesson|no-action|open> [--ref <pointers>]
+/// [--config <file>]`: change the `status` and `status_ref` keys of the ONE row with that id, in place, and
+/// nothing else. Every check runs inside one exclusive critical section on the inbox file (read through
+/// `read_inbox_locked` on the locked descriptor), and all of them pass before the recovery copy is made.
+/// Lines the verb does not change are written back from their original bytes. The write keeps the inode: the
+/// whole old inbox goes to `<inbox>.status-write` (exclusive create, synced), then the locked file is truncated
+/// and the new content written and synced, then the copy is removed. A failure after the copy exists leaves
+/// it (exit 2) and every verb refuses until it is moved aside by hand. Exit 0 ok (a set equal to the current
+/// values writes nothing); 1 a refusal (the inbox is byte-identical, stdout empty, one stderr line that names
+/// at most a line number, a field and a privacy class); 2 a usage or setup error.
+fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
+    let usage = || {
+        eprintln!("{}", FRICTION_USAGE);
+        2
+    };
+    let fail = |m: &str| {
+        eprintln!("harness: error: {}", m);
+        2
+    };
+    let refuse = |m: &str| {
+        eprintln!("harness: friction refused: {m}; the status was not set");
+        1
+    };
+    let mut o: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        let name = match arg.as_str() {
+            "--id" | "--set" | "--ref" | "--config" => arg.as_str(),
+            _ => return usage(),
+        };
+        let Some(v) = it.next() else { return usage() };
+        if o.insert(name, v.as_str()).is_some() {
+            return usage();
+        }
+    }
+    let (Some(&id), Some(&set)) = (o.get("--id"), o.get("--set")) else { return usage() };
+    if !token_ok(id) {
+        return refuse("--id is not a plain token");
+    }
+    if set != "open" && !STATUSES.contains(&set) {
+        return refuse("--set must be fixed, guarded, ticket, lesson, no-action or open");
+    }
+    let ref_val = o.get("--ref").copied();
+    let new = if set == "open" {
+        if ref_val.is_some() {
+            return refuse("--ref is not allowed with --set open");
+        }
+        Status::default()
+    } else {
+        Status { status: set.to_string(), status_ref: ref_val.unwrap_or("").to_string() }
+    };
+    let cfg = match config_path(o.get("--config").copied()) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let cfg = match crate::config::Config::load(&cfg) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    let list = match crate::overlay::load() {
+        Ok(l) => l,
+        Err(_) => return fail("no privacy list configured: an unscanned status is never stored"),
+    };
+    let ctx = crate::scan::Ctx { list: &list, testmode };
+    // The new pointers are scanned before they are used anywhere (the status rules included).
+    if let Some(r) = ref_val {
+        let hits = crate::scan::scan_text(&ctx, "friction.set-status", r);
+        if !hits.is_empty() {
+            let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
+            return refuse(&format!("field status_ref has a privacy hit ({})", classes.join(", ")));
+        }
+    }
+    if let Err(m) = validate_status(&new) {
+        return refuse(&m);
+    }
+    let inbox_path = std::path::PathBuf::from(cfg.friction_inbox());
+    // Opened without create: a missing inbox holds no such row, and the check has no time gap to the open.
+    let mut f = match fs::OpenOptions::new().read(true).write(true).open(&inbox_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return refuse("no row with that id"),
+        Err(_) => return fail("the inbox cannot be written"),
+    };
+    if let Err(m) = lock_wait(&f, false) {
+        return fail(&m);
+    }
+    // A hard link would keep the old bytes under the other name when the file is truncated and rewritten.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match f.metadata() {
+            Ok(m) if m.nlink() > 1 => return refuse("the inbox has more than one hard link"),
+            Ok(_) => {}
+            Err(_) => return fail("the inbox cannot be read"),
+        }
+    }
+    let perms = match f.metadata() {
+        Ok(m) => m.permissions(),
+        Err(_) => return fail("the inbox cannot be read"),
+    };
+    let (inbox, text) = match read_inbox_locked(&f, &inbox_path) {
+        Ok(x) => x,
+        Err(m) => return fail(&m),
+    };
+    if inbox.recovery_copy {
+        eprintln!("harness: {RECOVERY_MSG}");
+        return 1;
+    }
+    if let Some(n) = inbox.torn_tail {
+        return refuse(&format!("the inbox has a torn tail at line {n}"));
+    }
+    if let Some((n, m)) = inbox.problems.first() {
+        return refuse(&format!("the inbox has a problem at line {n}: {m}"));
+    }
+    if let Some((n, m)) = privacy_problems(&ctx, &inbox.rows).first() {
+        return refuse(&format!("the inbox has a problem at line {n}: {m}"));
+    }
+    let Some(idx) = inbox.rows.iter().position(|(_, r)| r.id == id) else {
+        return refuse("no row with that id");
+    };
+    let (line_no, row) = &inbox.rows[idx];
+    if inbox.rows.statuses[idx] == new {
+        println!("status set id={} status={}", row.id, new.word());
+        return 0;
+    }
+    let new_line = match encode_row_status(row, &new) {
+        Ok(l) => l,
+        Err(m) => return refuse(&m),
+    };
+    // Every line but the target is copied from its original bytes; the target is the canonical new line.
+    let mut out = String::with_capacity(text.len() + new_line.len() + 1);
+    for (i, l) in text.split_inclusive('\n').enumerate() {
+        if i + 1 == *line_no {
+            out.push_str(&new_line);
+            out.push('\n');
+        } else {
+            out.push_str(l);
+        }
+    }
+    if out.len() as u64 > INBOX_CAP {
+        return refuse(&format!("the inbox would be over the {INBOX_CAP}-byte cap"));
+    }
+    let Some(rp) = recovery_path(&inbox_path) else {
+        return fail("the recovery copy path cannot be built; the status was not set");
+    };
+    let Some(dir) = rp.parent().map(|d| d.to_path_buf()) else {
+        return fail("the recovery copy path cannot be built; the status was not set");
+    };
+    // Every check has passed. From the exclusive create on, a failure leaves the copy in place (fail closed).
+    let mut copy = match create_recovery(&rp, &perms) {
+        Ok(c) => c,
+        Err(_) => return fail("the recovery copy cannot be created; the status was not set"),
+    };
+    const LEFT: &str = "the inbox write did not finish; a recovery copy was left next to the inbox";
+    if copy.write_all(text.as_bytes()).and_then(|()| copy.sync_all()).and_then(|()| sync_folder(&dir)).is_err() {
+        return fail(LEFT);
+    }
+    let rewrite = f
+        .set_len(0)
+        .and_then(|()| std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| f.write_all(out.as_bytes()))
+        .and_then(|()| f.sync_all());
+    if rewrite.is_err() {
+        return fail(LEFT);
+    }
+    drop(copy);
+    if fs::remove_file(&rp).and_then(|()| sync_folder(&dir)).is_err() {
+        return fail(LEFT);
+    }
+    println!("status set id={} status={}", row.id, new.word());
     0
 }
 
@@ -1472,6 +1724,10 @@ pub fn patterns_cmd(rest: &[String], testmode: bool) -> i32 {
         Err(e) => return fail(&e),
     };
     // The full lint, byte for byte the `lint` verb's refusal behaviour.
+    if inbox.recovery_copy {
+        eprintln!("harness: {RECOVERY_MSG}");
+        return 1;
+    }
     if let Some(n) = inbox.torn_tail {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
         return 1;
@@ -1603,10 +1859,17 @@ fn close_check_cmd(rest: &[String], testmode: bool) -> i32 {
     // A DAMAGED inbox (unreadable, oversized, torn, bad rows, a privacy hit in a stored row) fails the check
     // closed: it cannot be compared against.
     let rows = if !inbox_path.exists() {
+        // No lock to take on a file that is not there; a recovery copy beside the missing path still refuses.
+        if recovery_copy_present(inbox_path) {
+            return fail(RECOVERY_MSG);
+        }
         Vec::new()
     } else {
         match read_inbox(inbox_path) {
             Ok(i) => {
+                if i.recovery_copy {
+                    return fail(RECOVERY_MSG);
+                }
                 if let Some(n) = i.torn_tail {
                     return fail(&format!("the inbox has a torn tail at line {n}; the close line cannot be checked"));
                 }
@@ -1795,9 +2058,13 @@ pub(crate) fn sweep_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(f) => f,
         Err(m) => return fail(&m),
     };
-    let mut rows = match rows_for_add(&file, &ctx) {
+    let mut rows = match rows_for_add(&file, &inbox_path, &ctx) {
         Ok(r) => r,
         Err((code, m)) => {
+            if m == RECOVERY_MSG {
+                eprintln!("harness: friction refused: {m}");
+                return code;
+            }
             eprintln!("harness: friction refused: {}", m);
             eprintln!("harness: ROWS NOT RECORDED");
             return code;
