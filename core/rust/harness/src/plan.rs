@@ -693,7 +693,7 @@ fn sha_ok(s: &str) -> bool {
 /// branch? Local refs only: no fetch, no network. Exit 0 `plan-index current head=<12> base=<12>` (HEAD equals the
 /// ref or is ahead with nothing behind); 1 `plan-index behind=<n> ...` (behind, not ahead) or `plan-index diverged
 /// ahead=<a> behind=<b> ...`; 2 usage (the usage line on stderr), or one fixed engine stderr line when the plan index
-/// file is missing, is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the
+/// file is not a regular file that opens for reading (missing, a folder, unreadable), is not inside a git work tree, `refs/remotes/origin/HEAD` is not set, HEAD is detached, the
 /// current branch is not the branch origin/HEAD names, or a git call fails. A dirty work tree does not change the
 /// answer: the check is about commits.
 fn fresh_cmd(a: &[String]) -> i32 {
@@ -712,12 +712,17 @@ fn fresh_cmd(a: &[String]) -> i32 {
     // The file is canonicalized first (a symlink is followed), so the work tree found is the one holding the real file.
     let canon = match std::fs::canonicalize(idx) {
         Ok(p) => p,
-        Err(_) => return fail("the plan index file is missing or cannot be read"),
+        Err(_) => return fail("the plan index is not a readable regular file"),
     };
     let dir = match canon.parent() {
         Some(d) => d,
         None => return fail("the plan index is not inside a git work tree"),
     };
+    // A regular file that opens for reading: a folder, a file that cannot be opened and a special file are refused.
+    let readable = std::fs::metadata(&canon).map(|m| m.is_file()).unwrap_or(false) && std::fs::File::open(&canon).is_ok();
+    if !readable {
+        return fail("the plan index is not a readable regular file");
+    }
     let top = match git_local(dir, &["rev-parse", "--show-toplevel"]) {
         Some(o) => PathBuf::from(o.trim_end_matches(['\n', '\r'])),
         None => return fail("the plan index is not inside a git work tree"),
