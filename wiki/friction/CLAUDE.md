@@ -10,10 +10,10 @@ wiki schema (layers, page front-matter, index and log rules, lint) is the schema
 
 - `raw/friction-inbox.jsonl` and `raw/triage-state.jsonl` are raw sources that the `harness friction` verbs append
   to (`add`, `sweep`, `triage`, `bind`). The one in-place writer is `harness friction set-status`: it changes the
-  `status` and `status_ref` of one inbox row and keeps every other line as it was. Nothing else, no agent and no
-  editor, writes or rewrites a line. A `raw/friction-inbox.jsonl.status-write` file next to the inbox is a left-over
-  recovery copy: the verbs refuse until it is moved aside by hand. The lint of the harness (`harness friction lint`)
-  is the one reader that audits them.
+  `status` and `status_ref` of one inbox row and writes the other lines back from their original bytes. Agents and
+  editors do not write or rewrite a line. A `raw/friction-inbox.jsonl.status-write` file next to the inbox is a
+  left-over recovery copy: the verbs that read the inbox refuse until it is moved aside by hand. The lint of the
+  harness (`harness friction lint`) is the reader that audits them.
 - Pages are `triage-<yyyy>-w<ww>.md`, written by `harness friction page` (front-matter `kind: note`,
   `verified: no`). The page is the only place lesson text is printed: the verbs' stdout carries ids and numbers.
 - `index.md` and `log.md` follow the shared schema; `bin/friction-loop.sh` appends one line to each per week.

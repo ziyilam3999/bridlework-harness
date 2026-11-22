@@ -145,7 +145,8 @@ fn now_ts() -> String {
 }
 
 fn lint_rows(cfg: &Config, ctx: &crate::scan::Ctx) -> Result<Vec<Row>, i32> {
-    // The read takes the shared inbox lock and lets it go before it returns, so the Jev call later never holds it.
+    // The read takes the shared inbox lock and releases it when `read_inbox` returns, so the later Jev call runs
+    // with no inbox lock held.
     let inbox = friction::read_inbox(Path::new(cfg.friction_inbox())).map_err(|e| fail(&e))?;
     if inbox.recovery_copy {
         eprintln!("harness: {}", friction::RECOVERY_MSG);

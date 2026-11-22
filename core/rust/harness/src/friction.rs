@@ -48,7 +48,7 @@ const INBOX_CAP: u64 = 4 * 1024 * 1024;
 const NOTE_CAP: u64 = 1024 * 1024;
 /// The event log a sweep reads no further than; past it the sweep fails closed (exit 2). The same bound as
 /// the inbox: the verb family reads both whole (ticket 200). The event log is append-only; the inbox is
-/// appended to, and `set-status` is the one verb that rewrites a line of it in place.
+/// appended to, and `set-status` rewrites a line of it in place.
 const EVENT_LOG_CAP: u64 = 4 * 1024 * 1024;
 
 /// One inbox row. `breaks` is empty or the id of the lesson that broke again (K-1 rule 3). `kind` is empty
@@ -620,11 +620,12 @@ pub struct Inbox {
     pub problems: Vec<(usize, String)>,
     pub torn_tail: Option<usize>,
     /// True when a `set-status` recovery copy sits next to the inbox (a write did not finish). The inbox was not
-    /// read then: the rows are empty and every verb refuses, like it does for a torn tail.
+    /// read then: the rows are empty. `read_inbox`, `read_inbox_locked` and close-check's missing-inbox branch set
+    /// this flag, and the verbs built on them refuse on it, like they do for a torn tail.
     pub recovery_copy: bool,
 }
 
-/// The one stderr line of every verb that meets a recovery copy (no path, no row).
+/// The fixed stderr line of a verb that meets a recovery copy (no path, no row).
 pub(crate) const RECOVERY_MSG: &str = "the inbox has a status-write recovery copy next to it (a set-status write did not finish); compare the two files by hand and move the copy aside";
 
 /// True when the inbox path names no file and a recovery copy sits beside it. `add` and `sweep` open the inbox
@@ -633,8 +634,8 @@ fn missing_inbox_with_recovery_copy(inbox: &Path) -> bool {
     matches!(fs::metadata(inbox), Err(e) if e.kind() == std::io::ErrorKind::NotFound) && recovery_copy_present(inbox)
 }
 
-/// The recovery copy path: the canonical inbox path plus `.status-write`, so every spelling of the inbox path
-/// names the same copy, in the real file's folder. A missing inbox resolves through its folder.
+/// The recovery copy path: the canonical inbox path plus `.status-write`, so a symlinked-file or symlinked-folder
+/// spelling of the inbox path names the same copy, in the real file's folder. A missing inbox resolves through its folder.
 fn recovery_path(inbox: &Path) -> Option<std::path::PathBuf> {
     let real = match fs::canonicalize(inbox) {
         Ok(p) => p,
@@ -699,8 +700,8 @@ impl<'a> IntoIterator for &'a Rows {
 /// UTF-8); a bad row is a `problems` entry, not an `Err`, so one checker reports every line.
 ///
 /// The read holds the SHARED lock on the inbox file (waiting up to `LOCK_WAIT`, then `Err`: busy) and releases
-/// it before it returns, so a writer never changes the file under a reader and no caller keeps the lock while
-/// it does other work. The recovery copy check runs after the lock is held, in the same run that reads.
+/// it when the function returns, so a writer does not change the file during the read and the caller holds no
+/// lock afterwards. The recovery copy check runs after the lock is held, in the same run that reads.
 ///
 /// A missing inbox has no file to lock. When a recovery copy sits beside the missing path the read still
 /// reports it, so the verb gives the recovery line and not a read error.
@@ -863,7 +864,7 @@ pub fn cross_check(rows: &[(usize, Row)]) -> Vec<(usize, String)> {
 
 // ---------------------------------------------------------------- the writer
 
-/// Append one row as a single whole line plus newline, after every check has passed. The file is created when absent
+/// Append one row as a single whole line plus newline, after the caller's checks have passed. The file is created when absent
 /// (its folder is not). One write, then sync: success means the line is on disk.
 pub fn append_row(path: &Path, row: &Row) -> Result<(), String> {
     let mut f = fs::OpenOptions::new().append(true).create(true).open(path).map_err(|_| "the inbox cannot be written".to_string())?;
@@ -884,13 +885,14 @@ fn append_row_to(f: &mut fs::File, row: &Row) -> Result<(), String> {
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Open the inbox FILE (creating it when absent, in its existing folder) and take the exclusive writer lock ON IT:
-/// one kernel advisory lock (flock(2), std's file lock, Rust 1.89+) on the inbox's own inode. Every spelling of
-/// the path (a symlinked folder or file, a `.`/`..` detour, a hard link, a not-yet-created file behind a
-/// symlink) opens the same inode, so they all take the ONE lock; there is no side lock file and no path is
+/// one kernel advisory lock (flock(2), std's file lock, Rust 1.89+) on the inbox's own inode. The spellings of
+/// the path named here (a symlinked folder or file, a `.`/`..` detour, a hard link, a not-yet-created file
+/// behind a symlink) open the same inode, so they take the one lock; there is no side lock file and no path is
 /// built or compared. The kernel releases the lock when the descriptor closes (return, panic, kill -9), so
-/// there is no stale-steal rule. The returned file is the locked descriptor: the caller reads and appends
+/// there is no stale-steal rule. The returned file is the locked descriptor: `add` and `sweep` read and append
 /// through it (a second open of the inbox in the same process would wait for this very lock), and dropping it
-/// releases the lock. `Err` is a setup failure (cannot open) or the lock stayed busy past LOCK_WAIT. Nothing
+/// releases the lock. `set-status` does not call this function: it opens the inbox without create, takes the
+/// same lock on its own descriptor and reads through `read_inbox_locked`. `Err` is a setup failure (cannot open) or the lock stayed busy past LOCK_WAIT. Nothing
 /// here prints any path.
 pub(crate) fn open_locked(inbox: &Path) -> Result<fs::File, String> {
     let f = fs::OpenOptions::new()
@@ -1178,7 +1180,7 @@ fn add_cmd(rest: &[String], testmode: bool) -> i32 {
         return 1;
     }
     // One writer at a time: the exclusive lock is on the inbox file itself, held across read, check and append,
-    // and released on every exit path, so the duplicate-id check can never race a concurrent add of the same id.
+    // and released when the function returns, so the duplicate-id check does not race a concurrent add of the same id.
     let mut file = match open_locked(&inbox_path) {
         Ok(f) => f,
         Err(m) => return fail(&m),
@@ -1388,10 +1390,11 @@ fn create_recovery(path: &Path, perms: &fs::Permissions) -> Result<fs::File, Str
 /// nothing else. The flag checks, the scan of the new `--ref` and the status rules run before the lock is taken.
 /// The hard-link check, the read, the stored-row checks, the id lookup and the cap checks run inside one
 /// exclusive critical section on the inbox file (read through `read_inbox_locked` on the locked descriptor), and
-/// they have passed before the recovery copy is made. Lines the verb does not change are written back from their original bytes. The write keeps the inode: the
-/// whole old inbox goes to `<inbox>.status-write` (exclusive create, synced), then the locked file is truncated
-/// and the new content written and synced, then the copy is removed. A failure after the copy exists leaves
-/// it (exit 2) and every verb refuses until it is moved aside by hand. Exit 0 ok (a set equal to the current
+/// they have passed before the recovery copy is made. Lines the verb does not change are written back from
+/// their original bytes. The write keeps the inode: the whole old inbox goes to `<inbox>.status-write`
+/// (exclusive create, synced), then the locked file is truncated and the new content written and synced, then
+/// the copy is removed. A failure after the copy exists leaves it (exit 2). The readers that go through
+/// `read_inbox` or `read_inbox_locked` refuse while it is there, until it is moved aside by hand. Exit 0 ok (a set equal to the current
 /// values writes nothing); 1 a refusal (the inbox is byte-identical, stdout empty, one stderr line that names
 /// at most a line number, a field and a privacy class); 2 a usage or setup error.
 fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
@@ -1445,7 +1448,7 @@ fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
     };
     let list = match crate::overlay::load() {
         Ok(l) => l,
-        Err(_) => return fail("no privacy list configured: an unscanned status is never stored"),
+        Err(_) => return fail("no privacy list configured: an unscanned status is not stored"),
     };
     let ctx = crate::scan::Ctx { list: &list, testmode };
     // The new pointers are scanned before they are used anywhere (the status rules included).
@@ -1519,7 +1522,7 @@ fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
         Ok(l) => l,
         Err(m) => return refuse(&m),
     };
-    // Every line but the target is copied from its original bytes; the target is the canonical new line.
+    // The lines other than the target are copied from their original bytes; the target is the canonical new line.
     let mut out = String::with_capacity(text.len() + new_line.len() + 1);
     for (i, l) in text.split_inclusive('\n').enumerate() {
         if i + 1 == *line_no {
@@ -1538,7 +1541,7 @@ fn set_status_cmd(rest: &[String], testmode: bool) -> i32 {
     let Some(dir) = rp.parent().map(|d| d.to_path_buf()) else {
         return fail("the recovery copy path cannot be built; the status was not set");
     };
-    // Every check has passed. From the exclusive create on, a failure leaves the copy in place (fail closed).
+    // The checks above have passed. From the exclusive create on, a failure leaves the copy in place (fail closed).
     let mut copy = match create_recovery(&rp, &perms) {
         Ok(c) => c,
         Err(m) => return fail(&m),

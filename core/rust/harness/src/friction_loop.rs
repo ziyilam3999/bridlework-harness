@@ -233,8 +233,8 @@ pub(crate) fn load_list(what: &str) -> Result<crate::overlay::List, i32> {
 
 /// The inbox rows after the FULL lint (`friction lint`'s own refusal behaviour: nothing on stdout, same stderr).
 pub(crate) fn lint_rows(cfg: &Config, ctx: &crate::scan::Ctx) -> Result<Vec<Row>, i32> {
-    // The read takes the shared inbox lock and lets it go before it returns (a writer waits for it, never for
-    // the verb's later work).
+    // The read takes the shared inbox lock and releases it when `read_inbox` returns, so a writer waits for the
+    // read and not for the verb's later work.
     let inbox = friction::read_inbox(Path::new(cfg.friction_inbox())).map_err(|e| fail(&e))?;
     if inbox.recovery_copy {
         eprintln!("harness: {}", friction::RECOVERY_MSG);

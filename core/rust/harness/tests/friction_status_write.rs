@@ -1,8 +1,8 @@
-//! Ticket friction-status-write: `harness friction set-status`, the one verb that rewrites a line of the inbox in
+//! Ticket friction-status-write: `harness friction set-status`, the verb that rewrites a line of the inbox in
 //! place, and the inbox lock the readers now share. The real binary runs as a child process on scratch inboxes.
 //! The fixture (neighbour rows that are valid but not canonical, rows that carry a status) is built here; the
-//! helpers and the neighbour verb run of `friction_status.rs` are reused through the `status` module. Every row,
-//! pointer and deny word is synthetic. The tests hold the inbox lock with std's `File::lock` on their own open of
+//! helpers and the neighbour verb run of `friction_status.rs` are reused through the `status` module. The rows,
+//! pointers and deny words are synthetic. The tests hold the inbox lock with std's `File::lock` on their own open of
 //! the inbox (the crate's `open_locked` is not public).
 #![cfg(unix)]
 #[path = "friction_status.rs"]
@@ -543,7 +543,7 @@ fn readers_share_the_lock_with_each_other() {
 
 // ---------------------------------------------------------------- the recovery copy (e), (g), (h)
 
-/// A scratch folder with every file the thirteen verbs below need.
+/// A scratch folder with the files the fourteen verbs below need.
 struct Verbs {
     t: Tmp,
 }
@@ -555,7 +555,8 @@ impl Verbs {
         Verbs { t }
     }
 
-    /// (name, args, the exit code a refusal gives): ten verbs of the engine and the three that write.
+    /// (name, args, the exit code a refusal gives): fourteen verbs, three that write (set-status, add, sweep) and
+    /// eleven that read.
     fn calls(&self) -> Vec<(&'static str, Vec<String>, i32)> {
         let t = &self.t;
         let cfg = p(&t.config()).to_string();
@@ -644,8 +645,9 @@ impl Verbs {
 }
 
 #[test]
-fn a_planted_recovery_copy_makes_every_verb_refuse_with_its_damaged_inbox_code() {
-    // The calls are real: on a scratch folder with no copy none of them hits the recovery refusal.
+fn a_planted_recovery_copy_makes_the_fourteen_listed_verbs_refuse_with_their_damaged_inbox_code() {
+    // The calls are well formed: on a scratch folder with no copy, none of them prints the recovery-copy line
+    // (this loop does not check their exit codes).
     let plain = Verbs::new();
     for (name, args, _) in &plain.calls() {
         let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -807,7 +809,7 @@ fn a_planted_symlink_or_folder_at_the_recovery_path_stops_set_status_before_any_
 }
 
 #[test]
-fn the_recovery_copy_has_the_inbox_permission_bits_and_is_gone_after_a_good_write() {
+fn a_good_write_keeps_the_inbox_permission_bits_and_leaves_no_recovery_copy() {
     let t = fixture();
     fs::set_permissions(t.inbox(), fs::Permissions::from_mode(0o640)).unwrap();
     let o = set(&t, "a-1", "fixed", Some(FIXED));
