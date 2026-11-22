@@ -359,6 +359,8 @@ fn body_that_is_a_link_is_exit_2() {
     symlink(&real, &link).unwrap();
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", link.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: drop the link check -> the run says "not a regular file" and this turns red.
+    assert_eq!(o.stderr.trim_end(), "harness: error: the body file is a link");
 }
 
 #[test]
@@ -368,6 +370,8 @@ fn body_that_is_a_directory_or_missing_is_exit_2() {
     fs::create_dir_all(&d).unwrap();
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", d.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: drop the regular-file check -> the folder read fails with another text and this turns red.
+    assert_eq!(o.stderr.trim_end(), "harness: error: the body file is not a regular file");
     let m = c.t.0.join("missing.md");
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", m.to_str().unwrap()], &[]);
     refused(&o);
@@ -392,6 +396,8 @@ fn relative_repo_dir_is_exit_2() {
     fs::write(&f, "x\n").unwrap();
     let o = run_args(&["--repo-dir", "repo", "--head", &c.head, "--base", &c.base, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: accept a relative --repo-dir -> the run refuses later with another text and this turns red.
+    assert_eq!(o.stderr.trim_end(), USAGE);
 }
 
 #[test]
@@ -403,6 +409,50 @@ fn repo_dir_that_is_not_a_work_tree_is_exit_2() {
     fs::write(&f, "x\n").unwrap();
     let o = run_args(&["--repo-dir", plain.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: drop the work tree check -> the run refuses on the commit check instead and this turns red.
+    assert_eq!(o.stderr.trim_end(), "harness: error: the repo dir is not a git work tree");
+}
+
+#[test]
+fn empty_fragment_is_not_a_strict_cite_so_it_is_unparsed() {
+    // Mutant: take an empty fragment as strict -> this prints OK or a cite count and turns red.
+    let c = case();
+    let h = &c.head;
+    let o = run(&c, &format!("{h}:src/a.rs:1 \"\"\n"));
+    assert_eq!(o.code, 1);
+    assert_eq!(lines(&o), vec![format!("FLAG unparsed {h}:src/a.rs:1"), "cites=0 ok=0 flag=0 unparsed=1".to_string()]);
+}
+
+#[test]
+fn a_flag_given_twice_is_exit_2() {
+    // Mutant: let a second --head replace the first -> the run succeeds and this turns red.
+    let c = case();
+    let f = c.t.0.join("b.md");
+    fs::write(&f, "x\n").unwrap();
+    let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--head", &c.head, "--base", &c.base, "--body-file", f.to_str().unwrap()], &[]);
+    refused(&o);
+    assert_eq!(o.stderr.trim_end(), USAGE);
+}
+
+#[test]
+fn blob_over_1048576_bytes_and_blob_not_utf8_are_not_a_file() {
+    // Mutants: read a blob over the size limit; read a blob that is not UTF-8 as text -> this turns red.
+    let t = Tmp::new();
+    let dir = init(&t, "repo");
+    let big = format!("fn big() {{}}\n{}", "a".repeat(1_048_576));
+    let exact = format!("fn edge() {{}}\n{}", "a".repeat(1_048_576 - 13));
+    assert_eq!(exact.len(), 1_048_576);
+    let base = commit_all(&dir, &[("big.txt", big.as_str()), ("edge.txt", exact.as_str())]);
+    fs::write(dir.join("bin.txt"), b"fn bin() {}\n\xff\xfe\n").unwrap();
+    let head = commit_all(&dir, &[("ok.txt", "x\n")]);
+    let big_c = cite(&base, "big.txt", "1", "fn big");
+    let edge_c = cite(&base, "edge.txt", "1", "fn edge");
+    let bin_c = cite(&head, "bin.txt", "1", "fn bin");
+    let f = t.0.join("b.md");
+    fs::write(&f, format!("{big_c}\n{edge_c}\n{bin_c}\n")).unwrap();
+    let o = run_args(&["--repo-dir", dir.to_str().unwrap(), "--head", &head, "--base", &base, "--body-file", f.to_str().unwrap()], &[]);
+    assert_eq!(o.code, 1);
+    assert_eq!(lines(&o), vec![format!("FLAG not-a-file {big_c}"), format!("OK {edge_c}"), format!("FLAG not-a-file {bin_c}"), "cites=3 ok=1 flag=2 unparsed=0".to_string()]);
 }
 
 #[test]
