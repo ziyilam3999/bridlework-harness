@@ -253,6 +253,45 @@ fn bad_head_exit_two_and_the_head_stays_private() {
     assert!(!err(&o).contains(SECRET));
 }
 
+/// A head that breaks one rule only: 39 lowercase hex characters (the length rule).
+#[test]
+fn head_of_39_hex_exit_two() {
+    let f = fix();
+    let mut lines = base_lines();
+    lines[3] = case_line("test-d", "fail", "test", &"d".repeat(39), Some("answer"));
+    f.write_cases(&lines);
+    let o = run(&f);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: case test-d: head is missing or not 40 lowercase hex characters\n");
+}
+
+/// A head that breaks one rule only: 40 hex characters in upper case (the character rule).
+#[test]
+fn head_of_upper_case_hex_exit_two() {
+    let f = fix();
+    let mut lines = base_lines();
+    lines[3] = case_line("test-d", "fail", "test", &"ABCDEF0123".repeat(4), Some("answer"));
+    f.write_cases(&lines);
+    let o = run(&f);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: case test-d: head is missing or not 40 lowercase hex characters\n");
+}
+
+/// An id of 33 characters, all of the allowed kind (the length rule).
+#[test]
+fn id_of_33_characters_exit_two_named_by_line() {
+    let f = fix();
+    let mut lines = base_lines();
+    lines[2] = case_line(&"a".repeat(33), "fail", "test", &head('c'), Some("answer"));
+    f.write_cases(&lines);
+    let o = run(&f);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: case line 3: the id is missing or not 1 to 32 characters of a-z 0-9 and -\n");
+}
+
 #[test]
 fn bad_id_exit_two_named_by_line() {
     let f = fix();

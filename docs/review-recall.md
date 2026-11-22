@@ -103,16 +103,17 @@ The lines hold counts and the fixed words only — never an answer key and never
   - a duplicate `id`;
   - the tune set has no `fail` case, the test set has no `fail` case, or the test set has no
     control;
-  - the results dir is missing, not a folder, or holds a file that names no case;
+  - the results dir is missing, not a folder, cannot be read, or holds a file that names no case;
   - a result file for any case and stage is missing or unreadable;
-  - a result file is not a JSON object of string fields, or its `verdict` is not `pass` or `fail`;
+  - a result file is not UTF-8 text, is not a JSON object of string fields, or its `verdict` is not
+    `pass` or `fail`;
   - a `fail`-case result has no `matched` field, or a `matched` value that is not `yes` or `no`;
   - a control result carries a `matched` field.
 
 An error about one case names it (`harness: error: case <id>: <cause>`, or `case line <n>:` when
 the `id` itself is unreadable) and states the cause. Errors about the cases file, the results
-folder or a whole set name no case. No error line holds a field value, so no answer key and no
-head reaches stderr.
+folder or a whole set name no case. No error line holds a field value other than the case `id`, so
+no answer key and no head reaches stderr.
 
 ## Read only
 

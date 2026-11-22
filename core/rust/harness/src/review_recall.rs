@@ -5,7 +5,8 @@
 //! miss at stage fixround. A control is a false block when its report verdict is fail. Read only:
 //! nothing is written. The printed lines hold ids, counts and the fixed words only, never an answer
 //! key or a head. An error line about one case names it by id (by line number when the id is
-//! unreadable) and the cause; no error line holds a field value. Fail closed: exit 2 with one stderr
+//! unreadable) and the cause; no error line holds a field value other than the case id, so no answer
+//! key and no head reaches stderr. Fail closed: exit 2 with one stderr
 //! line and an empty stdout, and no case is skipped.
 
 use std::collections::{BTreeMap, HashSet};
@@ -16,8 +17,8 @@ pub const USAGE: &str = "usage: harness review recall <absolute-cases-file> --re
 /// The replay stages in order: a hit at a later stage needs every earlier stage too.
 const STAGES: [&str; 3] = ["report", "record", "fixround"];
 
-/// One case with its graded results. `through[i]` says the stages up to and including `i` all had
-/// verdict fail and (for a FAIL case) matched yes; for a control only `report_fail` is read.
+/// One case with its graded results. `through[i]` is set for FAIL cases only: the stages up to and
+/// including `i` all had verdict fail and matched yes. A control uses `report_fail` only.
 struct Case {
     id: String,
     fail: bool,
@@ -214,7 +215,7 @@ pub fn review_cmd(a: &[String]) -> i32 {
         let Some(f) = parse_object(line) else {
             return fail(&format!("case line {}: the line is not a JSON object of string fields", n + 1));
         };
-        // The id names the case in every later error line; while it is unreadable the line number does.
+        // The id names the case in each later error about this case; while it is unreadable the line number does.
         let Some(id) = f.get("id").filter(|v| id_ok(v)) else {
             return fail(&format!("case line {}: the id is missing or not 1 to 32 characters of a-z 0-9 and -", n + 1));
         };
