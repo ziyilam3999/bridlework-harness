@@ -508,7 +508,7 @@ fn session_record_start(rest: &[String]) -> i32 {
     }
 }
 
-const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] [--plan-index <absolute-file>] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> [--log <absolute-path>] | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>] | ticket merge-text <ticket-file> --pr <n> --body-file <absolute-file> --out-dir <absolute-dir> | ticket words-only --repo-dir <absolute-dir> --from <full-sha> --to <full-sha> | ticket review-fail <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --caps-dir <absolute-dir> --head <full-sha> | ticket fix-round-check <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --caps-dir <absolute-dir> --role <token> --model <token>";
+const TICKET_USAGE: &str = "usage: harness ticket intake <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] [--plan-index <absolute-file>] | ticket gate <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --base <full-sha> --result-dir <absolute-dir> --caps-dir <absolute-dir> [--log <absolute-path>] | ticket finalize <ticket-file> --manifest-dir <absolute-dir> --repo-dir <absolute-dir> --workspace-root <absolute-dir> --quarantine-dir <absolute-dir> --result-dir <absolute-dir> --caps-dir <absolute-dir> --log <absolute-path> --role <token> --model <token> [--grace-ms <n>] [--ts-ms <n>] | ticket merge-text <ticket-file> --pr <n> --body-file <absolute-file> --out-dir <absolute-dir> | ticket words-only --repo-dir <absolute-dir> --from <full-sha> --to <full-sha> | ticket body-cites --repo-dir <absolute-dir> --head <full-sha> --base <full-sha> --body-file <absolute-file> [--cite-ok \"<cite or token>\"]... | ticket review-fail <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --caps-dir <absolute-dir> --head <full-sha> | ticket fix-round-check <ticket-file> --repo-map <repo_id>=<absolute-dir> [--repo-map ...] --caps-dir <absolute-dir> --role <token> --model <token>";
 /// One byte over the 1 MiB ticket cap: an oversize file is read no further than this, then refused by the strict reader.
 const TICKET_READ_LIMIT: u64 = 1024 * 1024 + 1;
 
@@ -552,6 +552,12 @@ fn ticket_cmd(a: &[String]) -> i32 {
         return crate::merge_text::merge_text_cmd(&a[1..]);
         #[cfg(not(unix))]
         return fail("ticket merge-text is not available on this platform");
+    }
+    if a.first().map(|s| s.as_str()) == Some("body-cites") {
+        #[cfg(unix)]
+        return crate::body_cites::body_cites_cmd(&a[1..]);
+        #[cfg(not(unix))]
+        return fail("ticket body-cites is not available on this platform");
     }
     if a.first().map(|s| s.as_str()) == Some("words-only") {
         #[cfg(unix)]
