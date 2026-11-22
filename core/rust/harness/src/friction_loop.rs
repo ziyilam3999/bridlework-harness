@@ -233,7 +233,13 @@ pub(crate) fn load_list(what: &str) -> Result<crate::overlay::List, i32> {
 
 /// The inbox rows after the FULL lint (`friction lint`'s own refusal behaviour: nothing on stdout, same stderr).
 pub(crate) fn lint_rows(cfg: &Config, ctx: &crate::scan::Ctx) -> Result<Vec<Row>, i32> {
+    // The read takes the shared inbox lock and releases it when `read_inbox` returns, so a writer waits for the
+    // read and not for the verb's later work.
     let inbox = friction::read_inbox(Path::new(cfg.friction_inbox())).map_err(|e| fail(&e))?;
+    if inbox.recovery_copy {
+        eprintln!("harness: {}", friction::RECOVERY_MSG);
+        return Err(1);
+    }
     if let Some(n) = inbox.torn_tail {
         eprintln!("harness: inbox has a torn tail at line {n} (no trailing newline); not read as a row");
         return Err(1);
@@ -1292,11 +1298,21 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
     else {
         return fail("bind needs --state, --group, --task-id and --task-session");
     };
-    if let Some(c) = flag(&flags, "--config") {
-        if let Err(c) = load_cfg(Some(c)) {
-            return c;
+    // The config names the inbox. A `--config` that cannot be loaded exits 2. Without `--config` the config comes
+    // from HARNESS_CONFIG when that is set (a bad one exits 2); with neither, no inbox is named and no copy can sit beside it.
+    let named_cfg = if let Some(c) = flag(&flags, "--config") {
+        match load_cfg(Some(c)) {
+            Ok(cfg) => Some(cfg),
+            Err(c) => return c,
         }
-    }
+    } else if std::env::var_os("HARNESS_CONFIG").is_some() {
+        match load_cfg(None) {
+            Ok(cfg) => Some(cfg),
+            Err(c) => return c,
+        }
+    } else {
+        None
+    };
     let list = match load_list("an unscanned binding is never stored") {
         Ok(l) => l,
         Err(c) => return c,
@@ -1313,6 +1329,15 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
         if !hits.is_empty() {
             let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
             return refuse(&format!("field {name} has a privacy hit ({})", classes.join(", ")));
+        }
+    }
+    // A recovery copy beside the inbox: bind refuses here, for a group with a state row too, and writes nothing.
+    // The check needs a config: with neither --config nor HARNESS_CONFIG no inbox is named and no check runs.
+    // The fresh-row path reads the inbox through `lint_rows`, which refuses the same way.
+    if let Some(cfg) = &named_cfg {
+        if friction::recovery_copy_present(Path::new(cfg.friction_inbox())) {
+            eprintln!("harness: {}", friction::RECOVERY_MSG);
+            return 1;
         }
     }
     let state_path = Path::new(state);

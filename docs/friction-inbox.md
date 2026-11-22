@@ -10,7 +10,7 @@ operational text, so it is private data. This repo holds the contract, the reade
 
 Status: contract plus `harness friction add | lint | close-check` (ticket 154), the pattern half — `kind`,
 `repeats`, `friction patterns` and the trial record (ticket 192) — and the T-9.3 event-to-row mapper with
-`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, the read-only `suggest` verb (ask A32, unix only), and the two status keys `status` and `status_ref` with the read-only `open` verb (ticket friction-row-status-fields). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
+`source` (ticket 193), the four evidence keys and the triage loop `rank | triage | bind | page` (ticket 3601), the read-only `controls-check` verb, the read-only `suggest` verb (ask A32, unix only), the two status keys `status` and `status_ref` with the read-only `open` verb (ticket friction-row-status-fields), and `set-status`, the one verb that rewrites a line in place (ticket friction-status-write). The generated lessons index (`harness find`) is slice 2; see "Not in slice 1" below.
 
 ## 1. The row (the one contract everything else reads)
 
@@ -63,8 +63,8 @@ status word are each refused with a reason that names the field.
 ```
 
 `status_ref` goes through the privacy engine like `proof` (section 4). A `status_ref` that pushes the line
-over the 16 KiB cap is refused. No verb writes a status yet: it is set by hand or by a data change, and `friction add`
-stores a new row with no status (a new row is open). `rank` and `suggest` list rows of any status, on purpose: a
+over the 16 KiB cap is refused. `harness friction set-status` writes a status (section 2); `friction add` stores a
+new row with no status (a new row is open). `rank` and `suggest` list rows of any status, on purpose: a
 fixed row can still repeat, and the repeat belongs in its group. Only `friction open` filters by status.
 
 **Privacy behaviour of the evidence keys.** All four pass through the UNCHANGED privacy engine like every other field
@@ -142,10 +142,10 @@ harness friction add --id <id> --date <YYYY-MM-DD> --ticket <t> \
   --text <lesson> [--config <file>]
 ```
 
-Appends one row. Everything is checked before anything is written, in this order: the flags, the row rules
-(section 1), the cause tag of `why` (the next paragraph), every field of the new row through the same privacy
+Appends one row. The checks run before anything is written, in this order: the flags, the row rules
+(section 1), the cause tag of `why` (the next paragraph), the fields of the new row through the same privacy
 engine as the rest of the harness, then — under
-one exclusive writer lock (section 4) — the same privacy engine over every stored row and the inbox cross rules
+one exclusive writer lock (section 4) — the same privacy engine over the stored rows and the inbox cross rules
 (a duplicate `id`; a `breaks` naming no lesson or naming itself; the `repeats` pointer rules of section 1; the
 existing inbox must itself be clean, untorn and privacy-clean). Only then is one whole line (plus newline) appended and synced; the file is created when
 absent, its folder is not; a refused row never creates the file (a first row whose only possible refusal is a
@@ -194,7 +194,7 @@ every field of every row — a hand-written row holding private text is refused 
 privacy hit or a torn tail, each named with its line on stderr. With no privacy list configured lint fails
 closed (exit 2): an inbox is never linted clean unscanned. Hand-written rows from before this contract and the
 154b weekly script share this one checker. A missing inbox is a setup error (2): `lint` is how a real inbox is
-audited, so it must exist.
+audited, so it must exist. A recovery copy next to the missing inbox gives the recovery refusal (1) instead.
 
 ### `harness friction open`
 
@@ -213,6 +213,65 @@ rows open=<n> fixed=<n> guarded=<n> ticket=<n> lesson=<n> no-action=<n> total=<n
 
 The word `rows` marks the count line as per row. The `open=<n>` of `triage` counts groups. The open lines hold no
 `text`, `why`, `proof` or `status_ref`. The verb writes nothing.
+
+### `harness friction set-status`
+
+```
+harness friction set-status --id <row id> --set <fixed|guarded|ticket|lesson|no-action|open> [--ref <pointers>] [--config <file>]
+```
+
+Sets the `status` and `status_ref` of the one row with that id, in place, and changes nothing else. It is the
+verb that rewrites a line of the inbox. The lines it does not change are written back from their original bytes
+(a row that is valid but not canonical stays as it is). The changed line is the canonical encoding of the stored row
+with the new status. `--set open` removes both keys and refuses a `--ref`. Any other status needs a `--ref` that the
+status rules of section 1 accept. A row that already has a status gets both keys replaced. A set equal to the stored
+values writes nothing and exits 0. On success stdout is one line: `status set id=<id> status=<word>`.
+
+Exit 1 is a refusal. The inbox is byte-identical, stdout is empty and stderr is one line. It says the status was not
+set, except in the recovery copy refusal, whose line is the shared recovery line and names the copy instead. The line names at most a line number, a field, a privacy class and byte counts (the line cap refusal prints two numbers, the row size and the cap; the inbox cap refusal prints the cap). It holds no row, no `--id`, no `--ref` and no path.
+The refusals are: no row with that id (a missing inbox included, and the file is not created; a recovery copy next to a
+missing inbox gives the recovery refusal below instead); an `--id` that is not
+a plain token; a problem the full read finds (a torn tail, a bad or CRLF line, a duplicate id, a privacy hit in a
+stored row, the same read as `add`); a privacy hit in the new `--ref` (scanned first, under the scope
+`friction.set-status`); a status and pointer pair the status rules refuse; a new line over the 16 KiB line cap; a new
+inbox over the 4 MiB cap; a hard-linked inbox; a recovery copy next to the inbox (below). Exit 2 is a usage or
+setup error, or a failed write after the recovery copy exists (see the crash windows below): a missing or repeated flag, an unknown flag, an extra word, no config, no privacy list, an inbox that
+cannot be read or written, an inbox over the cap or not UTF-8, a lock busy past the wait, a folder that cannot take the
+recovery copy. A setup error leaves the inbox unchanged. It leaves no recovery copy, with one exception: when the
+removal of a partly made copy fails, the copy stays and the exit 2 line names it (below).
+
+**How the write goes.** The flag checks, the scan of the new `--ref` and the status rules run first, before the lock.
+Then one exclusive lock on the inbox file covers the read, the stored-row checks, the id lookup, the hard-link check,
+the line cap check, the inbox cap check and the write. Those checks have passed before the recovery copy is made. Then
+the verb creates `<inbox>.status-write` (exclusive create, with the inbox's permission bits) in the real file's
+folder, writes the whole old inbox to it and syncs the copy and the folder. If the copy cannot be made, or its
+permission bits cannot be set, no copy is left: a partly made copy is removed, and when that removal fails the exit 2
+line names the path of the copy. Then the verb truncates the locked file, writes the new content and syncs. Then it
+removes the copy and syncs the folder. If the removal succeeds and only the folder sync fails, the exit 2 line says the
+status was written and the copy was removed. The file keeps its inode: no temp file is renamed onto the path, so a
+symlink to the inbox sees the new content. A hard link would keep the old bytes under the other name, so a
+hard-linked inbox is refused. The recovery path is the canonical inbox path plus `.status-write`, so a symlinked file
+or folder spelling of the inbox path finds the same copy.
+
+**Crash windows.** A failure after the copy exists leaves the copy in place and exits 2, except the folder sync failure
+after the copy was removed (above). A kill has the same effect as a failure. The verbs that read the inbox check for the
+copy after they hold their lock, and refuse while it exists (exit 1; exit 2 for `close-check`), with one fixed stderr
+line that names the recovery copy and no path. When the inbox file is missing, there is no lock to take, and the
+copy is still reported the same way: `lint`, `open`, `patterns`, `close-check`, `add`, `sweep`, `set-status` and the
+verbs that read through the same reader give the recovery line, and none of them creates the inbox. A `sweep` week that
+maps no row reads no inbox and does not check for the copy. The windows are:
+
+| window | state on disk | how it shows |
+|---|---|---|
+| while the copy is written | inbox whole, copy partial | the copy exists |
+| after the truncate | inbox empty, copy whole | the copy exists |
+| a partial write that ends on a newline | inbox missing rows, copy whole | the copy exists |
+| a partial write that ends mid-line | inbox with a torn tail, copy whole | the copy exists |
+
+To recover by hand, compare the two by row id. Keep the inbox only when it lints clean and holds every row id of the
+copy. Otherwise put the copy back as the inbox. Then move the leftover file aside with `mv`. Length alone is not a
+test: a partial write can lint clean, and a grown `status_ref` line can outweigh a missing tail. The syncs use `File::sync_all`, which is `fsync` and, on macOS, `F_FULLFSYNC`. This is a recovery aid, not a
+claim that the write is all or nothing.
 
 ### `harness friction patterns`
 
@@ -544,24 +603,38 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 ## 4. Privacy, caps, torn tails
 
 - Every field of a new row is scanned by the existing privacy engine (`harness privacy`'s classes); a hit refuses
-  the row naming the field and the class, never the bytes. These verbs scan the stored rows: `add`, `lint`,
+  the row naming the field and the class, never the bytes. These verbs scan the stored rows: `add`, `set-status`, `lint`,
   `open`, `patterns`, `close-check`, `rank`, `controls-check`, `triage`, `page`, `suggest`, `sweep` (when the
   week maps at least one row), `bind` (for a group with no state row) and `lesson replay` (with its answer key). `close-check` scans its `lesson:` lines too.
-  The scan covers `status` and `status_ref` as it covers `proof`.
-- One writer at a time: `add` takes ONE exclusive kernel advisory lock (`flock(2)`, the std file lock) on the inbox
-  file itself, and does the read, scan, cross check and append through that same open descriptor, so two
-  concurrent adds can never both store the same id (the check and the append are one critical section) — however
-  many writers arrive at once and however the inbox path is spelled. The lock lives on the inbox's inode, so every
-  spelling of the path shares it: a symlinked folder, a symlinked file, a `./` or doubled-slash detour, a hard
-  link, and a not-yet-created file behind a symlink (the first append creates the target and locks it). There is
-  no side lock file, no path built for locking and nothing canonicalized. The kernel releases the lock the moment
-  the holder exits — return, panic, or a kill -9 — so a crashed writer can never leave the inbox locked: there is
-  NO steal rule and no stale-lock age at all. A file or folder named `<inbox>.lock` is not a lock and is simply
-  ignored (never read, locked, renamed or deleted: the friction verbs delete nothing they did not create). A
+  The scan covers `status` and `status_ref` as it covers `proof`. `set-status` also scans its new `--ref`.
+- One writer at a time: `add`, `sweep` and `set-status` take ONE exclusive kernel advisory lock (`flock(2)`, the std
+  file lock) on the inbox file itself, and do the read, scan, cross check and write through that same open
+  descriptor, so two concurrent adds do not both store the same id (the check and the write are one critical
+  section). The readers that go through `read_inbox` take the SHARED lock on the file they
+  read, for the length of the read, and release it when the read returns (`suggest` holds no lock across its Jev
+  call). `read_inbox_locked` takes no lock of its own: it reads on a descriptor its caller has already locked
+  (shared inside `read_inbox`, exclusive in `add`, `sweep` and `set-status`). A reader waits for a writer, and a writer waits for the readers. Readers do not wait
+  for each other. The lock lives on the inbox's inode, so the spellings named here share it: a symlinked
+  folder, a symlinked file, a `./` or doubled-slash detour, a hard
+  link, and a not-yet-created file behind a symlink (the first append creates the target and locks it). `set-status`
+  refuses a hard-linked inbox, because it rewrites the file in place. There is
+  no side lock file and no path built for locking. The recovery copy path (above) is built from the
+  canonical inbox path. The kernel releases the lock the moment
+  the holder exits — return, panic, or a kill -9 — so a crashed writer does not leave the inbox locked: there is
+  no steal rule and no stale-lock age. A file or folder named `<inbox>.lock` is not a lock and is simply
+  ignored (not read, locked, renamed or deleted: the friction verbs delete nothing they did not create). A
   lock held longer than 10 seconds by a live writer fails the verb closed (exit 2, `the inbox is busy`, no
-  path). The lock call (`File::try_lock`) needs Rust 1.89 or newer; the workspace pins 1.99.1. `lint` and
-  `close-check` only read and take no lock; the lock is advisory, so it protects against other harness writers,
-  not against an editor that ignores it. A refused row never creates the inbox file.
+  path); a reader waits the same 10 seconds and then exits 2, with `the inbox is busy (it is locked)` because the
+  holder may be a reader or a writer. The lock calls (`File::try_lock` and
+  `File::try_lock_shared`) need Rust 1.89 or newer; the workspace pins 1.99.1. The lock is advisory, so it protects
+  against other harness verbs, not against an editor that ignores it. The engine's `close-check` reads under the shared
+  lock. The private `bw` script reads the inbox without the lock through one function, `fr_rows`, which three steps use.
+  `fr_rows` lists the rows for the id
+  lookup: a row it misses gives a refusal at that step, and a duplicate next id is refused by `add`. `expected_close_line`
+  runs `lint` and then reads the rows with no lock held across the two steps. The hint can be wrong in two
+  windows of a `set-status` write: the emptied inbox (it prints `lesson: none`) and a read that ends on a newline
+  with rows missing (it prints a short id list). The refusal itself comes from the
+  engine's `close-check`. A refused row does not create the inbox file.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
   than 4 MiB; a close note no further than 1 MiB; the event log a `sweep` reads no further than 4 MiB (each
   event line is separately capped at 4 KiB by the event reader's own rules). Over the bound the verb refuses
@@ -571,6 +644,18 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   itself cannot loop or grow past its bound (one pass over the already-capped inbox, one line per root).
 - Each row is written as one whole line plus newline. A last line with no newline is a torn tail (a crashed
   append): reported by `lint` with its line number, never read as a row; `add` refuses to append onto it.
+- A recovery copy next to the inbox (`<inbox>.status-write`, left by a `set-status` write that did not finish) is the
+  other crash sign. The verbs that read the inbox check for it after they hold their lock (a missing inbox has no
+  lock; the check runs there without one), and refuse (1; `close-check` 2) with one line that names the copy and no
+  path, until the copy is moved aside by hand (see `set-status`). `bind` makes the check also for a group that has
+  a state row (it reads no inbox there, but it refuses without writing). The check needs a config: `bind` uses
+  `--config` or `HARNESS_CONFIG`, and with neither no inbox is named and no check runs.
+  `lesson replay` makes it when it builds its answer key (`--config`); without `--config` it reads no inbox.
+  An inbox behind a dangling symlink is checked beside the file the link points to, so `add` and `sweep` find a
+  copy there and create nothing. An inbox path whose recovery path cannot be built (a link loop, a folder that cannot
+  be read) is a setup error for `add`, `lint` and `set-status` (exit 2, nothing on stdout, the inbox cannot be read or
+  written), and `close-check` gives the recovery line there (exit 2), since a copy next to the real file cannot be
+  ruled out. A missing folder is not that case: no copy can sit in it.
 
 ### `friction suggest` (ask A32)
 

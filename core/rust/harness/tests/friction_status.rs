@@ -4,17 +4,18 @@
 //! pointer and deny word is synthetic.
 #![cfg(unix)]
 mod friction_common;
-use friction_common::*;
+// Public so the set-status tests (`friction_status_write.rs`) reuse the helpers and the neighbour fixture of this file.
+pub(crate) use friction_common::*;
 use harness::friction::{encode_row, encode_row_status, parse_row, parse_row_status};
 use std::fs;
 use std::process::Output;
 
 // ---- pointers, one good one per status
-const FIXED: &str = "pr:owner/repo#101";
-const GUARDED: &str = "bridlework-harness@abcdef1:wiki/friction/friction-controls.txt:12";
-const TICKET: &str = "~/.bridlework/tickets/friction-row-status-fields.json";
-const LESSON: &str = "bridlework-harness@abcdef1:.sources/bridlework/lessons/ISSUE-001-x.md";
-const NOACT: &str = "cmd:one-off, the cause is gone";
+pub const FIXED: &str = "pr:owner/repo#101";
+pub const GUARDED: &str = "bridlework-harness@abcdef1:wiki/friction/friction-controls.txt:12";
+pub const TICKET: &str = "~/.bridlework/tickets/friction-row-status-fields.json";
+pub const LESSON: &str = "bridlework-harness@abcdef1:.sources/bridlework/lessons/ISSUE-001-x.md";
+pub const NOACT: &str = "cmd:one-off, the cause is gone";
 
 fn st_row(id: &str, status: &str, status_ref: &str) -> String {
     row(id, "2026-11-02", "", "a lesson", &[("status", status), ("status_ref", status_ref)])
@@ -365,11 +366,16 @@ fn the_usage_text_lists_the_open_verb() {
     let o = run(&["friction"]);
     assert_eq!(code(&o), 2);
     assert!(err(&o).contains("friction open [--config <file>]"), "{}", err(&o));
+    assert!(
+        err(&o).contains("friction set-status --id <row id> --set <fixed|guarded|ticket|lesson|no-action|open> [--ref <pointers>] [--config <file>]"),
+        "{}",
+        err(&o)
+    );
 }
 
 // ---------------------------------------------------------------- the neighbours do not move
 
-fn plain_or_statused(with: bool) -> Vec<String> {
+pub fn plain_or_statused(with: bool) -> Vec<String> {
     let s = |status: &'static str, ptr: &'static str| -> Vec<(&'static str, &'static str)> {
         if with {
             vec![("status", status), ("status_ref", ptr)]
@@ -399,6 +405,11 @@ fn plain_or_statused(with: bool) -> Vec<String> {
 fn neighbours(with: bool) -> Vec<(String, String, String, String)> {
     let t = Tmp::new();
     t.write_inbox(&plain_or_statused(with));
+    neighbours_in(&t)
+}
+
+/// The same run over a scratch folder whose inbox is already written (the set-status tests change one status first).
+pub fn neighbours_in(t: &Tmp) -> Vec<(String, String, String, String)> {
     let cfg = t.config();
     let note = t.file("note.md", "lesson: g-1, g-1b, g-2, g-3, g-3b, g-4\n");
     let controls = t.file("controls.txt", "g-1 | control: a guard pointer | lesson: ISSUE-001\ng-3 | control: a guard pointer | lesson: ISSUE-001\n");
