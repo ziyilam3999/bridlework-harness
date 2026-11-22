@@ -375,18 +375,39 @@ fn body_that_is_a_directory_or_missing_is_exit_2() {
     let m = c.t.0.join("missing.md");
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", m.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: drop the missing check -> the run refuses with another text and this turns red.
+    assert_eq!(o.stderr.trim_end(), "harness: error: the body file is missing");
 }
 
 #[test]
 fn body_over_1048576_bytes_is_exit_2() {
+    // Mutant: drop the size check -> the run refuses with another text (or not at all) and this turns red.
     let c = case();
-    refused(&run_full(&c, &vec![b'a'; 1_048_577], &[], &[]));
+    let o = run_full(&c, &vec![b'a'; 1_048_577], &[], &[]);
+    refused(&o);
+    assert_eq!(o.stderr.trim_end(), "harness: error: the body file is over 1048576 bytes");
 }
 
 #[test]
 fn body_not_utf8_is_exit_2() {
+    // Mutant: read the body lossily -> the run succeeds and this turns red.
     let c = case();
-    refused(&run_full(&c, b"abc \xff\xfe\n", &[], &[]));
+    let o = run_full(&c, b"abc \xff\xfe\n", &[], &[]);
+    refused(&o);
+    assert_eq!(o.stderr.trim_end(), "harness: error: the body file is not UTF-8");
+}
+
+#[test]
+fn body_path_with_a_dotdot_part_is_exit_2() {
+    // Mutant: accept a .. part in --body-file -> the run reads the file and this turns red.
+    let c = case();
+    let f = c.t.0.join("b.md");
+    fs::write(&f, "x\n").unwrap();
+    let dd = format!("{}/adir/../b.md", c.t.0.display());
+    fs::create_dir_all(c.t.0.join("adir")).unwrap();
+    let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", &dd], &[]);
+    refused(&o);
+    assert_eq!(o.stderr.trim_end(), USAGE);
 }
 
 #[test]
@@ -462,6 +483,8 @@ fn short_head_is_exit_2() {
     fs::write(&f, "x\n").unwrap();
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head[..12], "--base", &c.base, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: accept a short --head -> the run refuses on the commit check with another text and this turns red.
+    assert_eq!(o.stderr.trim_end(), USAGE);
 }
 
 #[test]
@@ -472,6 +495,7 @@ fn head_that_is_not_a_commit_is_exit_2() {
     let zero = "0".repeat(40);
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &zero, "--base", &c.base, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
+    assert_eq!(o.stderr.trim_end(), "harness: error: --head is not a commit of the repo");
 }
 
 #[test]
@@ -482,6 +506,8 @@ fn base_that_is_not_a_commit_is_exit_2() {
     let tree = g(&c.dir, &["rev-parse", "HEAD^{tree}"]);
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &tree, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
+    // Mutant: accept any object type as --base -> the run succeeds and this turns red.
+    assert_eq!(o.stderr.trim_end(), "harness: error: --base is not a commit of the repo");
 }
 
 #[test]
@@ -494,4 +520,57 @@ fn unknown_flag_and_missing_flag_are_exit_2() {
     assert_eq!(o.stderr.trim_end(), USAGE);
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
+    assert_eq!(o.stderr.trim_end(), USAGE);
+    // A --cite-ok with no value is also the usage line.
+    let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head, "--base", &c.base, "--body-file", f.to_str().unwrap(), "--cite-ok"], &[]);
+    refused(&o);
+    assert_eq!(o.stderr.trim_end(), USAGE);
+}
+
+#[test]
+fn a_range_ending_on_a_tab_only_line_is_blank_line() {
+    // Mutant: drop b'\t' from the blank rule -> this turns red.
+    let t = Tmp::new();
+    let dir = init(&t, "repo");
+    let base = commit_all(&dir, &[("w.txt", "fn alpha\n\t\nfn beta\n")]);
+    let head = commit_all(&dir, &[("x.txt", "x\n")]);
+    let x = cite(&base, "w.txt", "1-2", "fn alpha");
+    let f = t.0.join("b.md");
+    fs::write(&f, format!("{x}\n")).unwrap();
+    let o = run_args(&["--repo-dir", dir.to_str().unwrap(), "--head", &head, "--base", &base, "--body-file", f.to_str().unwrap()], &[]);
+    assert_eq!(o.code, 1);
+    assert_eq!(lines(&o), vec![format!("FLAG blank-line {x}"), "cites=1 ok=0 flag=1 unparsed=0".to_string()]);
+}
+
+#[test]
+fn a_range_ending_on_a_cr_only_line_is_blank_line() {
+    // Mutant: drop b'\r' from the blank rule -> this turns red.
+    let t = Tmp::new();
+    let dir = init(&t, "repo");
+    let base = commit_all(&dir, &[("w.txt", "fn alpha\n\r\nfn beta\n")]);
+    let head = commit_all(&dir, &[("x.txt", "x\n")]);
+    let x = cite(&base, "w.txt", "1-2", "fn alpha");
+    let f = t.0.join("b.md");
+    fs::write(&f, format!("{x}\n")).unwrap();
+    let o = run_args(&["--repo-dir", dir.to_str().unwrap(), "--head", &head, "--base", &base, "--body-file", f.to_str().unwrap()], &[]);
+    assert_eq!(o.code, 1);
+    assert_eq!(lines(&o), vec![format!("FLAG blank-line {x}"), "cites=1 ok=0 flag=1 unparsed=0".to_string()]);
+}
+
+#[test]
+fn a_submodule_at_the_cite_path_is_not_a_file() {
+    // Mutant: read a gitlink entry as a file -> this turns red.
+    let t = Tmp::new();
+    let dir = init(&t, "repo");
+    let first = commit_all(&dir, &[("a.txt", "fn alpha\n")]);
+    g(&dir, &["update-index", "--add", "--cacheinfo", &format!("160000,{first},sub")]);
+    g(&dir, &["commit", "-q", "-m", "m"]);
+    let head = g(&dir, &["rev-parse", "HEAD"]);
+    assert!(g(&dir, &["ls-tree", &head, "sub"]).starts_with("160000 commit"));
+    let x = cite(&head, "sub", "1", "fn alpha");
+    let f = t.0.join("b.md");
+    fs::write(&f, format!("{x}\n")).unwrap();
+    let o = run_args(&["--repo-dir", dir.to_str().unwrap(), "--head", &head, "--base", &first, "--body-file", f.to_str().unwrap()], &[]);
+    assert_eq!(o.code, 1);
+    assert_eq!(lines(&o), vec![format!("FLAG not-a-file {x}"), "cites=1 ok=0 flag=1 unparsed=0".to_string()]);
 }

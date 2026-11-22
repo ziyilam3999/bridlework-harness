@@ -80,8 +80,8 @@ counted in `flag`).
 - 2: one stderr line and nothing on stdout: a missing, repeated or unknown flag; `--repo-dir` not absolute, holding
   a `..` part, or not a git work tree; `--head` or `--base` not 40 lowercase hex or not a commit there; the body
   file missing, a link, not a regular file, over 1048576 bytes or not UTF-8. Also exit 2: `--body-file` not
-  absolute (the usage line); the repo dir missing or not a folder; git cannot run; a git call failed; the body
-  file cannot be read.
+  absolute or holding a `..` part (the usage line); a `--cite-ok` with no value (the usage line); the repo dir
+  missing or not a folder; git cannot run; a git call failed; the body file cannot be read.
 
 ## Worked example
 
