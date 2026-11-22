@@ -228,7 +228,7 @@ status rules of section 1 accept. A row that already has a status gets both keys
 values writes nothing and exits 0. On success stdout is one line: `status set id=<id> status=<word>`.
 
 Exit 1 is a refusal. The inbox is byte-identical, stdout is empty and stderr is one line. It says the status was not
-set, except in the recovery copy refusal, whose line is the shared recovery line and names the copy instead. The line names at most a line number, a field and a privacy class. It holds no row, no `--id`, no `--ref` and no path.
+set, except in the recovery copy refusal, whose line is the shared recovery line and names the copy instead. The line names at most a line number, a field, a privacy class and a byte count (the line cap and inbox cap refusals print one). It holds no row, no `--id`, no `--ref` and no path.
 The refusals are: no row with that id (a missing inbox included, and the file is not created; a recovery copy next to a
 missing inbox gives the recovery refusal below instead); an `--id` that is not
 a plain token; a problem the full read finds (a torn tail, a bad or CRLF line, a duplicate id, a privacy hit in a
@@ -647,7 +647,13 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 - A recovery copy next to the inbox (`<inbox>.status-write`, left by a `set-status` write that did not finish) is the
   other crash sign. The verbs that read the inbox check for it after they hold their lock (a missing inbox has no
   lock; the check runs there without one), and refuse (1; `close-check` 2) with one line that names the copy and no
-  path, until the copy is moved aside by hand (see `set-status`).
+  path, until the copy is moved aside by hand (see `set-status`). `bind` makes the check on every path, also for a
+  group that has a state row (it reads no inbox there, but it names the config and refuses without writing).
+  `lesson replay` makes it when it builds its answer key (`--config`); without `--config` it reads no inbox.
+  An inbox behind a dangling symlink is checked beside the file the link points to, so `add` and `sweep` find a
+  copy there and create nothing. An inbox path whose recovery path cannot be built (a link loop, a folder that cannot
+  be read) gets the same refusal, since a copy next to the real file cannot be ruled out. A missing folder does not:
+  no copy can sit in it.
 
 ### `friction suggest` (ask A32)
 

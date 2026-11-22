@@ -626,7 +626,7 @@ pub struct Inbox {
 }
 
 /// The fixed stderr line of a verb that meets a recovery copy (no path, no row).
-pub(crate) const RECOVERY_MSG: &str = "the inbox has a status-write recovery copy next to it (a set-status write did not finish); compare the two files by hand and move the copy aside";
+pub(crate) const RECOVERY_MSG: &str = "the inbox has a status-write recovery copy next to it, or the place for one cannot be checked (a set-status write may not have finished); compare the two files by hand and move the copy aside";
 
 /// True when the inbox path names no file and a recovery copy sits beside it. `add` and `sweep` open the inbox
 /// with create, so they check this first and refuse without creating the file.
@@ -637,10 +637,49 @@ fn missing_inbox_with_recovery_copy(inbox: &Path) -> bool {
 /// The recovery copy path: the canonical inbox path plus `.status-write`, so a symlinked-file or symlinked-folder
 /// spelling of the inbox path names the same copy, in the real file's folder. A missing inbox resolves through its folder.
 fn recovery_path(inbox: &Path) -> Option<std::path::PathBuf> {
-    let real = match fs::canonicalize(inbox) {
-        Ok(p) => p,
-        Err(_) => resolved_form(inbox)?,
-    };
+    recovery_path_checked(inbox).ok().flatten()
+}
+
+/// Links followed by hand when the inbox path is a link to a file that does not exist yet.
+const LINK_HOPS: usize = 40;
+
+/// The recovery copy path with three answers. `Ok(Some(p))`: the path. `Ok(None)`: the folder of the inbox does not
+/// exist, so no copy can sit there. `Err(())`: the path cannot be built (a link loop, a folder that cannot be
+/// read), so the place for a copy cannot be checked.
+///
+/// A found inbox resolves with `canonicalize`. A link to a file that does not exist yet (a dangling link) is
+/// followed by hand to its end, so the copy is looked for beside the file the first append would create.
+fn recovery_path_checked(inbox: &Path) -> Result<Option<std::path::PathBuf>, ()> {
+    let mut path = inbox.to_path_buf();
+    if path.is_relative() {
+        path = std::env::current_dir().map_err(|_| ())?.join(path);
+    }
+    for _ in 0..LINK_HOPS {
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                // A link that resolves to a found file is `canonicalize`d below; a dangling one is followed one hop.
+                if let Ok(real) = fs::canonicalize(&path) {
+                    return Ok(with_copy_name(&real));
+                }
+                let to = fs::read_link(&path).map_err(|_| ())?;
+                path = if to.is_absolute() { to } else { path.parent().ok_or(())?.join(to) };
+            }
+            Ok(_) => return Ok(with_copy_name(&fs::canonicalize(&path).map_err(|_| ())?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let name = path.file_name().ok_or(())?.to_os_string();
+                return match fs::canonicalize(path.parent().ok_or(())?) {
+                    Ok(dir) => Ok(with_copy_name(&dir.join(name))),
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
+                    Err(_) => Err(()),
+                };
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Err(())
+}
+
+fn with_copy_name(real: &Path) -> Option<std::path::PathBuf> {
     let mut name = real.file_name()?.to_os_string();
     name.push(".status-write");
     Some(real.with_file_name(name))
@@ -648,10 +687,15 @@ fn recovery_path(inbox: &Path) -> Option<std::path::PathBuf> {
 
 /// True when a recovery copy (a regular file) sits at the recovery path. A symlink or a folder there is not a
 /// copy this module made; `set-status` meets it at its exclusive create and refuses.
-fn recovery_copy_present(inbox: &Path) -> bool {
-    match recovery_path(inbox) {
-        Some(p) => fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()),
-        None => false,
+///
+/// A path that cannot be built (a link loop, a folder that cannot be read) counts as a copy: the place for a copy
+/// cannot be checked, so the verb refuses with the same line and the damaged-inbox code. A missing folder does
+/// not: no copy can sit there.
+pub(crate) fn recovery_copy_present(inbox: &Path) -> bool {
+    match recovery_path_checked(inbox) {
+        Ok(Some(p)) => fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()),
+        Ok(None) => false,
+        Err(()) => true,
     }
 }
 

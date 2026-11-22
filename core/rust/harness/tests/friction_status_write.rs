@@ -760,6 +760,116 @@ fn the_recovery_copy_is_found_through_every_spelling_of_the_inbox_path() {
     }
 }
 
+/// Bind for a group that already has a state row reads no inbox, but it still refuses while a recovery copy sits
+/// beside the inbox, and writes nothing. The state row comes from a real triage run.
+#[test]
+fn bind_for_a_group_with_a_state_row_refuses_while_a_recovery_copy_exists() {
+    let v = Verbs::new();
+    let calls = v.calls();
+    let call = |name: &str| -> Vec<String> { calls.iter().find(|c| c.0 == name).unwrap().1.clone() };
+    let triage = call("triage");
+    let a: Vec<&str> = triage.iter().map(|s| s.as_str()).collect();
+    let o = run(&a);
+    assert_eq!(code(&o), 0, "triage: {}", err(&o));
+    let state = v.t.0.join("state.jsonl");
+    let state_before = fs::read(&state).unwrap();
+    assert!(String::from_utf8_lossy(&state_before).contains("\"g-1\""), "triage proposed no g-1 row: {}", String::from_utf8_lossy(&state_before));
+    let bind = call("bind");
+    let b: Vec<&str> = bind.iter().map(|s| s.as_str()).collect();
+    fs::write(copy_path(&v.t), b"a partial copy").unwrap();
+    let o = run(&b);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+    assert!(out(&o).is_empty(), "{}", out(&o));
+    assert_eq!(err(&o).lines().count(), 1, "{}", err(&o));
+    assert!(err(&o).contains("status-write recovery copy"), "{}", err(&o));
+    assert_eq!(fs::read(&state).unwrap(), state_before, "bind wrote the state file");
+    // the same call binds once the copy is moved aside: the fixture is a real state-row case
+    fs::remove_file(copy_path(&v.t)).unwrap();
+    let o = run(&b);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert!(fs::read(&state).unwrap().len() > state_before.len(), "bind wrote no row without the copy");
+}
+
+/// An inbox spelled through a dangling symlink: the copy is looked for beside the file the link points to, so a
+/// copy there refuses `add` and `sweep` before they create the target (the other verbs find a missing inbox).
+#[test]
+fn an_inbox_behind_a_dangling_symlink_finds_the_copy_beside_the_target_and_creates_no_target() {
+    let t = fixture();
+    let real = t.0.join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("inbox.jsonl.status-write"), b"a partial copy").unwrap();
+    let link = t.0.join("dangling.jsonl");
+    std::os::unix::fs::symlink(real.join("inbox.jsonl"), &link).unwrap();
+    refuse_everywhere(&t, &link, Some(&real.join("inbox.jsonl")));
+    // a relative link, and a chain of two links, reach the same copy
+    let rel = t.0.join("rel.jsonl");
+    std::os::unix::fs::symlink("real/inbox.jsonl", &rel).unwrap();
+    refuse_everywhere(&t, &rel, Some(&real.join("inbox.jsonl")));
+    let chain = t.0.join("chain.jsonl");
+    std::os::unix::fs::symlink(&rel, &chain).unwrap();
+    refuse_everywhere(&t, &chain, Some(&real.join("inbox.jsonl")));
+}
+
+/// An inbox path whose recovery path cannot be built (a link loop) counts as a copy, not as "no copy": close-check,
+/// which treats a path that does not exist as a fresh install, refuses with the recovery line instead. The verbs
+/// that open the inbox stop on the loop with a setup error and create nothing.
+#[test]
+fn an_inbox_path_whose_recovery_path_cannot_be_built_refuses() {
+    let t = fixture();
+    let a = t.0.join("loop-a.jsonl");
+    let b = t.0.join("loop-b.jsonl");
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    let cfg = config_spelled(&t, "loop-config.yaml", &a);
+    let note = p(&t.file("note.md", "lesson: none\n")).to_string();
+    let o = run(&["friction", "close-check", &note, "--ticket", "t-1", "--config", p(&cfg)]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(out(&o).is_empty() && err(&o).lines().count() == 1, "{}", err(&o));
+    assert!(err(&o).contains("status-write recovery copy") && !err(&o).contains(p(&t.0)), "{}", err(&o));
+    for args in [
+        vec!["friction", "add", "--id", "new-1", "--date", "2026-11-05", "--ticket", "t-1", "--where-it-lives", "memory", "--why", "cause: system", "--text", "x", "--config", p(&cfg)],
+        vec!["friction", "lint", "--config", p(&cfg)],
+        vec!["friction", "set-status", "--id", "a-1", "--set", "open", "--config", p(&cfg)],
+    ] {
+        let o = run(&args);
+        assert_ne!(code(&o), 0, "{}: {}", args[1], out(&o));
+        assert!(out(&o).is_empty(), "{}: {}", args[1], out(&o));
+    }
+    assert!(fs::symlink_metadata(&a).unwrap().file_type().is_symlink() && fs::metadata(&a).is_err());
+}
+
+/// Run the five verbs that meet a missing or odd inbox path against `link` as the inbox: each refuses with the
+/// recovery line (its damaged-inbox code), and no file named `target` is created.
+fn refuse_everywhere(t: &Tmp, link: &Path, target: Option<&Path>) {
+    let cfg = config_spelled(t, "spelled-config.yaml", link);
+    let note = p(&t.file("note.md", "lesson: none\n")).to_string();
+    let log = p(&t.file("events.jsonl", "{\"v\":2,\"kind\":\"replan_required\",\"ts_ms\":1794182400000,\"run_id\":\"run-1\",\"ticket\":\"193\",\"repo\":\"example-repo\",\"reason\":\"replan-threshold\",\"role\":\"executor\",\"model\":\"worker\"}\n")).to_string();
+    let c = p(&cfg).to_string();
+    let verbs: Vec<(&str, Vec<String>, i32)> = vec![
+        ("add", strings(&["friction", "add", "--id", "new-1", "--date", "2026-11-05", "--ticket", "t-1", "--where-it-lives", "memory", "--why", "cause: system", "--text", "x", "--config", &c]), 1),
+        ("sweep", strings(&["friction", "sweep", "--log", &log, "--week", "2026-w46", "--config", &c]), 1),
+        ("set-status", strings(&["friction", "set-status", "--id", "a-1", "--set", "open", "--config", &c]), 1),
+        ("lint", strings(&["friction", "lint", "--config", &c]), 1),
+        ("close-check", strings(&["friction", "close-check", &note, "--ticket", "t-1", "--config", &c]), 2),
+    ];
+    for (name, args, want) in &verbs {
+        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let o = run(&a);
+        assert_eq!(code(&o), *want, "{name}: {}", err(&o));
+        assert!(out(&o).is_empty(), "{name}: stdout {}", out(&o));
+        let e = err(&o);
+        assert_eq!(e.lines().count(), 1, "{name}: {e}");
+        assert!(e.contains("status-write recovery copy"), "{name}: {e}");
+        assert!(!e.contains(p(&t.0)), "{name}: a path leaked: {e}");
+        if let Some(target) = target {
+            assert!(!target.exists(), "{name}: the dangling target was created");
+            let copy = PathBuf::from(format!("{}.status-write", p(target)));
+            assert_eq!(fs::read(copy).unwrap(), b"a partial copy", "{name}: the copy changed");
+        }
+        assert!(fs::metadata(link).is_err(), "{name}: the link now names a file");
+    }
+}
+
 #[test]
 fn a_crash_while_a_reader_waits_is_seen_by_the_reader() {
     let t = fixture();

@@ -1298,11 +1298,21 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
     else {
         return fail("bind needs --state, --group, --task-id and --task-session");
     };
-    if let Some(c) = flag(&flags, "--config") {
-        if let Err(c) = load_cfg(Some(c)) {
-            return c;
+    // The config names the inbox. A `--config` that cannot be loaded exits 2. Without `--config` the config comes
+    // from HARNESS_CONFIG when that is set (a bad one exits 2); with neither, no inbox is named and no copy can sit beside it.
+    let named_cfg = if let Some(c) = flag(&flags, "--config") {
+        match load_cfg(Some(c)) {
+            Ok(cfg) => Some(cfg),
+            Err(c) => return c,
         }
-    }
+    } else if std::env::var_os("HARNESS_CONFIG").is_some() {
+        match load_cfg(None) {
+            Ok(cfg) => Some(cfg),
+            Err(c) => return c,
+        }
+    } else {
+        None
+    };
     let list = match load_list("an unscanned binding is never stored") {
         Ok(l) => l,
         Err(c) => return c,
@@ -1319,6 +1329,14 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
         if !hits.is_empty() {
             let classes: Vec<&str> = hits.iter().map(|h| h.class).collect();
             return refuse(&format!("field {name} has a privacy hit ({})", classes.join(", ")));
+        }
+    }
+    // A recovery copy beside the inbox: bind refuses on every path (a group with a state row too), and writes
+    // nothing. The fresh-row path reads the inbox through `lint_rows`, which refuses the same way.
+    if let Some(cfg) = &named_cfg {
+        if friction::recovery_copy_present(Path::new(cfg.friction_inbox())) {
+            eprintln!("harness: {}", friction::RECOVERY_MSG);
+            return 1;
         }
     }
     let state_path = Path::new(state);
