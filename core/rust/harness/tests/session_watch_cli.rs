@@ -23,20 +23,11 @@ struct R {
     err: String,
 }
 
-/// Runs the verb child. A stub script written a moment ago can meet a busy-file error at exec when another test forks; that run (exit 3
-/// with the listing timeout message) is repeated, up to 8 tries, 100 ms apart.
+/// Runs the verb child once. `Fx::stub` warms each script it writes (one untimed run), so the run under the verb does not pay the
+/// macOS first-exec wait of a freshly written script.
 fn go_run(c: &mut Command) -> R {
-    let mut tries = 0;
-    loop {
-        let o = c.output().unwrap();
-        let r = R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() };
-        tries += 1;
-        if r.code == 3 && r.err.contains("could not be run or timed out") && tries < 8 {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        return r;
-    }
+    let o = c.output().unwrap();
+    R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() }
 }
 
 fn now_s() -> u64 {
@@ -176,12 +167,21 @@ impl Fx {
         fs::write(self.root.join("records.jsonl"), body).unwrap();
     }
 
+    /// Writes the host stub, then warms it: one untimed run with the `warm` argument, which the script guard answers before the calls
+    /// append, so it leaves no trace a test reads. On macOS the first exec of a freshly written script waits on the system security
+    /// check of the new file (seconds under load, f-20261122-10) and can pass the verb's 10 s listing timeout; the warm run pays that
+    /// wait, so the run under the verb is fast.
     fn stub(&self, body: &str) {
         let p = self.root.join("host.sh");
         let calls = self.root.join("calls");
-        let text = format!("#!/bin/sh\nif [ \"$1\" != agents ]; then echo \"$1\" >> '{}'; exit 1; fi\n{body}\n", calls.display());
+        let text = format!(
+            "#!/bin/sh\nif [ \"$1\" = warm ]; then exit 0; fi\nif [ \"$1\" != agents ]; then echo \"$1\" >> '{}'; exit 1; fi\n{body}\n",
+            calls.display()
+        );
         fs::write(&p, text).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        let o = Command::new(&p).arg("warm").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(o.success(), "the warm start of the stub failed: {o}");
     }
 
     fn list(&self, entries: &[String]) {
@@ -281,7 +281,7 @@ impl Fx {
         v.to_vec()
     }
 
-    /// Runs the verb (a busy-file run repeats, see `go_run`).
+    /// Runs the verb once.
     fn go(&self, a: &[String]) -> R {
         let mut c = Command::new(BIN);
         c.args(a).stdin(Stdio::null());
@@ -970,51 +970,41 @@ fn go_priv(fx: &Fx, a: &[String], secret: Option<&str>) -> R {
     go_run(&mut c)
 }
 
-/// `go_priv` of the fifo test only: the child is spawned and polled, never waited on without a bound, so a try that has not exited within
+/// `go_priv` of the fifo test only: the child is spawned and polled, never waited on without a bound, so a run that has not exited within
 /// 30 s is killed and fails the test (an open that blocked on the fifo, the O_NONBLOCK switch-off, ends red instead of hanging the run).
-/// A listing-timeout run is repeated as `go_run` repeats it, each try under its own 30 s deadline.
 fn go_priv_bounded(fx: &Fx, a: &[String], secret: Option<&str>) -> R {
     use std::io::Read as _;
     let _ = fx;
-    let mut tries = 0;
-    loop {
-        let mut c = Command::new(BIN);
-        c.args(a).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        for k in PRIV_VARS {
-            c.env_remove(k);
-        }
-        if let Some(s) = secret {
-            c.env("HARNESS_PRIVACY_LIST_SECRET", s);
-        }
-        let mut ch = c.spawn().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let status = loop {
-            if let Some(s) = ch.try_wait().unwrap() {
-                break s;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = ch.kill();
-                let _ = ch.wait();
-                panic!("the run did not return");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let mut out = String::new();
-        let mut err = String::new();
-        if let Some(mut o) = ch.stdout.take() {
-            o.read_to_string(&mut out).unwrap();
-        }
-        if let Some(mut e) = ch.stderr.take() {
-            e.read_to_string(&mut err).unwrap();
-        }
-        let r = R { code: status.code().unwrap_or(-1), out, err };
-        tries += 1;
-        if r.code == 3 && r.err.contains("could not be run or timed out") && tries < 8 {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        return r;
+    let mut c = Command::new(BIN);
+    c.args(a).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for k in PRIV_VARS {
+        c.env_remove(k);
     }
+    if let Some(s) = secret {
+        c.env("HARNESS_PRIVACY_LIST_SECRET", s);
+    }
+    let mut ch = c.spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = ch.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = ch.kill();
+            let _ = ch.wait();
+            panic!("the run did not return");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut out = String::new();
+    let mut err = String::new();
+    if let Some(mut o) = ch.stdout.take() {
+        o.read_to_string(&mut out).unwrap();
+    }
+    if let Some(mut e) = ch.stderr.take() {
+        e.read_to_string(&mut err).unwrap();
+    }
+    R { code: status.code().unwrap_or(-1), out, err }
 }
 
 const LIST: &str = "zzdenytoken\n";
@@ -1171,7 +1161,7 @@ fn t20j_a_fifo_as_the_seat_log_is_unreadable_and_does_not_block() {
     assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
     let mut a = fx.args(300, 600);
     a.extend(["--seat-log".to_string(), fifo.display().to_string()]);
-    // the run is bounded, not timed: a try that has not exited within 30 s is killed and fails the test, so an open that blocked on the
+    // the run is bounded, not timed: a run that has not exited within 30 s is killed and fails the test, so an open that blocked on the
     // fifo (the O_NONBLOCK switch-off) ends red in 30 s instead of hanging the run
     let r = go_priv_bounded(&fx, &a, Some(LIST));
     assert_eq!(r.code, 12, "{} {}", r.out, r.err);
@@ -1258,6 +1248,17 @@ fn t20o_a_folder_as_the_seat_log_is_unreadable() {
     fs::create_dir_all(&d).unwrap();
     let mut a = fx.args(300, 600);
     a.extend(["--seat-log".to_string(), d.display().to_string()]);
+    let r = go_priv(&fx, &a, Some(LIST));
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    assert_eq!(lines(&r)[1], "detail unreadable");
+}
+
+#[test]
+fn t20s_a_device_as_the_seat_log_is_unreadable() {
+    // /dev/null is a character device: the open works, the regular-file check of the fstat on the opened handle does not pass
+    let fx = dialog();
+    let mut a = fx.args(300, 600);
+    a.extend(["--seat-log".to_string(), "/dev/null".to_string()]);
     let r = go_priv(&fx, &a, Some(LIST));
     assert_eq!(r.code, 12, "{} {}", r.out, r.err);
     assert_eq!(lines(&r)[1], "detail unreadable");

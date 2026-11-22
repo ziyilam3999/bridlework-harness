@@ -83,14 +83,16 @@ final blocked line; exit codes unchanged):
 `command=` and `message=` are the last field and run to the end of the line. Only records with `ts_ms` at or after the launch record
 `ts_ms` count. The newest is the largest whole-number `ts_ms` (the later line on a tie). A record whose `ts_ms` is not a whole number or
 whose `event` is not a string is skipped. An absent or non-string `tool`, `command` or `message` prints as `-`. No such record, or a
-missing file: `detail none`. A link, a folder, a FIFO, a socket, a device or a file that cannot be read: `detail unreadable`. The log never
+missing file: `detail none`. A link (on Linux arm64 the open flag value has no `O_NOFOLLOW`, so a link is followed; known, WAITING-153), a
+folder, a FIFO, a socket, a device or a file that cannot be read: `detail unreadable`. The log never
 makes a refusal and never changes the verdict or exit code. A verdict other than blocked reads no log and prints no detail line.
 
 Record format, the contract for the writer: one JSON object per line, with the fields `ts_ms` (whole number, milliseconds since the
 epoch), `event` (`PermissionRequest` or `Stop`), `tool` (string, for `PermissionRequest`), `command` (string, for `PermissionRequest`) and
 `message` (string, for `Stop`, the seat's last message).
 
-Reading: the file is opened with `O_NOFOLLOW|O_NONBLOCK` and must be a regular file by fstat on the opened handle, so a FIFO never blocks.
+Reading: the file is opened with `O_NOFOLLOW|O_NONBLOCK` (on Linux arm64 the flag value lacks `O_NOFOLLOW`, so a link is followed; known,
+WAITING-153) and must be a regular file by fstat on the opened handle, so a FIFO never blocks.
 Only the last 65536 bytes are read; the first, possibly partial, line of that window is skipped; a line that is not valid UTF-8 or not a
 JSON object is skipped.
 
