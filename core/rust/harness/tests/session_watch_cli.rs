@@ -970,6 +970,53 @@ fn go_priv(fx: &Fx, a: &[String], secret: Option<&str>) -> R {
     go_run(&mut c)
 }
 
+/// `go_priv` of the fifo test only: the child is spawned and polled, never waited on without a bound, so a try that has not exited within
+/// 30 s is killed and fails the test (an open that blocked on the fifo, the O_NONBLOCK switch-off, ends red instead of hanging the run).
+/// A listing-timeout run is repeated as `go_run` repeats it, each try under its own 30 s deadline.
+fn go_priv_bounded(fx: &Fx, a: &[String], secret: Option<&str>) -> R {
+    use std::io::Read as _;
+    let _ = fx;
+    let mut tries = 0;
+    loop {
+        let mut c = Command::new(BIN);
+        c.args(a).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        for k in PRIV_VARS {
+            c.env_remove(k);
+        }
+        if let Some(s) = secret {
+            c.env("HARNESS_PRIVACY_LIST_SECRET", s);
+        }
+        let mut ch = c.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = ch.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = ch.kill();
+                let _ = ch.wait();
+                panic!("the run did not return");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut out = String::new();
+        let mut err = String::new();
+        if let Some(mut o) = ch.stdout.take() {
+            o.read_to_string(&mut out).unwrap();
+        }
+        if let Some(mut e) = ch.stderr.take() {
+            e.read_to_string(&mut err).unwrap();
+        }
+        let r = R { code: status.code().unwrap_or(-1), out, err };
+        tries += 1;
+        if r.code == 3 && r.err.contains("could not be run or timed out") && tries < 8 {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return r;
+    }
+}
+
 const LIST: &str = "zzdenytoken\n";
 
 fn blocked_ent(fx: &Fx, status: Option<&str>, wf: Option<&str>) -> String {
@@ -1124,11 +1171,9 @@ fn t20j_a_fifo_as_the_seat_log_is_unreadable_and_does_not_block() {
     assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
     let mut a = fx.args(300, 600);
     a.extend(["--seat-log".to_string(), fifo.display().to_string()]);
-    let t = std::time::Instant::now();
-    let r = go_priv(&fx, &a, Some(LIST));
-    // the budget is a tripwire, not a measure: the shared runner may repeat a listing-timeout run (up to 8 tries at the verb's 10 s
-    // timeout) under the load of four parallel test copies, while an open that blocked on the fifo would hang the run past any bound
-    assert!(t.elapsed() < Duration::from_secs(150), "the run did not return");
+    // the run is bounded, not timed: a try that has not exited within 30 s is killed and fails the test, so an open that blocked on the
+    // fifo (the O_NONBLOCK switch-off) ends red in 30 s instead of hanging the run
+    let r = go_priv_bounded(&fx, &a, Some(LIST));
     assert_eq!(r.code, 12, "{} {}", r.out, r.err);
     assert_eq!(lines(&r)[1], "detail unreadable");
 }
