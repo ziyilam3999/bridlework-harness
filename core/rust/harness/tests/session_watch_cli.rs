@@ -5,7 +5,6 @@
 #![cfg(unix)]
 use harness::gate_result::{GateResult, Status};
 use std::fs;
-use std::io::ErrorKind;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,10 +16,6 @@ const SHORT: &str = "ab12cd34";
 const SID: &str = "11111111-2222-4333-8444-555555555555";
 const NAME: &str = "seat-a";
 static SEQ: AtomicUsize = AtomicUsize::new(0);
-/// The warm exec of a freshly written host stub retries a busy exec (Linux ETXTBSY: a sibling test thread that forked while the write
-/// handle of the stub was open keeps a copy until its own exec) this many tries, this many milliseconds apart, before the test fails.
-const WARM_BUSY_TRIES: usize = 50;
-const WARM_BUSY_GAP_MS: u64 = 20;
 
 struct R {
     code: i32,
@@ -28,8 +23,8 @@ struct R {
     err: String,
 }
 
-/// Runs the verb child once. `Fx::stub` warms each script it writes (one untimed run), so the run under the verb pays neither the
-/// macOS first-exec wait of a freshly written script nor a Linux busy-file exec of it.
+/// Runs the verb child once. `Fx::stub` warms each script it writes (one untimed run), so the run under the verb pays no macOS
+/// first-exec wait of a freshly written script.
 fn go_run(c: &mut Command) -> R {
     let o = c.output().unwrap();
     R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() }
@@ -172,34 +167,23 @@ impl Fx {
         fs::write(self.root.join("records.jsonl"), body).unwrap();
     }
 
-    /// Writes the host stub, then warms it: one untimed run with the `warm` argument, which the script guard answers before the calls
-    /// append, so it leaves no trace a test reads. Two causes sit on the first exec of a freshly written script: on Linux a sibling
-    /// test thread that forks while the write handle is open keeps a copy until its own exec, so the exec meets ETXTBSY (busy); on
-    /// macOS the first exec waits on the system security check of the new file (seconds under load, f-20261122-10). The warm exec
-    /// retries the busy one and pays the wait, so the run under the verb is fast.
+    /// Writes the stub text to host.sh.src and copies it onto host.sh with a cp child: a direct write would leave this process
+    /// holding the script's write handle, which a Linux sibling thread's fork inherits, and the exec would then fail with ETXTBSY
+    /// until that child execs. The warm exec stays for the macOS slow first exec of a fresh script (f-20261122-10).
     fn stub(&self, body: &str) {
         let p = self.root.join("host.sh");
+        let src = self.root.join("host.sh.src");
         let calls = self.root.join("calls");
         let text = format!(
             "#!/bin/sh\nif [ \"$1\" = warm ]; then exit 0; fi\nif [ \"$1\" != agents ]; then echo \"$1\" >> '{}'; exit 1; fi\n{body}\n",
             calls.display()
         );
-        fs::write(&p, text).unwrap();
+        fs::write(&src, text).unwrap();
+        let o = Command::new("cp").arg(&src).arg(&p).stdin(Stdio::null()).status().unwrap();
+        assert!(o.success(), "the cp of the stub onto host.sh failed: {o}");
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
-        let o = {
-            let mut tries = 0;
-            loop {
-                match Command::new(&p).arg("warm").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() {
-                    Ok(o) => break o,
-                    // busy only: a sibling fork holds the write handle of the script until its exec; every other error is real
-                    Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && tries + 1 < WARM_BUSY_TRIES => {
-                        tries += 1;
-                        std::thread::sleep(Duration::from_millis(WARM_BUSY_GAP_MS));
-                    }
-                    Err(e) => panic!("the warm exec of {} failed on try {} of {WARM_BUSY_TRIES}: {e}", p.display(), tries + 1),
-                }
-            }
-        };
+        let o = Command::new(&p).arg("warm").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()
+            .unwrap_or_else(|e| panic!("the warm exec of {} failed: {e}", p.display()));
         assert!(o.success(), "the warm start of the stub failed: {o}");
     }
 
