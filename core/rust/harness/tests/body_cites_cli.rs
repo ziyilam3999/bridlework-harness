@@ -381,7 +381,7 @@ fn body_that_is_a_directory_or_missing_is_exit_2() {
 
 #[test]
 fn body_over_1048576_bytes_is_exit_2() {
-    // Mutant: drop the size check -> the run refuses with another text (or not at all) and this turns red.
+    // Mutant: drop both size checks (the same text is given at two places in src/body_cites.rs) -> the run does not refuse with this text and this turns red.
     let c = case();
     let o = run_full(&c, &vec![b'a'; 1_048_577], &[], &[]);
     refused(&o);
@@ -483,7 +483,7 @@ fn short_head_is_exit_2() {
     fs::write(&f, "x\n").unwrap();
     let o = run_args(&["--repo-dir", c.dir.to_str().unwrap(), "--head", &c.head[..12], "--base", &c.base, "--body-file", f.to_str().unwrap()], &[]);
     refused(&o);
-    // Mutant: accept a short --head -> the run refuses on the commit check with another text and this turns red.
+    // Mutant: accept a short --head -> a 12-character prefix of a real commit passes the commit check, the run succeeds (exit 0) and this turns red.
     assert_eq!(o.stderr.trim_end(), USAGE);
 }
 
