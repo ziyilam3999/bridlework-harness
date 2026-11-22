@@ -6,6 +6,7 @@
 use crate::lane::stale::open_launch_records;
 use crate::launcher::{read_launches, Launch};
 use crate::session_close::{raw_listing, Entry};
+use crate::session_watch_log::{self, Block};
 use crate::status;
 use std::collections::HashMap;
 use std::fs::{canonicalize, read_dir, symlink_metadata};
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness session watch --host <abs> --records <file> --name <seat name> --ticket <file> --repo-map <id>=<tree> --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n> [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>]";
+pub const USAGE: &str = "usage: harness session watch --host <abs> --records <file> --name <seat name> --ticket <file> --repo-map <id>=<tree> --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n> [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>] [--seat-log <abs file>]";
 
 /// At most this many entries of the work tree are looked at.
 const WALK_CAP: usize = 200_000;
@@ -41,6 +42,8 @@ struct Opts {
     stop: Option<String>,
     /// `--poll-s` and `--max-s`, present with `--follow`.
     follow: Option<(u64, u64)>,
+    /// `--seat-log`, read only on a blocked verdict.
+    seat_log: Option<PathBuf>,
 }
 
 fn secs(v: &str, flag: &str) -> R<u64> {
@@ -60,9 +63,9 @@ fn abs(v: &str, flag: &str) -> R<PathBuf> {
 }
 
 fn parse(a: &[String]) -> R<Opts> {
-    const VALUED: [&str; 15] = [
+    const VALUED: [&str; 16] = [
         "host", "records", "name", "ticket", "repo-map", "base", "result-dir", "caps-dir", "transcript-root", "idle-s", "silence-s",
-        "stopped-at", "stop", "poll-s", "max-s",
+        "stopped-at", "stop", "poll-s", "max-s", "seat-log",
     ];
     let mut m: HashMap<&str, &str> = HashMap::new();
     let mut follow = false;
@@ -116,7 +119,12 @@ fn parse(a: &[String]) -> R<Opts> {
         (true, _, _) => return Err("--follow needs --poll-s and --max-s".into()),
         (false, _, _) => return Err("--poll-s and --max-s go with --follow".into()),
     };
+    let seat_log = match m.get("seat-log") {
+        None => None,
+        Some(v) => Some(abs(v, "--seat-log")?),
+    };
     Ok(Opts {
+        seat_log,
         host: abs(need("host")?, "--host")?,
         records: PathBuf::from(need("records")?),
         name: name.to_string(),
@@ -321,6 +329,8 @@ struct Out {
     line: String,
     /// The transcript age of a check whose host state was working.
     working_age: Option<u64>,
+    /// The seat log detail line of a blocked verdict (only with `--seat-log`).
+    detail: Option<String>,
 }
 
 struct Show<'a> {
@@ -355,7 +365,7 @@ fn out(verdict: &'static str, s: &Show, extra: &str, working_age: Option<u64>) -
         s.session,
         s.skipped
     );
-    Out { verdict, code, line, working_age }
+    Out { verdict, code, line, working_age, detail: None }
 }
 
 fn check(o: &Opts) -> R<Out> {
@@ -422,7 +432,23 @@ fn check(o: &Opts) -> R<Out> {
                 s.commits = Some(f.commits);
                 s.gate = format!("{}/{}", f.last, if f.current { "yes" } else { "no" });
             }
-            Ok(out("stopped-early", &s, " why=blocked", None))
+            let wf = e.waiting_for.as_deref().filter(|w| !w.is_empty());
+            let kind = match (e.status.as_deref(), wf) {
+                (Some("waiting"), Some(_)) => Block::Dialog,
+                (Some("idle"), None) => Block::Asked,
+                _ => Block::Other,
+            };
+            let word = match kind {
+                Block::Dialog => "dialog",
+                Block::Asked => "asked",
+                Block::Other => "other",
+            };
+            let wf_text: String = wf.map_or("-".to_string(), |w| {
+                w.chars().take(40).map(|c| c.to_ascii_lowercase()).map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '-' }).collect()
+            });
+            let mut r = out("stopped-early", &s, &format!(" why=blocked block={word} waiting_for={wf_text}"), None);
+            r.detail = o.seat_log.as_deref().map(|p| session_watch_log::detail_line(p, l.ts_ms, kind));
+            Ok(r)
         }
         _ => {
             let f = facts(o, floor)?;
@@ -460,6 +486,9 @@ fn follow(o: &Opts, poll: u64, max: u64) -> i32 {
         }
         if !matches!(o1.verdict, "working" | "slow-alive") {
             println!("{} max_transcript_age={}", o1.line, age(top));
+            if let Some(d) = &o1.detail {
+                println!("{d}");
+            }
             return o1.code;
         }
         if printed != Some(o1.verdict) {
@@ -495,6 +524,9 @@ pub fn watch_cmd(a: &[String]) -> i32 {
         None => match check(&o) {
             Ok(r) => {
                 println!("{}", r.line);
+                if let Some(d) = &r.detail {
+                    println!("{d}");
+                }
                 r.code
             }
             Err(m) => refuse(&m),

@@ -6,11 +6,12 @@ calls the host for the listing only (never `stop` or `rm`). A seat stopped by `b
 ```
 harness session watch --host <abs> --records <launch records file> --name <seat name> --ticket <ticket file> --repo-map <id>=<tree>
   --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n>
-  [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>]
+  [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>] [--seat-log <abs file>]
 ```
 
 Numbers are whole seconds, 1 to 86400. `--base` is a 40-hex sha. `--stopped-at` and `--stop` come together. `--poll-s` and `--max-s` go
-with `--follow` and both are required there. A missing, repeated or bad flag is exit 2 with the usage line.
+with `--follow` and both are required there. `--seat-log` is optional and must be an absolute path. A missing, repeated or bad flag
+(a relative or empty `--seat-log` included) is exit 2 with the usage line.
 
 ## Join
 
@@ -36,7 +37,7 @@ Decided in this order on each check.
 | v3 | state `working`, transcript age below `--silence-s` | `slow-alive` | 10 |
 | v3 | state `working`, past both limits, entry pid a live process, a commit in base..HEAD at or after the launch second, `last_gate=pass`, `gate_current=yes` | `finished` | 13 |
 | v3 | state `working`, entry pid is a live process, otherwise | `stalled` | 11 |
-| v4 | state `blocked` | `stopped-early why=blocked` | 12 |
+| v4 | state `blocked` | `stopped-early why=blocked block=<dialog\|asked\|other> waiting_for=<text>` | 12 |
 | v5 | state `done` or `idle`, a commit in base..HEAD at or after the launch second, and `gate_current=yes` | `finished gate=<pass\|fail>` | 13 |
 | v5 | otherwise | `stopped-early why=no-commit` (wins) or `why=no-gate` | 12 |
 
@@ -55,7 +56,53 @@ entries is a refusal), the mtime of the git index, and the committer time of HEA
 then `why=` or `by=` where named. `skipped_entries` counts the listing entries left out of the join (0 when none). A value the verdict
 did not need is `-` (tree age and the commit and gate facts are read only
 where the verdict uses them; `blocked` shows them when they can be read; `stalled` shows the commits and gate it read). No path,
-transcript text or file name is printed.
+transcript text or file name is printed; the detail line below prints scanned seat text, never a path of its own.
+
+### Blocked kind
+
+The listing parse keeps the host `waitingFor` string of an entry (absent when the host leaves it out or it is not a string). The blocked
+line adds `block=` and `waiting_for=`:
+
+- `block=dialog`: status `waiting` and a non-empty `waitingFor` (a real dialog, for example a permission prompt).
+- `block=asked`: status `idle` and no `waitingFor` (the seat ended its turn on a question).
+- `block=other`: any other blocked entry.
+
+`waiting_for=` is the `waitingFor` lowercased (ASCII), each character outside `a-z 0-9` made `-`, at most 40 characters; `-` when it is
+absent, not a string or empty. The verdict, exit code 12 and `why=blocked` do not change. These host values come from the WAITING-149
+research (six probe sessions, each case seen once), not from a log. Lines of other verdicts do not change.
+
+### Detail line (`--seat-log`)
+
+With `--seat-log <abs file>`, a blocked verdict prints one more stdout line right after the verdict line (in follow mode too, after the
+final blocked line; exit codes unchanged):
+
+- `block=dialog`: the newest record of event `PermissionRequest`, as `detail tool=<tool> command=<command>`.
+- `block=asked`: the newest record of event `Stop`, as `detail message=<message>`.
+- `block=other`: the newest record of either kind, shown as its own event is.
+
+`command=` and `message=` are the last field and run to the end of the line. Only records with `ts_ms` at or after the launch record
+`ts_ms` count. The newest is the largest whole-number `ts_ms` (the later line on a tie). A record whose `ts_ms` is not a whole number or
+whose `event` is not a string is skipped. An absent or non-string `tool`, `command` or `message` prints as `-`. No such record, or a
+missing file: `detail none`. A link (on Linux arm64 the open flag value has no `O_NOFOLLOW`, so a link is followed; known, WAITING-153), a
+folder, a FIFO, a socket, a device or a file that cannot be read: `detail unreadable`. The log never
+makes a refusal and never changes the verdict or exit code. A verdict other than blocked reads no log and prints no detail line.
+
+Record format, the contract for the writer: one JSON object per line, with the fields `ts_ms` (whole number, milliseconds since the
+epoch), `event` (`PermissionRequest` or `Stop`), `tool` (string, for `PermissionRequest`), `command` (string, for `PermissionRequest`) and
+`message` (string, for `Stop`, the seat's last message).
+
+Reading: the file is opened with `O_NOFOLLOW|O_NONBLOCK` (on Linux arm64 the flag value lacks `O_NOFOLLOW`, so a link is followed; known,
+WAITING-153) and must be a regular file by fstat on the opened handle, so a FIFO never blocks.
+Only the last 65536 bytes are read; the first, possibly partial, line of that window is skipped only when the window does not start at
+the file start (a log of 65536 bytes or less keeps its first line); a line that is not valid UTF-8 or not a JSON object is skipped.
+
+Text scan: the text is cut to one line (a control character becomes a space) and to at most 200 bytes on a UTF-8 character boundary, then
+run through the engine privacy scan with the list `overlay::load` resolves (`HARNESS_PRIVACY_LIST_SECRET`, else `HARNESS_PRIVACY_LIST`;
+`HARNESS_PRIVACY_OLD_LIST` drift is a scan error). A hit, a scan error or no list prints `withheld` in place of the text. The tool name is
+not scanned text: each character outside `A-Za-z0-9_` is made `-`, at most 40 characters.
+
+The seat log is not the transcript (WAITING-150): it is the file the seat hooks write, and the transcript stays read by metadata only.
+The code that reads it lives in `session_watch_log.rs`; `session_watch.rs` opens and reads no file.
 
 ## Refusals
 
