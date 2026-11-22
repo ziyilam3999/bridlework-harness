@@ -228,7 +228,7 @@ status rules of section 1 accept. A row that already has a status gets both keys
 values writes nothing and exits 0. On success stdout is one line: `status set id=<id> status=<word>`.
 
 Exit 1 is a refusal. The inbox is byte-identical, stdout is empty and stderr is one line. It says the status was not
-set, except in the recovery copy refusal, whose line is the shared recovery line and names the copy instead. The line names at most a line number, a field, a privacy class and a byte count (the line cap and inbox cap refusals print one). It holds no row, no `--id`, no `--ref` and no path.
+set, except in the recovery copy refusal, whose line is the shared recovery line and names the copy instead. The line names at most a line number, a field, a privacy class and byte counts (the line cap refusal prints two numbers, the row size and the cap; the inbox cap refusal prints the cap). It holds no row, no `--id`, no `--ref` and no path.
 The refusals are: no row with that id (a missing inbox included, and the file is not created; a recovery copy next to a
 missing inbox gives the recovery refusal below instead); an `--id` that is not
 a plain token; a problem the full read finds (a torn tail, a bad or CRLF line, a duplicate id, a privacy hit in a
