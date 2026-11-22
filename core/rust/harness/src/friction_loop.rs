@@ -1331,8 +1331,9 @@ pub fn bind_cmd(rest: &[String], testmode: bool) -> i32 {
             return refuse(&format!("field {name} has a privacy hit ({})", classes.join(", ")));
         }
     }
-    // A recovery copy beside the inbox: bind refuses on every path (a group with a state row too), and writes
-    // nothing. The fresh-row path reads the inbox through `lint_rows`, which refuses the same way.
+    // A recovery copy beside the inbox: bind refuses here, for a group with a state row too, and writes nothing.
+    // The check needs a config: with neither --config nor HARNESS_CONFIG no inbox is named and no check runs.
+    // The fresh-row path reads the inbox through `lint_rows`, which refuses the same way.
     if let Some(cfg) = &named_cfg {
         if friction::recovery_copy_present(Path::new(cfg.friction_inbox())) {
             eprintln!("harness: {}", friction::RECOVERY_MSG);
