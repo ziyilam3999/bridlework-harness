@@ -343,6 +343,48 @@ fn fail_result_without_matched_exit_two() {
 }
 
 #[test]
+fn empty_repo_exit_two() {
+    let f = fix();
+    let mut lines = base_lines();
+    lines[1] = lines[1].replace("\"repo\":\"r\"", "\"repo\":\"\"");
+    f.write_cases(&lines);
+    let o = run(&f);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: case tune-b: repo is missing or empty\n");
+}
+
+#[test]
+fn matched_not_yes_or_no_exit_two() {
+    let f = fix();
+    result(&f.dir, "tune-a", "record", "fail", Some("maybe"));
+    let o = run(&f);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: case tune-a: the record result matched field is not yes or no\n");
+}
+
+#[test]
+fn results_dir_that_does_not_exist_exit_two() {
+    let f = fix();
+    let missing = f._t.raw.join("no-such-dir");
+    let o = recall(f.cases_str(), missing.to_str().unwrap(), None);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: the results dir is missing or not a folder\n");
+}
+
+#[test]
+fn results_dir_that_is_a_file_exit_two() {
+    let f = fix();
+    // The cases file is a regular file: pass it where the folder belongs.
+    let o = recall(f.cases_str(), f.cases_str(), None);
+    assert_eq!(code(&o), 2);
+    assert_eq!(out(&o), "");
+    assert_eq!(err(&o), "harness: error: the results dir is missing or not a folder\n");
+}
+
+#[test]
 fn result_file_naming_no_case_exit_two() {
     let f = fix();
     fs::write(f.dir.join("zzz.report"), "{}\n").unwrap();
