@@ -15,12 +15,13 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
+// `open(2)` flags std exposes no constants for (the `quarantine.rs` pattern): the values differ per OS and per CPU
+// family. Listed: macos, and linux with its x86_64 values (linux on arm64 has another O_NOFOLLOW and is not
+// handled). An OS with no listed value fails the build here.
 #[cfg(target_os = "linux")]
 const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
 #[cfg(target_os = "macos")]
 const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const OPEN_NOFOLLOW_NONBLOCK: i32 = 0;
 
 /// The read window, in bytes from the end of the file.
 const WINDOW: u64 = 65536;

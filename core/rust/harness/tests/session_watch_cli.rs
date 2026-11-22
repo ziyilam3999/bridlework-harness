@@ -23,6 +23,22 @@ struct R {
     err: String,
 }
 
+/// Runs the verb child. A stub script written a moment ago can meet a busy-file error at exec when another test forks; that run (exit 3
+/// with the listing timeout message) is repeated, up to 8 tries, 100 ms apart.
+fn go_run(c: &mut Command) -> R {
+    let mut tries = 0;
+    loop {
+        let o = c.output().unwrap();
+        let r = R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() };
+        tries += 1;
+        if r.code == 3 && r.err.contains("could not be run or timed out") && tries < 8 {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return r;
+    }
+}
+
 fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
@@ -265,19 +281,11 @@ impl Fx {
         v.to_vec()
     }
 
-    /// Runs the verb. A stub script written a moment ago can meet a busy-file error at exec when another test forks; that run is repeated.
+    /// Runs the verb (a busy-file run repeats, see `go_run`).
     fn go(&self, a: &[String]) -> R {
-        let mut tries = 0;
-        loop {
-            let o = Command::new(BIN).args(a).stdin(Stdio::null()).output().unwrap();
-            let r = R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() };
-            tries += 1;
-            if r.code == 3 && r.err.contains("could not be run or timed out") && tries < 8 {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            return r;
-        }
+        let mut c = Command::new(BIN);
+        c.args(a).stdin(Stdio::null());
+        go_run(&mut c)
     }
 
     fn run(&self) -> R {
@@ -959,8 +967,7 @@ fn go_priv(fx: &Fx, a: &[String], secret: Option<&str>) -> R {
         c.env("HARNESS_PRIVACY_LIST_SECRET", s);
     }
     let _ = fx;
-    let o = c.output().unwrap();
-    R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() }
+    go_run(&mut c)
 }
 
 const LIST: &str = "zzdenytoken\n";
@@ -1119,7 +1126,9 @@ fn t20j_a_fifo_as_the_seat_log_is_unreadable_and_does_not_block() {
     a.extend(["--seat-log".to_string(), fifo.display().to_string()]);
     let t = std::time::Instant::now();
     let r = go_priv(&fx, &a, Some(LIST));
-    assert!(t.elapsed() < Duration::from_secs(20), "the run did not return at once");
+    // the budget is a tripwire, not a measure: the shared runner may repeat a listing-timeout run (up to 8 tries at the verb's 10 s
+    // timeout) under the load of four parallel test copies, while an open that blocked on the fifo would hang the run past any bound
+    assert!(t.elapsed() < Duration::from_secs(150), "the run did not return");
     assert_eq!(r.code, 12, "{} {}", r.out, r.err);
     assert_eq!(lines(&r)[1], "detail unreadable");
 }
