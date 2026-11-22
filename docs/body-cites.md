@@ -20,7 +20,8 @@ harness ticket body-cites --repo-dir <absolute dir> --head <full sha> --base <fu
 ```
 
 - `sha`: 7 to 40 hex characters.
-- `path`: repo relative, no `..` part, not absolute, no empty or `.` part, no space, tab, quote or backtick.
+- `path`: repo relative, no `..` part, not absolute, no empty or `.` part, no ASCII white space (space, tab, line feed, form feed or CR), no straight `"` and no backtick. The path ends
+  at the first such character.
 - `n` or `n-m`: a line number or a range (lines count from 1).
 - Exactly one space or tab between `<n>[-<m>]` and the opening quote. A curly quote does not open a fragment.
 - `fragment`: not empty, no line break, ends at the next straight `"`.
@@ -40,7 +41,8 @@ The file is read at the cite sha: the blob at `<sha>:<path>`.
    catches a cite left on an older head. Such a cite is not read further.
 2. `file-missing`: no such path at the cite sha.
 3. `not-a-file`: the path is a folder, a symlink or a submodule, or the blob is over 1048576 bytes or not UTF-8.
-   Its text is not read.
+   Its text is not checked (a blob that is not UTF-8 is fetched and then refused). A path that is not UTF-8 is not
+   listed, so a cite to it reads as `file-missing`.
 4. `out-of-range`: `n < 1`, `m < n`, or `m` past the last line. The last line is the last newline-ended line (a
    final line with no newline counts), so `m` one past it is out of range, not blank. A cite with this reason
    carries no other.
@@ -51,8 +53,8 @@ The file is read at the cite sha: the blob at `<sha>:<path>`.
 
 After the strict cites are taken out, each `:<digits>` (or `:<digits>-<digits>`) left counts as unparsed when its
 name holds a `.` or a `/`, or when the character before the colon is not a letter or digit. The name is the run of
-characters before the colon back to the last space, tab, quote, backtick, parenthesis, bracket, comma or the start
-of the line. It prints `FLAG unparsed <name>:<digits>[-<digits>]`, as written.
+characters before the colon back to the last space, tab, `"`, `'`, backtick, `(`, `)`, `[`, `]`, comma, one of the
+curly quotes U+201C, U+201D, U+2018, U+2019, or the start of the line. `{`, `}`, `<` and `>` do not stop it. It prints `FLAG unparsed <name>:<digits>[-<digits>]`, as written.
 
 | Text | Unparsed? | Why |
 | --- | --- | --- |
@@ -77,7 +79,9 @@ counted in `flag`).
 - 1: at least one FLAG or `unparsed > 0` or an unused `--cite-ok`.
 - 2: one stderr line and nothing on stdout: a missing, repeated or unknown flag; `--repo-dir` not absolute, holding
   a `..` part, or not a git work tree; `--head` or `--base` not 40 lowercase hex or not a commit there; the body
-  file missing, a link, not a regular file, over 1048576 bytes or not UTF-8.
+  file missing, a link, not a regular file, over 1048576 bytes or not UTF-8. Also exit 2: `--body-file` not
+  absolute (the usage line); the repo dir missing or not a folder; git cannot run; a git call failed; the body
+  file cannot be read.
 
 ## Worked example
 

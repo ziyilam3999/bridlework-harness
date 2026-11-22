@@ -136,7 +136,7 @@ fn refused(o: &Out) {
 
 #[test]
 fn all_good_body_exits_0_every_line_ok() {
-    // Red if a good cite is flagged: any reason check that fires on a clean cite (sha prefix, range, blank, case).
+    // Red if a good cite is flagged: any reason check that fires on a clean cite (sha prefix, range, blank).
     let c = case();
     let c1 = cite(&c.head, "src/a.rs", "1", "fn alpha");
     let c2 = cite(&c.head[..7], "src/a.rs", "1-3", "fn beta");

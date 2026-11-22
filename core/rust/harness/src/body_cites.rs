@@ -229,7 +229,8 @@ struct Entry {
     size: Option<u64>,
 }
 
-/// Every blob and submodule entry of one commit, and every folder that holds one.
+/// Every blob and submodule entry of one commit, and every folder that holds one. An entry whose path is not UTF-8
+/// is skipped, so it is not in the listing (a cite to such a path reads as file-missing).
 struct Listing {
     files: HashMap<String, Entry>,
     dirs: HashSet<String>,
