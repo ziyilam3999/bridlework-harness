@@ -647,13 +647,15 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 - A recovery copy next to the inbox (`<inbox>.status-write`, left by a `set-status` write that did not finish) is the
   other crash sign. The verbs that read the inbox check for it after they hold their lock (a missing inbox has no
   lock; the check runs there without one), and refuse (1; `close-check` 2) with one line that names the copy and no
-  path, until the copy is moved aside by hand (see `set-status`). `bind` makes the check on every path, also for a
-  group that has a state row (it reads no inbox there, but it names the config and refuses without writing).
+  path, until the copy is moved aside by hand (see `set-status`). `bind` makes the check also for a group that has
+  a state row (it reads no inbox there, but it refuses without writing). The check needs a config: `bind` uses
+  `--config` or `HARNESS_CONFIG`, and with neither no inbox is named and no check runs.
   `lesson replay` makes it when it builds its answer key (`--config`); without `--config` it reads no inbox.
   An inbox behind a dangling symlink is checked beside the file the link points to, so `add` and `sweep` find a
   copy there and create nothing. An inbox path whose recovery path cannot be built (a link loop, a folder that cannot
-  be read) gets the same refusal, since a copy next to the real file cannot be ruled out. A missing folder does not:
-  no copy can sit in it.
+  be read) is a setup error for `add`, `lint` and `set-status` (exit 2, nothing on stdout, the inbox cannot be read or
+  written), and `close-check` gives the recovery line there (exit 2), since a copy next to the real file cannot be
+  ruled out. A missing folder is not that case: no copy can sit in it.
 
 ### `friction suggest` (ask A32)
 
