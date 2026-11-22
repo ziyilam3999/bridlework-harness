@@ -4,9 +4,9 @@
 //! earlier stage has verdict fail and matched yes, so a finding that never reaches the fix round is a
 //! miss at stage fixround. A control is a false block when its report verdict is fail. Read only:
 //! nothing is written. The printed lines hold ids, counts and the fixed words only, never an answer
-//! key or a head, and an error line names the case by id (by line number when the id is unreadable)
-//! and the cause, never a field value. Fail closed: exit 2 with one stderr line and an empty stdout,
-//! and no case is skipped.
+//! key or a head. An error line about one case names it by id (by line number when the id is
+//! unreadable) and the cause; no error line holds a field value. Fail closed: exit 2 with one stderr
+//! line and an empty stdout, and no case is skipped.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};

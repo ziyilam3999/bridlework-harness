@@ -480,6 +480,55 @@ fn writes_no_file_in_the_fixture_or_the_working_folder() {
     assert_eq!(snapshot(&cwd.raw), cwd_before);
 }
 
+/// Asserts exit 2, an empty stdout and a stderr that holds the refusal's own text.
+fn refused_with(o: &Output, text: &str) {
+    assert_eq!(code(o), 2);
+    assert_eq!(out(o), "");
+    assert!(err(o).contains(text), "stderr: {}", err(o));
+}
+
+#[test]
+fn cases_path_that_does_not_exist_exit_two() {
+    let f = fix();
+    let missing = f._t.raw.join("no-such-cases.jsonl");
+    let o = recall(missing.to_str().unwrap(), f.dir_str(), None);
+    refused_with(&o, "the cases file is not a readable regular file");
+}
+
+#[test]
+fn cases_path_that_is_a_folder_exit_two() {
+    let f = fix();
+    // The results folder is a folder: pass it where the cases file belongs.
+    let o = recall(f.dir_str(), f.dir_str(), None);
+    refused_with(&o, "the cases file is not a readable regular file");
+}
+
+#[test]
+fn cases_file_not_utf8_exit_two() {
+    let f = fix();
+    let mut bytes = base_lines().join("\n").into_bytes();
+    bytes.extend_from_slice(&[b'\n', 0xff, b'\n']);
+    fs::write(&f.cases, bytes).unwrap();
+    let o = run(&f);
+    refused_with(&o, "the cases file is not UTF-8 text");
+}
+
+#[test]
+fn result_file_not_utf8_exit_two() {
+    let f = fix();
+    fs::write(f.dir.join("tune-a.record"), [0xffu8, b'\n']).unwrap();
+    let o = run(&f);
+    refused_with(&o, "case tune-a: the record result file is not UTF-8 text");
+}
+
+#[test]
+fn result_file_not_a_json_object_exit_two() {
+    let f = fix();
+    fs::write(f.dir.join("tune-a.record"), "not json\n").unwrap();
+    let o = run(&f);
+    refused_with(&o, "case tune-a: the record result is not a JSON object of string fields");
+}
+
 /// A passing run prints ids, counts and the fixed words only: no answer-key text, no head (printing
 /// the answer key would make this red).
 #[test]

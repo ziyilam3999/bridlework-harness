@@ -109,9 +109,10 @@ The lines hold counts and the fixed words only — never an answer key and never
   - a `fail`-case result has no `matched` field, or a `matched` value that is not `yes` or `no`;
   - a control result carries a `matched` field.
 
-The error line names the case by its `id` (`harness: error: case <id>: <cause>`), or by line number
-when the `id` itself is unreadable (`harness: error: case line <n>: <cause>`), and states the cause;
-it never holds a field value, so no answer key and no head reaches stderr.
+An error about one case names it (`harness: error: case <id>: <cause>`, or `case line <n>:` when
+the `id` itself is unreadable) and states the cause. Errors about the cases file, the results
+folder or a whole set name no case. No error line holds a field value, so no answer key and no
+head reaches stderr.
 
 ## Read only
 
