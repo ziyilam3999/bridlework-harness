@@ -41,6 +41,8 @@ pub struct Entry {
     pub cwd: Option<String>,
     pub status: Option<String>,
     pub pid: Option<String>,
+    /// The host's `waitingFor` string, when the entry has one.
+    pub waiting_for: Option<String>,
 }
 
 /// One raw listing entry before the id and name rules of `listing`: the host may leave the id, the name or any other field out. The
@@ -54,6 +56,7 @@ pub struct RawEntry {
     pub cwd: Option<String>,
     pub status: Option<String>,
     pub pid: Option<String>,
+    pub waiting_for: Option<String>,
 }
 
 impl RawEntry {
@@ -79,6 +82,7 @@ impl RawEntry {
             cwd: self.cwd,
             status: self.status,
             pid: self.pid,
+            waiting_for: self.waiting_for,
         }
     }
 }
@@ -127,6 +131,7 @@ pub fn raw_listing(host: &Path) -> Result<Vec<RawEntry>, String> {
                 Some(J::Str(s)) => Some(s.clone()),
                 _ => None,
             },
+            waiting_for: e.str("waitingFor").map(|s| s.to_string()),
         });
     }
     Ok(v)

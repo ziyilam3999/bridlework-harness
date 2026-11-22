@@ -943,3 +943,305 @@ fn usage_errors_are_exit_2() {
     bad[i] = "abc".into();
     assert_eq!(fx.go(&bad).code, 2);
 }
+
+// ------------------------------------------------------------------------------------------------ blocked kind and the seat log
+
+const PRIV_VARS: [&str; 3] = ["HARNESS_PRIVACY_LIST_SECRET", "HARNESS_PRIVACY_LIST", "HARNESS_PRIVACY_OLD_LIST"];
+
+/// Runs the verb with the three privacy variables removed from the child, then the given secret list set (when there is one).
+fn go_priv(fx: &Fx, a: &[String], secret: Option<&str>) -> R {
+    let mut c = Command::new(BIN);
+    c.args(a).stdin(Stdio::null());
+    for k in PRIV_VARS {
+        c.env_remove(k);
+    }
+    if let Some(s) = secret {
+        c.env("HARNESS_PRIVACY_LIST_SECRET", s);
+    }
+    let _ = fx;
+    let o = c.output().unwrap();
+    R { code: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() }
+}
+
+const LIST: &str = "zzdenytoken\n";
+
+fn blocked_ent(fx: &Fx, status: Option<&str>, wf: Option<&str>) -> String {
+    let mut e = fx.ent("blocked", status);
+    if let Some(w) = wf {
+        e.pop();
+        e.push_str(&format!(",\"waitingFor\":\"{w}\"}}"));
+    }
+    e
+}
+
+/// A blocked seat (status and waitingFor as given) with a fresh transcript.
+fn blocked(status: Option<&str>, wf: Option<&str>) -> Fx {
+    let fx = Fx::new();
+    fx.list(&[blocked_ent(&fx, status, wf)]);
+    fx.transcript(30);
+    fx
+}
+
+fn dialog() -> Fx {
+    blocked(Some("waiting"), Some("permission prompt"))
+}
+
+fn asked() -> Fx {
+    blocked(Some("idle"), None)
+}
+
+fn log_path(fx: &Fx) -> PathBuf {
+    fx.root.join("seat.log")
+}
+
+fn perm(ts: u64, tool: &str, command: &str) -> String {
+    format!("{{\"ts_ms\":{ts},\"event\":\"PermissionRequest\",\"tool\":\"{tool}\",\"command\":\"{command}\"}}\n")
+}
+
+fn stop(ts: u64, message: &str) -> String {
+    format!("{{\"ts_ms\":{ts},\"event\":\"Stop\",\"message\":\"{message}\"}}\n")
+}
+
+fn with_log(fx: &Fx, body: &str, secret: Option<&str>) -> R {
+    fs::write(log_path(fx), body).unwrap();
+    let mut a = fx.args(300, 600);
+    a.extend(["--seat-log".to_string(), log_path(fx).display().to_string()]);
+    go_priv(fx, &a, secret)
+}
+
+fn lines(r: &R) -> Vec<&str> {
+    r.out.lines().collect()
+}
+
+#[test]
+fn t20a_a_dialog_block_shows_the_tool_and_the_command() {
+    let fx = dialog();
+    let r = with_log(&fx, &perm(fx.launch_ms + 1000, "Bash", "echo hi"), Some(LIST));
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    let l = lines(&r);
+    assert_eq!(l.len(), 2, "{:?}", r.out);
+    for w in ["verdict=stopped-early", "why=blocked", "block=dialog", "waiting_for=permission-prompt"] {
+        assert!(l[0].contains(w), "{w} missing in {}", l[0]);
+    }
+    assert_eq!(l[1], "detail tool=Bash command=echo hi");
+}
+
+#[test]
+fn t20b_an_asked_block_shows_the_question() {
+    let fx = asked();
+    let r = with_log(&fx, &stop(fx.launch_ms + 1000, "Should I drop the table?"), Some(LIST));
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    let l = lines(&r);
+    assert_eq!(l.len(), 2, "{:?}", r.out);
+    assert!(l[0].contains("block=asked") && l[0].contains("waiting_for=-"), "{}", l[0]);
+    assert_eq!(l[1], "detail message=Should I drop the table?");
+}
+
+#[test]
+fn t20c_a_record_older_than_the_launch_does_not_count() {
+    let fx = dialog();
+    let r = with_log(&fx, &perm(fx.launch_ms - 1, "Bash", "echo hi"), Some(LIST));
+    assert_eq!(r.code, 12);
+    assert_eq!(lines(&r)[1], "detail none");
+    // twin: a record at the launch time counts
+    let r = with_log(&fx, &perm(fx.launch_ms, "Bash", "echo hi"), Some(LIST));
+    assert_eq!(lines(&r)[1], "detail tool=Bash command=echo hi");
+}
+
+#[test]
+fn t20d_a_message_with_a_deny_list_token_is_withheld() {
+    let fx = asked();
+    let r = with_log(&fx, &stop(fx.launch_ms + 1000, "please use zzdenytoken here"), Some(LIST));
+    assert_eq!(r.code, 12);
+    let l = lines(&r);
+    assert_eq!(l[1], "detail message=withheld");
+    assert!(!r.out.contains("zzdenytoken"));
+}
+
+#[test]
+fn t20e_no_privacy_list_withholds_the_text() {
+    let fx = dialog();
+    let r = with_log(&fx, &perm(fx.launch_ms + 1000, "Bash", "echo hi"), None);
+    assert_eq!(r.code, 12);
+    assert_eq!(lines(&r)[1], "detail tool=Bash command=withheld");
+}
+
+#[test]
+fn t20f_a_long_two_line_message_is_one_line_of_at_most_200_bytes() {
+    let fx = asked();
+    let msg = format!("{}\\n{}", "x".repeat(150), "y".repeat(150));
+    let r = with_log(&fx, &stop(fx.launch_ms + 1000, &msg), Some(LIST));
+    assert_eq!(r.code, 12);
+    let l = lines(&r);
+    assert_eq!(l.len(), 2, "{:?}", r.out);
+    let text = l[1].strip_prefix("detail message=").expect("a message detail");
+    assert!(text.len() <= 200, "{} bytes", text.len());
+    assert_eq!(text, format!("{} {}", "x".repeat(150), "y".repeat(49)));
+}
+
+#[test]
+fn t20g_a_link_as_the_seat_log_is_unreadable_not_a_refusal() {
+    let fx = dialog();
+    let real = fx.root.join("real.log");
+    fs::write(&real, perm(fx.launch_ms + 1000, "Bash", "echo hi")).unwrap();
+    symlink(&real, log_path(&fx)).unwrap();
+    let mut a = fx.args(300, 600);
+    a.extend(["--seat-log".to_string(), log_path(&fx).display().to_string()]);
+    let r = go_priv(&fx, &a, Some(LIST));
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    assert_eq!(lines(&r)[1], "detail unreadable");
+}
+
+#[test]
+fn t20h_a_working_seat_with_a_seat_log_prints_the_same_line() {
+    let fx = working();
+    let plain = go_priv(&fx, &fx.args(300, 600), Some(LIST));
+    let r = with_log(&fx, &perm(fx.launch_ms + 1000, "Bash", "echo hi"), Some(LIST));
+    assert_eq!(r.code, 0, "{} {}", r.out, r.err);
+    assert_eq!(r.out.lines().count(), 1, "{:?}", r.out);
+    assert_eq!(norm(&r.out), norm(&plain.out));
+}
+
+#[test]
+fn t20i_a_blocked_seat_with_no_seat_log_has_no_detail_line() {
+    let fx = dialog();
+    let r = fx.run();
+    is(&r, 12, &["block=dialog"]);
+    assert!(!r.out.contains("detail"), "{:?}", r.out);
+}
+
+#[test]
+fn t20j_a_fifo_as_the_seat_log_is_unreadable_and_does_not_block() {
+    let fx = dialog();
+    let fifo = log_path(&fx);
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut a = fx.args(300, 600);
+    a.extend(["--seat-log".to_string(), fifo.display().to_string()]);
+    let t = std::time::Instant::now();
+    let r = go_priv(&fx, &a, Some(LIST));
+    assert!(t.elapsed() < Duration::from_secs(20), "the run did not return at once");
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    assert_eq!(lines(&r)[1], "detail unreadable");
+}
+
+#[test]
+fn t20k_a_bad_seat_log_flag_is_a_usage_error() {
+    let fx = dialog();
+    for extra in [vec!["--seat-log", "rel/seat.log"], vec!["--seat-log", ""], vec!["--seat-log", "/tmp/a", "--seat-log", "/tmp/b"]] {
+        let mut a = fx.args(300, 600);
+        a.extend(extra.iter().map(|s| s.to_string()));
+        let r = fx.go(&a);
+        assert_eq!(r.code, 2, "{extra:?}: {} {}", r.out, r.err);
+        assert!(r.err.contains("usage: harness session watch"), "{}", r.err);
+        assert!(r.err.contains("--seat-log"), "{}", r.err);
+    }
+}
+
+#[test]
+fn t20l_a_waiting_seat_with_no_waiting_for_is_block_other() {
+    let fx = blocked(Some("waiting"), None);
+    let r = fx.run();
+    is(&r, 12, &["why=blocked", "block=other", "waiting_for=-"]);
+    let fx = blocked(Some("waiting"), Some(""));
+    is(&fx.run(), 12, &["block=other", "waiting_for=-"]);
+}
+
+#[test]
+fn t20l_waiting_for_is_lowercased_made_plain_and_cut_to_40() {
+    let fx = blocked(Some("waiting"), Some("Permission Prompt: ABC/def 0123456789 0123456789 0123456789 0123456789"));
+    let r = fx.run();
+    assert_eq!(r.code, 12);
+    let v = r.out.split(' ').find_map(|t| t.strip_prefix("waiting_for=")).unwrap().trim();
+    assert_eq!(v, "permission-prompt--abc-def-0123456789-01");
+    assert_eq!(v.len(), 40);
+}
+
+#[test]
+fn t20m_follow_prints_the_detail_line_after_the_blocked_line() {
+    let fx = dialog();
+    fs::write(log_path(&fx), perm(fx.launch_ms + 1000, "Bash", "echo hi")).unwrap();
+    let mut a = fx.args(300, 600);
+    a.extend(["--follow", "--poll-s", "1", "--max-s", "3", "--seat-log"].map(String::from));
+    a.push(log_path(&fx).display().to_string());
+    let r = go_priv(&fx, &a, Some(LIST));
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    let l = lines(&r);
+    assert_eq!(l.len(), 2, "{:?}", r.out);
+    assert!(l[0].contains("verdict=stopped-early") && l[0].contains("max_transcript_age="), "{}", l[0]);
+    assert_eq!(l[1], "detail tool=Bash command=echo hi");
+}
+
+fn filler(n: usize) -> String {
+    let pad = "p".repeat(900);
+    (0..n).map(|_| format!("{{\"ts_ms\":1,\"event\":\"Other\",\"note\":\"{pad}\"}}\n")).collect()
+}
+
+#[test]
+fn t20n_only_the_last_65536_bytes_of_the_log_are_read() {
+    // a log over the window whose newest record is last
+    let fx = dialog();
+    let body = format!("{}{}", filler(75), perm(fx.launch_ms + 1000, "Bash", "echo last"));
+    assert!(body.len() > 65536);
+    let r = with_log(&fx, &body, Some(LIST));
+    assert_eq!(lines(&r)[1], "detail tool=Bash command=echo last");
+    // a record outside the window with a larger ts_ms is not seen; the one inside is
+    let outside = perm(fx.launch_ms + 5000, "Bash", "echo outside");
+    let inside = perm(fx.launch_ms + 1000, "Bash", "echo inside");
+    let mut body = outside.clone();
+    let room = 70000 - outside.len() - inside.len();
+    body.push_str(&"q".repeat(room - 1));
+    body.push('\n');
+    body.push_str(&inside);
+    assert_eq!(body.len(), 70000);
+    let r = with_log(&fx, &body, Some(LIST));
+    assert_eq!(lines(&r)[1], "detail tool=Bash command=echo inside");
+}
+
+#[test]
+fn t20o_a_folder_as_the_seat_log_is_unreadable() {
+    let fx = dialog();
+    let d = fx.root.join("logdir");
+    fs::create_dir_all(&d).unwrap();
+    let mut a = fx.args(300, 600);
+    a.extend(["--seat-log".to_string(), d.display().to_string()]);
+    let r = go_priv(&fx, &a, Some(LIST));
+    assert_eq!(r.code, 12, "{} {}", r.out, r.err);
+    assert_eq!(lines(&r)[1], "detail unreadable");
+}
+
+#[test]
+fn t20p_a_missing_seat_log_is_detail_none() {
+    let fx = dialog();
+    let mut a = fx.args(300, 600);
+    a.extend(["--seat-log".to_string(), fx.root.join("nope.log").display().to_string()]);
+    let r = go_priv(&fx, &a, Some(LIST));
+    assert_eq!(r.code, 12);
+    assert_eq!(lines(&r)[1], "detail none");
+}
+
+#[test]
+fn t20q_the_newest_record_wins_and_a_block_kind_picks_the_event() {
+    let body_of = |fx: &Fx| {
+        format!(
+            "{}{}{}garbage\n{{\"ts_ms\":1.5,\"event\":\"PermissionRequest\",\"tool\":\"X\"}}\n",
+            perm(fx.launch_ms + 100, "Bash", "old"),
+            perm(fx.launch_ms + 300, "Edit", "new"),
+            stop(fx.launch_ms + 900, "not a dialog")
+        )
+    };
+    let fx = dialog();
+    let r = with_log(&fx, &body_of(&fx), Some(LIST));
+    assert_eq!(lines(&r)[1], "detail tool=Edit command=new");
+    // block=other takes the newest of either kind
+    let fx = blocked(Some("waiting"), None);
+    let r = with_log(&fx, &body_of(&fx), Some(LIST));
+    assert_eq!(lines(&r)[1], "detail message=not a dialog");
+}
+
+#[test]
+fn t20r_the_seat_log_module_builds_no_transcript_path() {
+    let src = include_str!("../src/session_watch_log.rs");
+    for w in ["transcript", "join(", "jsonl", "read_dir"] {
+        assert!(!src.contains(w), "session_watch_log.rs holds {w}");
+    }
+}

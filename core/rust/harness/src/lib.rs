@@ -70,6 +70,8 @@ pub mod session_close;
 pub mod session_name;
 #[cfg(unix)]
 pub mod session_watch;
+#[cfg(unix)]
+pub mod session_watch_log;
 pub mod session_tokens;
 #[cfg(unix)]
 pub mod signoff;
