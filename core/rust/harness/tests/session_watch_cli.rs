@@ -167,9 +167,9 @@ impl Fx {
         fs::write(self.root.join("records.jsonl"), body).unwrap();
     }
 
-    /// Writes the stub text to host.sh.src and copies it onto host.sh with a cp child: a direct write would leave this process
-    /// holding the script's write handle, which a Linux sibling thread's fork inherits, and the exec would then fail with ETXTBSY
-    /// until that child execs. The warm exec stays for the macOS slow first exec of a fresh script (f-20261122-10).
+    /// Writes the stub text to host.sh.src and copies it onto host.sh with a cp child: while a direct write runs, this process
+    /// holds the script's write handle, and a Linux sibling thread that forks in that window inherits it, so the exec fails with
+    /// ETXTBSY until that child execs. The warm exec stays for the macOS slow first exec of a fresh script (f-20261122-10).
     fn stub(&self, body: &str) {
         let p = self.root.join("host.sh");
         let src = self.root.join("host.sh.src");

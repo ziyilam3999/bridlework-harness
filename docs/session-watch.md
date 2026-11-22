@@ -93,8 +93,8 @@ epoch), `event` (`PermissionRequest` or `Stop`), `tool` (string, for `Permission
 
 Reading: the file is opened with `O_NOFOLLOW|O_NONBLOCK` (on Linux arm64 the flag value lacks `O_NOFOLLOW`, so a link is followed; known,
 WAITING-153) and must be a regular file by fstat on the opened handle, so a FIFO never blocks.
-Only the last 65536 bytes are read; the first, possibly partial, line of that window is skipped; a line that is not valid UTF-8 or not a
-JSON object is skipped.
+Only the last 65536 bytes are read; the first, possibly partial, line of that window is skipped only when the window does not start at
+the file start (a log of 65536 bytes or less keeps its first line); a line that is not valid UTF-8 or not a JSON object is skipped.
 
 Text scan: the text is cut to one line (a control character becomes a space) and to at most 200 bytes on a UTF-8 character boundary, then
 run through the engine privacy scan with the list `overlay::load` resolves (`HARNESS_PRIVACY_LIST_SECRET`, else `HARNESS_PRIVACY_LIST`;
