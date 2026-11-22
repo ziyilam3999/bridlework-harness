@@ -721,8 +721,9 @@ pub fn read_inbox(path: &Path) -> Result<Inbox, String> {
     read_inbox_locked(&f, path).map(|(inbox, _)| inbox)
 }
 
-/// The same read over an already-open and already-locked (shared or exclusive) inbox descriptor: the rows a
-/// write will follow are read from the very file the lock is held on. `path` only names the recovery copy.
+/// The same read over an inbox descriptor the caller has already locked (shared in `read_inbox`, exclusive in
+/// `add`, `sweep` and `set-status`). This function takes no lock itself. The rows a write will follow are read from
+/// the very file the lock is held on. `path` only names the recovery copy.
 /// It also returns the text read (empty when a recovery copy stopped the read), so a writer can keep the
 /// bytes of the lines it does not change.
 fn read_inbox_locked(f: &fs::File, path: &Path) -> Result<(Inbox, String), String> {
@@ -1029,11 +1030,14 @@ pub(crate) fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, Stri
 /// `harness friction add | lint | patterns | close-check | sweep | open | set-status` (K-1 slice 1 plus tickets
 /// 192, 200; the contract is `docs/friction-inbox.md`). `set-status` is the one verb that rewrites a line in place.
 /// Exit 0 ok; 1 a refusal (a refused write leaves the inbox byte-identical, stdout empty, stderr naming the field
-/// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error. Nothing is written
-/// before every check has passed: flags, then row rules, then the cause tag of a hand-written friction row's
-/// `why` (below), then the privacy engine over the new row, then — under
-/// the exclusive writer lock — the same privacy engine over every stored row and the inbox cross rules, and only
-/// then one append.
+/// and the reason — never the lesson text, never the inbox path); 2 a usage or setup error.
+///
+/// The order below is that of `add` (and `sweep` in the same shape): flags, then row rules, then the cause tag of a
+/// hand-written friction row's `why` (below), then the privacy engine over the new row, then — under the exclusive
+/// writer lock — the same privacy engine over every stored row and the inbox cross rules, and only then one append.
+/// `set-status` has its own order: the flag checks and the scan of the new `--ref` run before the lock; under the
+/// lock come the read, the stored-row checks, the caps and the hard-link check, then the recovery copy, then the
+/// rewrite in place (see `set_status_cmd`).
 pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     let Some((sub, rest)) = a.split_first() else {
         eprintln!("{}", FRICTION_USAGE);

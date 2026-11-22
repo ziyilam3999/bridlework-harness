@@ -227,8 +227,8 @@ with the new status. `--set open` removes both keys and refuses a `--ref`. Any o
 status rules of section 1 accept. A row that already has a status gets both keys replaced. A set equal to the stored
 values writes nothing and exits 0. On success stdout is one line: `status set id=<id> status=<word>`.
 
-Exit 1 is a refusal. The inbox is byte-identical, stdout is empty and stderr is one line that says the status was not
-set. The line names at most a line number, a field and a privacy class. It holds no row, no `--id`, no `--ref` and no path.
+Exit 1 is a refusal. The inbox is byte-identical, stdout is empty and stderr is one line. It says the status was not
+set, except in the recovery copy refusal, whose line is the shared recovery line and names the copy instead. The line names at most a line number, a field and a privacy class. It holds no row, no `--id`, no `--ref` and no path.
 The refusals are: no row with that id (a missing inbox included, and the file is not created; a recovery copy next to a
 missing inbox gives the recovery refusal below instead); an `--id` that is not
 a plain token; a problem the full read finds (a torn tail, a bad or CRLF line, a duplicate id, a privacy hit in a
@@ -237,7 +237,8 @@ stored row, the same read as `add`); a privacy hit in the new `--ref` (scanned f
 inbox over the 4 MiB cap; a hard-linked inbox; a recovery copy next to the inbox (below). Exit 2 is a usage or
 setup error: a missing or repeated flag, an unknown flag, an extra word, no config, no privacy list, an inbox that
 cannot be read or written, an inbox over the cap or not UTF-8, a lock busy past the wait, a folder that cannot take the
-recovery copy. A setup error leaves the inbox unchanged and no recovery copy.
+recovery copy. A setup error leaves the inbox unchanged. It leaves no recovery copy, with one exception: when the
+removal of a partly made copy fails, the copy stays and the exit 2 line names it (below).
 
 **How the write goes.** The flag checks, the scan of the new `--ref` and the status rules run first, before the lock.
 Then one exclusive lock on the inbox file covers the read, the stored-row checks, the id lookup, the hard-link check,
@@ -267,8 +268,9 @@ maps no row reads no inbox and does not check for the copy. The windows are:
 | a partial write that ends on a newline | inbox missing rows, copy whole | the copy exists |
 | a partial write that ends mid-line | inbox with a torn tail, copy whole | the copy exists |
 
-To recover by hand, compare the inbox and the copy, keep the longer whole one as the inbox, then move the copy aside
-with `mv`. The syncs use `File::sync_all`, which is `fsync` and, on macOS, `F_FULLFSYNC`. This is a recovery aid, not a
+To recover by hand, compare the two by row id. Keep the inbox only when it lints clean and holds every row id of the
+copy. Otherwise put the copy back as the inbox. Then move the leftover file aside with `mv`. Length alone is not a
+test: a partial write can lint clean, and a grown `status_ref` line can outweigh a missing tail. The syncs use `File::sync_all`, which is `fsync` and, on macOS, `F_FULLFSYNC`. This is a recovery aid, not a
 claim that the write is all or nothing.
 
 ### `harness friction patterns`
@@ -608,9 +610,10 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
 - One writer at a time: `add`, `sweep` and `set-status` take ONE exclusive kernel advisory lock (`flock(2)`, the std
   file lock) on the inbox file itself, and do the read, scan, cross check and write through that same open
   descriptor, so two concurrent adds do not both store the same id (the check and the write are one critical
-  section). The readers that go through `read_inbox` or `read_inbox_locked` take the SHARED lock on the file they
+  section). The readers that go through `read_inbox` take the SHARED lock on the file they
   read, for the length of the read, and release it when the read returns (`suggest` holds no lock across its Jev
-  call). A reader waits for a writer, and a writer waits for the readers. Readers do not wait
+  call). `read_inbox_locked` takes no lock of its own: it reads on a descriptor its caller has already locked
+  (shared inside `read_inbox`, exclusive in `add`, `sweep` and `set-status`). A reader waits for a writer, and a writer waits for the readers. Readers do not wait
   for each other. The lock lives on the inbox's inode, so the spellings named here share it: a symlinked
   folder, a symlinked file, a `./` or doubled-slash detour, a hard
   link, and a not-yet-created file behind a symlink (the first append creates the target and locks it). `set-status`
@@ -627,8 +630,9 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   against other harness verbs, not against an editor that ignores it. The engine's `close-check` reads under the shared
   lock. The private `bw` script reads the inbox without the lock in two places. `fr_rows` lists the rows for the id
   lookup: a row it misses gives a refusal at that step, and a duplicate next id is refused by `add`. `expected_close_line`
-  runs `lint` and then reads the rows with no lock held across the two steps; in a window where the inbox is
-  emptied it can print `lesson: none` as a hint, and the hint can be wrong there. The refusal itself comes from the
+  runs `lint` and then reads the rows with no lock held across the two steps. The hint can be wrong in two
+  windows of a `set-status` write: the emptied inbox (it prints `lesson: none`) and a read that ends on a newline
+  with rows missing (it prints a short id list). The refusal itself comes from the
   engine's `close-check`. A refused row does not create the inbox file.
 - Input bounds, all failing closed past the bound: one row line is capped at 16 KiB; the inbox is read no further
   than 4 MiB; a close note no further than 1 MiB; the event log a `sweep` reads no further than 4 MiB (each
