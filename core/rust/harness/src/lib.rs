@@ -61,6 +61,7 @@ pub mod question_class;
 pub mod repo_id;
 #[cfg(unix)]
 pub mod review_cap;
+pub mod review_recall;
 pub mod runner;
 pub mod scan;
 #[cfg(all(test, unix))]
