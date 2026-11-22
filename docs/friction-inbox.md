@@ -235,7 +235,7 @@ a plain token; a problem the full read finds (a torn tail, a bad or CRLF line, a
 stored row, the same read as `add`); a privacy hit in the new `--ref` (scanned first, under the scope
 `friction.set-status`); a status and pointer pair the status rules refuse; a new line over the 16 KiB line cap; a new
 inbox over the 4 MiB cap; a hard-linked inbox; a recovery copy next to the inbox (below). Exit 2 is a usage or
-setup error: a missing or repeated flag, an unknown flag, an extra word, no config, no privacy list, an inbox that
+setup error, or a failed write after the recovery copy exists (see the crash windows below): a missing or repeated flag, an unknown flag, an extra word, no config, no privacy list, an inbox that
 cannot be read or written, an inbox over the cap or not UTF-8, a lock busy past the wait, a folder that cannot take the
 recovery copy. A setup error leaves the inbox unchanged. It leaves no recovery copy, with one exception: when the
 removal of a partly made copy fails, the copy stays and the exit 2 line names it (below).
@@ -628,7 +628,8 @@ reaches a printed list (K-1 rule 8). `--out` may not name the inbox or the state
   holder may be a reader or a writer. The lock calls (`File::try_lock` and
   `File::try_lock_shared`) need Rust 1.89 or newer; the workspace pins 1.99.1. The lock is advisory, so it protects
   against other harness verbs, not against an editor that ignores it. The engine's `close-check` reads under the shared
-  lock. The private `bw` script reads the inbox without the lock in two places. `fr_rows` lists the rows for the id
+  lock. The private `bw` script reads the inbox without the lock through one function, `fr_rows`, which three steps use.
+  `fr_rows` lists the rows for the id
   lookup: a row it misses gives a refusal at that step, and a duplicate next id is refused by `add`. `expected_close_line`
   runs `lint` and then reads the rows with no lock held across the two steps. The hint can be wrong in two
   windows of a `set-status` write: the emptied inbox (it prints `lesson: none`) and a read that ends on a newline

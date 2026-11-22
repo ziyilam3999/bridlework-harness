@@ -1035,9 +1035,9 @@ pub(crate) fn config_path(file: Option<&str>) -> Result<std::path::PathBuf, Stri
 /// The order below is that of `add` (and `sweep` in the same shape): flags, then row rules, then the cause tag of a
 /// hand-written friction row's `why` (below), then the privacy engine over the new row, then — under the exclusive
 /// writer lock — the same privacy engine over every stored row and the inbox cross rules, and only then one append.
-/// `set-status` has its own order: the flag checks and the scan of the new `--ref` run before the lock; under the
-/// lock come the read, the stored-row checks, the caps and the hard-link check, then the recovery copy, then the
-/// rewrite in place (see `set_status_cmd`).
+/// `set-status` has its own order: the flag checks, the config and privacy list, the scan of the new `--ref` and the
+/// status rules run before the lock; under the lock come the hard-link check, the read, the stored-row checks, the
+/// id lookup and the caps, then the recovery copy, then the rewrite in place (see `set_status_cmd`).
 pub fn friction_cmd(a: &[String], testmode: bool) -> i32 {
     let Some((sub, rest)) = a.split_first() else {
         eprintln!("{}", FRICTION_USAGE);
