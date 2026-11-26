@@ -42,9 +42,10 @@ Decided in this order on each check.
 | v5 | otherwise | `stopped-early why=no-commit` (wins) or `why=no-gate` | 12 |
 
 Follow mode ends with 16 (`verdict=watch-limit last=<verdict>`) at the time limit, unless the newest check faulted (see Follow mode).
-Refusals (cannot judge) are exit 3 with empty stdout and one stderr line. In a follow run, stdout keeps the lines printed before the
-refusal, and after transient faults stderr has the note lines (`harness: session watch note: ...`, one per fault that did not end the
-run) before its one refusal line. The bound is the engine constant `FAULT_BOUND`, value 3. Exit 1 is not used.
+Refusals (cannot judge) are exit 3 with one refusal line on stderr. Without `--follow`, stdout is empty. In a follow run, stdout keeps
+the lines printed before the refusal, and after transient faults stderr has the note lines (`harness: session watch note: ...`, one per
+fault that did not end the run) before its one refusal line. The bound is the engine constant `FAULT_BOUND`, value 3. Exit 1 is not
+used.
 
 The v3 `finished` row is a seat the host still lists as working. The seat may still be running. It needs `last_gate=pass`, which the v5
 row does not. Its line carries `state=working/<status>`, which tells it from a v5 finish.
@@ -115,8 +116,8 @@ kind that cannot be the watched one is left out and counted in `skipped_entries`
 no launch record for the name, or the newest is not bound; two or more joined entries; cwd not the tree; the transcript check fails; a
 working seat past both limits with a pid that is missing, not a whole number or not a live process (one `ps -p` run); a working seat past
 both limits also reads git base..HEAD and `harness status`, and their failures refuse it; the tree walk is
-over its cap; the tree cannot be listed; an entry inside the tree cannot be inspected ("the tree cannot be inspected"); git cannot report
-HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
+over its cap; the tree cannot be listed; the tree root or an entry inside the tree cannot be inspected ("the tree cannot be
+inspected"); git cannot report HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
 working, done, blocked, idle, stopped. A refusal is never printed as working or slow-alive.
 
 Without `--follow` a refusal ends the run on first sight, with one stderr line. In follow mode these are transient faults: "the tree
@@ -146,8 +147,8 @@ working (`-` if none).
 `--stopped-at` is read once at start: a `bw stop` during a follow run reads `stopped by=host` or `gone` (the host state or listing
 changes), not `by=bw`.
 
-A transient fault (see Refusals) does not end the run at once. Tree and host faults share one count, and a check that judges sets it back
-to 0. At `FAULT_BOUND` (value 3) transient faults in a row the run ends as the refusal of the last fault: exit 3 and the same single
+A transient fault (see Refusals) before the bound does not end the run at once. Tree and host faults share one count, and a check that
+judges sets it back to 0. At `FAULT_BOUND` (value 3) transient faults in a row the run ends as the refusal of the last fault: exit 3 and the same single
 refusal line. When the time limit comes while the newest check faulted (or no check has judged yet), the run also ends as the refusal of
 that fault, with no watch-limit line. A faulted check prints no stdout line. Each fault that does not end the run prints one note line on
 stderr, with the fault text and the count and no path. It is printed after the wait, once the time limit is ruled out:

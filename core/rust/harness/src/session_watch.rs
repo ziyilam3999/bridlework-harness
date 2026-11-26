@@ -29,7 +29,8 @@ const MAX_ARG: usize = 4096;
 
 type R<T> = Result<T, String>;
 
-/// Why a check gave no verdict. Without `--follow` both kinds refuse; follow mode looks again after a transient fault.
+/// Why a check gave no verdict. Without `--follow` both kinds refuse. After a transient fault, follow mode looks again until
+/// `FAULT_BOUND` faults in a row or the time limit.
 #[derive(Debug)]
 enum Fault {
     /// A fault of one look: the next look may judge.
