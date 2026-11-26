@@ -21,7 +21,7 @@ pub const USAGE: &str = "usage: harness session watch --host <abs> --records <fi
 const WALK_CAP: usize = 200_000;
 /// A transcript time this far ahead of the clock is a refusal.
 const AHEAD_S: u64 = 5;
-/// Follow mode: this many faulted checks in a row end the run as the refusal of the last fault.
+/// Follow mode: this many transient faults in a row end the run as the refusal of the last fault.
 const FAULT_BOUND: u32 = 3;
 /// The text `raw_listing` gives a host that could not be run or timed out.
 const LISTING_FAULT: &str = "the host's listing could not be run or timed out";
@@ -29,12 +29,13 @@ const MAX_ARG: usize = 4096;
 
 type R<T> = Result<T, String>;
 
-/// Why a check gave no verdict. `--once` refuses both kinds; follow mode looks again after a transient fault.
+/// Why a check gave no verdict. Without `--follow` both kinds refuse; follow mode looks again after a transient fault.
 #[derive(Debug)]
 enum Fault {
     /// A fault of one look: the next look may judge.
     Transient(String),
-    /// A real refusal. A plain error text becomes this kind, so a transient fault is named where it is raised.
+    /// A real refusal. A plain error text becomes this kind. A transient fault is built by name: a tree fault where `walk` raises it,
+    /// the host fault in `watch_listing`, which matches the `raw_listing` text against `LISTING_FAULT`.
     Final(String),
 }
 

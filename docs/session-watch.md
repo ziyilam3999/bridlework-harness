@@ -115,13 +115,16 @@ kind that cannot be the watched one is left out and counted in `skipped_entries`
 no launch record for the name, or the newest is not bound; two or more joined entries; cwd not the tree; the transcript check fails; a
 working seat past both limits with a pid that is missing, not a whole number or not a live process (one `ps -p` run); a working seat past
 both limits also reads git base..HEAD and `harness status`, and their failures refuse it; the tree walk is
-over its cap; git cannot report HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
+over its cap; the tree cannot be listed; an entry inside the tree cannot be inspected ("the tree cannot be inspected"); git cannot report
+HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
 working, done, blocked, idle, stopped. A refusal is never printed as working or slow-alive.
 
-Without `--follow` each of these ends the run on first sight, with one stderr line. In follow mode these are transient faults: "the tree
-cannot be listed"; "the tree cannot be inspected" for an entry inside the tree (not for the tree root); and "the host's listing could not
-be run or timed out". Every other refusal ends a follow run on first sight too. `FAULT_BOUND` (value 3) bounds the transient faults (see
-Follow mode): after faults, a follow refusal has the note lines (`harness: session watch note: ...`) before its one refusal line.
+Without `--follow` a refusal ends the run on first sight, with one stderr line. In follow mode these are transient faults: "the tree
+cannot be listed"; "the tree cannot be inspected" for an entry inside the tree (the same text for the tree root is not transient); and
+"the host's listing could not be run or timed out" (the listing cannot be run or times out). The other refusals end a follow run on first
+sight too. `FAULT_BOUND` (value 3) bounds the transient faults (see Follow mode). Before its one refusal line, a follow refusal has the
+note lines (`harness: session watch note: ...`) of the earlier faults that did not end the run. A fault that ends the run gets no note
+line, and that includes a fault followed by the time limit: if it is the only fault, the refusal has no note line.
 
 ## Transcript
 
@@ -134,14 +137,17 @@ approved a 10-minute silence watch on 2026-11-16, built on the session file mtim
 
 ## Follow mode
 
-The check runs at start and then every poll interval. A line is printed at start, on each verdict change and at the end. The run ends
-with the exit code of the first verdict other than `working` or `slow-alive` (a refusal that is not a transient fault included), or with
-16 at the time limit (monotonic clock). The end line carries `max_transcript_age=`, the largest transcript age seen with host state working (`-` if none).
+The check runs at start and then every poll interval. A stdout line is printed for the first check that gives a verdict (a faulted check
+prints none), on each later verdict change, and at an end that is not a refusal. The run ends
+with the exit code of the first verdict other than `working` or `slow-alive`, with exit 3 at a refusal that is not a transient fault, with
+exit 3 at `FAULT_BOUND` transient faults in a row, with exit 3 when the time limit comes while the newest check faulted, or else with
+16 at the time limit (monotonic clock). The end line carries `max_transcript_age=`, the largest transcript age seen with host state
+working (`-` if none).
 `--stopped-at` is read once at start: a `bw stop` during a follow run reads `stopped by=host` or `gone` (the host state or listing
 changes), not `by=bw`.
 
 A transient fault (see Refusals) does not end the run at once. Tree and host faults share one count, and a check that judges sets it back
-to 0. At `FAULT_BOUND` (value 3) faulted checks in a row the run ends as the refusal of the last fault: exit 3 and the same single
+to 0. At `FAULT_BOUND` (value 3) transient faults in a row the run ends as the refusal of the last fault: exit 3 and the same single
 refusal line. When the time limit comes while the newest check faulted (or no check has judged yet), the run also ends as the refusal of
 that fault, with no watch-limit line. A faulted check prints no stdout line. Each fault that does not end the run prints one note line on
 stderr, with the fault text and the count and no path. It is printed after the wait, once the time limit is ruled out:

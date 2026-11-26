@@ -1470,6 +1470,8 @@ fn t21i_the_time_limit_during_faults_is_the_refusal_of_the_fault() {
     refused(&r, "time limit during faults");
     let last = r.err.lines().last().unwrap();
     assert!(last.starts_with("harness: session watch refused: ") && last.contains(UNLISTED), "{last}");
+    // the one fault is followed by the time limit, so it gets no note line
+    assert!(!r.err.contains(NOTE), "{}", r.err);
 }
 
 #[test]
