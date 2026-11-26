@@ -21,9 +21,34 @@ pub const USAGE: &str = "usage: harness session watch --host <abs> --records <fi
 const WALK_CAP: usize = 200_000;
 /// A transcript time this far ahead of the clock is a refusal.
 const AHEAD_S: u64 = 5;
+/// Follow mode: this many faulted checks in a row end the run as the refusal of the last fault.
+const FAULT_BOUND: u32 = 3;
+/// The text `raw_listing` gives a host that could not be run or timed out.
+const LISTING_FAULT: &str = "the host's listing could not be run or timed out";
 const MAX_ARG: usize = 4096;
 
 type R<T> = Result<T, String>;
+
+/// Why a check gave no verdict. `--once` refuses both kinds; follow mode looks again after a transient fault.
+#[derive(Debug)]
+enum Fault {
+    /// A fault of one look: the next look may judge.
+    Transient(String),
+    /// A real refusal. A plain error text becomes this kind, so a transient fault is named where it is raised.
+    Final(String),
+}
+
+impl From<String> for Fault {
+    fn from(m: String) -> Fault {
+        Fault::Final(m)
+    }
+}
+
+impl From<&str> for Fault {
+    fn from(m: &str) -> Fault {
+        Fault::Final(m.to_string())
+    }
+}
 
 struct Opts {
     host: PathBuf,
@@ -196,13 +221,14 @@ fn git(tree: &Path, args: &[&str]) -> R<String> {
 }
 
 /// The newest mtime (epoch s) of the tree and everything in it outside `.git`; no link is followed.
-fn walk(root: &Path, cap: usize) -> R<u64> {
-    let top = symlink_metadata(root).and_then(|m| m.modified()).map_err(|_| "the tree cannot be inspected".to_string())?;
+fn walk(root: &Path, cap: usize) -> Result<u64, Fault> {
+    let top = symlink_metadata(root).and_then(|m| m.modified()).map_err(|_| Fault::Final("the tree cannot be inspected".into()))?;
+    let unlisted = || Fault::Transient("the tree cannot be listed".into());
     let mut newest = epoch(top);
     let (mut stack, mut seen) = (vec![root.to_path_buf()], 0usize);
     while let Some(d) = stack.pop() {
-        for e in read_dir(&d).map_err(|_| "the tree cannot be listed".to_string())? {
-            let e = e.map_err(|_| "the tree cannot be listed".to_string())?;
+        for e in read_dir(&d).map_err(|_| unlisted())? {
+            let e = e.map_err(|_| unlisted())?;
             if e.file_name() == ".git" {
                 continue;
             }
@@ -210,7 +236,7 @@ fn walk(root: &Path, cap: usize) -> R<u64> {
             if seen > cap {
                 return Err("the tree walk is over its entry cap".into());
             }
-            let m = e.metadata().map_err(|_| "the tree cannot be inspected".to_string())?;
+            let m = e.metadata().map_err(|_| Fault::Transient("the tree cannot be inspected".into()))?;
             if let Ok(t) = m.modified() {
                 newest = newest.max(epoch(t));
             }
@@ -223,7 +249,7 @@ fn walk(root: &Path, cap: usize) -> R<u64> {
 }
 
 /// Tree age: now minus the newest of the work tree mtimes, the git index mtime and the committer time of HEAD.
-fn tree_age(o: &Opts, now_s: u64) -> R<u64> {
+fn tree_age(o: &Opts, now_s: u64) -> Result<u64, Fault> {
     let mut newest = walk(&o.tree, WALK_CAP)?;
     let ip = git(&o.tree, &["rev-parse", "--git-path", "index"])?;
     let ip = Path::new(ip.trim());
@@ -297,11 +323,12 @@ fn pid_live(pid: Option<&str>) -> R<bool> {
 /// name and its cwd, canonicalized, is not the tree. Such an entry that could be the watched one (its sessionId equals the record
 /// session_id, its id equals the record short_id, its name equals the record name, or its cwd equals the tree) refuses. Returns the
 /// entries to join on and how many were left out.
-fn watch_listing(o: &Opts, short: &str, sid: &str, name: &str) -> R<(Vec<Entry>, usize)> {
+fn watch_listing(o: &Opts, short: &str, sid: &str, name: &str) -> Result<(Vec<Entry>, usize), Fault> {
     let tree = canonicalize(&o.tree).ok();
     let mut entries = Vec::new();
     let mut skipped = 0usize;
-    for r in raw_listing(&o.host)? {
+    let raw = raw_listing(&o.host).map_err(|m| if m == LISTING_FAULT { Fault::Transient(m) } else { Fault::Final(m) })?;
+    for r in raw {
         let could_be_watched = r.session_id.as_deref() == Some(sid)
             || r.id.as_deref() == Some(short)
             || r.name.as_deref() == Some(name)
@@ -311,7 +338,7 @@ fn watch_listing(o: &Opts, short: &str, sid: &str, name: &str) -> R<(Vec<Entry>,
                 .is_some_and(|c| tree.as_ref().is_some_and(|t| c == *t));
         if let Some(m) = r.bad() {
             if could_be_watched {
-                return Err(m.to_string());
+                return Err(m.into());
             }
             skipped += 1;
             continue;
@@ -368,7 +395,7 @@ fn out(verdict: &'static str, s: &Show, extra: &str, working_age: Option<u64>) -
     Out { verdict, code, line, working_age, detail: None }
 }
 
-fn check(o: &Opts) -> R<Out> {
+fn check(o: &Opts) -> Result<Out, Fault> {
     let now = SystemTime::now();
     let now_s = epoch(now);
     let l = load_launch(o)?;
@@ -399,7 +426,7 @@ fn check(o: &Opts) -> R<Out> {
         return Ok(out("stopped", &s, " by=host", None));
     }
     if !matches!(state, "working" | "done" | "blocked" | "idle") {
-        return Err(format!("the host state {} is not one this verb judges", state.chars().take(24).collect::<String>()));
+        return Err(format!("the host state {} is not one this verb judges", state.chars().take(24).collect::<String>()).into());
     }
     let t_age = transcript_age(o, cwd, &sid, now)?;
     s.transcript = Some(t_age);
@@ -474,38 +501,53 @@ fn follow(o: &Opts, poll: u64, max: u64) -> i32 {
     let start = Instant::now();
     let limit = Duration::from_secs(max);
     let (mut printed, mut top): (Option<&str>, Option<u64>) = (None, None);
-    let mut last: &str;
+    // transient faults in a row, tree and host together
+    let mut faults = 0u32;
     let age = |t: Option<u64>| t.map_or("-".to_string(), |x| x.to_string());
     loop {
-        let o1 = match check(o) {
-            Ok(x) => x,
-            Err(m) => return refuse(&m),
-        };
-        if let Some(w) = o1.working_age {
-            top = Some(top.map_or(w, |x: u64| x.max(w)));
-        }
-        if !matches!(o1.verdict, "working" | "slow-alive") {
-            println!("{} max_transcript_age={}", o1.line, age(top));
-            if let Some(d) = &o1.detail {
-                println!("{d}");
+        let fault = match check(o) {
+            Ok(o1) => {
+                faults = 0;
+                if let Some(w) = o1.working_age {
+                    top = Some(top.map_or(w, |x: u64| x.max(w)));
+                }
+                if !matches!(o1.verdict, "working" | "slow-alive") {
+                    println!("{} max_transcript_age={}", o1.line, age(top));
+                    if let Some(d) = &o1.detail {
+                        println!("{d}");
+                    }
+                    return o1.code;
+                }
+                if printed != Some(o1.verdict) {
+                    println!("{}", o1.line);
+                    printed = Some(o1.verdict);
+                }
+                None
             }
-            return o1.code;
-        }
-        if printed != Some(o1.verdict) {
-            println!("{}", o1.line);
-            printed = Some(o1.verdict);
-        }
-        last = o1.verdict;
+            Err(Fault::Final(m)) => return refuse(&m),
+            Err(Fault::Transient(m)) => {
+                faults += 1;
+                if faults >= FAULT_BOUND {
+                    return refuse(&m);
+                }
+                Some(m)
+            }
+        };
         let left = limit.saturating_sub(start.elapsed());
-        if left.is_zero() {
-            break;
+        if !left.is_zero() {
+            std::thread::sleep(left.min(Duration::from_secs(poll)));
         }
-        std::thread::sleep(left.min(Duration::from_secs(poll)));
-        if start.elapsed() >= limit {
-            break;
+        let over = start.elapsed() >= limit;
+        // the note is for a fault that does not end the run, so it waits until the time limit is ruled out
+        match fault {
+            Some(m) if over => return refuse(&m),
+            Some(m) => eprintln!("harness: session watch note: {m} (fault {faults} of {FAULT_BOUND})"),
+            None if over => break,
+            None => {}
         }
     }
-    println!("verdict=watch-limit last={last} max_transcript_age={}", age(top));
+    // the newest check judged, so the last printed verdict is its verdict
+    println!("verdict=watch-limit last={} max_transcript_age={}", printed.unwrap_or("-"), age(top));
     16
 }
 
@@ -529,7 +571,7 @@ pub fn watch_cmd(a: &[String]) -> i32 {
                 }
                 r.code
             }
-            Err(m) => refuse(&m),
+            Err(Fault::Transient(m) | Fault::Final(m)) => refuse(&m),
         },
     }
 }
@@ -544,6 +586,13 @@ mod tests {
             assert!(session_id_ok(bad).is_err(), "{bad:?} must be refused");
         }
         assert!(session_id_ok("11111111-2222-4333-8444-555555555555").is_ok(), "twin: a uuid is accepted");
+    }
+
+    #[test]
+    fn a_missing_tree_root_is_a_final_fault() {
+        let d = std::env::temp_dir().join(format!("swatch-unit-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(matches!(walk(&d, 4), Err(Fault::Final(_))), "a missing root is not a fault of one look");
     }
 
     #[test]

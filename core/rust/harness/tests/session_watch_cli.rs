@@ -1303,3 +1303,195 @@ fn t20r_the_seat_log_module_builds_no_transcript_path() {
         assert!(!src.contains(w), "session_watch_log.rs holds {w}");
     }
 }
+
+// ------------------------------------------------------------------------------------------------ faulted checks in follow mode
+
+const UNLISTED: &str = "the tree cannot be listed";
+const HOST_FAULT: &str = "the host's listing could not be run or timed out";
+const NOTE: &str = "harness: session watch note: ";
+
+/// A mode-000 folder inside the tree; its mode is restored on drop. Declare it after the `Fx`, so it drops first.
+struct Locked(PathBuf);
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Made after `age_tree`; the test fails if the folder can still be read.
+fn lock_folder(fx: &Fx) -> Locked {
+    let l = Locked(fx.tree.join("locked"));
+    fs::create_dir(&l.0).unwrap();
+    fs::set_permissions(&l.0, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(fs::read_dir(&l.0).is_err(), "FAIL: the mode-000 folder can be read by this user, so no tree fault is made");
+    l
+}
+
+/// The host stub counts its `agents` runs, runs `before` (the shell variable `n` is the run number), then prints the listing.
+fn counted(fx: &Fx, before: &str) {
+    let count = fx.root.join("agents-runs").display().to_string();
+    let list = fx.root.join("list.json").display().to_string();
+    fx.stub(&format!("echo x >> '{count}'\nn=$(($(wc -l < '{count}')))\n{before}\ncat '{list}'"));
+}
+
+fn runs(fx: &Fx) -> usize {
+    fs::read_to_string(fx.root.join("agents-runs")).map_or(0, |s| s.lines().count())
+}
+
+fn follow_run(fx: &Fx, max: &str) -> R {
+    fx.run_extra(&["--follow", "--poll-s", "1", "--max-s", max])
+}
+
+/// A note line holds the fault and the count, and no path.
+fn note_line(fx: &Fx, l: &str, fault: &str, count: usize) {
+    assert!(l.starts_with(NOTE), "{l}");
+    assert!(l.contains(fault) && l.contains(&format!("fault {count} of 3")), "{l}");
+    assert!(!l.contains(&fx.root.display().to_string()) && !l.contains('/'), "the note line holds a path: {l}");
+}
+
+/// Exit 3, empty stdout, and stderr is `notes` note lines that hold the fault, then the one refusal line that holds `msg`.
+fn notes_then_refusal(fx: &Fx, r: &R, notes: usize, fault: &str, msg: &str) {
+    refused(r, msg);
+    let l: Vec<&str> = r.err.lines().collect();
+    assert_eq!(l.len(), notes + 1, "{:?}", r.err);
+    for (i, n) in l[..notes].iter().enumerate() {
+        note_line(fx, n, fault, i + 1);
+    }
+    assert!(l[notes].starts_with("harness: session watch refused: ") && l[notes].contains(msg), "{}", l[notes]);
+}
+
+/// A follow run that kept watching to the time limit: one working line, then the watch-limit line.
+fn watched_to_the_limit(r: &R) {
+    assert_eq!(r.code, 16, "{} {}", r.out, r.err);
+    let l = lines(r);
+    assert_eq!(l.len(), 2, "{:?}", r.out);
+    assert!(l[0].starts_with("verdict=working state=working/busy "), "{}", l[0]);
+    assert!(l[1].starts_with("verdict=watch-limit last=working max_transcript_age="), "{}", l[1]);
+}
+
+#[test]
+fn t21a_a_tree_fault_on_each_try_ends_after_the_bound() {
+    let fx = working();
+    counted(&fx, "");
+    let _l = lock_folder(&fx);
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 2, UNLISTED, UNLISTED);
+    assert_eq!(runs(&fx), 3);
+}
+
+#[test]
+fn t21b_a_host_listing_fault_on_each_try_ends_after_the_bound() {
+    let fx = working();
+    fs::set_permissions(fx.root.join("host.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 2, HOST_FAULT, HOST_FAULT);
+}
+
+#[test]
+fn t21c_a_tree_fault_then_success_keeps_watching() {
+    let fx = working();
+    let l = lock_folder(&fx);
+    counted(&fx, &format!("if [ $n -ge 2 ]; then chmod 755 '{}'; fi", l.0.display()));
+    let r = follow_run(&fx, "4");
+    watched_to_the_limit(&r);
+    let e: Vec<&str> = r.err.lines().collect();
+    assert_eq!(e.len(), 1, "{:?}", r.err);
+    note_line(&fx, e[0], UNLISTED, 1);
+}
+
+#[test]
+fn t21d_a_host_listing_timeout_then_success_keeps_watching() {
+    let fx = working();
+    counted(&fx, "if [ $n -eq 1 ]; then sleep 30; fi");
+    let r = follow_run(&fx, "15");
+    watched_to_the_limit(&r);
+    let e: Vec<&str> = r.err.lines().collect();
+    assert_eq!(e.len(), 1, "{:?}", r.err);
+    note_line(&fx, e[0], HOST_FAULT, 1);
+}
+
+#[test]
+fn t21e_the_host_state_failed_ends_at_once() {
+    let fx = working();
+    fx.list(&[fx.ent("failed", Some("busy"))]);
+    counted(&fx, "");
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 0, "", "the host state failed is not one this verb judges");
+    assert_eq!(runs(&fx), 1);
+}
+
+#[test]
+fn t21f_other_real_refusals_are_final_on_first_sight() {
+    let fx = working();
+    let cwd = other_dir(&fx);
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &cwd, None)]);
+    counted(&fx, "");
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 0, "", "the entry cwd is not the tree");
+    assert_eq!(runs(&fx), 1);
+    let fx = working();
+    counted(&fx, "exit 1");
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 0, "", "the host's listing exited non-zero");
+    assert_eq!(runs(&fx), 1);
+}
+
+#[test]
+fn t21g_once_does_not_retry() {
+    let fx = working();
+    counted(&fx, "");
+    let _l = lock_folder(&fx);
+    let r = fx.run();
+    notes_then_refusal(&fx, &r, 0, "", UNLISTED);
+    assert_eq!(runs(&fx), 1);
+}
+
+#[test]
+fn t21h_faults_that_alternate_with_good_checks_do_not_end_the_run() {
+    let fx = working();
+    let l = lock_folder(&fx);
+    let d = l.0.display();
+    counted(&fx, &format!("if [ $n -le 5 ] && [ $((n % 2)) -eq 1 ]; then chmod 000 '{d}'; else chmod 755 '{d}'; fi"));
+    let r = follow_run(&fx, "10");
+    watched_to_the_limit(&r);
+    let e: Vec<&str> = r.err.lines().collect();
+    assert_eq!(e.len(), 3, "{:?}", r.err);
+    for n in e {
+        note_line(&fx, n, UNLISTED, 1);
+    }
+}
+
+#[test]
+fn t21i_the_time_limit_during_faults_is_the_refusal_of_the_fault() {
+    let fx = working();
+    let _l = lock_folder(&fx);
+    let r = follow_run(&fx, "1");
+    refused(&r, "time limit during faults");
+    let last = r.err.lines().last().unwrap();
+    assert!(last.starts_with("harness: session watch refused: ") && last.contains(UNLISTED), "{last}");
+}
+
+#[test]
+fn t21j_a_missing_tree_root_is_final_at_once() {
+    // the cwd test sees the missing tree before the walk does; the walk's own root case has a unit test in session_watch.rs
+    let fx = working();
+    counted(&fx, "");
+    fs::rename(&fx.tree, fx.root.join("tree-moved")).unwrap();
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 0, "", "the entry cwd is not the tree");
+    assert_eq!(runs(&fx), 1);
+}
+
+#[test]
+fn t21k_a_real_refusal_after_a_fault_ends_the_run() {
+    let fx = working();
+    let cwd = other_dir(&fx);
+    let moved = fx.root.join("moved.json");
+    fs::write(&moved, format!("[{}]", fx.entry(SHORT, SID, "working", Some("busy"), &cwd, None))).unwrap();
+    counted(&fx, &format!("if [ $n -ge 2 ]; then cat '{}'; exit 0; fi", moved.display()));
+    let _l = lock_folder(&fx);
+    let r = follow_run(&fx, "30");
+    notes_then_refusal(&fx, &r, 1, UNLISTED, "the entry cwd is not the tree");
+    assert_eq!(runs(&fx), 2);
+}

@@ -41,8 +41,10 @@ Decided in this order on each check.
 | v5 | state `done` or `idle`, a commit in base..HEAD at or after the launch second, and `gate_current=yes` | `finished gate=<pass\|fail>` | 13 |
 | v5 | otherwise | `stopped-early why=no-commit` (wins) or `why=no-gate` | 12 |
 
-Follow mode ends with 16 (`verdict=watch-limit last=<verdict>`) at the time limit. Refusals (cannot judge) are exit 3 with empty stdout
-and one stderr line. Exit 1 is not used.
+Follow mode ends with 16 (`verdict=watch-limit last=<verdict>`) at the time limit, unless the newest check faulted (see Follow mode).
+Refusals (cannot judge) are exit 3 with empty stdout and one stderr line. In a follow run, stdout keeps the lines printed before the
+refusal, and after transient faults stderr has the note lines (`harness: session watch note: ...`, one per fault that did not end the
+run) before its one refusal line. The bound is the engine constant `FAULT_BOUND`, value 3. Exit 1 is not used.
 
 The v3 `finished` row is a seat the host still lists as working. The seat may still be running. It needs `last_gate=pass`, which the v5
 row does not. Its line carries `state=working/<status>`, which tells it from a v5 finish.
@@ -116,6 +118,11 @@ both limits also reads git base..HEAD and `harness status`, and their failures r
 over its cap; git cannot report HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
 working, done, blocked, idle, stopped. A refusal is never printed as working or slow-alive.
 
+Without `--follow` each of these ends the run on first sight, with one stderr line. In follow mode these are transient faults: "the tree
+cannot be listed"; "the tree cannot be inspected" for an entry inside the tree (not for the tree root); and "the host's listing could not
+be run or timed out". Every other refusal ends a follow run on first sight too. `FAULT_BOUND` (value 3) bounds the transient faults (see
+Follow mode): after faults, a follow refusal has the note lines (`harness: session watch note: ...`) before its one refusal line.
+
 ## Transcript
 
 Path: `<transcript root>/<entry cwd with each character outside [A-Za-z0-9] made ->/<sessionId>.jsonl`. It is read by metadata only
@@ -128,7 +135,17 @@ approved a 10-minute silence watch on 2026-11-16, built on the session file mtim
 ## Follow mode
 
 The check runs at start and then every poll interval. A line is printed at start, on each verdict change and at the end. The run ends
-with the exit code of the first verdict other than `working` or `slow-alive` (a refusal included), or with 16 at the time limit
-(monotonic clock). The end line carries `max_transcript_age=`, the largest transcript age seen with host state working (`-` if none).
+with the exit code of the first verdict other than `working` or `slow-alive` (a refusal that is not a transient fault included), or with
+16 at the time limit (monotonic clock). The end line carries `max_transcript_age=`, the largest transcript age seen with host state working (`-` if none).
 `--stopped-at` is read once at start: a `bw stop` during a follow run reads `stopped by=host` or `gone` (the host state or listing
 changes), not `by=bw`.
+
+A transient fault (see Refusals) does not end the run at once. Tree and host faults share one count, and a check that judges sets it back
+to 0. At `FAULT_BOUND` (value 3) faulted checks in a row the run ends as the refusal of the last fault: exit 3 and the same single
+refusal line. When the time limit comes while the newest check faulted (or no check has judged yet), the run also ends as the refusal of
+that fault, with no watch-limit line. A faulted check prints no stdout line. Each fault that does not end the run prints one note line on
+stderr, with the fault text and the count and no path. It is printed after the wait, once the time limit is ruled out:
+
+```
+harness: session watch note: the tree cannot be listed (fault 1 of 3)
+```
