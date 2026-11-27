@@ -126,10 +126,29 @@ fn children(pid: u32) -> Vec<u32> {
     ps_rows().iter().filter(|r| r.1 == pid && !r.2.starts_with('Z')).map(|r| r.0).collect()
 }
 
-/// The live grandchildren of `pid`: what the verb counts as a child of the seat.
-fn grandchildren(pid: u32) -> Vec<u32> {
-    let kids = children(pid);
-    ps_rows().iter().filter(|r| kids.contains(&r.1) && !r.2.starts_with('Z')).map(|r| r.0).collect()
+/// Each live process under `root` as (pid, depth), lowest depth first and each pid once; a child of `root` is depth 1.
+fn under(root: u32) -> Vec<(u32, u32)> {
+    let rows = ps_rows();
+    let (mut level, mut seen, mut out): (Vec<u32>, Vec<u32>, Vec<(u32, u32)>) = (vec![root], vec![root], Vec::new());
+    let mut depth = 0;
+    loop {
+        let found: Vec<u32> = rows.iter().filter(|r| level.contains(&r.1) && !r.2.starts_with('Z') && !seen.contains(&r.0)).map(|r| r.0).collect();
+        if found.is_empty() {
+            return out;
+        }
+        depth += 1;
+        for pid in &found {
+            seen.push(*pid);
+            out.push((*pid, depth));
+        }
+        level = found;
+    }
+}
+
+/// The depths of the live processes under `root`, lowest first: the shape of a fixture as the verb sees it (it counts a live process
+/// at depth 2 or more under the seat).
+fn depths(root: u32) -> Vec<u32> {
+    under(root).iter().map(|x| x.1).collect()
 }
 
 /// Every process under `root` on the process list, deepest first, each pid once.
@@ -157,12 +176,26 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Fails the test unless the live processes under the seat sit at exactly these depths (lowest first) within 5 s, and shows the
+/// depths it saw otherwise. A test checks the shape its fixture describes here, before its verdict, on every OS: a shell that kept
+/// a wrapper under the seat pid shows as depths one too deep.
+fn shaped(seat: u32, want: &[u32]) {
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let mut got = depths(seat);
+    while got != want && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        got = depths(seat);
+    }
+    assert_eq!(got, want, "the live processes under the seat, by depth (wanted {want:?})");
+}
+
 fn kill(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-/// A shell the test started with `-c script` and `args` after its name. At the end of the test every process under it on the process
-/// list is killed (deepest first), then it is: a tool call outlives the shell that started it otherwise.
+/// A shell the test started with `-c script` and `args` after its name. The spawned pid is the shell of `script` itself on every
+/// OS: the spawn goes through `exec "$0" "$@"` (`tree_n`). At the end of the test every process under it on the process list is
+/// killed (deepest first), then it is: a tool call outlives the shell that started it otherwise.
 struct Tree(Child);
 
 impl Drop for Tree {
@@ -175,9 +208,24 @@ impl Drop for Tree {
     }
 }
 
+/// `sh -c 'exec "$0" "$@"' sh -c script args...`, so the spawned pid is the shell of `script` on every OS. A bare `sh -c script`
+/// is not: macOS `sh` (bash) replaces itself with a `-c` string that is one command, while Ubuntu `sh` (dash 0.5.12, CI
+/// ubuntu-latest) keeps a wrapper shell, so every process of the script sat one level deeper than its test assumed and the seat
+/// pid was not the shell the script describes. `exec` means the same on every POSIX shell: the wrapper becomes the shell of
+/// `script`, with `$0` `sh` and `$1..` `args` as before. Each fixture script also forces every fork it makes (a `&`, or a command
+/// followed by another one), so the depths under the seat do not depend on the shell either: the tests check them (`shaped`)
+/// before the verdict.
 fn tree_n(script: &str, args: &[&str]) -> Tree {
     let mut c = Command::new("sh");
-    c.arg("-c").arg(script).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    c.arg("-c")
+        .arg("exec \"$0\" \"$@\"")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     Tree(c.spawn().unwrap())
 }
 
@@ -1617,7 +1665,17 @@ fn t21k_a_real_refusal_after_a_fault_ends_the_run() {
 
 /// A seat busy in a long tool call: the entry shell waits on a shell that runs a two-minute `sleep`, so the sleep is at depth 2.
 const BUSY: &str = "sh -c 'sh -c \"sleep 120; :\" & wait'";
+/// A seat that holds the wait in a sleep of its own while another shell runs a two-minute sleep.
+const HELD: &str = "sh -c 'sh -c \"sleep 120; :\" & sleep 120; wait'";
 const UNREAD: &str = "harness: session watch refused: the process list cannot be read\n";
+
+/// The busy seat of `BUSY`, once its shape was seen: the middle shell at depth 1, its two-minute sleep at depth 2, nothing else,
+/// both just started. So the fresh process the verdict counts is at depth 2, whatever shell `sh` is.
+fn busy() -> Tree {
+    let p = tree(BUSY);
+    shaped(p.0.id(), &[1, 2]);
+    p
+}
 
 /// A working seat past both limits whose entry is `pid`: transcript 700 s old, tree 800 s old.
 fn past(fx: &Fx, pid: u32) {
@@ -1636,9 +1694,8 @@ fn no_names(fx: &Fx, out: &str) {
 #[test]
 fn t22_a_busy_seat_in_a_long_tool_call_is_slow_alive_by_its_child() {
     let fx = Fx::new();
-    let p = tree(BUSY);
+    let p = busy();
     past(&fx, p.0.id());
-    assert!(!grandchildren(p.0.id()).is_empty(), "the fixture must have a live process at depth 2 under the seat");
     let r = fx.go(&fx.args(720, 600));
     is(&r, 10, &["verdict=slow-alive", "why=child", "state=working/busy", "ps_skip=0"]);
     num(&r, "child_age=", 0, 30);
@@ -1650,13 +1707,14 @@ fn t22_a_busy_seat_in_a_long_tool_call_is_slow_alive_by_its_child() {
 #[test]
 fn t22b_a_child_older_than_the_transcript_time_and_the_slack_does_not_count() {
     let fx = Fx::new();
-    let p = tree(BUSY);
+    let p = busy();
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
     fx.age_tree(800);
     // the depth-2 sleep is over 4 s old; the transcript is 1 s old
     std::thread::sleep(Duration::from_secs(5));
     fx.mk_file(&fx.tpath(&fx.cwd(), SID), 1);
-    assert!(!grandchildren(p.0.id()).is_empty());
+    // the same two processes under the seat, the sleep still at depth 2
+    shaped(p.0.id(), &[1, 2]);
     let r = fx.run_extra_slack(1, 1, 1);
     is(&r, 11, &["verdict=stalled", "ps_skip=0"]);
     assert!(!r.out.contains("why="), "{}", r.out);
@@ -1673,7 +1731,8 @@ fn t22c_a_fresh_helper_at_depth_1_does_not_count() {
     fx.age_tree(800);
     fx.mk_file(&fx.tpath(&fx.cwd(), SID), 0);
     std::thread::sleep(Duration::from_millis(3500));
-    wait_until("the two-minute sleep alone at depth 1", || !children(p.0.id()).is_empty() && grandchildren(p.0.id()).is_empty());
+    // the two-minute sleep alone at depth 1, the 3 s helper gone: nothing at depth 2
+    shaped(p.0.id(), &[1]);
     let r = fx.run_extra_slack(720, 1, 1);
     is(&r, 11, &["verdict=stalled"]);
     assert!(!r.out.contains("why="), "{}", r.out);
@@ -1681,8 +1740,8 @@ fn t22c_a_fresh_helper_at_depth_1_does_not_count() {
 
 #[test]
 fn t22d_the_child_check_comes_after_finished_and_the_two_windows() {
-    // a quiet passed seat is finished, with a fresh child under it
-    let p = tree(BUSY);
+    // a quiet passed seat is finished, with a fresh child at depth 2 under it
+    let p = busy();
     let fx = Fx::new();
     fx.commit_at(900);
     fx.note(true);
@@ -1691,7 +1750,7 @@ fn t22d_the_child_check_comes_after_finished_and_the_two_windows() {
     is(&r, 13, &["verdict=finished", "gate=pass/yes"]);
     assert!(!r.out.contains("why=") && !r.out.contains("ps_skip="), "{}", r.out);
     // a fresh tree is working
-    let p = tree(BUSY);
+    let p = busy();
     let fx = Fx::new();
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
     fx.transcript(700);
@@ -1700,7 +1759,7 @@ fn t22d_the_child_check_comes_after_finished_and_the_two_windows() {
     is(&r, 0, &["verdict=working"]);
     assert!(!r.out.contains("why=") && !r.out.contains("ps_skip="), "{}", r.out);
     // a fresh transcript is the plain slow-alive
-    let p = tree(BUSY);
+    let p = busy();
     let fx = Fx::new();
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
     fx.transcript(30);
@@ -1767,10 +1826,11 @@ fn t22h_child_slack_s_is_1_to_86400_and_given_once() {
 
 #[test]
 fn t22i_follow_holds_the_wait_while_the_child_is_fresh() {
-    // the entry shell waits in a sleep of its own on a shell that runs a two-minute sleep
-    const HELD: &str = "sh -c 'sh -c \"sleep 120; :\" & sleep 120; wait'";
+    // the entry shell waits in a sleep of its own on a shell that runs a two-minute sleep: two processes at depth 1 (the shell
+    // and the entry's own sleep), the two-minute sleep at depth 2
     let fx = Fx::new();
     let p = tree(HELD);
+    shaped(p.0.id(), &[1, 1, 2]);
     past(&fx, p.0.id());
     let r = follow_run(&fx, "3");
     assert_eq!(r.code, 16, "{} {}", r.out, r.err);
@@ -1779,17 +1839,18 @@ fn t22i_follow_holds_the_wait_while_the_child_is_fresh() {
     assert!(l[0].contains("verdict=slow-alive") && l[0].contains("why=child"), "{}", l[0]);
     assert!(l[1].starts_with("verdict=watch-limit last=slow-alive "), "{}", l[1]);
     no_names(&fx, &r.out);
-    // the depth-2 sleep killed: the seat is alive with nothing at depth 2, and is stalled
+    // the depth-2 sleep killed: the seat is alive in its own sleep with nothing at depth 2, and is stalled
     let fx = Fx::new();
     let p = tree(HELD);
+    shaped(p.0.id(), &[1, 1, 2]);
     past(&fx, p.0.id());
-    let prey = grandchildren(p.0.id());
-    assert!(!prey.is_empty(), "the fixture must have a live process at depth 2 under the seat");
+    let prey: Vec<u32> = under(p.0.id()).into_iter().filter(|x| x.1 == 2).map(|x| x.0).collect();
+    assert_eq!(prey.len(), 1, "the fixture must have one live process at depth 2 under the seat");
     for pid in prey {
         kill(pid);
     }
-    wait_until("no live process at depth 2 under the seat", || grandchildren(p.0.id()).is_empty());
-    assert!(!children(p.0.id()).is_empty(), "the seat is alive in its own sleep");
+    // the entry's own sleep alone is left: the seat is alive, and no live process is at depth 2
+    shaped(p.0.id(), &[1]);
     let r = fx.run();
     is(&r, 11, &["verdict=stalled"]);
     assert!(!r.out.contains("why="), "{}", r.out);
@@ -1799,7 +1860,7 @@ fn t22i_follow_holds_the_wait_while_the_child_is_fresh() {
 #[test]
 fn t22j_follow_prints_a_line_when_the_why_changes() {
     let fx = Fx::new();
-    let p = tree(BUSY);
+    let p = busy();
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
     fx.age_tree(800);
     // the transcript is as new as the child: the seat is the plain slow-alive until 2 s pass, then busy by its child
@@ -1822,7 +1883,10 @@ fn t22l_a_zombie_under_the_seat_does_not_count() {
     let fx = Fx::new();
     let p = tree("sh -c 'perl -e \"if(fork()==0){exit 0} sleep 120\"; :'");
     past(&fx, p.0.id());
-    wait_until("the zombie row under the perl child", || ps_rows().iter().any(|r| r.2.starts_with('Z') && children(p.0.id()).contains(&r.1)));
+    // perl is the one live process under the seat, at depth 1; the zombie is the child of a live child of the seat
+    wait_until("perl alone at depth 1 and its zombie at depth 2", || {
+        depths(p.0.id()) == vec![1] && ps_rows().iter().any(|r| r.2.starts_with('Z') && children(p.0.id()).contains(&r.1))
+    });
     let r = fx.run();
     is(&r, 11, &["verdict=stalled"]);
     assert!(!r.out.contains("why="), "{}", r.out);
@@ -1832,9 +1896,8 @@ fn t22l_a_zombie_under_the_seat_does_not_count() {
 fn t22m_the_entry_pid_1_is_not_walked() {
     // the seat's own tree hangs under pid 1 too, so walking from 1 would find this fixture's fresh depth-2 sleep
     let fx = Fx::new();
-    let p = tree(BUSY);
+    let _p = busy();
     past(&fx, 1);
-    assert!(!grandchildren(p.0.id()).is_empty());
     let r = fx.run();
     is(&r, 11, &["verdict=stalled"]);
     assert!(!r.out.contains("why="), "{}", r.out);
@@ -1849,7 +1912,8 @@ fn t22n_the_watcher_skips_its_own_subtree() {
     fx.transcript(700);
     fx.age_tree(800);
     // the entry shell writes its pid, then its child shell execs the verb: the verb and its ps child are under the entry. The
-    // verb's exit status is the shell's (`exit $?`, not a trailing `:`).
+    // verb's exit status is the shell's (`exit $?`, not a trailing `:`). The entry shell runs three commands, so no shell
+    // replaces itself here, and the inner `exec` is the same on every shell: the tree is the same under bash and under dash.
     let mut c = Command::new("sh");
     c.arg("-c")
         .arg(format!("echo $$ > '{}'; sh -c 'exec \"$0\" \"$@\"' \"$@\"; exit $?", pidfile.display()))
@@ -1875,12 +1939,14 @@ fn t22n_the_watcher_skips_its_own_subtree() {
 
 #[test]
 fn t22o_a_fresh_process_40_levels_down_is_a_child() {
-    // 40 nested shells by one script (`$1` is the script, `$2` the levels left), the sleep at the bottom
+    // 40 nested shells by one script (`$1` is the script, `$2` the levels left), the sleep at the bottom: depth 41 under the seat.
+    // The arguments reach the script (`$1` and `$2`) through the exec of `tree_n`; each shell waits on the next, so every level
+    // is a forced fork.
     const DEEP: &str = "n=$2; if [ \"$n\" -gt 0 ]; then sh -c \"$1\" sh \"$1\" $(($n - 1)); else sleep 120; fi; :";
     let fx = Fx::new();
     let p = tree_n(DEEP, &["sh", DEEP, "40"]);
+    shaped(p.0.id(), &(1..=41).collect::<Vec<u32>>());
     past(&fx, p.0.id());
-    wait_until("the 40 shells and the sleep", || family(p.0.id()).len() == 41);
     let r = fx.run();
     is(&r, 10, &["verdict=slow-alive", "why=child", "ps_skip=0"]);
     num(&r, "child_age=", 0, 30);
@@ -1889,14 +1955,16 @@ fn t22o_a_fresh_process_40_levels_down_is_a_child() {
 #[test]
 fn t22p_a_process_reparented_away_from_the_seat_does_not_count() {
     let fx = Fx::new();
-    // the first child shell ends at once, so its sleep is adopted elsewhere: no longer under the entry
+    // the first child shell ends at once, so its sleep is adopted elsewhere: no longer under the entry. What is left under the
+    // entry is its own two-minute sleep, at depth 1 (the trailing `:` keeps the entry a shell around it on every OS).
     let pidfile = fx.root.join("orphan.pid");
-    let p = tree(&format!("sh -c 'sleep 120 & echo $! > \"{}\"'; sleep 120", pidfile.display()));
+    let p = tree(&format!("sh -c 'sleep 120 & echo $! > \"{}\"'; sleep 120; :", pidfile.display()));
     past(&fx, p.0.id());
-    wait_until("the pid of the orphan", || pidfile.exists());
-    let orphan: u32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-    let _k = Kill(orphan);
-    wait_until("the sleep leaves the tree of the seat", || !family(p.0.id()).contains(&orphan));
+    let written = || fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse::<u32>().ok());
+    wait_until("the pid of the orphan", || written().is_some());
+    let _k = Kill(written().unwrap());
+    wait_until("the sleep leaves the tree of the seat", || !family(p.0.id()).contains(&_k.0));
+    shaped(p.0.id(), &[1]);
     let r = fx.run();
     is(&r, 11, &["verdict=stalled"]);
     assert!(!r.out.contains("why="), "{}", r.out);
