@@ -53,15 +53,18 @@ The v3 `finished` row is a seat the host still lists as working. The seat may st
 row does not. Its line carries `state=working/<status>`, which tells it from a v5 finish.
 
 The v3 `slow-alive why=child` row and the `stalled` row share the child check, which runs after the `finished` facts. A working seat
-past both limits can be busy in a long tool call that writes nothing to the tree or the transcript: a live `sleep` two levels under
-the entry pid is the sign. Depth is counted from the entry pid of the listing (its children are depth 1): depth 1 holds the host's
+past both limits can be busy in a long tool call that writes nothing to the tree or the transcript. The sign is any live (not
+zombie) process at depth 2 or more under the entry pid that started late enough, whatever program it runs (a `sleep` is one
+example). Depth is counted from the entry pid of the listing (its children are depth 1): depth 1 holds the host's
 helpers, which do not count (probe 2026-11-27: `caffeinate`, the host's `git` polls).
 `child_age=` is the age in seconds of the newest process that counts. A process started before (transcript mtime - `CHILD_SLACK_S`)
-does not count, so a long tool call of an earlier turn cannot keep a seat alive; a zombie does not count; a process whose parent
-ended (reparented, on macOS to launchd) is no longer under the entry pid; and the entry pid 1 is not walked at all (everything
-reparented ends under it, and the process list is not read for it). The check reads the process list once per check that reaches it
-(`ps -A -o pid=,ppid=,etime=,state=`: one snapshot), walks the pids under the entry pid (each pid once, so a parent-pid cycle
-ends), skips the watcher's own pid and subtree (so its own `ps` child never counts), and reads no command name.
+does not count, so a process left from long before the last transcript write cannot keep a seat alive; a zombie does not count; a
+process whose parent ended is reparented, on macOS, and on Linux without a subreaper, to pid 1, so it is no longer under the entry
+pid (a Linux subreaper can adopt it instead); and the entry pid 1 is not walked at all (on macOS, and on Linux without a
+subreaper, everything reparented ends under it; the process list is not read for it). The check reads the process list once per
+check that reaches it (`ps -A -o pid=,ppid=,etime=,state=`: one snapshot), walks the pids under the entry pid (each pid once, so
+a parent-pid cycle ends), skips the watcher's own pid and subtree (so neither the watcher nor its own `ps` child counts), and
+reads no command name.
 
 Tree age is now minus the newest of: the mtime of every file and folder of the work tree outside `.git` (no link followed, over 200000
 entries is a refusal), the mtime of the git index, and the committer time of HEAD. Transcript age is now minus the transcript mtime.

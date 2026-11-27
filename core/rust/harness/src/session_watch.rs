@@ -1,9 +1,11 @@
 //! `harness session watch` (A29; std only, unix). One verdict line per check for a builder seat, from the host listing, the tree, the
 //! transcript file time, the commits since the launch and the ticket gate. Report only: it writes no file, stops no session, changes no
 //! lane and writes no event; the host is called for the listing only. The transcript is read by metadata only (kind and mtime): this
-//! code opens no transcript and reads no byte of it. A working seat past both limits is `slow-alive` while a process at depth 2 or more
-//! under its entry pid is newer than the transcript: one process list per such check, read for pid, parent pid, age and state only (no
-//! command name is read or printed). See docs/session-watch.md.
+//! code opens no transcript and reads no byte of it. A working seat past both limits is first judged `finished` or not. When it is not,
+//! it is `slow-alive` while a live (not zombie) process at depth 2 or more under its entry pid started at or after (transcript mtime -
+//! `CHILD_SLACK_S`, 60 s, or `--child-slack-s`); entry pid 1 is not walked, and the watcher's own pid and subtree are left out. That is
+//! one process list per such check, read for pid, parent pid, age and state only (no command name is read or printed). See
+//! docs/session-watch.md.
 
 use crate::lane::stale::open_launch_records;
 use crate::launcher::{read_launches, Launch};
@@ -350,8 +352,11 @@ struct Proc {
     zombie: bool,
 }
 
-/// Elapsed seconds of an etime field, `[[dd-]hh:]mm:ss`; anything else is no value.
+/// Elapsed seconds of an etime field, `[[dd-]hh:]mm:ss`, or bare seconds of two digits or more; anything else is no value.
 fn etime_secs(s: &str) -> Option<u64> {
+    if s.len() >= 2 && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse().ok();
+    }
     let (days, rest) = match s.split_once('-') {
         Some((d, r)) => (d.parse::<u64>().ok()?, r),
         None => (0, s),
@@ -407,24 +412,22 @@ fn procs(cap: usize) -> Result<(Vec<Proc>, usize), String> {
     parse_procs(&String::from_utf8_lossy(&out.stdout), cap).map_err(str::to_string)
 }
 
-/// Every pid under `root` with its depth (a child of `root` is 1), each pid once, outside the subtree of `skip`. The set of pids seen
-/// ends the walk on a ppid cycle. More pids pushed than the list has rows means the set no longer holds (a walk that would not
-/// end): the cap refusal.
+/// Every pid under `root` with its depth (a child of `root` is 1), each pid once, without `skip` and its subtree (nothing at all when
+/// `root` is `skip`). The set of pids seen ends the walk on a ppid cycle. More pids pushed than the list has rows means the set no
+/// longer holds (a walk that would not end): the cap refusal.
 fn descend(rows: &[Proc], root: u32, skip: u32) -> Result<HashMap<u32, u32>, &'static str> {
     let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
     for r in rows {
         kids.entry(r.ppid).or_default().push(r.pid);
     }
     let (mut seen, mut under, mut pushed) = (HashSet::from([root]), HashMap::new(), 0usize);
-    let (mut level, mut depth) = (vec![root], 1u32);
+    let (mut level, mut depth) = (if root == skip { Vec::new() } else { vec![root] }, 1u32);
     loop {
         let mut next = Vec::new();
         for p in level {
-            if p == skip {
-                continue;
-            }
             for k in kids.get(&p).into_iter().flatten() {
-                if seen.insert(*k) {
+                // `skip` is never walked, so neither is anything under it
+                if *k != skip && seen.insert(*k) {
                     under.insert(*k, depth);
                     next.push(*k);
                 }
@@ -452,9 +455,10 @@ fn fresh_under(rows: &[Proc], under: &HashMap<u32, u32>, t_age: u64, slack: u64)
 }
 
 /// The age of the newest live process at depth 2 or more under the entry pid that started at or after (transcript mtime - `slack`),
-/// and how many rows of the list did not parse. `None` when there is no such process. The watcher's own subtree is left out, so
-/// the `ps` child of this check never counts. Pid 1 is not walked: a process whose parent ended is reparented to it, so nothing
-/// can be said to be under it; the list is not read then.
+/// and how many rows of the list did not parse. `None` when there is no such process. The watcher's own pid and subtree are left
+/// out, so neither the watcher nor the `ps` child of this check counts. Pid 1 is not walked: on macOS, and on Linux without a
+/// subreaper, a process whose parent ended is reparented to it, so a process under it need not belong to the seat; the list is not
+/// read then.
 fn child_age(pid: u32, t_age: u64, slack: u64) -> Result<(Option<u64>, usize), String> {
     if pid == 1 {
         return Ok((None, 0));
@@ -600,9 +604,10 @@ fn check(o: &Opts) -> Result<Out, Fault> {
             if f.commits > 0 && f.last == "pass" && f.current {
                 return Ok(out("finished", &s, "", w));
             }
-            // A quiet seat the host still lists as working can be busy in a long tool call: a process at depth 2 or more under the
-            // entry pid (depth 1 holds the host's own helpers) that started after the transcript. `ps_skip` counts the rows of the
-            // process list that did not parse. A list that cannot be read refuses: it is never read as "no child".
+            // A quiet seat the host still lists as working can be busy in a long tool call: a live process at depth 2 or more under
+            // the entry pid (depth 1 holds the host's own helpers) that started at or after (transcript mtime - slack). `ps_skip`
+            // counts the rows of the process list that did not parse. A list that cannot be read refuses: it is never read as "no
+            // child".
             let (child, skipped) = child_age(pid_num(e.pid.as_deref())?, t_age, o.slack)?;
             let why = child.map_or_else(String::new, |a| format!(" why=child child_age={a}"));
             let mut r = out(if child.is_some() { "slow-alive" } else { "stalled" }, &s, &format!("{why} ps_skip={skipped}"), w);
@@ -771,7 +776,15 @@ mod tests {
             ("02:01:05", Some(7265)),
             ("3-02:01:05", Some(266_465)),
             ("12-00:00:00", Some(1_036_800)),
-            ("05", None),
+            // bare seconds: two digits or more
+            ("05", Some(5)),
+            ("00", Some(0)),
+            ("125", Some(125)),
+            ("5", None),
+            ("+05", None),
+            ("0a", None),
+            ("3-05", None),
+            ("99999999999999999999", None),
             ("1:2:3:4", None),
             ("-05", None),
             ("aa:bb", None),
@@ -782,7 +795,7 @@ mod tests {
         }
         // a row: four fields, a positive pid; anything else is skipped
         assert!(proc_row("100 1 10:00 S").is_some() && proc_row("  100     1   00:03 Z\n").is_some());
-        for bad in ["x y z", "0 1 10:00 S", "100 1 10:00", "100 1 10:00 S more", "100 1 00 S"] {
+        for bad in ["x y z", "0 1 10:00 S", "100 1 10:00", "100 1 10:00 S more", "100 1 0 S"] {
             assert!(proc_row(bad).is_none(), "{bad:?}");
         }
     }
@@ -801,8 +814,15 @@ mod tests {
         // the entry pid is part of the cycle
         let rows = [r(101, 100), r(100, 101), r(102, 101)];
         assert_eq!(descend(&rows, 100, 0).unwrap().len(), 2);
-        // the subtree of the skipped pid is left out, the pid itself is walked
-        assert_eq!(descend(&rows, 100, 101).unwrap().len(), 1);
+        // the skipped pid is left out with its subtree; a branch beside it stays
+        let rows = [r(101, 100), r(102, 101), r(103, 100), r(104, 103)];
+        let under = descend(&rows, 100, 101).unwrap();
+        assert_eq!(under, HashMap::from([(103, 1), (104, 2)]), "101 and its child 102 are left out");
+        // deeper: the skipped pid at depth 2 is not in the result, nor is its child
+        let rows = [r(101, 100), r(102, 101), r(103, 102)];
+        assert_eq!(descend(&rows, 100, 102).unwrap(), HashMap::from([(101, 1)]));
+        // an entry pid that is the skipped pid has nothing under it
+        assert!(descend(&rows, 100, 100).unwrap().is_empty());
     }
 
     #[test]

@@ -168,10 +168,15 @@ fn family(root: u32) -> Vec<u32> {
 }
 
 /// Up to 5 s, in steps of 50 ms, until `done` holds; the test fails when it never does.
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let end = std::time::Instant::now() + Duration::from_secs(5);
+fn wait_until(what: &str, done: impl FnMut() -> bool) {
+    wait_within(5, what, done);
+}
+
+/// `wait_until` with its own limit in seconds.
+fn wait_within(limit: u64, what: &str, mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(limit);
     while !done() {
-        assert!(std::time::Instant::now() < end, "not seen in 5 s: {what}");
+        assert!(std::time::Instant::now() < end, "not seen in {limit} s: {what}");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1875,8 +1880,11 @@ fn t22j_follow_prints_a_line_when_the_why_changes() {
     let p = busy();
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
     fx.age_tree(800);
-    // the transcript is as new as the child: the seat is the plain slow-alive until 2 s pass, then busy by its child
-    fx.mk_file(&fx.tpath(&fx.cwd(), SID), 0);
+    // The transcript starts 700 s old and the host stub sets it to now during the first listing only, which is inside the first
+    // check: so that check sees an age of 0 however late it runs, and is the plain slow-alive. The age then grows past 2 s and
+    // the seat is busy by its child.
+    fx.transcript(700);
+    counted(&fx, &format!("if [ $n -eq 1 ]; then touch -c '{}'; fi", fx.tpath(&fx.cwd(), SID).display()));
     let mut a = fx.args(720, 2);
     a.extend(["--follow", "--poll-s", "1", "--max-s", "5"].map(String::from));
     let r = fx.go(&a);
@@ -1921,17 +1929,28 @@ fn t22m_the_entry_pid_1_is_not_walked() {
 fn t22n_the_watcher_skips_its_own_subtree() {
     let fx = Fx::new();
     let pidfile = fx.root.join("seat.pid");
+    let above = fx.root.join("above-the-verb.pid");
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some("PIDPLACEHOLDER".to_string()))]);
-    fx.stub(&format!("sed \"s/PIDPLACEHOLDER/$(cat '{}')/\" '{}'", pidfile.display(), fx.root.join("list.json").display()));
+    // the host stub is a child of the verb: it also writes the pid two parents above the verb, which shows the verb's depth
+    fx.stub(&format!(
+        "echo $(ps -o ppid= -p $(ps -o ppid= -p $PPID)) > '{}'\nsed \"s/PIDPLACEHOLDER/$(cat '{}')/\" '{}'",
+        above.display(),
+        pidfile.display(),
+        fx.root.join("list.json").display()
+    ));
     fx.transcript(700);
     fx.age_tree(800);
-    // the entry shell writes its pid, then its child shell execs the verb: the verb and its ps child are under the entry. The
-    // verb's exit status is the shell's (`exit $?`, not a trailing `:`). The entry shell runs three commands, so no shell
-    // replaces itself here, and the inner `exec` is the same on every shell: the tree is the same under bash and under dash.
+    // the entry shell writes its pid and starts a second shell that stays; that one starts a third which execs the verb. So the
+    // verb is at depth 2 under the entry, its ps child at depth 3, and the one other process under the entry is the second shell
+    // at depth 1: only the watcher and what it starts could count. Each shell that stays passes the exit status on (`exit $?`),
+    // so it runs two commands or more and no shell replaces itself; the `exec` is the same on every shell: the tree is the same
+    // under bash and under dash.
+    const MIDDLE: &str = "sh -c 'exec \"$0\" \"$@\"' \"$@\"; exit $?";
     let mut c = Command::new("sh");
     c.arg("-c")
-        .arg(format!("echo $$ > '{}'; sh -c 'exec \"$0\" \"$@\"' \"$@\"; exit $?", pidfile.display()))
+        .arg(format!("echo $$ > '{}'; m=$1; shift; sh -c \"$m\" middle \"$@\"; exit $?", pidfile.display()))
         .arg("harness")
+        .arg(MIDDLE)
         .arg(BIN)
         .args(fx.args(720, 600))
         .stdin(Stdio::null())
@@ -1946,6 +1965,8 @@ fn t22n_the_watcher_skips_its_own_subtree() {
     }
     let code = p.0.wait().unwrap().code().unwrap_or(-1);
     let r = R { code, out, err };
+    let read = |f: &Path| fs::read_to_string(f).unwrap_or_default().trim().to_string();
+    assert_eq!(read(&above), read(&pidfile), "the shape: two parents above the verb is the entry shell, so the verb is at depth 2");
     is(&r, 11, &["verdict=stalled"]);
     assert!(!r.out.contains("why="), "{}", r.out);
     no_names(&fx, &r.out);
@@ -1953,17 +1974,28 @@ fn t22n_the_watcher_skips_its_own_subtree() {
 
 #[test]
 fn t22o_a_fresh_process_40_levels_down_is_a_child() {
-    // 40 nested shells by one script (`$1` is the script, `$2` the levels left), the sleep at the bottom: depth 41 under the seat.
+    // 40 nested shells by one script (`$1` is the script, `$2` the levels left), a sleep at the bottom: depth 41 under the seat.
     // The arguments reach the script (`$1` and `$2`) through the exec of `tree_n`; each shell waits on the next, so every level
-    // is a forced fork.
-    const DEEP: &str = "n=$2; if [ \"$n\" -gt 0 ]; then sh -c \"$1\" sh \"$1\" $(($n - 1)); else sleep 120; fi; :";
+    // is a forced fork. The bottom shell runs a 10 s sleep and then a two-minute one: when the second starts, all 40 shells
+    // are about 10 s old, so it alone can be newer than a transcript set then with a slack of 4 s. A walk that stops short
+    // of depth 41 finds nothing fresh.
+    const DEEP: &str = "n=$2; if [ \"$n\" -gt 0 ]; then sh -c \"$1\" sh \"$1\" $(($n - 1)); else sleep 10; sleep 120; fi; :";
     let fx = Fx::new();
     let p = tree_n(DEEP, &["sh", DEEP, "40"]);
-    shaped(p.0.id(), &(1..=41).collect::<Vec<u32>>());
-    past(&fx, p.0.id());
-    let r = fx.run();
+    let chain = (1..=41).collect::<Vec<u32>>();
+    shaped(p.0.id(), &chain);
+    let bottom = || under(p.0.id()).into_iter().find(|x| x.1 == 41).map(|x| x.0);
+    let first = bottom().unwrap();
+    fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
+    fx.age_tree(800);
+    wait_within(20, "the second sleep at depth 41", || bottom().is_some_and(|b| b != first));
+    // the transcript is 1 s old, set as soon as the second sleep is seen
+    fx.mk_file(&fx.tpath(&fx.cwd(), SID), 1);
+    let r = fx.run_extra_slack(720, 1, 4);
     is(&r, 10, &["verdict=slow-alive", "why=child", "ps_skip=0"]);
-    num(&r, "child_age=", 0, 30);
+    // under the age of the shells above it, so the process the walk found is the sleep at depth 41
+    num(&r, "child_age=", 0, 8);
+    shaped(p.0.id(), &chain);
 }
 
 #[test]
