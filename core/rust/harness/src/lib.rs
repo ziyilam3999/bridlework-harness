@@ -31,6 +31,8 @@ pub mod friction_loop;
 pub mod friction_suggest;
 #[cfg(unix)]
 pub mod friction_suggest_jev;
+#[cfg(unix)]
+pub mod goal;
 pub mod gate_result;
 pub mod gates;
 pub mod gitio;
