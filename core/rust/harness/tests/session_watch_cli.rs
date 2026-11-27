@@ -176,17 +176,25 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Fails the test unless the live processes under the seat sit at exactly these depths (lowest first) within 5 s, and shows the
-/// depths it saw otherwise. A test checks the shape its fixture describes here, before its verdict, on every OS: a shell that kept
-/// a wrapper under the seat pid shows as depths one too deep.
+/// Fails the test unless the live processes under the seat sit at exactly these depths (lowest first) on every sample across
+/// 200 ms, within 5 s, and shows the depths it saw otherwise. A test checks the shape its fixture describes here, before its
+/// verdict, on every OS. One matching sample is not enough: a tree that is still growing passes through the shallower shapes on
+/// its way down (a shell that has started the next one but that one has not forked yet), so the shape must hold for a moment.
 fn shaped(seat: u32, want: &[u32]) {
     let end = std::time::Instant::now() + Duration::from_secs(5);
-    let mut got = depths(seat);
-    while got != want && std::time::Instant::now() < end {
+    let (mut got, mut held) = (depths(seat), None);
+    loop {
+        if got == want {
+            if held.get_or_insert_with(std::time::Instant::now).elapsed() >= Duration::from_millis(200) {
+                return;
+            }
+        } else {
+            held = None;
+        }
+        assert!(std::time::Instant::now() < end, "the live processes under the seat, by depth: wanted {want:?}, saw {got:?}");
         std::thread::sleep(Duration::from_millis(50));
         got = depths(seat);
     }
-    assert_eq!(got, want, "the live processes under the seat, by depth (wanted {want:?})");
 }
 
 fn kill(pid: u32) {
@@ -208,13 +216,12 @@ impl Drop for Tree {
     }
 }
 
-/// `sh -c 'exec "$0" "$@"' sh -c script args...`, so the spawned pid is the shell of `script` on every OS. A bare `sh -c script`
-/// is not: macOS `sh` (bash) replaces itself with a `-c` string that is one command, while Ubuntu `sh` (dash 0.5.12, CI
-/// ubuntu-latest) keeps a wrapper shell, so every process of the script sat one level deeper than its test assumed and the seat
-/// pid was not the shell the script describes. `exec` means the same on every POSIX shell: the wrapper becomes the shell of
-/// `script`, with `$0` `sh` and `$1..` `args` as before. Each fixture script also forces every fork it makes (a `&`, or a command
-/// followed by another one), so the depths under the seat do not depend on the shell either: the tests check them (`shaped`)
-/// before the verdict.
+/// `sh -c 'exec "$0" "$@"' sh -c script args...`: the spawned pid is the shell that runs `script`. `exec` means the same on every
+/// POSIX shell, `$0` stays `sh` and `$1..` stay `args`, so the 40-deep chain keeps its script and level arguments.
+/// A script runs its commands itself: it is not one `sh -c '...'` wrapped around them. bash (macOS `sh`) replaces itself with a
+/// `-c` string that is one command; the dash of Ubuntu (CI) does not, so under it a wrapped script holds every process one level
+/// deeper than under bash. And every fork of a script is forced by its text (a `&`, or a command followed by another one), so the
+/// depths under the seat are the same on every shell: the tests check them (`shaped`) before the verdict.
 fn tree_n(script: &str, args: &[&str]) -> Tree {
     let mut c = Command::new("sh");
     c.arg("-c")
@@ -1663,10 +1670,14 @@ fn t21k_a_real_refusal_after_a_fault_ends_the_run() {
 
 // ------------------------------------------------------------------------------------------------ the child check
 
-/// A seat busy in a long tool call: the entry shell waits on a shell that runs a two-minute `sleep`, so the sleep is at depth 2.
-const BUSY: &str = "sh -c 'sh -c \"sleep 120; :\" & wait'";
-/// A seat that holds the wait in a sleep of its own while another shell runs a two-minute sleep.
-const HELD: &str = "sh -c 'sh -c \"sleep 120; :\" & sleep 120; wait'";
+/// A seat busy in a long tool call. The entry shell (the spawned pid) starts a shell in the background that runs a two-minute
+/// `sleep`, then waits: the shell is at depth 1, the sleep at depth 2. The script runs its commands itself: no `sh -c '...'` wraps
+/// them (`tree_n`), and its forks are forced by its text (`&`, or a command followed by another one).
+const BUSY: &str = "sh -c \"sleep 120; :\" & wait";
+/// A seat that holds the wait in a sleep of its own while another shell runs a two-minute sleep. The entry shell (the spawned pid)
+/// starts that shell in the background, runs a two-minute `sleep` of its own, then waits: the shell and the entry's own sleep are
+/// at depth 1, the shell's sleep at depth 2.
+const HELD: &str = "sh -c \"sleep 120; :\" & sleep 120; wait";
 const UNREAD: &str = "harness: session watch refused: the process list cannot be read\n";
 
 /// The busy seat of `BUSY`, once its shape was seen: the middle shell at depth 1, its two-minute sleep at depth 2, nothing else,
@@ -1724,9 +1735,10 @@ fn t22b_a_child_older_than_the_transcript_time_and_the_slack_does_not_count() {
 
 #[test]
 fn t22c_a_fresh_helper_at_depth_1_does_not_count() {
-    // the entry shell runs a 3 s helper, then a two-minute sleep: the only fresh process under it is at depth 1, with no child
+    // the entry shell (the spawned pid) runs a 3 s helper, then starts a two-minute sleep in the background and waits: the only
+    // fresh process under it is at depth 1, with no child
     let fx = Fx::new();
-    let p = tree("sh -c 'sleep 3; sleep 120 & wait'");
+    let p = tree("sleep 3; sleep 120 & wait");
     fx.list(&[fx.entry(SHORT, SID, "working", Some("busy"), &fx.cwd(), Some(p.0.id().to_string()))]);
     fx.age_tree(800);
     fx.mk_file(&fx.tpath(&fx.cwd(), SID), 0);
@@ -1879,9 +1891,11 @@ fn t22j_follow_prints_a_line_when_the_why_changes() {
 
 #[test]
 fn t22l_a_zombie_under_the_seat_does_not_count() {
-    // perl (depth 1) forks a child that ends at once and is never reaped: a zombie at depth 2, on the list with an etime
+    // the entry shell (the spawned pid) runs perl (depth 1), which forks a child that ends at once and is never reaped: a zombie
+    // at depth 2, on the list with an etime. The trailing `:` keeps the entry shell in place above perl: without it bash would
+    // replace itself with perl.
     let fx = Fx::new();
-    let p = tree("sh -c 'perl -e \"if(fork()==0){exit 0} sleep 120\"; :'");
+    let p = tree("perl -e \"if(fork()==0){exit 0} sleep 120\"; :");
     past(&fx, p.0.id());
     // perl is the one live process under the seat, at depth 1; the zombie is the child of a live child of the seat
     wait_until("perl alone at depth 1 and its zombie at depth 2", || {
