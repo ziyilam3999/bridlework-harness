@@ -38,7 +38,9 @@ an id is `open` after its add row, and `met` or `dropped` after its close row.
 Pairing: `met` needs `--ref` and takes no `--reason`; `dropped` needs `--reason` and takes no `--ref`.
 Pairing is judged on values: an empty `--ref` or `--reason` counts as not given. A close row is checked in the
 order id, at, by, status, pairing, then ref (met) or reason (dropped); an add row in the order id, at, by,
-title, done_when, source. No refusal message echoes a field value.
+title, done_when, source. No refusal message echoes a field value, except the id in the stdout
+`goal refused id=<id> reason=<reason>` line of `check` and `show` (the id is scanned against the privacy list
+first).
 
 **The id convention.** One id per focus group, named for the group: `gs-video-1`, `bw-harness-running`. The
 id is the one goal id rule; the ticket side (T2) uses the same rule. A new goal needs the operator's yes in
@@ -84,9 +86,10 @@ write, no time limit; (9) the store lint, exit 2; (10) the id is already in the 
 1; (11) one line is written and synced. Success: exit 0, stdout `goal added id=<id> state=open`. A refusal
 in steps 1 to 10 leaves the store byte for byte unchanged and creates no file. Parent folders of the store
 path are followed, so a linked parent folder is accepted; only the last part must not be a link: the stat
-refuses it in step 6, and the open of step 7 is the backstop for a link swapped in after the stat. No verb
-reaches the open with a link in place, so that backstop (`O_NOFOLLOW`: `0x100` on macOS) is pinned by a unit
-test of the open alone (`goal.rs`, `the_open_itself_refuses_a_link`), for a read as for a write.
+refuses it in step 6, and the open of step 7 is the backstop for a link swapped in after the stat. No test
+can drive a verb to the open with a link in place, because the stat refuses it first, so that backstop
+(`O_NOFOLLOW`: `0x100` on macOS) is pinned by a unit test of the open alone (`goal.rs`,
+`the_open_itself_refuses_a_link`), for a read as for a write.
 
 ### `harness goal list`
 

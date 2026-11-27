@@ -4,7 +4,9 @@
 //! parent field. This module is the small store of goals, modelled on the owed store (`owed.rs`). The store file
 //! sits in the private overlay, named by `--store <absolute-file>`, created once by hand as an empty file; no
 //! verb creates it, so a wrong path cannot start a second store. No clock runs here: times arrive by `--at`.
-//! A refusal names a field and a reason, no field value.
+//! A refusal names a field and a reason, no field value, except the id in the stdout
+//! `goal refused id=<id> reason=<reason>` line of `check` and `show` (the id is scanned against the privacy
+//! list first).
 //! Exit codes: 0 ok; 1 a refused input; 2 usage, setup or a damaged store.
 
 use crate::events::token_ok;
@@ -386,7 +388,7 @@ fn append_line(f: &mut fs::File, line: &str) -> Result<(), ()> {
 // ---------------------------------------------------------------- flags
 
 /// The `--flag value` parser of add, close, show and check: each listed flag at most once, one value (a value
-/// that starts with `--` is taken as the value; `--testmode` and its word were taken by the global parser).
+/// that starts with `--` is taken as the value; a first `--testmode` and its word were taken by the global parser).
 fn take_value_flags(a: &[String], allowed: &[&str]) -> Result<std::collections::HashMap<String, String>, String> {
     let mut m = std::collections::HashMap::new();
     let mut it = a.iter();
