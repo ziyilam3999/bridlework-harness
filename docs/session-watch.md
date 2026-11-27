@@ -5,11 +5,12 @@ calls the host for the listing only (never `stop` or `rm`). A seat stopped by `b
 
 ```
 harness session watch --host <abs> --records <launch records file> --name <seat name> --ticket <ticket file> --repo-map <id>=<tree>
-  --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n>
+  --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n> [--child-slack-s <n>]
   [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>] [--seat-log <abs file>]
 ```
 
-Numbers are whole seconds, 1 to 86400. `--base` is a 40-hex sha. `--stopped-at` and `--stop` come together. `--poll-s` and `--max-s` go
+Numbers are whole seconds, 1 to 86400. `--base` is a 40-hex sha. `--child-slack-s` is optional (default: the engine constant `CHILD_SLACK_S`, value 60; for tests, `bw` passes none).
+`--stopped-at` and `--stop` come together. `--poll-s` and `--max-s` go
 with `--follow` and both are required there. `--seat-log` is optional and must be an absolute path. A missing, repeated or bad flag
 (a relative or empty `--seat-log` included) is exit 2 with the usage line.
 
@@ -36,6 +37,7 @@ Decided in this order on each check.
 | v3 | state `working`, tree age below `--idle-s` | `working` | 0 |
 | v3 | state `working`, transcript age below `--silence-s` | `slow-alive` | 10 |
 | v3 | state `working`, past both limits, entry pid a live process, a commit in base..HEAD at or after the launch second, `last_gate=pass`, `gate_current=yes` | `finished` | 13 |
+| v3 | state `working`, past both limits, entry pid a live process and not 1, not finished, a live non-zombie process at depth 2 or more under the entry pid, outside the watcher's own subtree, started at or after (transcript mtime - `CHILD_SLACK_S`) | `slow-alive why=child child_age=<s>` | 10 |
 | v3 | state `working`, entry pid is a live process, otherwise | `stalled` | 11 |
 | v4 | state `blocked` | `stopped-early why=blocked block=<dialog\|asked\|other> waiting_for=<text>` | 12 |
 | v5 | state `done` or `idle`, a commit in base..HEAD at or after the launch second, and `gate_current=yes` | `finished gate=<pass\|fail>` | 13 |
@@ -50,16 +52,31 @@ used.
 The v3 `finished` row is a seat the host still lists as working. The seat may still be running. It needs `last_gate=pass`, which the v5
 row does not. Its line carries `state=working/<status>`, which tells it from a v5 finish.
 
+The v3 `slow-alive why=child` row and the `stalled` row share the child check, which runs after the `finished` facts. A working seat
+past both limits can be busy in a long tool call that writes nothing to the tree or the transcript: a live `sleep` two levels under
+the entry pid is the sign. Depth is counted from the entry pid of the listing (its children are depth 1): depth 1 holds the host's
+helpers, which do not count (probe 2026-11-27: `caffeinate`, the host's `git` polls).
+`child_age=` is the age in seconds of the newest process that counts. A process started before (transcript mtime - `CHILD_SLACK_S`)
+does not count, so a long tool call of an earlier turn cannot keep a seat alive; a zombie does not count; a process whose parent
+ended (reparented, on macOS to launchd) is no longer under the entry pid; and the entry pid 1 is not walked at all (everything
+reparented ends under it, and the process list is not read for it). The check reads the process list once per check that reaches it
+(`ps -A -o pid=,ppid=,etime=,state=`: one snapshot), walks the pids under the entry pid (each pid once, so a parent-pid cycle
+ends), skips the watcher's own pid and subtree (so its own `ps` child never counts), and reads no command name.
+
 Tree age is now minus the newest of: the mtime of every file and folder of the work tree outside `.git` (no link followed, over 200000
 entries is a refusal), the mtime of the git index, and the committer time of HEAD. Transcript age is now minus the transcript mtime.
 
 ## Output line
 
 `verdict= state=<host state>/<host status or -> tree_age= transcript_age= commits_since_launch= gate=<pass|fail|none>/<yes|no> session=<short id> skipped_entries=<n>`
-then `why=` or `by=` where named. `skipped_entries` counts the listing entries left out of the join (0 when none). A value the verdict
+then `why=` or `by=` where named. `skipped_entries` counts the listing entries left out of the join (0 when none). The `slow-alive why=child`
+line adds `why=child child_age=<s>`, the age of the newest process that counts. The `why=child` line and the `stalled` line add
+`ps_skip=<n>`, the rows of the process list that did not parse, on the checks where the child check ran (the `finished` line does not
+change). A value the verdict
 did not need is `-` (tree age and the commit and gate facts are read only
 where the verdict uses them; `blocked` shows them when they can be read; `stalled` shows the commits and gate it read). No path,
-transcript text or file name is printed; the detail line below prints scanned seat text, never a path of its own.
+transcript text or file name is printed; the detail line below prints scanned seat text, never a path of its own. The child check
+prints numbers only: no pid, no command name.
 
 ### Blocked kind
 
@@ -115,7 +132,10 @@ record session_id, its id equals the record short_id, its name equals the record
 kind that cannot be the watched one is left out and counted in `skipped_entries`;
 no launch record for the name, or the newest is not bound; two or more joined entries; cwd not the tree; the transcript check fails; a
 working seat past both limits with a pid that is missing, not a whole number or not a live process (one `ps -p` run); a working seat past
-both limits also reads git base..HEAD and `harness status`, and their failures refuse it; the tree walk is
+both limits also reads git base..HEAD and `harness status`, and their failures refuse it; the process list (read only by the child
+check: `ps -A` cannot be run, exits non-zero or gives no row that parses is "the process list cannot be read"; more rows than the
+engine constant `PROC_CAP` (40000, about forty times the thousand-odd rows of a busy Mac) is "the process list is over its cap".
+A list that cannot be read is never taken as "no child", so the seat is never `stalled` on it); the tree walk is
 over its cap; the tree cannot be listed; the tree root or an entry inside the tree cannot be inspected ("the tree cannot be
 inspected"); git cannot report HEAD, the index path, base..HEAD or the commit times; `harness status` exits 1 or 2; a host state outside
 working, done, blocked, idle, stopped. A refusal is never printed as working or slow-alive.
@@ -139,7 +159,7 @@ approved a 10-minute silence watch on 2026-11-16, built on the session file mtim
 ## Follow mode
 
 The check runs at start and then every poll interval. A stdout line is printed for the first check that gives a verdict (a faulted check
-prints none), on each later verdict change, and at an end that is not a refusal. The run ends
+prints none), on each later verdict change, when `why` changes (the plain `slow-alive` becoming `slow-alive why=child`, or back), and at an end that is not a refusal. The run ends
 with the exit code of the first verdict other than `working` or `slow-alive`, with exit 3 at a refusal that is not a transient fault, with
 exit 3 at `FAULT_BOUND` transient faults in a row, with exit 3 when the time limit comes while the newest check faulted, or else with
 16 at the time limit (monotonic clock). The end line carries `max_transcript_age=`, the largest transcript age seen with host state

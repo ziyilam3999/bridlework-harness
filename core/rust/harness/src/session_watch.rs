@@ -1,28 +1,38 @@
 //! `harness session watch` (A29; std only, unix). One verdict line per check for a builder seat, from the host listing, the tree, the
 //! transcript file time, the commits since the launch and the ticket gate. Report only: it writes no file, stops no session, changes no
 //! lane and writes no event; the host is called for the listing only. The transcript is read by metadata only (kind and mtime): this
-//! code opens no transcript and reads no byte of it. See docs/session-watch.md.
+//! code opens no transcript and reads no byte of it. A working seat past both limits is `slow-alive` while a process at depth 2 or more
+//! under its entry pid is newer than the transcript: one process list per such check, read for pid, parent pid, age and state only (no
+//! command name is read or printed). See docs/session-watch.md.
 
 use crate::lane::stale::open_launch_records;
 use crate::launcher::{read_launches, Launch};
 use crate::session_close::{raw_listing, Entry};
 use crate::session_watch_log::{self, Block};
 use crate::status;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{canonicalize, read_dir, symlink_metadata};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "usage: harness session watch --host <abs> --records <file> --name <seat name> --ticket <file> --repo-map <id>=<tree> --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n> [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>] [--seat-log <abs file>]";
+pub const USAGE: &str = "usage: harness session watch --host <abs> --records <file> --name <seat name> --ticket <file> --repo-map <id>=<tree> --base <sha> --result-dir <dir> --caps-dir <dir> --transcript-root <abs dir> --idle-s <n> --silence-s <n> [--child-slack-s <n>] [--stopped-at <epoch s> --stop <stopped|absent>] [--follow --poll-s <n> --max-s <n>] [--seat-log <abs file>]";
 
 /// At most this many entries of the work tree are looked at.
 const WALK_CAP: usize = 200_000;
+/// At most this many rows of the process list the child check looks at (a busy Mac lists about a thousand).
+pub const PROC_CAP: usize = 40_000;
 /// A transcript time this far ahead of the clock is a refusal.
 const AHEAD_S: u64 = 5;
 /// Follow mode: this many transient faults in a row end the run as the refusal of the last fault.
 const FAULT_BOUND: u32 = 3;
+/// A process under the seat counts as fresh when it started this many seconds before the transcript mtime or later (`--child-slack-s`).
+const CHILD_SLACK_S: u64 = 60;
+/// The process list gave no row, could not be run or exited non-zero.
+const PROC_UNREAD: &str = "the process list cannot be read";
+/// The process list has more rows than `PROC_CAP`, or the walk under the entry pid does not end.
+const PROC_OVER: &str = "the process list is over its cap";
 /// The text `raw_listing` gives a host that could not be run or timed out.
 const LISTING_FAULT: &str = "the host's listing could not be run or timed out";
 const MAX_ARG: usize = 4096;
@@ -65,6 +75,8 @@ struct Opts {
     root: PathBuf,
     idle: u64,
     silence: u64,
+    /// `--child-slack-s`, else `CHILD_SLACK_S`.
+    slack: u64,
     /// `--stop`, present with `--stopped-at`.
     stop: Option<String>,
     /// `--poll-s` and `--max-s`, present with `--follow`.
@@ -90,9 +102,9 @@ fn abs(v: &str, flag: &str) -> R<PathBuf> {
 }
 
 fn parse(a: &[String]) -> R<Opts> {
-    const VALUED: [&str; 16] = [
+    const VALUED: [&str; 17] = [
         "host", "records", "name", "ticket", "repo-map", "base", "result-dir", "caps-dir", "transcript-root", "idle-s", "silence-s",
-        "stopped-at", "stop", "poll-s", "max-s", "seat-log",
+        "child-slack-s", "stopped-at", "stop", "poll-s", "max-s", "seat-log",
     ];
     let mut m: HashMap<&str, &str> = HashMap::new();
     let mut follow = false;
@@ -164,6 +176,7 @@ fn parse(a: &[String]) -> R<Opts> {
         root: abs(need("transcript-root")?, "--transcript-root")?,
         idle: secs(need("idle-s")?, "--idle-s")?,
         silence: secs(need("silence-s")?, "--silence-s")?,
+        slack: m.get("child-slack-s").map_or(Ok(CHILD_SLACK_S), |v| secs(v, "--child-slack-s"))?,
         stop,
         follow,
     })
@@ -308,16 +321,147 @@ fn facts(o: &Opts, floor: u64) -> R<Facts> {
     Ok(Facts { commits, last, current: cur == "yes" })
 }
 
+/// The entry pid of the listing as a number.
+fn pid_num(pid: Option<&str>) -> R<u32> {
+    pid.filter(|p| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| n > 0))
+        .and_then(|p| p.parse().ok())
+        .ok_or("the entry pid is missing or not a whole number".into())
+}
+
 fn pid_live(pid: Option<&str>) -> R<bool> {
-    let p = pid.filter(|p| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| n > 0));
-    let p = p.ok_or("the entry pid is missing or not a whole number")?;
+    let n = pid_num(pid)?;
+    let p = n.to_string();
     let out = Command::new("ps")
-        .args(["-p", p, "-o", "pid="])
+        .args(["-p", p.as_str(), "-o", "pid="])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .map_err(|_| "the pid check cannot be run".to_string())?;
     Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == p)
+}
+
+/// One process of the list. No command name is read.
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    /// Seconds since the process started.
+    etime: u64,
+    /// A zombie: it ended and waits to be reaped, so it is not a live process.
+    zombie: bool,
+}
+
+/// Elapsed seconds of an etime field, `[[dd-]hh:]mm:ss`; anything else is no value.
+fn etime_secs(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let (h, m, s) = match rest.split(':').collect::<Vec<_>>().as_slice() {
+        [m, s] => ("0", *m, *s),
+        [h, m, s] => (*h, *m, *s),
+        _ => return None,
+    };
+    if h.is_empty() || m.is_empty() || s.is_empty() {
+        return None;
+    }
+    Some(days * 86_400 + h.parse::<u64>().ok()? * 3600 + m.parse::<u64>().ok()? * 60 + s.parse::<u64>().ok()?)
+}
+
+fn proc_row(l: &str) -> Option<Proc> {
+    let f: Vec<&str> = l.split_whitespace().collect();
+    let [pid, ppid, etime, state] = f.as_slice() else { return None };
+    Some(Proc { pid: pid.parse::<u32>().ok().filter(|p| *p > 0)?, ppid: ppid.parse().ok()?, etime: etime_secs(etime)?, zombie: state.starts_with('Z') })
+}
+
+/// The rows of one process list text, and how many of its lines did not parse. A list with no row cannot be judged, and more lines
+/// than `cap` is the cap refusal.
+fn parse_procs(text: &str, cap: usize) -> Result<(Vec<Proc>, usize), &'static str> {
+    let (mut rows, mut skipped) = (Vec::new(), 0usize);
+    for l in text.lines() {
+        if rows.len() + skipped >= cap {
+            return Err(PROC_OVER);
+        }
+        match proc_row(l) {
+            Some(r) => rows.push(r),
+            None => skipped += 1,
+        }
+    }
+    if rows.is_empty() {
+        Err(PROC_UNREAD)
+    } else {
+        Ok((rows, skipped))
+    }
+}
+
+/// One read of the process list: pid, parent pid, etime and state of every process, most `cap` rows.
+fn procs(cap: usize) -> Result<(Vec<Proc>, usize), String> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,etime=,state="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| PROC_UNREAD.to_string())?;
+    if !out.status.success() {
+        return Err(PROC_UNREAD.to_string());
+    }
+    parse_procs(&String::from_utf8_lossy(&out.stdout), cap).map_err(str::to_string)
+}
+
+/// Every pid under `root` with its depth (a child of `root` is 1), each pid once, outside the subtree of `skip`. The set of pids seen
+/// ends the walk on a ppid cycle. More pids pushed than the list has rows means the set no longer holds (a walk that would not
+/// end): the cap refusal.
+fn descend(rows: &[Proc], root: u32, skip: u32) -> Result<HashMap<u32, u32>, &'static str> {
+    let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
+    for r in rows {
+        kids.entry(r.ppid).or_default().push(r.pid);
+    }
+    let (mut seen, mut under, mut pushed) = (HashSet::from([root]), HashMap::new(), 0usize);
+    let (mut level, mut depth) = (vec![root], 1u32);
+    loop {
+        let mut next = Vec::new();
+        for p in level {
+            if p == skip {
+                continue;
+            }
+            for k in kids.get(&p).into_iter().flatten() {
+                if seen.insert(*k) {
+                    under.insert(*k, depth);
+                    next.push(*k);
+                }
+            }
+        }
+        pushed += next.len();
+        if next.is_empty() {
+            return Ok(under);
+        }
+        if pushed > rows.len() {
+            return Err(PROC_OVER);
+        }
+        level = next;
+        depth += 1;
+    }
+}
+
+/// The age of the newest live process at depth 2 or more of `under` (from `descend`) that started at or after (transcript mtime -
+/// `slack`); `None` when there is no such process.
+fn fresh_under(rows: &[Proc], under: &HashMap<u32, u32>, t_age: u64, slack: u64) -> Option<u64> {
+    rows.iter()
+        .filter(|r| under.get(&r.pid).is_some_and(|d| *d >= 2) && !r.zombie && r.etime <= t_age.saturating_add(slack))
+        .map(|r| r.etime)
+        .min()
+}
+
+/// The age of the newest live process at depth 2 or more under the entry pid that started at or after (transcript mtime - `slack`),
+/// and how many rows of the list did not parse. `None` when there is no such process. The watcher's own subtree is left out, so
+/// the `ps` child of this check never counts. Pid 1 is not walked: a process whose parent ended is reparented to it, so nothing
+/// can be said to be under it; the list is not read then.
+fn child_age(pid: u32, t_age: u64, slack: u64) -> Result<(Option<u64>, usize), String> {
+    if pid == 1 {
+        return Ok((None, 0));
+    }
+    let (rows, skipped) = procs(PROC_CAP)?;
+    let under = descend(&rows, pid, std::process::id()).map_err(str::to_string)?;
+    Ok((fresh_under(&rows, &under, t_age, slack), skipped))
 }
 
 /// The listing for the join. An entry with no string id or no string name, or whose id is not a plain token, is left out when it cannot
@@ -354,6 +498,8 @@ fn watch_listing(o: &Opts, short: &str, sid: &str, name: &str) -> Result<(Vec<En
 
 struct Out {
     verdict: &'static str,
+    /// The `why` of the line, empty when none: follow mode prints a line when it changes too.
+    reason: &'static str,
     code: i32,
     line: String,
     /// The transcript age of a check whose host state was working.
@@ -394,7 +540,7 @@ fn out(verdict: &'static str, s: &Show, extra: &str, working_age: Option<u64>) -
         s.session,
         s.skipped
     );
-    Out { verdict, code, line, working_age, detail: None }
+    Out { verdict, reason: "", code, line, working_age, detail: None }
 }
 
 fn check(o: &Opts) -> Result<Out, Fault> {
@@ -454,7 +600,14 @@ fn check(o: &Opts) -> Result<Out, Fault> {
             if f.commits > 0 && f.last == "pass" && f.current {
                 return Ok(out("finished", &s, "", w));
             }
-            Ok(out("stalled", &s, "", w))
+            // A quiet seat the host still lists as working can be busy in a long tool call: a process at depth 2 or more under the
+            // entry pid (depth 1 holds the host's own helpers) that started after the transcript. `ps_skip` counts the rows of the
+            // process list that did not parse. A list that cannot be read refuses: it is never read as "no child".
+            let (child, skipped) = child_age(pid_num(e.pid.as_deref())?, t_age, o.slack)?;
+            let why = child.map_or_else(String::new, |a| format!(" why=child child_age={a}"));
+            let mut r = out(if child.is_some() { "slow-alive" } else { "stalled" }, &s, &format!("{why} ps_skip={skipped}"), w);
+            r.reason = if child.is_some() { "child" } else { "" };
+            Ok(r)
         }
         "blocked" => {
             if let Ok(f) = facts(o, floor) {
@@ -502,7 +655,8 @@ fn refuse(m: &str) -> i32 {
 fn follow(o: &Opts, poll: u64, max: u64) -> i32 {
     let start = Instant::now();
     let limit = Duration::from_secs(max);
-    let (mut printed, mut top): (Option<&str>, Option<u64>) = (None, None);
+    // the verdict and why of the last printed line: a line is printed when either changes
+    let (mut printed, mut top): (Option<(&str, &str)>, Option<u64>) = (None, None);
     // transient faults in a row, tree and host together
     let mut faults = 0u32;
     let age = |t: Option<u64>| t.map_or("-".to_string(), |x| x.to_string());
@@ -520,9 +674,9 @@ fn follow(o: &Opts, poll: u64, max: u64) -> i32 {
                     }
                     return o1.code;
                 }
-                if printed != Some(o1.verdict) {
+                if printed != Some((o1.verdict, o1.reason)) {
                     println!("{}", o1.line);
-                    printed = Some(o1.verdict);
+                    printed = Some((o1.verdict, o1.reason));
                 }
                 None
             }
@@ -549,12 +703,12 @@ fn follow(o: &Opts, poll: u64, max: u64) -> i32 {
         }
     }
     // the newest check judged, so the last printed verdict is its verdict
-    println!("verdict=watch-limit last={} max_transcript_age={}", printed.unwrap_or("-"), age(top));
+    println!("verdict=watch-limit last={} max_transcript_age={}", printed.map_or("-", |p| p.0), age(top));
     16
 }
 
-/// `harness session watch ...`: 0 working, 10 slow-alive, 11 stalled, 12 stopped-early, 13 finished, 14 stopped, 15 gone, 16 time limit,
-/// 3 refused (cannot judge), 2 usage.
+/// `harness session watch ...`: 0 working, 10 slow-alive (plain, or `why=child`), 11 stalled, 12 stopped-early, 13 finished, 14 stopped,
+/// 15 gone, 16 time limit, 3 refused (cannot judge), 2 usage.
 pub fn watch_cmd(a: &[String]) -> i32 {
     let o = match parse(a) {
         Ok(o) => o,
@@ -608,5 +762,77 @@ mod tests {
         assert!(walk(&d, 4).is_err(), "5 entries are over a cap of 4");
         assert!(walk(&d, 5).is_ok(), "twin: 5 entries fit a cap of 5");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_etime_field_is_whole_seconds() {
+        let cases: Vec<(&str, Option<u64>)> = vec![
+            ("01:05", Some(65)),
+            ("02:01:05", Some(7265)),
+            ("3-02:01:05", Some(266_465)),
+            ("12-00:00:00", Some(1_036_800)),
+            ("05", None),
+            ("1:2:3:4", None),
+            ("-05", None),
+            ("aa:bb", None),
+            ("", None),
+        ];
+        for (s, want) in cases {
+            assert_eq!(etime_secs(s), want, "{s:?}");
+        }
+        // a row: four fields, a positive pid; anything else is skipped
+        assert!(proc_row("100 1 10:00 S").is_some() && proc_row("  100     1   00:03 Z\n").is_some());
+        for bad in ["x y z", "0 1 10:00 S", "100 1 10:00", "100 1 10:00 S more", "100 1 00 S"] {
+            assert!(proc_row(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    fn r(pid: u32, ppid: u32) -> Proc {
+        Proc { pid, ppid, etime: 0, zombie: false }
+    }
+
+    #[test]
+    fn the_walk_under_the_entry_pid_ends_on_a_cycle() {
+        // 101 -> 102 -> 103 -> 101: a cycle of three pids under the entry pid 100
+        let rows = [r(101, 100), r(102, 101), r(103, 102), r(101, 103)];
+        let under = descend(&rows, 100, 0).unwrap();
+        assert_eq!(under.len(), 3, "each pid once: {under:?}");
+        assert_eq!((under[&101], under[&102], under[&103]), (1, 2, 3));
+        // the entry pid is part of the cycle
+        let rows = [r(101, 100), r(100, 101), r(102, 101)];
+        assert_eq!(descend(&rows, 100, 0).unwrap().len(), 2);
+        // the subtree of the skipped pid is left out, the pid itself is walked
+        assert_eq!(descend(&rows, 100, 101).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_process_list_stops_past_its_cap() {
+        let rows = |n: usize| (0..n).map(|i| format!("{} 1 00:01 S", 100 + i)).collect::<Vec<_>>().join("\n");
+        assert_eq!(parse_procs(&rows(5), 4).err(), Some(PROC_OVER), "5 rows are over a cap of 4");
+        assert!(parse_procs(&rows(5), 5).is_ok(), "twin: 5 rows fit a cap of 5");
+        // no row at all cannot be judged; a bad row among good ones is skipped and counted
+        assert_eq!(parse_procs("", 5).err(), Some(PROC_UNREAD));
+        assert_eq!(parse_procs("x y z", 5).err(), Some(PROC_UNREAD));
+        let (p, skipped) = parse_procs(&format!("{}\nx y z", rows(2)), 5).unwrap();
+        assert_eq!((p.len(), skipped), (2, 1));
+    }
+
+    #[test]
+    fn a_fresh_child_needs_depth_two_no_zombie_and_a_start_after_the_transcript() {
+        // the entry 100, its helper 101 at depth 1, 102 and the zombie 103 at depth 2, 104 at depth 3, 105 under another parent
+        let mut rows = [r(101, 100), r(102, 101), r(103, 101), r(104, 102), r(105, 1)];
+        rows[1].etime = 10;
+        rows[2].etime = 1;
+        rows[2].zombie = true;
+        rows[3].etime = 5;
+        rows[4].etime = 1;
+        let under = descend(&rows, 100, std::process::id()).unwrap();
+        assert_eq!(fresh_under(&rows, &under, 0, 60), Some(5), "the newest live process at depth 2 or more: no helper, no zombie");
+        assert_eq!(fresh_under(&rows, &under, 4, 1), Some(5), "a start at transcript time minus the slack counts");
+        assert_eq!(fresh_under(&rows, &under, 2, 1), None, "older than that counts for nothing");
+        // the subtree of the skipped pid is left out
+        assert_eq!(fresh_under(&rows, &descend(&rows, 100, 101).unwrap(), 100, 0), None);
+        // pid 1 is not walked, so the list is not read for it
+        assert_eq!(child_age(1, 700, 60).unwrap(), (None, 0));
     }
 }
