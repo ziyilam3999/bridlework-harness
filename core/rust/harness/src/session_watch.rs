@@ -352,7 +352,11 @@ struct Proc {
     zombie: bool,
 }
 
-/// Elapsed seconds of an etime field, `[[dd-]hh:]mm:ss`, or bare seconds of two digits or more; anything else is no value.
+/// Elapsed seconds of an etime field. The `ps` forms `[[dd-]hh:]mm:ss` and bare seconds of two digits or more are read. The
+/// parser is lenient beyond them: the forms with `:` have no width or range check (`1:2` is read), `dd-mm:ss` is read, and so is
+/// a `+` in front of the days or of a field of those forms. No value: an empty text or field, any other character that is not a
+/// digit or a separator in its place, one digit alone, bare seconds with a `+` or with days, more than three `:` fields, and a
+/// number too big for a u64. The arithmetic that adds the fields up is not checked for overflow.
 fn etime_secs(s: &str) -> Option<u64> {
     if s.len() >= 2 && s.bytes().all(|b| b.is_ascii_digit()) {
         return s.parse().ok();
