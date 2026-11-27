@@ -77,12 +77,16 @@ exit 2: an unscanned row is never stored; (5) the privacy scan of each field of 
 title, done_when, source), a hit is exit 1 naming the field and the classes; (6) the store path stat:
 missing (or under a file) is exit 2 `the goal store does not exist`; anything but a regular file (a symbolic
 link, a folder, a fifo) is exit 2 `the goal store is not a regular file`; (7) the open, read and append, no
-create, with `O_NOFOLLOW` and `O_NONBLOCK`, the handle re-checked to be a regular file; (8) a blocking
-exclusive lock on that handle, held from the read to the write, no time limit; (9) the store lint, exit 2;
-(10) the id is already in the store (open or closed), exit 1; (11) one line is written and synced. Success:
-exit 0, stdout `goal added id=<id> state=open`. A refusal in steps 1 to 10 leaves the store byte for byte
-unchanged and creates no file. Parent folders of the store path are followed, so a linked parent folder is
-accepted; only the last part must not be a link.
+create, with `O_NOFOLLOW` and `O_NONBLOCK`: the open itself refuses a link, so a link swapped in between the
+stat and the open is exit 2 `the goal store cannot be opened` and nothing is written through it; the handle
+is re-checked to be a regular file; (8) a blocking exclusive lock on that handle, held from the read to the
+write, no time limit; (9) the store lint, exit 2; (10) the id is already in the store (open or closed), exit
+1; (11) one line is written and synced. Success: exit 0, stdout `goal added id=<id> state=open`. A refusal
+in steps 1 to 10 leaves the store byte for byte unchanged and creates no file. Parent folders of the store
+path are followed, so a linked parent folder is accepted; only the last part must not be a link: the stat
+refuses it in step 6, and the open of step 7 is the backstop for a link swapped in after the stat. No verb
+reaches the open with a link in place, so that backstop (`O_NOFOLLOW`: `0x100` on macOS) is pinned by a unit
+test of the open alone (`goal.rs`, `the_open_itself_refuses_a_link`), for a read as for a write.
 
 ### `harness goal list`
 
@@ -119,16 +123,17 @@ again (see Privacy), so nothing reaches stdout that has not passed the scan unde
 ### `harness goal close`
 
 Checks, in this order: flags (required order store, id, at, by, status); `--store` absolute; the close-row
-field rules (a `--status` other than `met` or `dropped`, a bad `--ref` pointer, a broken pairing: exit 1
-naming the field); the privacy list; the privacy scan of id, at, by, status, ref, reason; steps (6) to (9)
-of add; then, exit 1 with the store unchanged: `id is not in the store`, `id is already closed`, `at is
-before the time the id was added` (both times have one fixed format, so a string compare is a time compare;
-an open goal has one earlier row, its add row); then one close row is written and synced. Success: exit 0,
-stdout `goal closed id=<id> state=<met|dropped>`.
+field rules (a `--status` other than `met` or `dropped`, a bad `--ref` pointer, a broken pairing, a
+`--reason` that is blank, holds a control character or is over 500 bytes: exit 1 naming the field); the
+privacy list; the privacy scan of id, at, by, status, ref, reason; steps (6) to (9) of add; then, exit 1
+with the store unchanged: `id is not in the store`, `id is already closed`, `at is before the time the id
+was added` (both times have one fixed format, so a string compare is a time compare; an open goal has one
+earlier row, its add row); then one close row is written and synced. Success: exit 0, stdout
+`goal closed id=<id> state=<met|dropped>`.
 
 A close of `met` needs a valid `--ref` (plan 5.14: "a close row is `met` with proof pointers (the inbox proof
-grammar)"; WAITING-229 Q4 A): the gs-video-1 goal closes only with a proof pointer. `met` with no `--ref`, an
-empty `--ref`, or a `--ref` that is not a pointer list is exit 1.
+grammar)"; the WAITING-229 pass field): the gs-video-1 goal closes only with a proof pointer. `met` with no
+`--ref`, an empty `--ref`, or a `--ref` that is not a pointer list is exit 1.
 
 ### `harness goal check`
 
@@ -150,15 +155,17 @@ The two refusal lines are on stdout with nothing on stderr. A damaged store is e
 
 Every verb, reads included, needs the privacy list (`overlay::load`: `HARNESS_PRIVACY_LIST_SECRET` wins when
 set, else `HARNESS_PRIVACY_LIST`; `HARNESS_PRIVACY_OLD_LIST` adds the drift check). Without a list every verb
-exits 2. As in `owed add`, the field rules come first, so "no list, exit 2" holds for a call with valid flags
-and fields.
+exits 2 for a call with valid flags and fields. As in `owed add`, the field rules come first: a call with a
+bad field or a malformed id exits 1 before the privacy list is looked for.
 
 - add and close scan every field of the new row before the store is opened: a hit is exit 1 naming the field
   and the classes, and nothing is written.
 - Every verb scans every stored row on every read, as the owed store lint does. A stored row that holds a
   token of the list (for example a token added to the list after the row was written) makes every verb exit
   2 with `the goal store has a privacy hit at line <n> in field <name> (<classes>)`, naming the line and the
-  field, never the value. A newly listed token stops every verb until the row is fixed by hand.
+  field, never the value. A newly listed token stops every verb until the row is fixed by hand. This holds
+  for a call with valid flags and fields, as above: the field rules (exit 1) and the scan of the new row or
+  of the id (exit 1) come before the store is read.
 - `show` and `check` print the id, so the id is scanned too: an id holding a deny token is exit 1 on stderr
   and is never printed.
 
@@ -173,8 +180,9 @@ One criterion for every verb: at most 4194305 bytes are read through the locked 
 - `harness: error: the goal store has a bad row at line <n>: <reason>` for the first bad line, where
   `<reason>` is one of: `not one JSON object of strings` (a CR LF line end is such a row), `op must be add or
   close`, `the keys are not the key set of its op`, a field rule reason (a blank `done_when`, or one that is
-  only `-`, `tbd` or `?`, is one: add never writes such a row), `id is added twice`, `close names no earlier
-  added id`, `id is closed twice`, `close is before the time the id was added`
+  only `-`, `tbd` or `?`, is one: add never writes such a row; a blank or multi-line `reason` on a stored
+  close row is one too), `id is added twice`, `close names no earlier added id`, `id is closed twice`,
+  `close is before the time the id was added`
 - `harness: error: the goal store has a privacy hit at line <n> in field <name> (<classes>)` for the first
   hit over the stored fields in line order
 
@@ -191,8 +199,11 @@ trimmed by hand.
   stdout.
 - No `--ask` and no `--group` flag.
 
-A value that starts with `--` is taken as the value, except the word `--testmode` and the word after it,
-which the global flag takes first.
+A value that starts with `--` is taken as the value. The one exception is the global flag: `harness` takes
+the first `--testmode` of the command line, and the word after it when there is one, before the verb parses
+its flags (the verb runs in test mode when that word is `synthetic-test`). A second `--testmode` is not
+taken by the global flag: it reaches the verb like any other word, where it is an unknown option (exit 2)
+or the value of the flag before it.
 
 ## Not in scope here
 

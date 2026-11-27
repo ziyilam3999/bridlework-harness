@@ -549,18 +549,26 @@ fn q(p: &str) -> String {
     format!("'{}'", p.replace('\'', "'\\''"))
 }
 
+/// A child of the race waits on the start flag for at most this many spins. The wait is a busy one, so the
+/// children start together; the bound is for a run that dies before the flag is written (a spawn or the
+/// flag write that panics): no child spins forever, and one that outlives the bound exits 99 without
+/// running the verb, which the test reports as a loser that is not a refusal. The flag is written right
+/// after the last spawn: a fraction of a second, some hundred thousand spins, far from the bound.
+const SPINS: u32 = 50_000_000;
+
 /// Start N child adds of one id at once, then wait for all: (exit code, stderr) per child. Each child
 /// waits on a start flag before it runs the verb, so the N adds are truly in flight together: spawned one
 /// after another, a child is done before the next one reaches its read, and no race is ever made.
 fn race_adds(flag: &Path, store: &Path, id: &str, n: usize) -> Vec<(Option<i32>, String)> {
     let script = format!(
-        "while [ ! -e {} ]; do :; done; exec {} goal add --store {} --id {} --at {} --by orch-a --title 'one goal' --done-when 'the line is done' --source {}",
-        q(&ss(flag)),
-        q(BIN),
-        q(&ss(store)),
-        q(id),
-        T0,
-        q(PTR)
+        "i=0; while [ ! -e {flag} ] && [ $i -lt {spins} ]; do i=$((i+1)); done; [ -e {flag} ] || exit 99; exec {bin} goal add --store {store} --id {id} --at {at} --by orch-a --title 'one goal' --done-when 'the line is done' --source {ptr}",
+        flag = q(&ss(flag)),
+        spins = SPINS,
+        bin = q(BIN),
+        store = q(&ss(store)),
+        id = q(id),
+        at = T0,
+        ptr = q(PTR)
     );
     let kids: Vec<_> = (0..n)
         .map(|_| {
@@ -672,6 +680,33 @@ fn close_bad_status() {
         let o = run(&close_args(&store, "gs-video-1", T1, "orch-a", status, PTR, ""));
         refused_unchanged(&store, &o, 1, line, &copy);
     }
+}
+
+/// `--reason` takes the line rule of `title`: one non-blank line of at most 500 bytes, no control character.
+/// The pairing is judged on values, so a reason of only blanks is a given `--reason` and passes the pairing;
+/// the line rule then refuses it, naming `reason`.
+#[test]
+fn close_bad_reason() {
+    let t = Tmp::new();
+    let store = t.store();
+    assert_eq!(code(&seed(&store)), 0);
+    let copy = t.copy_of(&store);
+    let line = "harness: goal refused: reason must be one non-blank line of at most 500 bytes";
+    let long = "a".repeat(501);
+    for reason in ["a\nb", "   ", "a\rb", "a\tb", "a\u{2028}b", long.as_str()] {
+        let o = run(&close_args(&store, "gs-video-1", T1, "orch-a", "dropped", "", reason));
+        refused_unchanged(&store, &o, 1, line, &copy);
+    }
+    // 500 bytes is accepted, and the stored reason is shown whole
+    let five = "r".repeat(500);
+    let o = run(&close_args(&store, "gs-video-1", T1, "orch-a", "dropped", "", &five));
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), "goal closed id=gs-video-1 state=dropped\n");
+    assert!(err(&o).is_empty());
+    let o = run(&show_args(&store, "gs-video-1"));
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o), format!("goal id=gs-video-1 state=dropped\ntitle: video 1 ships\ndone_when: the first video is published\nadded {T0} by orch-a source: {PTR}\nclosed {T1} by orch-a reason: {five}\n"));
+    assert!(err(&o).is_empty());
 }
 
 #[test]
@@ -908,6 +943,7 @@ fn bad_row(line: usize, reason: &str) -> String {
 fn planted_bad_rows_refuse_every_verb() {
     const DONE: &str = "done_when must be one non-blank line of at most 500 bytes";
     const PLACE: &str = "done_when must be one non-blank line of at most 500 bytes, not only -, tbd or ?";
+    const REASON: &str = "reason must be one non-blank line of at most 500 bytes";
     let mut v: Vec<Bad> = Vec::new();
     // an unknown op, and no op
     for row in [
@@ -946,6 +982,12 @@ fn planted_bad_rows_refuse_every_verb() {
     ] {
         v.push(bad(&bad_row(2, reason), format!("{}{row}", add1())));
     }
+    // a stored close row with a bad reason (the line rule of title): only blanks, a control character
+    // written as a JSON escape, or over 500 bytes
+    for reason in ["   ", r#"a\nb"#, r#"a\u0009b"#] {
+        v.push(bad(&bad_row(2, REASON), format!("{}{}", add1(), planted_close("gs-video-1", T1, "dropped", "", reason))));
+    }
+    v.push(bad(&bad_row(2, REASON), format!("{}{}", add1(), planted_close("gs-video-1", T1, "dropped", "", &"a".repeat(501)))));
     for b in &v {
         let t = Tmp::new();
         let store = t.named("goal.jsonl", &b.body);
@@ -976,6 +1018,8 @@ fn flag_errors_exit_2() {
         vec![s("goal"), s("list"), s("--store"), ss(&store), s("--id"), s("gs-video-1")],
         vec![s("goal"), s("show"), s("--store"), ss(&store), s("--open")],
         vec![s("goal"), s("check"), s("--store"), ss(&store), s("--ask"), s("A63")],
+        // the global flag takes only the first `--testmode` and its word: a second one reaches the verb
+        vec![s("--testmode"), s("synthetic-test"), s("goal"), s("check"), s("--store"), ss(&store), s("--id"), s("gs-video-1"), s("--testmode"), s("synthetic-test")],
     ] {
         refused2(&run(&a), "harness: error: unknown option");
     }

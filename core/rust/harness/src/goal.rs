@@ -23,13 +23,18 @@ const TOKEN_CAP: usize = 64;
 /// `title`, `done_when` and `reason` are at most this many bytes.
 const LINE_CAP: usize = 500;
 
-// The open(2) flags std exposes no constants for (the owed.rs pattern). O_NOFOLLOW makes a symlink store fail
-// the open itself; O_NONBLOCK makes the open of a fifo return at once instead of blocking (the regular-file
-// re-check then refuses it).
+// The open(2) flags std exposes no constants for (the quarantine.rs pattern). Values are the macOS ones and
+// the Linux asm-generic ones. The macOS value is written in hex: O_NOFOLLOW is 0x100 there (octal 0o400),
+// and the same digits written as octal, 0o0100, are O_ASYNC. O_NOFOLLOW makes a symlink store fail the open
+// itself, so a link swapped in between the stat and the open is refused and nothing is written through it
+// (the unit test `the_open_itself_refuses_a_link` pins the flag: on the command line the stat check refuses
+// a link one step earlier and hides it). O_NONBLOCK makes the open of a fifo return at once instead of
+// blocking (the regular-file re-check then refuses it). A platform with no listed OS fails the build here.
+// The Linux value is not right on every Linux arch: friction f-20261127-06 tracks that, not changed here.
 #[cfg(target_os = "linux")]
 const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
 #[cfg(target_os = "macos")]
-const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o0100 | 0x0004;
+const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
 
 /// One add row: `{"op":"add","id":..,"at":..,"by":..,"title":..,"done_when":..,"source":..}`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -330,11 +335,10 @@ fn read_store_locked(f: &fs::File, ctx: &crate::scan::Ctx) -> Result<Vec<Goal>, 
 
 // ---------------------------------------------------------------- the store file
 
-/// A no-follow stat of the store path (a linked parent folder is accepted, only the last part must not be a
-/// link), then an open with O_NOFOLLOW and O_NONBLOCK, read-only for the reads, read and append for add and
-/// close, no create. The handle is re-checked to be a regular file, so a path swapped for a fifo or a folder
-/// between the two calls is still refused (a swapped link fails the open itself). `Err` is the message after
-/// `harness: error: `.
+/// Steps (6) and (7) of add: a no-follow stat of the store path (a linked parent folder is accepted, only
+/// the last part must not be a link), then `open_store_handle`. The stat refuses a link, a folder or a fifo
+/// as `not a regular file`; a link swapped in after the stat fails the open itself. `Err` is the message
+/// after `harness: error: `.
 fn open_store(path: &Path, write: bool) -> Result<fs::File, String> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("the goal store does not exist".to_string()),
@@ -343,6 +347,15 @@ fn open_store(path: &Path, write: bool) -> Result<fs::File, String> {
         Ok(m) if !m.file_type().is_file() => return Err("the goal store is not a regular file".to_string()),
         Ok(_) => {}
     }
+    open_store_handle(path, write)
+}
+
+/// The open alone (step 7): O_NOFOLLOW and O_NONBLOCK, read-only for the reads, read and append for add and
+/// close, no create. O_NOFOLLOW makes a link at the path fail the open itself, for a read as for a write,
+/// so nothing is ever written through a link. O_NONBLOCK makes the open of a fifo return at once instead of
+/// blocking, and the handle is re-checked to be a regular file, so a path swapped for a fifo or a folder
+/// after the stat is still refused. `Err` is the message after `harness: error: `.
+fn open_store_handle(path: &Path, write: bool) -> Result<fs::File, String> {
     let mut o = fs::OpenOptions::new();
     o.read(true);
     if write {
@@ -743,5 +756,48 @@ pub fn goal_cmd(a: &[String], testmode: bool) -> i32 {
             eprintln!("{GOAL_USAGE}");
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder of this test, removed with it.
+    struct Tmp(PathBuf);
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The open itself refuses a link to the store, for a read as for a write: O_NOFOLLOW is in the flags,
+    /// so a link swapped in between the stat and the open of `open_store` fails the open and nothing is
+    /// written through it. No verb can show this: on the command line the stat check refuses a link one step
+    /// earlier and hides it. Here the open is called alone. With the macOS value written as the octal 0o0100
+    /// (O_ASYNC there: O_NOFOLLOW is 0x100) the open goes through the link and this test is red.
+    #[test]
+    fn the_open_itself_refuses_a_link() {
+        let dir = std::env::temp_dir().join(format!("goal-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let t = Tmp(dir.canonicalize().unwrap());
+        let real = t.0.join("real.jsonl");
+        fs::write(&real, "").unwrap();
+        let link = t.0.join("link.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for write in [false, true] {
+            match open_store_handle(&link, write) {
+                Err(m) if m == "the goal store cannot be opened" => {}
+                Err(m) => panic!("write {write}: the link was refused for another reason: {m}"),
+                Ok(_) => panic!("write {write}: the open went through the link, so O_NOFOLLOW is not in the flags"),
+            }
+        }
+        assert_eq!(fs::read(&real).unwrap(), b"", "something was written through the link");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link itself is unchanged");
+        // a regular file opens both ways: the flags refuse the link, not the file
+        assert!(open_store_handle(&real, false).is_ok());
+        assert!(open_store_handle(&real, true).is_ok());
     }
 }
