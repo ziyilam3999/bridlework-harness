@@ -5,7 +5,8 @@
 # A changed path that no entry covers is risk-routed (high): the map fails closed. The map file itself and
 # every other path under gates/ are high, whatever an entry says.
 #
-# Low: prose that no program runs. A diff is low only when every changed path is low here.
+# Low: prose. One part of it is run: the code blocks of docs/install.md, by ci/install-guide-smoke.sh
+# (CI job install-guide). A diff is low only when every changed path is low here.
 docs low
 README.md low
 CONTRIBUTING.md low

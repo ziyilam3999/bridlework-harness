@@ -10,7 +10,8 @@ The rule has two ends:
 - the low end: a diff is `low` only when every changed path is covered by a `low` entry of the risk path map
   and the ticket's risk is `normal`;
 - the high end: a path under `gates/`, a path the map does not cover, a path under a `high` entry, a ticket
-  that declares `high`, or an accepted override gives `high`.
+  that declares `high`, or an accepted override that raises the class gives `high`. An accepted override
+  that keeps the class leaves it as it was: `--override low` on a low diff stays `low`.
 
 ## Synopsis
 
@@ -21,7 +22,8 @@ usage: harness ticket risk <ticket-file> --repo-dir <absolute-dir> --from <full-
 - `<ticket-file>`: the ticket file, read with the strict ticket reader (`docs/ticket-contract.md`). Only its
   `id` and `risk` are used. The id must be a plain token (1 to 200 bytes, no blank, no control character),
   because it is printed.
-- `--repo-dir`: a git repo or a linked work tree. Absolute, with no `..` component.
+- `--repo-dir`: a git repo or a linked work tree. Absolute, with no `..` component, and the top of the repo
+  or work tree: a folder inside is refused (exit 2), because the changed paths are named from the top.
 - `--from`: 40 lowercase hex characters, the commit whose map judges the diff (the base).
 - `--to`: 40 lowercase hex characters, the other commit (the head). It need not descend from `--from`; the
   two trees are compared.
@@ -128,9 +130,9 @@ field can raise and never lower. `--by` names who overrode (`jev`, `model` or `h
 only that it is one of the three, it does not check who is calling. `effect` is `raised` or `same`.
 
 The log is the record: there is no event-log kind for an override. The append is the only write of the verb.
-`--log` is absolute with no `..` component and must be a plain file (it is created when missing). A file that
-does not end with a newline gets one first, so each record is a whole line. Each accepted call appends one
-line.
+`--log` is absolute with no `..` component and must be a plain file (it is created when missing). A symlink
+is refused, also one that points at a plain file. A file that does not end with a newline gets one first, so
+each record is a whole line. Each accepted call appends one line.
 
 ## Order of steps
 
@@ -140,14 +142,15 @@ The first failing step gives one stderr line and stops.
 2. The ticket file: missing, not a plain file, over 1 MiB, not a valid ticket, or an id that is not a plain
    token (exit 2).
 3. Setup (exit 2, `harness: error: <what>`, no path printed): the repo dir is missing or not a folder, it is
-   not a git repo, git cannot run or a call fails, `--from` or `--to` is not a commit of the repo.
+   not a git repo, it is a folder inside the repo and not its top, git cannot run or a call fails, `--from`
+   or `--to` is not a commit of the repo.
 4. `--from` equal to `--to`: `--from equals --to`.
 5. The map at `--from`: missing or not a plain file, over 1 MiB, not UTF-8, a malformed line, a path given
    twice, or no entry. The line names the map and the bad line by number, never its text.
 6. A changed path that is not UTF-8 or holds a control character (it could not be printed as one line).
 7. An override that lowers (exit 1).
-8. The log append of an accepted override: `--log` is not a plain file or cannot be written (exit 2, nothing
-   on stdout).
+8. The log append of an accepted override: `--log` is a symlink, is not a plain file or cannot be written
+   (exit 2, nothing on stdout).
 9. Done: stdout, exit 0.
 
 An unmapped changed path is never a refusal: it is high.
@@ -156,9 +159,10 @@ An unmapped changed path is never a refusal: it is high.
 
 Each git call runs on the repo dir, removes each inherited variable whose name starts with `GIT_`, gets no
 stdin and runs with `--no-replace-objects` and `--no-lazy-fetch`. It reads only: no fetch, no ref, config,
-index or work tree write. The map comes from `ls-tree` and `cat-file` of `--from`, the changed paths from
-`diff-tree --raw` with `--ignore-submodules=none`, so a `submodule.<name>.ignore` setting of `.gitmodules`
-does not hide a submodule entry. The work tree is not read.
+index or work tree write. The map comes from `ls-tree --full-tree` (the path is named from the top of the
+repo) and `cat-file` of `--from`, the changed paths from `diff-tree --raw` with
+`--ignore-submodules=none`, so a `submodule.<name>.ignore` setting of `.gitmodules` does not hide a
+submodule entry. The work tree is not read.
 
 ## Exit codes
 

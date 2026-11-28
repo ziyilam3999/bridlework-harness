@@ -8,6 +8,7 @@
 //! review and marks no finding: a caller uses the last line as one input. The map is read from the object
 //! store, never from the work tree, so a diff cannot change the map that judges it.
 //! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch, raw tree compare.
+//! `--repo-dir` is the top of the repo (a folder inside is refused) and the map is named from the top.
 //! Exit codes: 0 class printed; 1 an override that lowers is refused (one stderr line); 2 usage or setup
 //! error (one stderr line, no path). The only write is the append to --log of an accepted override.
 
@@ -213,13 +214,14 @@ fn parse_map(bytes: &[u8]) -> Result<Vec<Entry>, String> {
 }
 
 /// The map as it is at `sha`, read from the object store: `<mode> <type> <oid>` from `ls-tree`, then the blob.
+/// `--full-tree` names the path from the top of the repo, whatever folder git runs in.
 fn map_at(repo: &Path, sha: &str) -> Result<Vec<Entry>, String> {
     let name = format!("the risk map {MAP_PATH} at --from");
-    let Some(raw) = git_ok(repo, &["ls-tree", "-z", sha, "--", MAP_PATH]) else {
+    let Some(raw) = git_ok(repo, &["ls-tree", "-z", "--full-tree", sha, "--", MAP_PATH]) else {
         return Err(format!("{name} cannot be read"));
     };
-    // `<mode> <type> <oid>` TAB `<path>` NUL. A folder of that name lists its entries, so the map is the one
-    // record whose path is the map path: a folder is never read as the map.
+    // `<mode> <type> <oid>` TAB `<path>` NUL: one record for the path. A folder of that name is a `tree`
+    // record, refused here because the type must be `blob`.
     let records: Vec<&[u8]> = raw.split(|&b| b == 0).filter(|r| !r.is_empty()).collect();
     let head = records.first().copied().unwrap_or_default();
     let end = head.iter().position(|&b| b == b'\t');
@@ -317,9 +319,10 @@ fn judge(map: &[Entry], paths: &[&str], ticket_high: bool, over: Option<Class>) 
 }
 
 /// Appends one line to the log file. A file that exists and does not end with a newline gets one first, so
-/// the new line is a whole line. Nothing else of the file is touched.
+/// the new line is a whole line. Nothing else of the file is touched. The lookup does not follow a symlink:
+/// a link is not a plain file here, also when it points at one.
 fn append_log(path: &Path, line: &str) -> Result<(), String> {
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(m) if !m.is_file() => return Err("--log is not a plain file".to_string()),
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err("--log cannot be read".to_string()),
         _ => {}
@@ -349,6 +352,14 @@ pub fn risk_cmd(a: &[String]) -> i32 {
     match git(repo, &["rev-parse", "--git-dir"]) {
         None => return fail("git cannot run"),
         Some(o) if !o.status.success() => return fail("the repo dir is not a git repo"),
+        Some(_) => {}
+    }
+    // `rev-parse --show-prefix` prints the path from the top of the work tree down to the folder (empty at
+    // the top). A folder inside is refused: the changed paths are named from the top.
+    match git(repo, &["rev-parse", "--show-prefix"]) {
+        None => return fail("git cannot run"),
+        Some(o) if !o.status.success() => return fail("a git call failed"),
+        Some(o) if o.stdout.iter().any(|b| *b != b'\n') => return fail("--repo-dir is not the top of the repo"),
         Some(_) => {}
     }
     for (flag, sha) in [("--from", &args.from), ("--to", &args.to)] {
@@ -525,5 +536,50 @@ mod tests {
             assert!(ok(&extra).is_none(), "{extra:?}");
         }
         assert!(ok(&["--override", "high", "--by", "model", "--reason", &"r".repeat(200), "--log", "/l"]).is_some(), "a 200 byte reason is the limit");
+    }
+
+    /// A scratch git call (local git only) with the repo names of the caller removed.
+    fn scratch_git(dir: &Path, args: &[&str]) -> Output {
+        let contact = format!("user.email=t{}scratch", '@');
+        let mut c = Command::new("git");
+        c.args(["-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", contact.as_str(), "-c", "commit.gpgsign=false"]).arg("-C").arg(dir).args(args);
+        for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"] {
+            c.env_remove(k);
+        }
+        c.stdin(Stdio::null()).output().unwrap()
+    }
+
+    /// A scratch repo holding one commit of `files`; returns its folder and the sha.
+    fn scratch_repo(files: &[(&str, &str)]) -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("risk-unit-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = |args: &[&str]| assert!(scratch_git(&dir, args).status.success(), "scratch git call failed: {args:?}");
+        ok(&["init", "-q"]);
+        // Git's own background upkeep off, as for each scratch repo of this crate.
+        for (k, v) in [("maintenance.auto", "false"), ("gc.auto", "0"), ("gc.autoDetach", "false")] {
+            ok(&["config", k, v]);
+        }
+        for (p, text) in files {
+            let f = dir.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, text).unwrap();
+        }
+        ok(&["add", "-A"]);
+        ok(&["commit", "-q", "-m", "m"]);
+        let head = scratch_git(&dir, &["rev-parse", "HEAD"]);
+        assert!(head.status.success(), "scratch git call failed: rev-parse HEAD");
+        (dir, String::from_utf8(head.stdout).unwrap().trim().to_string())
+    }
+
+    /// The map read names its path from the top of the repo: run from a folder inside, it reads the one map
+    /// at the top and not a file of the same name under that folder.
+    #[test]
+    fn the_map_read_does_not_depend_on_the_run_folder() {
+        let (dir, sha) = scratch_repo(&[("gates/risk-map.txt", "docs low\nci high\n"), ("docs/gates/risk-map.txt", "core low\ngates low\n")]);
+        let top = Ok(map("docs low\nci high\n"));
+        assert_eq!(map_at(&dir, &sha), top);
+        assert_eq!(map_at(&dir.join("docs"), &sha), top, "the run folder does not choose the map");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

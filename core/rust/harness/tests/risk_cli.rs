@@ -270,6 +270,38 @@ fn risk_map_is_read_from_the_base_commit() {
     assert!(o.stderr.starts_with("harness: error: ") && o.stderr.contains("is missing"), "{}", o.stderr);
 }
 
+/// `--repo-dir` is the top of the repo. A folder inside is refused, so the map (one file at the top) and the
+/// changed paths (named from the top) cannot be read against two different folders.
+#[test]
+fn risk_repo_dir_inside_the_repo_is_refused() {
+    let r = repo();
+    // A second map of the same name under docs/, which a read relative to the run folder takes for the map.
+    let base = commit_all(&r.dir, &[("gates/risk-map.txt", "docs low\n"), ("docs/gates/risk-map.txt", "core low\ngates low\n"), ("docs/a.md", "one\n"), ("core/x.rs", "one\n")]);
+    let head = commit_all(&r.dir, &[("core/x.rs", "two\n")]);
+    let t = ticket(&r, "T-1", "normal");
+    let log = r.t.0.join("never.log");
+    for inside in ["docs", "docs/gates"] {
+        let mut a = s(&[t.to_str().unwrap(), "--repo-dir", r.dir.join(inside).to_str().unwrap(), "--from", &base, "--to", &head]);
+        a.extend(raising(&log));
+        let o = run_raw(&a);
+        assert_eq!((o.code, o.stdout.as_str()), (2, ""), "{inside}: stderr: {}", o.stderr);
+        assert_eq!(o.stderr.lines().count(), 1, "{inside}: {}", o.stderr);
+        assert_eq!(o.stderr, "harness: error: --repo-dir is not the top of the repo\n", "{inside}");
+        assert!(!log.exists(), "{inside}: writes no log");
+    }
+    // Twins: each top of the same history answers, and core/x.rs is unmapped there (the top map is the
+    // judge): the repo itself, a linked work tree, and a bare clone (a repo with no work tree).
+    let wt = r.t.0.join("wt");
+    g(&r.dir, &["worktree", "add", "-q", wt.to_str().unwrap(), &head]);
+    let bare = r.t.0.join("bare.git");
+    g(&r.dir, &["clone", "-q", "--bare", r.dir.to_str().unwrap(), bare.to_str().unwrap()]);
+    for top in [&r.dir, &wt, &bare] {
+        let o = run_raw(&s(&[t.to_str().unwrap(), "--repo-dir", top.to_str().unwrap(), "--from", &base, "--to", &head]));
+        assert_eq!((o.code, o.stderr.as_str()), (0, ""), "{}: stderr: {}", top.display(), o.stderr);
+        assert_eq!(o.stdout, format!("path=core/x.rs class=high why=unmapped\nrisk=high ticket=T-1 from={base} to={head} files=1 why=unmapped\n"), "{}", top.display());
+    }
+}
+
 /// An override lower than the computed class is refused by every author: exit 1, one stderr line, no
 /// stdout, nothing written to the log.
 #[test]
@@ -355,6 +387,72 @@ fn risk_ticket_high_raises() {
     // Twin: the same diff with a `normal` ticket is low.
     let o = run(&r, &ticket(&r, "T-1", "normal"), &base, &head, &[]);
     assert_eq!(last(&o), format!("risk=low ticket=T-1 from={base} to={head} files=1 why=mapped-low"));
+}
+
+/// Each inherited `GIT_` name is removed before git runs: a `GIT_DIR` that points at another repo changes
+/// nothing.
+#[test]
+fn risk_inherited_git_names_are_removed() {
+    let r = repo();
+    let base = commit_all(&r.dir, &[("gates/risk-map.txt", "docs low\n"), ("docs/a.md", "one\n")]);
+    let head = commit_all(&r.dir, &[("docs/a.md", "two\n")]);
+    let t = ticket(&r, "T-1", "normal");
+    let want = format!("path=docs/a.md class=low why=mapped-low\nrisk=low ticket=T-1 from={base} to={head} files=1 why=mapped-low\n");
+    let other = repo();
+    let mut c = Command::new(BIN);
+    c.args(["ticket", "risk"]).args(args_of(&r, &t, &base, &head, &[])).env("GIT_DIR", other.dir.join(".git")).stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), want);
+}
+
+/// A changed submodule entry counts as a changed path. The tree compare passes `--ignore-submodules=none`,
+/// so an ignore rule of `.gitmodules` (`submodule.<name>.ignore`) does not hide it.
+#[test]
+fn risk_submodule_change_is_listed() {
+    let r = repo();
+    let seed = commit_all(&r.dir, &[("gates/risk-map.txt", "docs low\nvendor/sub low\n"), (".gitmodules", "[submodule \"sub\"]\n\tpath = vendor/sub\n\tignore = all\n"), ("docs/a.md", "one\n")]);
+    // A submodule entry in the index that points at `sha`; git does not check that the commit exists.
+    let point = |sha: &str| {
+        g(&r.dir, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},vendor/sub")]);
+        commit(&r.dir)
+    };
+    let base = point(&seed);
+    let head = point(&base);
+    let o = run(&r, &ticket(&r, "T-1", "normal"), &base, &head, &[]);
+    assert_eq!((o.code, o.stderr.as_str()), (0, ""), "{}", o.stderr);
+    assert_eq!(o.stdout, format!("path=vendor/sub class=low why=mapped-low\nrisk=low ticket=T-1 from={base} to={head} files=1 why=mapped-low\n"), "the submodule entry is one changed path");
+}
+
+/// `--log` must be a plain file: a symlink is refused, also one that points at a plain file, and the file
+/// behind the link is left as it was.
+#[test]
+fn risk_log_symlink_is_refused() {
+    let r = repo();
+    let base = commit_all(&r.dir, &[("gates/risk-map.txt", "docs low\n"), ("docs/a.md", "one\n")]);
+    let head = commit_all(&r.dir, &[("docs/a.md", "two\n")]);
+    let t = ticket(&r, "T-1", "normal");
+    let real = r.t.0.join("real.log");
+    fs::write(&real, "old\n").unwrap();
+    let link = r.t.0.join("link.log");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let o = run(&r, &t, &base, &head, &["--override", "high", "--by", "jev", "--reason", "r", "--log", link.to_str().unwrap()]);
+    assert_eq!((o.code, o.stdout.as_str()), (2, ""), "{}", o.stderr);
+    assert_eq!(o.stderr, "harness: error: --log is not a plain file\n");
+    assert_eq!(fs::read_to_string(&real).unwrap(), "old\n", "the file behind the link is not written");
+    // A link to a missing file is refused the same way, and no file is created behind it.
+    let gone = r.t.0.join("gone.log");
+    std::os::unix::fs::symlink(r.t.0.join("no-such.log"), &gone).unwrap();
+    let o = run(&r, &t, &base, &head, &["--override", "high", "--by", "jev", "--reason", "r", "--log", gone.to_str().unwrap()]);
+    assert_eq!((o.code, o.stdout.as_str()), (2, ""), "{}", o.stderr);
+    assert_eq!(o.stderr, "harness: error: --log is not a plain file\n");
+    assert!(!r.t.0.join("no-such.log").exists());
+    // Twin: the plain file itself takes the line.
+    let mut a = args_of(&r, &t, &base, &head, &[]);
+    a.extend(raising(&real));
+    let o = run_raw(&a);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(fs::read_to_string(&real).unwrap(), format!("old\nrisk-override ticket=T-1 from={base} to={head} computed=low override=high by=jev effect=raised reason=ok\n"));
 }
 
 /// Flag-shape errors print the verb's usage line; content errors print one `harness: error: <what>` line.
@@ -462,14 +560,17 @@ fn risk_refuses_bad_inputs() {
     let folder_base = commit_all(&folder.dir, &[("gates/risk-map.txt/inner.txt", "docs low\n"), ("docs/a.md", "one\n")]);
     fs::remove_dir_all(folder.dir.join("gates")).unwrap();
     let folder_head = commit_all(&folder.dir, &good);
-    // A changed path that is not UTF-8, through git's own index (a file system may refuse such a name).
-    let odd = repo();
-    let odd_base = commit_all(&odd.dir, &[("gates/risk-map.txt", "docs low\n"), ("docs/a.md", "one\n")]);
-    let blob = g_stdin(&odd.dir, &["hash-object", "-w", "--stdin"], b"x");
-    let mut entry = format!("100644 {blob}\t").into_bytes();
-    entry.extend_from_slice(&[0xff, b'.', b't', b'x', b't', 0]);
-    g_stdin(&odd.dir, &["update-index", "-z", "--index-info"], &entry);
-    let odd_head = commit(&odd.dir);
+    // A symlink of the map name is a blob too (its content is the link target): only the mode tells it.
+    let link = repo();
+    commit_all(&link.dir, &[("docs/a.md", "one\n")]);
+    let target = g_stdin(&link.dir, &["hash-object", "-w", "--stdin"], b"docs/rule.txt");
+    g(&link.dir, &["update-index", "--add", "--cacheinfo", &format!("120000,{target},gates/risk-map.txt")]);
+    let link_base = commit(&link.dir);
+    let link_head = commit_all(&link.dir, &good);
+    // A map with valid entries only, over the 1 MiB cap.
+    let big: String = (0..50_000).map(|i| format!("dir{i:06}/file.txt low\n")).collect();
+    assert!(big.len() > 1024 * 1024, "the big map is over 1 MiB");
+    let (huge, huge_base, huge_head) = with_map(big.as_bytes());
 
     // Each needle is the whole text after `harness: error: the risk map gates/risk-map.txt at --from `.
     const MAP: &str = "the risk map gates/risk-map.txt at --from ";
@@ -481,6 +582,8 @@ fn risk_refuses_bad_inputs() {
         ("map path twice", &twice, &twice_base, &twice_head, "line 2 gives one path twice"),
         ("map not utf-8", &utf8, &utf8_base, &utf8_head, "is not utf-8"),
         ("map is a folder", &folder, &folder_base, &folder_head, "is missing or not a plain file"),
+        ("map is a symlink", &link, &link_base, &link_head, "is missing or not a plain file"),
+        ("map over 1 MiB", &huge, &huge_base, &huge_head, "is over 1 MiB"),
     ];
     for (name, x, b, h, needle) in &maps {
         let mut a = args_of(x, &t, b, h, &[]);
@@ -497,14 +600,27 @@ fn risk_refuses_bad_inputs() {
         assert_eq!(o.code, 0, "{name}: {}", o.stderr);
         assert_eq!(last(&o), format!("risk=low ticket=T-1 from={h} to={next} files=1 why=mapped-low"), "{name}");
     }
-    // The odd path is refused on either side of the diff, with a full raising override too, and writes no log.
-    for (from, to) in [(&odd_head, &odd_base), (&odd_base, &odd_head)] {
-        let mut a = args_of(&odd, &t, from, to, &[]);
-        a.extend(over.clone());
-        let o = run_raw(&a);
-        assert_eq!((o.code, o.stdout.as_str()), (2, ""));
-        assert_eq!(o.stderr, "harness: error: a changed path is not utf-8 or holds a control character\n");
-        assert!(!log.exists());
+    // A changed path that is not UTF-8, and one that holds a control character (a newline), each planted
+    // through git's own index (a file system may refuse such a name) in a repo of its own, so each is the
+    // only reason its run is refused. Refused on either side of the diff, with a full raising override
+    // too, and writes no log.
+    for path_bytes in [&b"\xff.txt"[..], b"\n.txt"] {
+        let x = repo();
+        let b = commit_all(&x.dir, &[("gates/risk-map.txt", "docs low\n"), ("docs/a.md", "one\n")]);
+        let blob = g_stdin(&x.dir, &["hash-object", "-w", "--stdin"], b"x");
+        let mut entry = format!("100644 {blob}\t").into_bytes();
+        entry.extend_from_slice(path_bytes);
+        entry.push(0);
+        g_stdin(&x.dir, &["update-index", "-z", "--index-info"], &entry);
+        let h = commit(&x.dir);
+        for (from, to) in [(&h, &b), (&b, &h)] {
+            let mut a = args_of(&x, &t, from, to, &[]);
+            a.extend(over.clone());
+            let o = run_raw(&a);
+            assert_eq!((o.code, o.stdout.as_str()), (2, ""), "{path_bytes:?}");
+            assert_eq!(o.stderr, "harness: error: a changed path is not utf-8 or holds a control character\n", "{path_bytes:?}");
+            assert!(!log.exists(), "{path_bytes:?}: writes no log");
+        }
     }
 }
 
