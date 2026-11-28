@@ -629,10 +629,10 @@ fn an_unbalanced_backtick_is_not_a_wrapped_cite() {
 }
 
 /// A locator counts as wrapped only when the byte before the sha is a backtick and the byte before that one is
-/// not. Two or three opening backticks and one closing one are not a strict cite.
-fn lopsided(body: String, code: i32, want: Vec<String>) {
-    let c = case();
-    let o = run(&c, &body);
+/// not. Two or three opening backticks and one closing one are not a strict cite. The body runs against `c`, the
+/// fixture its sha was cut from: a second fixture holds other shas when its commits fall into another second.
+fn lopsided(c: &Case, body: String, code: i32, want: Vec<String>) {
+    let o = run(c, &body);
     assert_eq!(o.code, code, "{body:?}: {}", o.stdout);
     assert_eq!(lines(&o), want, "{body:?}");
     assert_eq!(o.stderr, "", "{body:?}");
@@ -669,15 +669,15 @@ fn lopsided_backtick_hostile_cases() {
     let one = "cites=1 ok=1 flag=0 unparsed=1".to_string();
     let none = "cites=0 ok=0 flag=0 unparsed=1".to_string();
     // (i) On one line with a good wrapped cite: the first is a cite, the second is an unparsed token.
-    lopsided(format!("`{h}:src/a.rs:1` \"fn alpha\" and ``{h}:src/a.rs:1` \"fn alpha\""), 1, vec![format!("OK `{h}:src/a.rs:1` \"fn alpha\""), token.clone(), one]);
+    lopsided(&c, format!("`{h}:src/a.rs:1` \"fn alpha\" and ``{h}:src/a.rs:1` \"fn alpha\""), 1, vec![format!("OK `{h}:src/a.rs:1` \"fn alpha\""), token.clone(), one]);
     // (ii) The same lopsided form with a CR LF line end.
     let o = run_full(&c, format!("``{h}:src/a.rs:1` \"fn alpha\"\r\n").as_bytes(), &[], &[]);
     assert_eq!(o.code, 1, "{}", o.stdout);
     assert_eq!(lines(&o), vec![token.clone(), none.clone()], "{:?}", o.stdout);
     // (iii) After a letter and not at the start of the line.
-    lopsided(format!("x``{h}:src/a.rs:1` \"fn alpha\""), 1, vec![token.clone(), none.clone()]);
+    lopsided(&c, format!("x``{h}:src/a.rs:1` \"fn alpha\""), 1, vec![token.clone(), none.clone()]);
     // (iv) A backtick inside the quote: not a cite, so not a fragment-absent FLAG either.
-    lopsided(format!("``{h}:src/a.rs:1` \"a`b\""), 1, vec![token, none]);
+    lopsided(&c, format!("``{h}:src/a.rs:1` \"a`b\""), 1, vec![token, none]);
 }
 
 #[test]
