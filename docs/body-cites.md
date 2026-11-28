@@ -25,6 +25,10 @@ harness ticket body-cites --repo-dir <absolute dir> --head <full sha> --base <fu
 - `n` or `n-m`: a line number or a range (lines count from 1).
 - Exactly one space or tab between `<n>[-<m>]` and the opening quote. A curly quote does not open a fragment.
 - `fragment`: not empty, no line break, ends at the next straight `"`.
+- The `<sha>:<path>:<n>[-<m>]` part may be wrapped in one pair of backticks (an opening backtick just before the
+  sha, a closing one just after the range, then the one space or tab and the quote). It is the same cite: every
+  check runs on it, and it is printed with its backticks. A closing backtick with no opening one is not a strict
+  cite.
 
 ## Output
 
@@ -61,6 +65,7 @@ curly quotes U+201C, U+201D, U+2018, U+2019, or the start of the line. `{`, `}`,
 | `a1b2c3d:src/x.rs:12` (no fragment) | yes | name `a1b2c3d:src/x.rs` holds `.` and `/` |
 | `x.rs:12` | yes | name holds `.` |
 | `see :12` | yes | the character before the colon is a space |
+| ``15dc27f:src/a.rs:1` "x"`` | yes | a closing backtick with no opening one is not a strict cite |
 | `src/x:3-4` | yes | name holds `/` |
 | `at 16:35 UTC` | no | a clock time: name `16` has no `.` or `/`, a digit comes before the colon |
 | `std::fmt:12` | no | name has no `.` or `/`, a letter comes before the colon |

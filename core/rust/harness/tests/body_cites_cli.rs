@@ -558,6 +558,77 @@ fn a_range_ending_on_a_cr_only_line_is_blank_line() {
 }
 
 #[test]
+fn a_backtick_wrapped_locator_is_the_same_cite() {
+    // Mutant: leave the backtick-wrapped locator unparsed -> this prints FLAG unparsed and turns red.
+    let c = case();
+    let x = format!("`{}:src/a.rs:1` \"fn alpha\"", &c.head[..7]);
+    let o = run(&c, &x);
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    assert_eq!(lines(&o), vec![format!("OK {x}"), "cites=1 ok=1 flag=0 unparsed=0".to_string()]);
+}
+
+#[test]
+fn a_backtick_wrapped_locator_still_gets_every_check() {
+    // Mutant: let a wrapped locator skip a check, or clear it with a value that is not the printed text -> red.
+    let c = case();
+    let h = &c.head[..7];
+    let x = format!("`{h}:src/a.rs:1-3` \"fn gamma\"");
+    let o = run(&c, &format!("{x}\n"));
+    assert_eq!(o.code, 1);
+    assert_eq!(lines(&o), vec![format!("FLAG fragment-absent {x}"), "cites=1 ok=0 flag=1 unparsed=0".to_string()]);
+    let o = run_full(&c, format!("{x}\n").as_bytes(), &["--cite-ok", &x], &[]);
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    assert_eq!(lines(&o), vec![format!("CLEARED {x}"), "cites=1 ok=0 flag=0 unparsed=0".to_string()]);
+    let x = format!("`{}:src/a.rs:1` \"fn alpha\"", &c.old[..7]);
+    let y = format!("`{h}:src/gone.rs:1` \"fn alpha\"");
+    let z = format!("`{h}:src/a.rs:2-3` \"fn beta\"");
+    let o = run(&c, &format!("{x}\n{y}\n{z}\n"));
+    assert_eq!(o.code, 1);
+    assert_eq!(
+        lines(&o),
+        vec![
+            format!("FLAG sha-not-head-or-base {x}"),
+            format!("FLAG file-missing {y}"),
+            format!("FLAG blank-line {z}"),
+            "cites=3 ok=0 flag=3 unparsed=0".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_backtick_inside_the_quote_of_a_wrapped_locator_is_ok() {
+    // Mutant: let a backtick end the cite -> the quote is cut and this turns red.
+    let t = Tmp::new();
+    let dir = init(&t, "repo");
+    let base = commit_all(&dir, &[("g.txt", "x\n")]);
+    let head = commit_all(&dir, &[("f.txt", "fn alpha() {}\nlet x = `y`;\n")]);
+    let x = format!("`{}:f.txt:2` \"x = `y`\"", &head[..7]);
+    let f = t.0.join("b.md");
+    fs::write(&f, &x).unwrap();
+    let o = run_args(&["--repo-dir", dir.to_str().unwrap(), "--head", &head, "--base", &base, "--body-file", f.to_str().unwrap()], &[]);
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    assert_eq!(lines(&o), vec![format!("OK {x}"), "cites=1 ok=1 flag=0 unparsed=0".to_string()]);
+}
+
+#[test]
+fn an_unbalanced_backtick_is_not_a_wrapped_cite() {
+    // Guard: each of these prints a FLAG unparsed line and exits 1 (also before the wrapped locator was read).
+    let c = case();
+    let h = &c.head[..7];
+    let plain = format!("{h}:src/a.rs:1");
+    for (body, token) in [
+        (format!("{plain}` \"fn alpha\""), plain.clone()),
+        (format!("`{plain}`\"fn alpha\""), plain.clone()),
+        (format!("``{plain}`` \"fn alpha\""), plain.clone()),
+        (format!("`{plain}`\u{e9} \"fn alpha\""), plain),
+    ] {
+        let o = run(&c, &format!("{body}\n"));
+        assert_eq!(o.code, 1, "{body:?}: {}", o.stdout);
+        assert_eq!(lines(&o), vec![format!("FLAG unparsed {token}"), "cites=0 ok=0 flag=0 unparsed=1".to_string()], "{body:?}");
+    }
+}
+
+#[test]
 fn a_submodule_at_the_cite_path_is_not_a_file() {
     // Mutant: read a gitlink entry as a file -> this turns red.
     let t = Tmp::new();
