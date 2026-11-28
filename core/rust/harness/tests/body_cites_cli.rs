@@ -628,6 +628,58 @@ fn an_unbalanced_backtick_is_not_a_wrapped_cite() {
     }
 }
 
+/// A locator counts as wrapped only when the byte before the sha is a backtick and the byte before that one is
+/// not. Two or three opening backticks and one closing one are not a strict cite. The body runs against `c`, the
+/// fixture its sha was cut from: a second fixture holds other shas when its commits fall into another second.
+fn lopsided(c: &Case, body: String, code: i32, want: Vec<String>) {
+    let o = run(c, &body);
+    assert_eq!(o.code, code, "{body:?}: {}", o.stdout);
+    assert_eq!(lines(&o), want, "{body:?}");
+    assert_eq!(o.stderr, "", "{body:?}");
+}
+
+#[test]
+fn two_opening_backticks_and_one_closing_are_not_a_wrapped_cite() {
+    // Mutant: read the one byte before the sha only (the text before this change) -> this prints OK and turns red.
+    let c = case();
+    let h = &c.head[..7];
+    let body = format!("``{h}:src/a.rs:1` \"fn alpha\"");
+    let o = run(&c, &body);
+    assert_eq!(o.code, 1, "{}", o.stdout);
+    assert_eq!(lines(&o), vec![format!("FLAG unparsed {h}:src/a.rs:1"), "cites=0 ok=0 flag=0 unparsed=1".to_string()]);
+}
+
+#[test]
+fn three_opening_backticks_and_one_closing_are_not_a_wrapped_cite() {
+    // Mutant: refuse two opening backticks but let three through -> this prints OK and turns red.
+    let c = case();
+    let h = &c.head[..7];
+    let body = format!("```{h}:src/a.rs:1` \"fn alpha\"");
+    let o = run(&c, &body);
+    assert_eq!(o.code, 1, "{}", o.stdout);
+    assert_eq!(lines(&o), vec![format!("FLAG unparsed {h}:src/a.rs:1"), "cites=0 ok=0 flag=0 unparsed=1".to_string()]);
+}
+
+#[test]
+fn lopsided_backtick_hostile_cases() {
+    // Each of these printed an OK line or another FLAG before the second opening backtick was read.
+    let c = case();
+    let h = &c.head[..7];
+    let token = format!("FLAG unparsed {h}:src/a.rs:1");
+    let one = "cites=1 ok=1 flag=0 unparsed=1".to_string();
+    let none = "cites=0 ok=0 flag=0 unparsed=1".to_string();
+    // (i) On one line with a good wrapped cite: the first is a cite, the second is an unparsed token.
+    lopsided(&c, format!("`{h}:src/a.rs:1` \"fn alpha\" and ``{h}:src/a.rs:1` \"fn alpha\""), 1, vec![format!("OK `{h}:src/a.rs:1` \"fn alpha\""), token.clone(), one]);
+    // (ii) The same lopsided form with a CR LF line end.
+    let o = run_full(&c, format!("``{h}:src/a.rs:1` \"fn alpha\"\r\n").as_bytes(), &[], &[]);
+    assert_eq!(o.code, 1, "{}", o.stdout);
+    assert_eq!(lines(&o), vec![token.clone(), none.clone()], "{:?}", o.stdout);
+    // (iii) After a letter and not at the start of the line.
+    lopsided(&c, format!("x``{h}:src/a.rs:1` \"fn alpha\""), 1, vec![token.clone(), none.clone()]);
+    // (iv) A backtick inside the quote: not a cite, so not a fragment-absent FLAG either.
+    lopsided(&c, format!("``{h}:src/a.rs:1` \"a`b\""), 1, vec![token, none]);
+}
+
 #[test]
 fn a_submodule_at_the_cite_path_is_not_a_file() {
     // Mutant: read a gitlink entry as a file -> this turns red.

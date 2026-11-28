@@ -3,7 +3,8 @@
 //! sha must be --head or --base, the path a regular UTF-8 file, the range inside the file, its first and last line
 //! not blank, and the fragment (compared without case) on one of its lines. It prints one line per cite, then a
 //! count line. The locator may be wrapped in one pair of backticks (`` `<sha>:<path>:<n>` "fragment" ``): that is the
-//! same cite, printed as written. A `:<digits>` that looks like a line cite but is not a strict one is printed as an
+//! same cite, printed as written. A second backtick just before the opening one is not one pair: the token is not
+//! a strict cite. A `:<digits>` that looks like a line cite but is not a strict one is printed as an
 //! unparsed token.
 //! It decides no review: a caller uses it as one input. It writes no file and runs no network call.
 //! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch, raw blob bytes.
@@ -127,11 +128,13 @@ fn digits(b: &[u8], s: usize) -> Option<(u64, usize)> {
 
 /// A strict cite that starts at byte `i` of `line` (a hex digit): sha of 7 to 40 hex characters, `:`, a repo
 /// relative path, `:`, `<n>[-<m>]`, one space or tab, then a quoted fragment that is not empty. The locator may be
-/// wrapped in one pair of backticks (a backtick at `i - 1` and one right after the range): `text` then starts at
-/// that opening backtick and the cite is the same cite.
+/// wrapped in one pair of backticks (a backtick at `i - 1`, no backtick at `i - 2`, and one right after the
+/// range): `text` then starts at that opening backtick and the cite is the same cite. A second backtick just
+/// before the opening one (two before the sha) is not one pair: the locator is not wrapped and no strict cite is
+/// read there.
 fn cite_at(line: &str, i: usize) -> Option<Cite<'_>> {
     let b = line.as_bytes();
-    let opened = i > 0 && b[i - 1] == b'`';
+    let opened = i > 0 && b[i - 1] == b'`' && (i < 2 || b[i - 2] != b'`');
     let mut j = i;
     while j < b.len() && b[j].is_ascii_hexdigit() {
         j += 1;
@@ -158,7 +161,8 @@ fn cite_at(line: &str, i: usize) -> Option<Cite<'_>> {
             e = e2;
         }
     }
-    // The closing backtick of the pair. A backtick with no opening one is not skipped, so the cite ends there.
+    // The closing backtick of the pair. A backtick that is not skipped here is not the space or tab the cite
+    // needs, so no strict cite is read: the text stays for the unparsed tokens.
     let wrapped = opened && b.get(e) == Some(&b'`');
     if wrapped {
         e += 1;
