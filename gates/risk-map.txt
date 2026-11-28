@@ -1,0 +1,28 @@
+# Risk path map of bridlework-harness, read by `harness ticket risk` (docs/risk.md).
+# One entry per line: <repo-relative path> <low|high>, with one space. A blank line or a line that starts
+# with `#` is skipped. An entry covers the path itself and everything below it (whole path components, never
+# a substring); when entries nest, the longest one answers. There are no globs.
+# A changed path that no entry covers is risk-routed (high): the map fails closed. The map file itself and
+# every other path under gates/ are high, whatever an entry says.
+#
+# Low: prose that no program runs. A diff is low only when every changed path is low here.
+docs low
+README.md low
+CONTRIBUTING.md low
+SECURITY.md low
+# plan.rs is the plan reader: it reads links and states of plan files, never code, and writes nothing.
+core/rust/harness/src/plan.rs low
+#
+# High: each is high also when it is not listed (no low entry covers it); listed so the intent is on record
+# and a later low entry of a folder above cannot make it low by accident.
+.github high
+ci high
+controls high
+gates high
+hooks high
+mcp high
+plugins high
+providers high
+# The privacy scanner and its detector: an edit there changes what every gate catches.
+core/rust/harness/src/scan.rs high
+core/rust/harness/src/detect.rs high
