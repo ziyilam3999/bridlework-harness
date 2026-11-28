@@ -25,18 +25,31 @@ const TOKEN_CAP: usize = 64;
 /// `title`, `done_when` and `reason` are at most this many bytes.
 const LINE_CAP: usize = 500;
 
-// The open(2) flags std exposes no constants for (the quarantine.rs pattern). Values are the macOS ones and
-// the Linux asm-generic ones. The macOS value is written in hex: O_NOFOLLOW is 0x100 there (octal 0o400),
-// and the same digits written as octal, 0o0100, are O_ASYNC. O_NOFOLLOW makes a symlink store fail the open
-// itself, so a link swapped in between the stat and the open is refused and nothing is written through it
-// (the unit test `the_open_itself_refuses_a_link` pins the flag: on the command line the stat check refuses
-// a link one step earlier and hides it). O_NONBLOCK makes the open of a fifo return at once instead of
-// blocking (the regular-file re-check then refuses it). A platform with no listed OS fails the build here.
-// The Linux value is not right on every Linux arch: friction f-20261127-06 tracks that, not changed here.
-#[cfg(target_os = "linux")]
-const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
-#[cfg(target_os = "macos")]
-const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
+// The table of the open(2) flags std exposes no constants for, O_NOFOLLOW | O_NONBLOCK, one entry per target;
+// the owed store uses it too. O_NOFOLLOW makes a symlink store fail the open itself, so a link swapped in
+// between the stat and the open is refused and nothing is written through it (the unit test
+// `the_open_itself_refuses_a_link` pins the flag on the host: on the command line the stat check refuses a
+// link one step earlier and hides it). O_NONBLOCK makes the open of a fifo return at once instead of
+// blocking (the regular-file re-check then refuses it).
+// The Linux value depends on the arch. x86_64 takes O_NOFOLLOW from asm-generic/fcntl.h (0o400000); arm64
+// overrides it in arch/arm64/include/uapi/asm/fcntl.h (0o100000), where 0o400000 is O_LARGEFILE, so the
+// x86_64 value there would open through a link with no error. The macOS value is written in hex: O_NOFOLLOW
+// is 0x100 there (octal 0o400), and the same digits written as octal, 0o0100, are O_ASYNC.
+// Every entry is compiled on every host, so one unit test pins them all.
+const NOFOLLOW_NONBLOCK_LINUX_X86_64: i32 = 0o400000 | 0o4000;
+const NOFOLLOW_NONBLOCK_LINUX_AARCH64: i32 = 0o100000 | 0o4000;
+const NOFOLLOW_NONBLOCK_MACOS: i32 = 0x0100 | 0x0004;
+
+/// The entry of the build target. A target with no entry fails the build here.
+pub(crate) const OPEN_NOFOLLOW_NONBLOCK: i32 = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    NOFOLLOW_NONBLOCK_LINUX_X86_64
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    NOFOLLOW_NONBLOCK_LINUX_AARCH64
+} else if cfg!(target_os = "macos") {
+    NOFOLLOW_NONBLOCK_MACOS
+} else {
+    panic!("no O_NOFOLLOW and O_NONBLOCK entry for this target")
+};
 
 /// One add row: `{"op":"add","id":..,"at":..,"by":..,"title":..,"done_when":..,"source":..}`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -801,5 +814,22 @@ mod tests {
         // a regular file opens both ways: the flags refuse the link, not the file
         assert!(open_store_handle(&real, false).is_ok());
         assert!(open_store_handle(&real, true).is_ok());
+    }
+
+    /// The table entry by entry, so a wrong value for a target the tests never run on (linux aarch64) is red
+    /// on any host; then the build picked the entry of this host. This pins the numbers, it does not run the
+    /// open on another target.
+    #[test]
+    fn the_no_follow_flag_matches_each_platform() {
+        assert_eq!(NOFOLLOW_NONBLOCK_LINUX_AARCH64, 0o100000 | 0o4000, "linux aarch64");
+        assert_eq!(NOFOLLOW_NONBLOCK_LINUX_X86_64, 0o400000 | 0o4000, "linux x86_64");
+        assert_eq!(NOFOLLOW_NONBLOCK_MACOS, 0x0100 | 0x0004, "macos");
+        let host = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => NOFOLLOW_NONBLOCK_LINUX_X86_64,
+            ("linux", "aarch64") => NOFOLLOW_NONBLOCK_LINUX_AARCH64,
+            ("macos", _) => NOFOLLOW_NONBLOCK_MACOS,
+            (os, arch) => panic!("no table entry for {os} {arch}"),
+        };
+        assert_eq!(OPEN_NOFOLLOW_NONBLOCK, host, "the entry of this host");
     }
 }

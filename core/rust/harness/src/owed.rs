@@ -8,6 +8,8 @@
 
 use crate::events::token_ok;
 use crate::friction::{at_ok, jstr, proof_problem, P};
+// The per-target table of the open(2) flags lives in goal.rs.
+use crate::goal::OPEN_NOFOLLOW_NONBLOCK;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,15 +25,6 @@ const TOKEN_CAP: usize = 64;
 const LINE_CAP: usize = 500;
 /// `home` is at most this many bytes.
 const HOME_CAP: usize = 200;
-
-// The open(2) flags std exposes no constants for (the quarantine.rs pattern). Values are the Linux
-// asm-generic ones (arm and arm64 differ) and the macOS ones. O_NOFOLLOW makes a symlink store fail the
-// open itself; O_NONBLOCK makes the open of a fifo return at once instead of blocking (the regular-file
-// re-check then refuses it). A platform with no listed OS fails the build here.
-#[cfg(target_os = "linux")]
-const OPEN_NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
-#[cfg(target_os = "macos")]
-const OPEN_NOFOLLOW_NONBLOCK: i32 = 0x0100 | 0x0004;
 
 /// One add row: `{"op":"add","id":..,"at":..,"by":..,"what":..,"home":..}`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
