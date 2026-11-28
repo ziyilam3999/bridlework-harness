@@ -2,7 +2,9 @@
 //! each strict line cite (`<sha>:<path>:<n>[-<m>] "<fragment>"`) against the file at the cite sha in the repo: the
 //! sha must be --head or --base, the path a regular UTF-8 file, the range inside the file, its first and last line
 //! not blank, and the fragment (compared without case) on one of its lines. It prints one line per cite, then a
-//! count line. A `:<digits>` that looks like a line cite but is not a strict one is printed as an unparsed token.
+//! count line. The locator may be wrapped in one pair of backticks (`` `<sha>:<path>:<n>` "fragment" ``): that is the
+//! same cite, printed as written. A `:<digits>` that looks like a line cite but is not a strict one is printed as an
+//! unparsed token.
 //! It decides no review: a caller uses it as one input. It writes no file and runs no network call.
 //! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch, raw blob bytes.
 //! Exit codes: 0 no FLAG and unparsed=0; 1 at least one FLAG (after clearing) or unparsed > 0 or an unused
@@ -94,6 +96,8 @@ fn git_ok(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
 struct Cite<'a> {
     /// The cite as written in the body.
     text: &'a str,
+    /// The byte offset of `text` in its line.
+    from: usize,
     sha: &'a str,
     path: &'a str,
     n: u64,
@@ -122,9 +126,12 @@ fn digits(b: &[u8], s: usize) -> Option<(u64, usize)> {
 }
 
 /// A strict cite that starts at byte `i` of `line` (a hex digit): sha of 7 to 40 hex characters, `:`, a repo
-/// relative path, `:`, `<n>[-<m>]`, one space or tab, then a quoted fragment that is not empty.
+/// relative path, `:`, `<n>[-<m>]`, one space or tab, then a quoted fragment that is not empty. The locator may be
+/// wrapped in one pair of backticks (a backtick at `i - 1` and one right after the range): `text` then starts at
+/// that opening backtick and the cite is the same cite.
 fn cite_at(line: &str, i: usize) -> Option<Cite<'_>> {
     let b = line.as_bytes();
+    let opened = i > 0 && b[i - 1] == b'`';
     let mut j = i;
     while j < b.len() && b[j].is_ascii_hexdigit() {
         j += 1;
@@ -151,6 +158,11 @@ fn cite_at(line: &str, i: usize) -> Option<Cite<'_>> {
             e = e2;
         }
     }
+    // The closing backtick of the pair. A backtick with no opening one is not skipped, so the cite ends there.
+    let wrapped = opened && b.get(e) == Some(&b'`');
+    if wrapped {
+        e += 1;
+    }
     if !matches!(b.get(e), Some(b' ' | b'\t')) || b.get(e + 1) != Some(&b'"') {
         return None;
     }
@@ -159,7 +171,8 @@ fn cite_at(line: &str, i: usize) -> Option<Cite<'_>> {
     if q == fs {
         return None;
     }
-    Some(Cite { text: &line[i..=q], sha: &line[i..j], path: &line[p..k], n, m, frag: &line[fs..q] })
+    let from = if wrapped { i - 1 } else { i };
+    Some(Cite { text: &line[from..=q], from, sha: &line[i..j], path: &line[p..k], n, m, frag: &line[fs..q] })
 }
 
 fn is_delim(c: char) -> bool {
@@ -208,8 +221,9 @@ fn scan(body: &str) -> Vec<Item<'_>> {
         while i < b.len() {
             if b[i].is_ascii_hexdigit() && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
                 if let Some(c) = cite_at(line, i) {
-                    unparsed(&line[seg..i], &mut items);
-                    let end = i + c.text.len();
+                    // The text before the cite: a backtick wrapped locator starts at its opening backtick.
+                    unparsed(&line[seg..c.from], &mut items);
+                    let end = c.from + c.text.len();
                     items.push(Item::Cite(c));
                     i = end;
                     seg = end;
