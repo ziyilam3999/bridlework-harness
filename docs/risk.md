@@ -23,7 +23,8 @@ usage: harness ticket risk <ticket-file> --repo-dir <absolute-dir> --from <full-
   `id` and `risk` are used. The id must be a plain token (1 to 200 bytes, no blank, no control character),
   because it is printed.
 - `--repo-dir`: a git repo or a linked work tree. Absolute, with no `..` component, and the top of the repo
-  or work tree: a folder inside is refused (exit 2), because the changed paths are named from the top.
+  or work tree: a folder inside the work tree is refused (exit 2), because the changed paths are named from
+  the top.
 - `--from`: 40 lowercase hex characters, the commit whose map judges the diff (the base).
 - `--to`: 40 lowercase hex characters, the other commit (the head). It need not descend from `--from`; the
   two trees are compared.
@@ -142,8 +143,8 @@ The first failing step gives one stderr line and stops.
 2. The ticket file: missing, not a plain file, over 1 MiB, not a valid ticket, or an id that is not a plain
    token (exit 2).
 3. Setup (exit 2, `harness: error: <what>`, no path printed): the repo dir is missing or not a folder, it is
-   not a git repo, it is a folder inside the repo and not its top, git cannot run or a call fails, `--from`
-   or `--to` is not a commit of the repo.
+   not a git repo, it is a folder inside the work tree, git cannot run or a call fails, `--from` or `--to`
+   is not a commit of the repo.
 4. `--from` equal to `--to`: `--from equals --to`.
 5. The map at `--from`: missing or not a plain file, over 1 MiB, not UTF-8, a malformed line, a path given
    twice, or no entry. The line names the map and the bad line by number, never its text.

@@ -270,8 +270,8 @@ fn risk_map_is_read_from_the_base_commit() {
     assert!(o.stderr.starts_with("harness: error: ") && o.stderr.contains("is missing"), "{}", o.stderr);
 }
 
-/// `--repo-dir` is the top of the repo. A folder inside is refused, so the map (one file at the top) and the
-/// changed paths (named from the top) cannot be read against two different folders.
+/// `--repo-dir` is the top of the repo. A folder inside the work tree is refused, so the map (one file at
+/// the top) and the changed paths (named from the top) cannot be read against two different folders.
 #[test]
 fn risk_repo_dir_inside_the_repo_is_refused() {
     let r = repo();

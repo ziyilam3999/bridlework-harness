@@ -8,7 +8,8 @@
 //! review and marks no finding: a caller uses the last line as one input. The map is read from the object
 //! store, never from the work tree, so a diff cannot change the map that judges it.
 //! Git runs read only: no inherited GIT_ name, no stdin, no replace refs, no lazy fetch, raw tree compare.
-//! `--repo-dir` is the top of the repo (a folder inside is refused) and the map is named from the top.
+//! `--repo-dir` is the top of the repo (a folder inside the work tree is refused) and the map is named from
+//! the top.
 //! Exit codes: 0 class printed; 1 an override that lowers is refused (one stderr line); 2 usage or setup
 //! error (one stderr line, no path). The only write is the append to --log of an accepted override.
 
@@ -355,7 +356,7 @@ pub fn risk_cmd(a: &[String]) -> i32 {
         Some(_) => {}
     }
     // `rev-parse --show-prefix` prints the path from the top of the work tree down to the folder (empty at
-    // the top). A folder inside is refused: the changed paths are named from the top.
+    // the top). A folder inside the work tree is refused: the changed paths are named from the top.
     match git(repo, &["rev-parse", "--show-prefix"]) {
         None => return fail("git cannot run"),
         Some(o) if !o.status.success() => return fail("a git call failed"),

@@ -11,7 +11,7 @@ docs low
 README.md low
 CONTRIBUTING.md low
 SECURITY.md low
-# plan.rs is the plan reader: it reads links and states of plan files, never code, and writes nothing.
+# plan.rs reads plan, ticket, done and named note files and local git refs; it writes nothing.
 core/rust/harness/src/plan.rs low
 #
 # High: each is high also when it is not listed (no low entry covers it); listed so the intent is on record
@@ -24,6 +24,6 @@ hooks high
 mcp high
 plugins high
 providers high
-# The privacy scanner and its detector: an edit there changes what every gate catches.
+# The privacy scanner and its detector: an edit there changes what the privacy checks catch.
 core/rust/harness/src/scan.rs high
 core/rust/harness/src/detect.rs high
